@@ -74,14 +74,22 @@ top/right spine 关、PDF(矢量,投稿)+PNG(300dpi,预览)双输出、单位入
 = viz P3(同一数据层);viz 的 figure-spec 管线(P1)后续接本包做"点击导出
 论文图"。
 
-## 4. 实施分期(本分支)
+## 4. 实施分期(本分支;状态 2026-07-24)
 
-1. **绘图包**(本轮):style/schema/figures/demo + 渲染测试——先把图的形态、
-   输入契约定死,数据层照契约实现;
-2. **P-a**:verl patch(per-token 采样落盘)+ trace 侧 turn_token_spans;
-3. **P-b**:probe 工具(evalm 侧,四条件前向 + logits 缓存/差分);
-4. **P-c**:viz P3 接数据层(交互显微镜);
-5. **P-d**:重注入消融 teacher 变体(三分解的 b/a 判别);
-6. **P-e**(第二期):反事实对照(错位/反向 doc)。
+1. ✅ **绘图包**:style/schema/figures(7 图)/demo + 渲染测试;
+2. ✅ **P-a**:verl `6f3d089` 采样落盘 + trace 侧 turn_token_spans/哈希 +
+   `train.distill_microscope` 开关 + `analysis.collect` 离线 join;
+3. ◐ **P-b**:probe 核心与 CLI(build/sweep、doc loaders、决策点 = partial
+   assistant 开 `<action>` 标签处 ⇒ 下一 token 即动作选择、teacher 分布持久化)
+   **已完成**;**待服务器**:checkpoint→HF 权重路径、probe 集实跑冻结与
+   fork 复筛、端到端首验;
+4. ✅ **P-c**:viz 交互显微镜(深度地形 SVG + token 文本流着色 + 轨迹列表;
+   API `microscope`/`microscope_track`);**真实数据组装器** `analysis.assemble`
+   (ledger 三源拼装 / action-flow / fork / type_shares)与**类型标注器**
+   `analysis.annotate`(协议标签 token 子序列定位,无文本重构漂移)已就位;
+5. ☐ **P-d**:重注入消融 teacher 变体(三分解的 b/a 判别);
+6. ☐ **P-e**(第二期):反事实对照(错位/反向 doc)。
 
 E1 冻结臂注意事项:probe 与落盘 patch 必须在 E1 run 之前就位(两臂同测才可比)。
+JSONL 纪律:NaN 序列化为 null(浏览器 JSON 拒收 NaN 字面量),读侧对 float
+字段还原 NaN——`schema.write_jsonl/read_jsonl` 恒经此对(勿手写 json.dumps)。

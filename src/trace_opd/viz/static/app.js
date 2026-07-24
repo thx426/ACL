@@ -59,6 +59,7 @@ async function route() {
       if (parts[2] === "rollout") return await viewRollout(run, params.get("file"));
       if (parts[2] === "research") return await viewResearch(run, params.get("dir"));
       if (parts[2] === "task") return await viewTask(run, params.get("task_id"));
+      if (parts[2] === "microscope") return await viewMicroscope(run, params);
     }
     view.innerHTML = '<p class="bad">unknown route</p>';
   } catch (err) {
@@ -134,6 +135,8 @@ async function viewRun(run) {
     ${short.length ? `<div class="panel"><b class="bad">integrity:</b> steps with missing dumps:
       ${short.map((s) => `<a href="${link.step(run, s.step)}">${s.step} (${s.n}/${ov.expected_per_step})</a>`).join(", ")}
       <span class="muted">— may just be the step currently in flight</span></div>` : ""}
+    <p><a href="#/run/${encodeURIComponent(run)}/microscope">→ distillation microscope</a>
+       <span class="muted">(per-token KL depth terrain &amp; sampled trajectories — needs offline collect)</span></p>
     <h2>Train curves <span class="muted">(from per-sample dumps; click a point to open the step)</span></h2>
     <div class="grid charts" id="charts"></div>
     <h2>Validation (greedy, per split)</h2>
@@ -366,6 +369,81 @@ async function viewTask(run, taskId) {
         </tr>`).join("")}
     </table></div>`;
   bindRowLinks();
+}
+
+// Viridis-ish 5-stop interpolation for the terrain cells (sequential, CB-safe).
+const VIRIDIS = [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]];
+function viridis(x) {
+  x = Math.max(0, Math.min(1, x)) * (VIRIDIS.length - 1);
+  const i = Math.min(VIRIDIS.length - 2, Math.floor(x)), f = x - i;
+  const c = VIRIDIS[i].map((v, k) => Math.round(v + f * (VIRIDIS[i + 1][k] - v)));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+async function viewMicroscope(run, params) {
+  setCrumbs([{ label: "runs", href: link.runs() }, { label: run, href: link.run(run) },
+             { label: "microscope" }]);
+  const d = await api(`/api/run/${run}/microscope`);
+  if (!d.available) {
+    view.innerHTML = `<h1>Distillation microscope</h1>
+      <div class="panel"><p class="muted">No collect outputs found for this run.
+      Produce them offline with:</p>
+      <p class="mono">python -m trace_opd.analysis.collect --run-dir runs/${esc(run)}</p></div>`;
+    return;
+  }
+  const gmax = Math.max(...d.matrix.flat().filter((v) => v != null), 1e-6);
+  const cw = Math.max(6, Math.min(18, Math.floor(760 / d.turns.length)));
+  const ch = Math.max(3, Math.min(10, Math.floor(420 / d.steps.length)));
+  const cells = d.steps.flatMap((s, si) => d.turns.map((t, ti) => {
+    const v = d.matrix[si][ti];
+    return v == null ? "" :
+      `<rect x="${ti * cw}" y="${(d.steps.length - 1 - si) * ch}" width="${cw - 0.5}"
+        height="${ch - 0.5}" fill="${viridis(v / gmax)}"><title>step ${s} · turn ${t} · G=${v}</title></rect>`;
+  })).join("");
+  const selStep = params.get("step"), selTraj = params.get("traj");
+  view.innerHTML = `
+    <h1>Distillation microscope</h1>
+    <div class="panel">
+      <div class="chart-title">depth terrain — per-turn residual privileged info G<sub>τ</sub></div>
+      <div class="chart-sub">x = turn depth, y = training step (up = later); bright = more unconsumed doc signal</div>
+      <svg viewBox="0 0 ${d.turns.length * cw} ${d.steps.length * ch}"
+           style="width:100%;max-height:440px" preserveAspectRatio="none">${cells}</svg>
+      <div class="legend">G ∈ [0, ${gmax.toFixed(3)}] nats/token · steps ${d.steps[0]}–${d.steps[d.steps.length - 1]}</div>
+    </div>
+    <div class="grid cols2">
+      <div class="panel"><h2 style="margin-top:0">sampled trajectories</h2>
+        <table><tr><th>step</th><th>trajectory</th><th>turns</th><th>mean G</th></tr>
+        ${d.trajs.map((t) => `
+          <tr class="click ${String(t.step) === selStep && t.traj_id === selTraj ? "on" : ""}"
+              data-href="#/run/${encodeURIComponent(run)}/microscope?step=${t.step}&traj=${encodeURIComponent(t.traj_id)}">
+            <td>${t.step}</td><td class="mono">${esc(t.traj_id.split("/").pop())}</td>
+            <td>${t.turns}</td><td>${t.g_mean}</td>
+          </tr>`).join("")}
+        </table></div>
+      <div class="panel" id="track"><h2 style="margin-top:0">token strip</h2>
+        <p class="muted">select a trajectory — color = per-token KL, hover for detail</p></div>
+    </div>`;
+  bindRowLinks();
+  if (selStep && selTraj) {
+    const track = await api(
+      `/api/run/${run}/microscope_track?step=${selStep}&traj=${encodeURIComponent(selTraj)}`);
+    const kmax = Math.max(...track.tokens.map((t) => t.kl), 1e-6);
+    let lastTurn = null;
+    const strip = track.tokens.map((t) => {
+      const sep = t.turn !== lastTurn ? `<span class="turnsep">t${t.turn}</span>` : "";
+      lastTurn = t.turn;
+      const alpha = Math.min(1, t.kl / kmax);
+      const label = t.token_text ? esc(t.token_text) : "·";
+      return `${sep}<span class="tok" style="background:rgba(214,69,39,${(alpha * 0.85).toFixed(3)})"
+        title="t=${t.t} turn=${t.turn} kl=${t.kl}${t.token_type ? " · " + esc(t.token_type) : ""}">${label}</span>`;
+    }).join("");
+    document.getElementById("track").innerHTML = `
+      <h2 style="margin-top:0">token strip — step ${esc(selStep)}</h2>
+      <div class="mono" style="font-size:11px;color:var(--muted);margin-bottom:6px">${esc(selTraj)}</div>
+      <div class="tokstrip">${strip}</div>
+      <div class="legend" style="margin-top:6px">red intensity = KL (max ${kmax.toFixed(3)});
+        ${track.tokens.some((t) => t.token_type) ? "annotated" : "run the annotator for token text/types"}</div>`;
+  }
 }
 
 function bindRowLinks() {

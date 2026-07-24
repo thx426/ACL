@@ -296,6 +296,74 @@ class Queries:
             "consumers": consumers,
         }
 
+    # ------------------------------------------------ distillation microscope
+
+    _jsonl_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+    def _cached_jsonl(self, path: Path) -> list[dict[str, Any]]:
+        """analysis/ outputs are rewritten wholesale by collect — cache by mtime."""
+        import json
+
+        if not path.exists():
+            return []
+        key, mtime = str(path), path.stat().st_mtime
+        hit = self._jsonl_cache.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self._jsonl_cache[key] = (mtime, rows)
+        return rows
+
+    def microscope_overview(self, run: str) -> dict[str, Any]:
+        """Depth terrain + sampled-trajectory list from the collect outputs
+        (run/analysis/, produced offline by trace_opd.analysis.collect)."""
+        analysis = self.index.runs_root / run / "analysis"
+        profiles = self._cached_jsonl(analysis / "turn_profiles.jsonl")
+        if not profiles:
+            return {"run": run, "available": False}
+        acc: dict[tuple[int, int], list[float]] = {}
+        trajs: dict[tuple[int, str], dict[str, Any]] = {}
+        for p in profiles:
+            acc.setdefault((p["step"], p["turn"]), []).append(p["g_mean"])
+            t = trajs.setdefault(
+                (p["step"], p["traj_id"]),
+                {"step": p["step"], "traj_id": p["traj_id"], "turns": 0,
+                 "g_sum": 0.0, "n": 0},
+            )
+            t["turns"] = max(t["turns"], p["turn"])
+            t["g_sum"] += p["g_mean"] * p["n_tokens"]
+            t["n"] += p["n_tokens"]
+        steps = sorted({s for s, _ in acc})
+        turns = sorted({t for _, t in acc})
+        matrix = [
+            [
+                (round(sum(acc[(s, t)]) / len(acc[(s, t)]), 4) if (s, t) in acc else None)
+                for t in turns
+            ]
+            for s in steps
+        ]
+        traj_list = [
+            {**t, "g_mean": round(t["g_sum"] / max(1, t["n"]), 4)}
+            for t in sorted(trajs.values(), key=lambda x: (x["step"], x["traj_id"]))
+        ]
+        for t in traj_list:
+            t.pop("g_sum")
+        return {"run": run, "available": True, "steps": steps, "turns": turns,
+                "matrix": matrix, "trajs": traj_list}
+
+    def microscope_track(self, run: str, step: int, traj_id: str) -> dict[str, Any]:
+        analysis = self.index.runs_root / run / "analysis"
+        rows = [
+            r for r in self._cached_jsonl(analysis / "token_records.jsonl")
+            if r["step"] == step and r["traj_id"] == traj_id
+        ]
+        rows.sort(key=lambda r: r["t"])
+        return {"run": run, "step": step, "traj_id": traj_id, "tokens": rows}
+
     def task_history(self, run: str, task_id: str) -> dict[str, Any]:
         with self.index.connect() as db:
             rows = [

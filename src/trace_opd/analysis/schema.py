@@ -7,6 +7,7 @@ consumed by `figures`. JSONL on disk, one dataclass per line.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
@@ -52,6 +53,7 @@ class TokenRecord:
     in_overlap: bool = False
     token_type: str = ""   # offline annotation: action-verb / action-arg /
                            # reasoning-connective / format
+    token_text: str = ""   # decoded piece (annotator, for the viz microscope)
 
 
 # ------------------------------------------------------------- probe rows
@@ -112,20 +114,38 @@ class ForkStats:
 # ------------------------------------------------------------------- jsonl
 
 
+def _json_clean(value: Any) -> Any:
+    """NaN is not valid JSON (browsers reject it) — serialize as null; the
+    reader restores NaN for float-typed fields, keeping the pair symmetric."""
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _json_clean(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_clean(v) for v in value]
+    return value
+
+
 def write_jsonl(path: str | Path, rows: Iterable[Any]) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+            f.write(json.dumps(_json_clean(asdict(row)), ensure_ascii=False) + "\n")
     return path
 
 
 def read_jsonl(path: str | Path, cls: type[T]) -> list[T]:
-    names = {f.name for f in fields(cls)}
+    spec = {f.name: f.type for f in fields(cls)}
+    float_names = {n for n, t in spec.items() if t in (float, "float")}
     out: list[T] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         if line.strip():
             d = json.loads(line)
-            out.append(cls(**{k: v for k, v in d.items() if k in names}))
+            row = {
+                k: (float("nan") if v is None and k in float_names else v)
+                for k, v in d.items()
+                if k in spec
+            }
+            out.append(cls(**row))
     return out

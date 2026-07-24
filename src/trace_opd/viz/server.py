@@ -45,6 +45,8 @@ class VizHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # Live-updating data — heuristic browser caching serves stale steps.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -127,6 +129,17 @@ class VizHandler(BaseHTTPRequestHandler):
             if not task_id:
                 return self._error(400, "task_id required")
             return self._json(q.task_history(run, task_id))
+        if tail == ["microscope"]:
+            return self._json(q.microscope_overview(run))
+        if tail == ["microscope_track"]:
+            try:
+                step = int(params.get("step", ""))
+            except ValueError:
+                return self._error(400, "bad step")
+            traj = params.get("traj", "")
+            if _safe_rel(q.index.runs_root / run, traj) is None:
+                return self._error(400, "bad path")
+            return self._json(q.microscope_track(run, step, traj))
         return self._error(404, "not found")
 
 
