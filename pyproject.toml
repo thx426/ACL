@@ -12,6 +12,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# Publication-figure suite (trace_opd.analysis); the viz observatory is
+# stdlib-only on purpose and needs no extra.
+analysis = ["matplotlib>=3.8", "numpy>=1.26"]
 
 [build-system]
 requires = ["setuptools>=68"]
