@@ -1,0 +1,18 @@
+# experiment artifacts & data (source code only in git)
+runs/
+checkpoints/
+data/
+*.parquet
+swanlog/
+wandb/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# os / editor
+.DS_Store

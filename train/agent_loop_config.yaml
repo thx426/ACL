@@ -1,0 +1,5 @@
+# Registers the TRACE-OPD agent loop with verl's agent-loop registry.
+# Referenced by actor_rollout_ref.rollout.agent.agent_loop_config_path.
+# Requires PYTHONPATH to include trace_opd/src (the launcher sets it).
+- name: trace_opd
+  _target_: trace_opd.train.agent_loop.TraceAgentLoop
