@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -299,6 +302,78 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# trace-opd distillation microscope: sample per-token distillation quantities
+# to TRACE_DISTILL_MICROSCOPE_DIR for offline analysis (joined with rollout
+# dumps via a content hash over response token ids). The hash below MUST stay
+# bit-identical with trace_opd.common.hashing.response_token_hash.
+# ---------------------------------------------------------------------------
+_MICROSCOPE_MOD = (1 << 63) - 1
+_MICROSCOPE_MUL = 1000003
+
+
+def _resp_hash(ids) -> int:
+    h = 0
+    for x in ids:
+        h = (h * _MICROSCOPE_MUL + int(x)) & _MICROSCOPE_MOD
+    return h
+
+
+def _response_id_rows(data: TensorDict):
+    responses = data.get("responses", None)
+    if responses is None:
+        return None
+    if responses.is_nested:
+        return [t.tolist() for t in responses.unbind()]
+    prompts = data.get("prompts", None)
+    attention_mask = data.get("attention_mask", None)
+    if prompts is None or attention_mask is None:
+        return None
+    prompt_len = prompts.shape[1]
+    lens = attention_mask[:, prompt_len:].sum(dim=1).tolist()
+    return [responses[i, : int(n)].tolist() for i, n in enumerate(lens)]
+
+
+def _dump_microscope_rows(data: TensorDict, kl, mask, extras: dict) -> None:
+    out_dir = os.getenv("TRACE_DISTILL_MICROSCOPE_DIR")
+    if not out_dir:
+        return
+    try:
+        every = max(1, int(os.getenv("TRACE_DISTILL_SAMPLE_EVERY", "4")))
+        rows = _response_id_rows(data)
+        if rows is None:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        lines = []
+        for i, ids in enumerate(rows):
+            resp_hash = _resp_hash(ids)
+            if resp_hash % every:
+                continue
+            length = len(ids)
+
+            def row_of(t):
+                return [round(float(v), 5) for v in t[i, :length].tolist()]
+
+            record = {
+                "resp_hash": resp_hash,
+                "resp_len": length,
+                "ids": [int(x) for x in ids],
+                "mask": [int(v) for v in mask[i, :length].tolist()],
+                "kl": row_of(kl),
+            }
+            for name, tensor in extras.items():
+                record[name] = row_of(tensor) if tensor is not None else None
+            lines.append(json.dumps(record))
+        if lines:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f"rank{rank}.jsonl"), "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    except Exception:  # noqa: BLE001 — diagnostics must never kill training
+        logger.warning("distillation microscope dump failed", exc_info=True)
+
+
 @register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
@@ -345,6 +420,18 @@ def compute_forward_kl_topk(
         else:
             overlap_metrics["distillation/overlap_token_advantage"] = 0.0
 
+    # Padded per-token views for the microscope dump, saved before the metric
+    # code below flattens them through the response mask.
+    teacher_topk_entropy = model_output.get("teacher_topk_entropy")
+    if teacher_topk_entropy is not None:
+        teacher_topk_entropy = no_padding_2_padding(teacher_topk_entropy, data)
+    microscope_extras = {
+        "s_mass": student_mass,
+        "t_mass": teacher_mass,
+        "overlap": overlap_count,
+        "t_ent": teacher_topk_entropy,
+    }
+
     # Log amount of mass in the top-k log probabilities for both student and teacher.
     student_mass = student_mass[response_mask_bool]
     teacher_mass = teacher_mass[response_mask_bool]
@@ -360,6 +447,9 @@ def compute_forward_kl_topk(
 
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)
+
+    # Same clamped values the loss trains on — keep the dump loss-consistent.
+    _dump_microscope_rows(data, distillation_losses, response_mask_bool, microscope_extras)
 
     return distillation_losses, distillation_metrics
 

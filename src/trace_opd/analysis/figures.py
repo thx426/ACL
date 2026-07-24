@@ -154,14 +154,21 @@ def fig_token_microscope(track: list[TokenRecord], steps: list[int],
                          type_shares: dict[str, list[float]]):
     track = sorted(track, key=lambda r: r.t)
     ratios = np.array([[r.logratio for r in track]])
+    # Training-side samples carry only the (non-negative) per-token KL; the
+    # signed log-ratio needs the probe's full-vocab forward. Fall back to a
+    # sequential KL strip when the signed values are absent.
+    signed = bool(np.isfinite(ratios).all())
+    if not signed:
+        ratios = np.array([[r.kl for r in track]])
     vmax = max(1e-6, float(np.abs(ratios).max()))
     with style():
         fig, (ax1, ax2) = plt.subplots(
             2, 1, figsize=(SINGLE * 1.35, SINGLE * 0.95),
             height_ratios=[1, 1.6], constrained_layout=True,
         )
-        im = ax1.imshow(ratios, aspect="auto", cmap=DIVERGING_CMAP,
-                        norm=TwoSlopeNorm(0, -vmax, vmax),
+        im = ax1.imshow(ratios, aspect="auto",
+                        cmap=DIVERGING_CMAP if signed else SEQUENTIAL_CMAP,
+                        norm=TwoSlopeNorm(0, -vmax, vmax) if signed else None,
                         extent=[track[0].t, track[-1].t + 1, 0, 1])
         for a, b in zip(track, track[1:]):
             if b.turn != a.turn:
@@ -173,7 +180,7 @@ def fig_token_microscope(track: list[TokenRecord], steps: list[int],
         ax1.set_yticks([])
         ax1.set_xlabel("token position (turn boundaries marked)")
         cbar = fig.colorbar(im, ax=ax1, pad=0.02, fraction=0.06)
-        cbar.set_label(r"$\log p_T - \log p_S$")
+        cbar.set_label(r"$\log p_T - \log p_S$" if signed else r"$KL_t$ (nats)")
 
         order = [t for t in TOKEN_TYPES if t in type_shares]
         ax2.stackplot(steps, [type_shares[t] for t in order],

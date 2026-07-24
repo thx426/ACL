@@ -35,11 +35,16 @@ limitations(444 step 时间分辨率 + E1 对照臂补强)。
 **训练内(verl patch,P-a)**——蒸馏 loss 聚合前采样落盘,两级:
 - per-turn 聚合(**全量**,~40 turn×128 条×6 float/step,零负担):
   `{step, traj_id, turn, g_mean, g_gated, overlap, h_teacher, h_student, n_tokens}`
-- token 级(**抽样** 4-8 条/step,~5-10MB/step):
-  `{step, traj_id, t, turn, token_id, kl, logratio, h_t, h_s, top1_t, top1_s, in_overlap}`
+- token 级(**抽样**,默认 1/4 按内容哈希确定性抽,~几 MB/step):
+  `{resp_hash, resp_len, ids, mask, kl, s_mass, t_mass, overlap, t_ent}`
 - **turn 边界**:verl 侧没有 turn 概念——由 trace 侧在 rollout dump 里记
   `turn_token_spans: [[start,end),...]`(agent loop 逐轮 append 时天然知道),
-  离线 join。**这是 P-a 的 trace 侧半件。**
+  离线 join(`analysis.collect`,join 键 = response ids 的多项式滚动哈希,
+  trace/verl 双侧位级一致,单测锁 golden)。**v1 实现口径**(已落地,verl
+  `6f3d089` + trace 侧 spans/hash + `train.distill_microscope` 开关):训练侧
+  不采 signed log-ratio 与 student 熵(rmpad label 对齐是 off-by-one 雷区)
+  ——方向性与精确熵由 probe 全 vocab 前向补;`g_gated` v1 门控 =
+  `s_mass < 0.9`(student 在 teacher top-k 外仍有显著质量 ≈ 未锁定/分歧)。
 
 **probe 工具(evalm 侧,P-b)**——每 val 点对 64 条冻结前缀做四条件前向
 {π_k, π_k⊕d_k, π_k⊕d_fix, π_0(缓存)},全 vocab logits 落盘(供 align 差分),

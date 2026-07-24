@@ -243,6 +243,11 @@ train:
                             # 调大须同步调小 27B 侧 GPU_MEM(serve_researcher.sh)
   rollout_temperature: 1.0  # 训练 rollout 采样温度 | h3 定版
   distill_topk: 64          # forward_kl_topk 的 k | h3 定版(verl 官方推荐区间)
+  distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
+                            # <run>/microscope/(verl 6f3d089;~几 MB/step,离线经
+                            # analysis.collect 与 rollout dump join 出深度剖面/
+                            # token 显微镜;docs/analysis-design.md §2)
+  distill_sample_every: 4   # 抽样率 1/N(确定性内容哈希,跨 rank 一致)
   total_epochs: 2           # 全量 3553、batch 16、drop_last ⇒ 222 step/epoch,
                             # 2 epoch = 444 step(每 epoch 仅 1 任务随 shuffle 轮空)
   test_freq: 20             # 每 20 step 跑 val(seen140+unseen134 greedy)| 用户裁定

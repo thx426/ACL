@@ -118,4 +118,9 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # trace-opd distillation microscope: workers sample per-token distillation
+    # quantities to this directory when set (see trainer/distillation/losses.py).
+    for key in ("TRACE_DISTILL_MICROSCOPE_DIR", "TRACE_DISTILL_SAMPLE_EVERY"):
+        if os.environ.get(key):
+            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

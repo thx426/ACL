@@ -42,12 +42,14 @@ class TokenRecord:
     turn: int
     token_id: int
     kl: float
-    logratio: float        # log p_T(y_t) - log p_S(y_t) at the sampled token
-    h_t: float
-    h_s: float
-    top1_t: int
-    top1_s: int
-    in_overlap: bool
+    logratio: float = float("nan")  # log p_T(y_t) - log p_S(y_t) at the sampled
+                           # token; NOT captured by the v1 training-side sampler
+                           # (rmpad label alignment) — probe fills exact values
+    h_t: float = -1.0      # teacher TRUNCATED (top-k) entropy from training
+    h_s: float = -1.0      # not captured by the v1 training-side sampler —
+    top1_t: int = -1       # exact per-token entropies/top-1 come from the
+    top1_s: int = -1       # probe tool (full-vocab offline forward)
+    in_overlap: bool = False
     token_type: str = ""   # offline annotation: action-verb / action-arg /
                            # reasoning-connective / format
 

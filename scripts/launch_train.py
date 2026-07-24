@@ -264,6 +264,11 @@ def main() -> int:
             "HYDRA_FULL_ERROR": "1",
         }
     )
+    if cfg.train.distill_microscope:
+        # Per-token distillation sampling (verl patch 6f3d089); forwarded to
+        # ray workers via verl's call-time env whitelist.
+        env["TRACE_DISTILL_MICROSCOPE_DIR"] = str(run_dir / "microscope")
+        env["TRACE_DISTILL_SAMPLE_EVERY"] = str(cfg.train.distill_sample_every)
     if "swanlab" in cfg.train.loggers and not env.get("SWANLAB_API_KEY") and not env.get("SWANLAB_MODE"):
         print("[launch] SWANLAB_API_KEY not set — falling back to SWANLAB_MODE=offline")
         env["SWANLAB_MODE"] = "offline"

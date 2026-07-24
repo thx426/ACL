@@ -57,11 +57,18 @@ GenerateFn = Callable[[list[int], dict[str, Any]], Awaitable[GenResult]]
 
 @dataclass
 class EpisodeTokens:
-    """Append-only training-layout stream (prompt | response with mask)."""
+    """Append-only training-layout stream (prompt | response with mask).
+
+    turn_spans: [start, end) of every assistant generation segment within
+    response_ids — the offline turn-bucketing key of the distillation
+    microscope (analysis-design.md §2). Spans cover exactly the mask=1
+    positions, clamped to the response budget.
+    """
 
     prompt_ids: list[int]
     response_ids: list[int]
     response_mask: list[int]
+    turn_spans: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -124,6 +131,7 @@ async def run_episode(
 
     stream: list[int] = []
     mask: list[int] = []
+    turn_spans: list[list[int]] = []
     prompt_ids: list[int] = []
     assistant_turns = 0
     invalid_format = 0
@@ -182,6 +190,7 @@ async def run_episode(
                 truncated = True
                 break
             assistant_turns += 1
+            turn_spans.append([len(stream), len(stream) + len(gen_ids)])
             stream += gen_ids
             mask += [1] * len(gen_ids)
             for key in ("min_global_steps",):
@@ -269,6 +278,11 @@ async def run_episode(
                 prompt_ids=prompt_ids,
                 response_ids=stream[:response_budget],
                 response_mask=mask[:response_budget],
+                turn_spans=[
+                    [s, min(e, response_budget)]
+                    for s, e in turn_spans
+                    if s < response_budget
+                ],
             ),
             assistant_turns=assistant_turns,
             invalid_format=invalid_format,
@@ -284,6 +298,11 @@ async def run_episode(
                 prompt_ids=prompt_ids,
                 response_ids=stream[:response_budget],
                 response_mask=mask[:response_budget],
+                turn_spans=[
+                    [s, min(e, response_budget)]
+                    for s, e in turn_spans
+                    if s < response_budget
+                ],
             ),
             assistant_turns=assistant_turns,
             invalid_format=invalid_format,

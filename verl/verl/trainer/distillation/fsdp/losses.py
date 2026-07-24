@@ -140,10 +140,16 @@ def compute_forward_kl_topk(
         overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
     )
 
+    # Truncated (top-k) teacher entropy — the decision-point/uncertainty signal
+    # of the trace-opd distillation microscope (per-token, cheap to carry).
+    teacher_topk_probs = teacher_topk_log_probs.exp()
+    teacher_topk_entropy = -(teacher_topk_probs * teacher_topk_log_probs).sum(dim=-1)
+
     return {
         "distillation_losses": distillation_losses,
         "student_mass": student_mass,
         "teacher_mass": teacher_mass,
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
+        "teacher_topk_entropy": teacher_topk_entropy,
     }

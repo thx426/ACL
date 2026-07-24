@@ -165,6 +165,10 @@ class TrainCfg:
                                       # root cause at 4096; halved for coexistence)
     rollout_temperature: float = 1.0
     distill_topk: int = 64
+    distill_microscope: bool = True   # sample per-token distillation quantities
+                                      # to <run>/microscope/ for the analysis
+                                      # suite (docs/analysis-design.md; ~MBs/step)
+    distill_sample_every: int = 4     # deterministic 1/N trajectory sample rate
     total_epochs: int = 2
     test_freq: int = 10
     save_freq: int = 10
@@ -259,6 +263,10 @@ def _validate(cfg: "Config") -> None:
         problems.append(f"train.rollout_n={cfg.train.rollout_n} must be >= 1")
     if cfg.train.ppo_max_token_len_per_gpu < 1 or cfg.train.log_prob_max_token_len_per_gpu < 1:
         problems.append("train.ppo/log_prob_max_token_len_per_gpu must be >= 1")
+    if cfg.train.distill_sample_every < 1:
+        problems.append(
+            f"train.distill_sample_every={cfg.train.distill_sample_every} must be >= 1"
+        )
     for name, role in cfg.roles.items():
         if role.dp_size < 0:
             problems.append(f"roles.{name}.dp_size must be >= 0 (0 disables routing)")

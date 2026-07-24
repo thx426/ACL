@@ -56,6 +56,7 @@ from verl.experimental.agent_loop.agent_loop import (
 
 from ..common.aio import shared_task
 from ..common.config import Config, load_config
+from ..common.hashing import response_token_hash
 from ..common.llm import make_client
 from ..common.tape import TapeWriter
 from ..core.episode import EpisodeResult, run_episode
@@ -467,6 +468,14 @@ class TraceAgentLoop(AgentLoopBase):
                         k: v for k, v in research_fields.items() if k != "doc_words"
                     },
                     "trajectory": traj.to_dict(),
+                    # Distillation-microscope join keys (analysis-design.md §2):
+                    # the training-side sampler records the same rolling hash
+                    # over response ids; turn spans bucket per-token KL by turn.
+                    "response_token_len": len(result.tokens.response_ids),
+                    "response_token_hash": response_token_hash(
+                        result.tokens.response_ids
+                    ),
+                    "turn_token_spans": result.tokens.turn_spans,
                     "ts": time.time(),
                 },
             )

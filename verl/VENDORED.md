@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(e8f697c)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(6f3d089)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -28,6 +28,7 @@
 | f8f26d5 | trace-opd:训练侧聚合 per-sample `reward_extra_info` 数值键为 `rollout_extra/<key>/mean` 曲线(val 侧上游本就聚合,此为镜像) |
 | 6d77dc7 | trace-opd:微批 token 预算改为打包目标——超预算长尾单条自动独占微批 + warning(原 assert 会杀整个 run;显存不足仍 loud OOM) |
 | e8f697c | trace-opd:`rollout_extra/*` 训练曲线镜像到 **V1 trainer**(实际执行路径 TaskRunnerV1→`v1/trainer_base.py`;f8f26d5 只打在 V0 的 ray_trainer.py,曲线全缺——CD-006 2026-07-24 实证。V0 调用保留) |
+| 6f3d089 | trace-opd:**蒸馏显微镜采样落盘**——`TRACE_DISTILL_MICROSCOPE_DIR` 置位时 `compute_forward_kl_topk` 按内容哈希确定性抽样(默认 1/4,`TRACE_DISTILL_SAMPLE_EVERY`)落 per-token {kl, mask, top-k mass, overlap, teacher 截断熵, token ids};哈希与 `trace_opd.common.hashing` 位级一致(离线 join rollout dump);fsdp topk 路径新增 per-token teacher 截断熵;落盘失败绝不杀训练(schema:`docs/analysis-design.md` §2) |
 
 ## 修改/更新流程(保持单一真源)
 
