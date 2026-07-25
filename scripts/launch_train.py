@@ -44,27 +44,45 @@ from trace_opd.common.config import Config, load_config  # noqa: E402
 
 
 def preflight_researcher(cfg: Config) -> None:
-    """The endpoint must answer /models and serve the configured model —
-    otherwise every research session would silently degrade to doc=None and
-    the whole run would train on near-zero self-KL (review P1-8)."""
+    """Every pool endpoint must answer /models and serve the configured model —
+    otherwise research sessions would silently degrade to doc=None and the run
+    would train on near-zero self-KL (review P1-8). Pool mode (comma-separated
+    endpoint): >=1 healthy endpoint lets the run proceed (PooledClient fails
+    over per call); 0 healthy is FATAL. Auth header included (remote pools)."""
     if not (cfg.research.enabled and cfg.research.backend == "external"):
         return
     role = cfg.role("researcher")
     if not role.endpoint:
         raise SystemExit("FATAL: roles.researcher.endpoint is empty (env var unset?)")
-    url = role.endpoint.rstrip("/") + "/models"
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as err:  # noqa: BLE001
-        raise SystemExit(f"FATAL: researcher endpoint preflight failed ({url}): {err}") from err
-    served = {m.get("id") for m in data.get("data", [])}
-    if role.model not in served:
+    endpoints = [e.strip() for e in role.endpoint.split(",") if e.strip()]
+    healthy: list[str] = []
+    errors: list[str] = []
+    for ep in endpoints:
+        url = ep.rstrip("/") + "/models"
+        req = urllib.request.Request(url)
+        if role.api_key:
+            req.add_header("Authorization", f"Bearer {role.api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            served = {m.get("id") for m in data.get("data", [])}
+            if role.model not in served:
+                errors.append(f"{url}: model {role.model!r} not served ({sorted(served)})")
+                continue
+            healthy.append(ep)
+        except Exception as err:  # noqa: BLE001
+            errors.append(f"{url}: {err}")
+    for msg in errors:
+        print(f"[preflight] WARNING researcher endpoint unhealthy — {msg}")
+    if not healthy:
         raise SystemExit(
-            f"FATAL: researcher model {role.model!r} not served at {url} "
-            f"(served: {sorted(served)})"
+            f"FATAL: no healthy researcher endpoint (0/{len(endpoints)}): "
+            + " | ".join(errors)
         )
-    print(f"[preflight] researcher OK: {role.model} @ {role.endpoint}")
+    print(
+        f"[preflight] researcher OK: {role.model} @ "
+        f"{len(healthy)}/{len(endpoints)} endpoint(s) healthy: {', '.join(healthy)}"
+    )
 
     if role.sidecar_sleep:
         root = sidecar_root(role.endpoint)
@@ -211,6 +229,10 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "distillation.distillation_loss.use_task_rewards=False",
         "distillation.distillation_loss.loss_max_clamp=10.0",
         "distillation.distillation_loss.log_prob_min_clamp=-10.0",
+        # 信号增强三件套 K1/K2(K3 经 extra_fields 走 agent loop,无 CLI 项)
+        f"+distillation.distillation_loss.loss_soft_cap={t.distill_loss_soft_cap}",
+        f"+distillation.distillation_loss.kl_weight_alpha={t.distill_kl_weight_alpha}",
+        f"+distillation.distillation_loss.kl_weight_cap={t.distill_kl_weight_cap}",
     ]
 
 

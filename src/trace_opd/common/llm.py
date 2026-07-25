@@ -99,16 +99,18 @@ class OpenAICompatClient:
         tape: TapeWriter | None = None,
         extra_body: dict[str, Any] | None = None,
         dp_size: int = 0,
+        transport: Any = None,   # tests: httpx.MockTransport
     ) -> None:
         if not endpoint:
             raise LLMError(f"role {role!r}: empty endpoint (env var not set?)")
         self.role = role
         self.model = model
+        self.endpoint = endpoint
         self._url = endpoint.rstrip("/") + "/chat/completions"
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        self._client = httpx.AsyncClient(timeout=timeout_s, headers=headers)
+        self._client = httpx.AsyncClient(timeout=timeout_s, headers=headers, transport=transport)
         self._sem = asyncio.Semaphore(max_concurrency)
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -198,6 +200,7 @@ class OpenAICompatClient:
             {
                 "role": self.role,
                 "model": self.model,
+                "endpoint": self.endpoint,
                 "attempts": attempts,
                 "dp_rank": dp_rank,
                 "latency_s": round(time.monotonic() - t0, 3),
@@ -257,18 +260,166 @@ class OpenAICompatClient:
         )
 
 
-def make_client(role: str, model_cfg, tape: TapeWriter | None = None) -> OpenAICompatClient:
-    """Build a client from a RoleCfg (common/config.py)."""
-    return OpenAICompatClient(
+class PooledClient:
+    """Session-sticky pool over N independent OpenAI-compatible endpoints.
+
+    For a role served as SEPARATE replicas with no shared scheduler (e.g. two
+    remote vLLM instances behind SSH tunnels) — unlike ``dp_size`` routing,
+    which targets DP ranks INSIDE one server. Enabled by a comma-separated
+    ``endpoint`` in the role config (zero schema change).
+
+    Selection: sticky per route_key (= one research session), first assignment
+    = least-active endpoint (tie broken by crc32 for cross-run determinism) —
+    a pure static hash can skew 16 tasks up to ~12/4 (the 2.83× DP-skew
+    precedent, feedback 2026-07-23/24). Failover: when one endpoint exhausts
+    its (short) retry budget, the call moves to the next endpoint and the
+    session re-sticks there. Remote prefill is ~free (4.4k tok ≈ 0.4s,
+    measured 2026-07-24), so affinity loss costs little; availability wins.
+    In-process state is enough: one session lives entirely inside one
+    agent-loop worker process (train_batch_size % agent_num_workers == 0
+    keeps all copies of a task in one worker, config invariant)."""
+
+    # per-endpoint retry budget is kept SHORT so a dead endpoint fails over in
+    # seconds instead of riding the single-client 5-retry backoff (~60s)
+    INNER_RETRIES = 2
+
+    def __init__(
+        self,
+        *,
+        role: str,
+        clients: list[OpenAICompatClient],
+        max_concurrency: int = 4,
+        tape: TapeWriter | None = None,
+    ) -> None:
+        if not clients:
+            raise LLMError(f"role {role!r}: empty endpoint pool")
+        self.role = role
+        self.model = clients[0].model
+        self.endpoint = ",".join(c.endpoint for c in clients)
+        self._clients = clients
+        self._sem = asyncio.Semaphore(max_concurrency)
+        self._tape = tape
+        self._sticky: dict[str, int] = {}
+        self._active = [0] * len(clients)
+        self._stats = [
+            {"requests": 0, "failures": 0, "failovers_in": 0} for _ in clients
+        ]
+
+    def _least_active(self, route_key: str | None, exclude: set[int]) -> int:
+        cands = [i for i in range(len(self._clients)) if i not in exclude]
+        tie = zlib.crc32((route_key or "").encode("utf-8"))
+        return min(cands, key=lambda i: (self._active[i], (i + tie) % len(self._clients)))
+
+    def _order(self, route_key: str | None) -> list[int]:
+        """Sticky endpoint first, then the rest by load (failover order)."""
+        first = (
+            self._sticky[route_key]
+            if route_key is not None and route_key in self._sticky
+            else self._least_active(route_key, set())
+        )
+        rest: list[int] = []
+        seen = {first}
+        while len(seen) < len(self._clients):
+            nxt = self._least_active(route_key, seen)
+            rest.append(nxt)
+            seen.add(nxt)
+        return [first, *rest]
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        route_key: str | None = None,
+    ) -> ChatResult:
+        order = self._order(route_key)
+        last_err: Exception | None = None
+        async with self._sem:
+            for hop, idx in enumerate(order):
+                self._active[idx] += 1
+                self._stats[idx]["requests"] += 1
+                if hop > 0:
+                    self._stats[idx]["failovers_in"] += 1
+                try:
+                    result = await self._clients[idx].chat(
+                        messages,
+                        tools=tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        # inner dp_size=0 ⇒ no DP header; route_key still
+                        # forwarded for future single-server DP composition
+                        route_key=route_key,
+                    )
+                    if route_key is not None:
+                        self._sticky[route_key] = idx  # (re-)stick the session
+                    return result
+                except LLMError as err:
+                    self._stats[idx]["failures"] += 1
+                    last_err = err
+                finally:
+                    self._active[idx] -= 1
+        raise LLMError(
+            f"role {self.role}: all {len(self._clients)} endpoints failed — {last_err}"
+        )
+
+    def stats(self) -> list[dict[str, Any]]:
+        return [
+            {"endpoint": c.endpoint, **s} for c, s in zip(self._clients, self._stats)
+        ]
+
+    async def aclose(self) -> None:
+        if self._tape is not None:
+            self._tape.record({"role": self.role, "pool_summary": self.stats()})
+        for c in self._clients:
+            await c.aclose()
+
+
+def make_client(
+    role: str, model_cfg, tape: TapeWriter | None = None
+) -> OpenAICompatClient | PooledClient:
+    """Build a client from a RoleCfg (common/config.py).
+
+    A comma-separated ``endpoint`` ("http://a/v1,http://b/v1") builds a
+    session-sticky PooledClient over independent replicas; a single URL keeps
+    the plain client (incl. dp_size header routing) — fully backward
+    compatible."""
+    endpoints = [e.strip() for e in model_cfg.endpoint.split(",") if e.strip()]
+    if len(endpoints) <= 1:
+        return OpenAICompatClient(
+            role=role,
+            endpoint=model_cfg.endpoint,
+            model=model_cfg.model,
+            api_key=model_cfg.api_key,
+            max_concurrency=model_cfg.max_concurrency,
+            temperature=model_cfg.temperature,
+            max_tokens=model_cfg.max_tokens,
+            timeout_s=model_cfg.timeout_s,
+            tape=tape,
+            extra_body=model_cfg.extra_body,
+            dp_size=getattr(model_cfg, "dp_size", 0),
+        )
+    inner = [
+        OpenAICompatClient(
+            role=role,
+            endpoint=ep,
+            model=model_cfg.model,
+            api_key=model_cfg.api_key,
+            max_concurrency=model_cfg.max_concurrency,
+            temperature=model_cfg.temperature,
+            max_tokens=model_cfg.max_tokens,
+            timeout_s=model_cfg.timeout_s,
+            max_retries=PooledClient.INNER_RETRIES,
+            tape=tape,
+            extra_body=model_cfg.extra_body,
+            dp_size=0,  # independent replicas: DP header is meaningless
+        )
+        for ep in endpoints
+    ]
+    return PooledClient(
         role=role,
-        endpoint=model_cfg.endpoint,
-        model=model_cfg.model,
-        api_key=model_cfg.api_key,
+        clients=inner,
         max_concurrency=model_cfg.max_concurrency,
-        temperature=model_cfg.temperature,
-        max_tokens=model_cfg.max_tokens,
-        timeout_s=model_cfg.timeout_s,
         tape=tape,
-        extra_body=model_cfg.extra_body,
-        dp_size=getattr(model_cfg, "dp_size", 0),
     )

@@ -1045,6 +1045,16 @@ class AgentLoopWorker:
         # shared teacher prefix is prefilled once per task, not per sample.
         # Always popped — it must never leak into the training batch.
         teacher_routing_key = output.extra_fields.pop("teacher_routing_key", None)
+        # trace-opd K3 block-refresh scoring (2026-07-24, user-approved,
+        # W=4): the doc-as-prefix influence decays with context (~50x by turn
+        # 7, measured), so the trace agent loop may supply
+        # ``teacher_doc_ids`` (the tokenized "## Task guidance" + full doc)
+        # and ``teacher_block_starts`` (response-token offsets after every
+        # W-th assistant turn). Scoring then runs per block with ONE fresh
+        # doc copy inserted at the block start; block 0 is byte-identical to
+        # the historical single-call teacher. Always popped.
+        teacher_doc_ids = output.extra_fields.pop("teacher_doc_ids", None)
+        teacher_block_starts = output.extra_fields.pop("teacher_block_starts", None)
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
@@ -1053,7 +1063,94 @@ class AgentLoopWorker:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
             sequence_prompt_ids = list(teacher_prompt_ids) if teacher_prompt_ids is not None else prompt_ids
-            if self.self_teacher:
+            response_teacher_ids = None  # set by the K3 block path
+            response_teacher_logprobs = None
+            teacher_ids = None  # set by the single-call / external paths
+            teacher_logprobs = None
+            # K3 boundary validation (codex review 2026-07-24, medium): only
+            # strictly increasing starts inside (0, R) preserve invariant ①
+            # (block 0 byte-identical to the single-call teacher). Anything
+            # else silently degrades to the single-call path (never crashes).
+            k3_starts: list[int] = []
+            if teacher_block_starts:
+                cand = [int(s) for s in teacher_block_starts]
+                if all(
+                    isinstance(s, int) and 0 < s < len(response_ids) for s in cand
+                ) and all(a < b for a, b in zip(cand, cand[1:])):
+                    k3_starts = cand
+                else:
+                    logger.warning("K3: invalid block starts %s (R=%d) — falling back to single-call teacher", cand, len(response_ids))
+            if self.self_teacher and teacher_prompt_ids is not None and k3_starts:
+                # K3 block-refresh: score each block under [privileged prefix]
+                # + [pure student history up to block start] + [one fresh doc
+                # copy (blocks 1+)] + [block tokens]. Rows T_b-1 .. T_b+L-2
+                # predict the L block tokens (same row semantics as below);
+                # the trailing dummy row is never touched because the block is
+                # the sequence tail. All blocks share ONE routing key so a
+                # multi-replica balancer keeps the nested trunks on one
+                # replica's prefix cache (per-call engine request ids stay
+                # fresh UUIDs inside LLMServerClient). Concurrency is bounded
+                # per sample; any failure cancels the batch of blocks and
+                # falls back to the single-call privileged teacher (codex
+                # review HIGH-1) instead of killing the worker batch.
+                doc_ids = list(teacher_doc_ids or [])
+                starts = [0] + k3_starts
+                ends = k3_starts + [len(response_ids)]
+                block_key = teacher_routing_key or uuid4().hex
+                block_sem = asyncio.Semaphore(4)
+
+                async def _score_block(i: int, s: int, e: int):
+                    if e <= s:  # defensive: never issue a wasted call
+                        k = self.self_teacher_num_logprobs + 1
+                        return (
+                            torch.zeros((0, k), dtype=torch.int32),
+                            torch.zeros((0, k)),
+                        )
+                    ins = doc_ids if i > 0 else []
+                    seq = sequence_prompt_ids + response_ids[:s] + ins + response_ids[s:e]
+                    async with block_sem:
+                        out = await self.llm_client.generate(
+                            request_id=block_key,
+                            prompt_ids=seq,
+                            sampling_params={
+                                "max_tokens": 1,
+                                "temperature": 1.0,
+                                "prompt_logprobs": self.self_teacher_num_logprobs,
+                            },
+                        )
+                    ids_b = torch.tensor(out.extra_fields["prompt_ids"], dtype=torch.int32)
+                    lps_b = torch.tensor(out.extra_fields["prompt_logprobs"])
+                    if not (ids_b.shape[0] == lps_b.shape[0] == len(seq)):
+                        raise RuntimeError(
+                            f"K3 block {i}: teacher rows {ids_b.shape[0]}/{lps_b.shape[0]} != seq {len(seq)}"
+                        )
+                    t_b = len(sequence_prompt_ids) + s + len(ins)
+                    if t_b - 1 + (e - s) > len(seq) - 1:
+                        raise RuntimeError(f"K3 block {i}: slice would touch the dummy row")
+                    rows_i = ids_b[t_b - 1 : t_b - 1 + (e - s)]
+                    rows_l = lps_b[t_b - 1 : t_b - 1 + (e - s)]
+                    if rows_i.shape[0] != e - s:
+                        raise RuntimeError(f"K3 block {i}: got {rows_i.shape[0]} rows, expected {e - s}")
+                    return rows_i, rows_l
+
+                tasks = [
+                    asyncio.ensure_future(_score_block(i, s, e))
+                    for i, (s, e) in enumerate(zip(starts, ends))
+                ]
+                try:
+                    parts = await asyncio.gather(*tasks)
+                    response_teacher_ids = torch.cat([p[0] for p in parts], dim=0)
+                    response_teacher_logprobs = torch.cat([p[1] for p in parts], dim=0)
+                    teacher_ids = None
+                    teacher_logprobs = None
+                except Exception as err:  # noqa: BLE001 — degrade, never kill the batch
+                    for t_ in tasks:
+                        t_.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    logger.warning("K3 block scoring failed (%s) — falling back to single-call teacher", err)
+                    response_teacher_ids = None
+                    response_teacher_logprobs = None
+            if self.self_teacher and response_teacher_ids is None and teacher_ids is None:
                 # Score with the rollout engine itself: current policy weights
                 # + the (possibly privileged) prefix. Forward pass only.
                 sequence_ids = sequence_prompt_ids + response_ids
@@ -1071,8 +1168,9 @@ class AgentLoopWorker:
                 )
                 teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
                 teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-                assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
-            else:
+                if not (teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)):
+                    raise RuntimeError("teacher prompt-logprob rows do not match sequence length")
+            elif not self.self_teacher:  # external teacher server (unchanged path)
                 teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                     sequence_ids=sequence_prompt_ids + response_ids,
                     multi_modal_data=output.multi_modal_data,
@@ -1092,9 +1190,10 @@ class AgentLoopWorker:
                 # window lands exactly on the valid rows. (Slicing from T
                 # instead fed the zero row to the FIRST response token — the
                 # trace-opd P0-1 fix.)
-                T = len(sequence_prompt_ids)
-                response_teacher_ids = teacher_ids[T - 1 : -1]
-                response_teacher_logprobs = teacher_logprobs[T - 1 : -1]
+                if response_teacher_ids is None:  # single-call path: slice rows
+                    T = len(sequence_prompt_ids)
+                    response_teacher_ids = teacher_ids[T - 1 : -1]
+                    response_teacher_logprobs = teacher_logprobs[T - 1 : -1]
                 assert response_teacher_ids.shape[0] == len(response_ids), (
                     f"teacher response segment {response_teacher_ids.shape[0]} "
                     f"!= student response length {len(response_ids)}"
@@ -1106,12 +1205,16 @@ class AgentLoopWorker:
                     "first teacher response row looks like the dummy row — "
                     "prompt-logprob alignment is off"
                 )
-                prompt_pad_ids = torch.zeros((len(prompt_ids) - 1, teacher_ids.shape[1]), dtype=teacher_ids.dtype)
-                prompt_pad_logprobs = torch.zeros(
-                    (len(prompt_ids) - 1, teacher_logprobs.shape[1]), dtype=teacher_logprobs.dtype
+                prompt_pad_ids = torch.zeros(
+                    (len(prompt_ids) - 1, response_teacher_ids.shape[1]), dtype=response_teacher_ids.dtype
                 )
-                tail_dummy_ids = torch.zeros((1, teacher_ids.shape[1]), dtype=teacher_ids.dtype)
-                tail_dummy_logprobs = torch.zeros((1, teacher_logprobs.shape[1]), dtype=teacher_logprobs.dtype)
+                prompt_pad_logprobs = torch.zeros(
+                    (len(prompt_ids) - 1, response_teacher_logprobs.shape[1]), dtype=response_teacher_logprobs.dtype
+                )
+                tail_dummy_ids = torch.zeros((1, response_teacher_ids.shape[1]), dtype=response_teacher_ids.dtype)
+                tail_dummy_logprobs = torch.zeros(
+                    (1, response_teacher_logprobs.shape[1]), dtype=response_teacher_logprobs.dtype
+                )
                 teacher_ids = torch.cat([prompt_pad_ids, response_teacher_ids, tail_dummy_ids], dim=0)
                 teacher_logprobs = torch.cat(
                     [prompt_pad_logprobs, response_teacher_logprobs, tail_dummy_logprobs], dim=0

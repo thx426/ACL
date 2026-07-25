@@ -130,7 +130,7 @@ train:
     - "${TRACE_VAL_UNSEEN_FILE}"
   experiment_name: trace_opd_v1
   project_name: trace_opd
-  n_gpus: 4                 # 162 单机满 4 卡(A800-SXM 弃用后唯一训练机)。27B 同机
+  n_gpus: 2                 # 2026-07-24 起 162 与他人共享,只用卡 0/1(用户裁定;恢复 4 卡等通知)。原 4 卡注释:
                             # 分时:AgentLoop 阶段共存,训练阶段 sidecar_sleep 释放
                             # | 拓扑详见 design.md §9
   rollout_tp: 2             # rollout 引擎 TP(4 卡 ⇒ 2 replica)| 用户裁定方向:为长程
@@ -179,7 +179,7 @@ train:
                                  # 2026-07-23 起**不再直接用作微批预算**——那曾把
                                  # 21.2GiB logits 喂进训练前反向连炸两次(feedback
                                  # P0);微批打包预算解耦为下面两个独立参数
-  ppo_max_token_len_per_gpu: 16384     # actor 训练前反向的微批**打包预算**/卡 |
+  ppo_max_token_len_per_gpu: 8192     # actor 训练前反向的微批**打包预算**/卡 |
                                  # **用户裁定 2026-07-23(8192 → 16384):训练阶段
                                  # 显存富余,适当上调提吞吐,前提是绝不 OOM。**
                                  # 依据 CD-006 smoke7 实测:ppo=8192 时
@@ -197,7 +197,7 @@ train:
                                  # +警告,超长条独占微批(显存不足则 loud OOM)。
                                  # cap30 实测 response_length/max=4243,离逼近余量的
                                  # ~14k 单条很远,长尾风险低
-  log_prob_max_token_len_per_gpu: 16384  # old_log_prob 推理阶段打包预算/卡(纯
+  log_prob_max_token_len_per_gpu: 8192  # old_log_prob 推理阶段打包预算/卡(纯
                                  # 推理逐 token 独立,数值等价;此阶段同时产出
                                  # actor/entropy 曲线故不可跳过)| 随上条同步
                                  # 12288 → 16384(用户裁定);该阶段无梯度激活、
@@ -226,7 +226,10 @@ train:
                             # 降半 ⇒ 峰值 ≈0.58+0.29 GiB(账见 rollout_gpu_mem)。
                             # chunk 大小不影响 logprobs 数值(纯分块计算),decode
                             # 并发预算 2048 仍远高于实际并发,吞吐影响可忽略
-  rollout_gpu_mem: 0.35     # verl vLLM 显存占比(4 卡统一)| h3 第 4 次启动铁稳值。
+  rollout_gpu_mem: 0.7      # verl vLLM 显存占比(4 卡统一)| 2026-07-24 researcher 迁外部
+                            # 35B 池后 27B 下线、四卡归 policy 独占,0.35→0.7(CD-006 决策:训练阶段引擎 sleep 释放 KV 池,占比只影响 rollout 阶段;
+                            # KV 扩容提 rollout 吞吐;训练阶段引擎休眠不受影响)。
+                            # 0.35 = 与 27B 共存时的 h3 第 4 次启动铁稳值(回切 27B 时改回)。
                             # 162 共存预算 —— **CD-006 2026-07-23 实测修订**
                             # (原账 27B 0.60 + verl 0.35 ≈76-78GB 实测为 78.6GB,
                             # 且漏算 self-teacher 打分的 logits 临时张量,已 OOM
@@ -241,7 +244,13 @@ train:
                             #    并降至 2048 ⇒ 峰值 ≈0.9-1.2GiB,双保险)。
                             # 训练阶段两引擎皆 sleep,FSDP 可用 ~76GB/卡。
                             # 调大须同步调小 27B 侧 GPU_MEM(serve_researcher.sh)
-  rollout_temperature: 1.0  # 训练 rollout 采样温度 | h3 定版
+  rollout_temperature: 1.0
+  # --- OPD 信号增强三件套(2026-07-24 用户定稿;详见 docs/experiments/cd006-signal-enhancement-final.md)---
+  distill_block_turns: 4    # K3 分块保鲜打分块宽 W(0=关):每 W 轮一块,块首插一份全量 doc,
+                            # 块 1 免插(与旧 teacher 字节一致);半衰期实测 ≥8 轮,W=4 取 100% 区
+  distill_loss_soft_cap: true   # K1:loss 超 clamp 改 c+log1p(x-c) 软压缩,保决策尖峰有序
+  distill_kl_weight_alpha: 1.0  # K2:|KL|^α 自适应 token 加权(0=关);批内归一保尺度
+  distill_kl_weight_cap: 10.0   # K2 单 token 权重上限  # 训练 rollout 采样温度 | h3 定版
   distill_topk: 64          # forward_kl_topk 的 k | h3 定版(verl 官方推荐区间)
   distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
                             # <run>/microscope/(verl 6f3d089;~几 MB/step,离线经

@@ -165,6 +165,13 @@ class TrainCfg:
                                       # root cause at 4096; halved for coexistence)
     rollout_temperature: float = 1.0
     distill_topk: int = 64
+    # --- 信号增强三件套(2026-07-24 用户定稿,cd006-signal-enhancement-final.md)---
+    distill_block_turns: int = 4      # K3 分块保鲜打分块宽 W(0=关,退回单次前缀打分);
+                                      # 半衰期实测 ≥8 轮,W=4 取 100% 区(用户定)
+    distill_loss_soft_cap: bool = True   # K1 clamp 软化:超过 loss_max_clamp 改
+                                         # c+log1p(x-c) 压缩,保尖峰有序(不再削平)
+    distill_kl_weight_alpha: float = 1.0  # K2 |KL|^α 自适应加权(0=关);批内归一保尺度
+    distill_kl_weight_cap: float = 10.0   # K2 单 token 权重上限
     distill_microscope: bool = True   # sample per-token distillation quantities
                                       # to <run>/microscope/ for the analysis
                                       # suite (docs/analysis-design.md; ~MBs/step)
@@ -267,6 +274,14 @@ def _validate(cfg: "Config") -> None:
         problems.append(
             f"train.distill_sample_every={cfg.train.distill_sample_every} must be >= 1"
         )
+    # 信号增强三件套参数(codex review 2026-07-24:错误值会静默关闭/反转,必须显式校验)
+    import math as _math
+    if cfg.train.distill_block_turns < 0:
+        problems.append(f"train.distill_block_turns={cfg.train.distill_block_turns} must be >= 0 (0 disables K3)")
+    if not (_math.isfinite(cfg.train.distill_kl_weight_alpha) and cfg.train.distill_kl_weight_alpha >= 0):
+        problems.append(f"train.distill_kl_weight_alpha={cfg.train.distill_kl_weight_alpha} must be finite and >= 0 (0 disables K2)")
+    if not (_math.isfinite(cfg.train.distill_kl_weight_cap) and cfg.train.distill_kl_weight_cap >= 1):
+        problems.append(f"train.distill_kl_weight_cap={cfg.train.distill_kl_weight_cap} must be finite and >= 1 (final post-normalization weight bound)")
     for name, role in cfg.roles.items():
         if role.dp_size < 0:
             problems.append(f"roles.{name}.dp_size must be >= 0 (0 disables routing)")
@@ -301,6 +316,21 @@ def _validate(cfg: "Config") -> None:
                 f"roles.{name}.sidecar_sleep=true — only the researcher server "
                 "is driven by the trainer's sleep/wake rhythm"
             )
+    for name, role in cfg.roles.items():
+        if "," in role.endpoint:  # endpoint pool (independent replicas)
+            if role.sidecar_sleep:
+                problems.append(
+                    f"roles.{name}: endpoint pool + sidecar_sleep=true — the "
+                    "sleep/wake rhythm drives ONE local server, not a pool "
+                    "(remote pool deployments must set sidecar_sleep: false)"
+                )
+            if role.dp_size > 0:
+                problems.append(
+                    f"roles.{name}: endpoint pool + dp_size>0 — the "
+                    "X-data-parallel-rank header targets DP ranks inside one "
+                    "server; independent replicas need dp_size: 0 (the pool "
+                    "does its own session-sticky balancing)"
+                )
     if (
         "researcher" in cfg.roles
         and cfg.roles["researcher"].sidecar_sleep

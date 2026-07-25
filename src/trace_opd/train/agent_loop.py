@@ -228,10 +228,16 @@ class TraceAgentLoop(AgentLoopBase):
                 adapter=adapter,
                 research=rcfg,
                 narration=self.cfg.narration,
-                # Same routing key for every experiment episode: the whole
-                # research session sticks to one replica (prefix-cache affinity).
+                # Per-EPISODE routing key (2026-07-24, user ruling): task-level
+                # pinning starved one replica during long-tail tasks (measured:
+                # 2 GPUs idle while 2 ground the tail). A fresh key per factory
+                # call lets verl least-loaded spread episodes; turns WITHIN an
+                # episode still share the key (its growing-prefix KV survives).
+                # Cost: k copies re-prefill the shared doc+scaffold once each
+                # (~1-2k tok) — seconds vs minutes of tail idle.
                 generate_factory=lambda: EngineGenerate(
-                    self.server_manager, self.tokenizer, request_id=route
+                    self.server_manager, self.tokenizer,
+                    request_id=f"{route}:r{uuid4().hex[:6]}",
                 ),
                 tokenizer=self.tokenizer,
                 delta=self.delta,
@@ -377,12 +383,13 @@ class TraceAgentLoop(AgentLoopBase):
         extra_info = dict(kwargs["extra_info"])
         adapter = self.factory.adapter_from_item(extra_info)
         response_length = self.rollout_config.response_length
-        # Per-(step, task) sticky-routing key: every engine call about this
-        # task — research episodes, narrations, all rollout_n student episodes,
-        # teacher scoring — pins to ONE rollout replica so shared prefixes
-        # (scaffold+obs, growing turn prefixes, teacher doc prefix) hit that
-        # replica's vLLM prefix cache. Step in the key re-balances tasks
-        # across replicas every step (least-loaded on first touch).
+        # Base routing namespace, per (step, task). 2026-07-24 rebalance (user
+        # ruling): engine calls are now routed per-EPISODE — student episodes
+        # and research episodes append a unique suffix (":s…"/":r…") so verl's
+        # least-loaded selection can spread long-tail work across replicas
+        # (task-level pinning measurably idled half the GPUs during tails).
+        # An episode's own turns still share one key → its growing-prefix KV
+        # survives. Narration keeps the task key (one-shot small calls).
         route = f"task:{global_step}:{adapter.task_id}"
 
         doc: str | None = None
@@ -435,6 +442,31 @@ class TraceAgentLoop(AgentLoopBase):
             )
             if teacher_prompt_ids is not None:
                 output.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
+                # K3 block-refresh scoring (2026-07-24, user-approved, W=4):
+                # doc-as-prefix influence decays ~50x by turn 7 (measured), so
+                # ship block boundaries (response offsets after every W-th
+                # assistant turn) + the tokenized full doc; the verl scorer
+                # inserts ONE fresh copy per block. Block 0 stays byte-
+                # identical to the historical teacher (doc adjacent anyway).
+                W = self.cfg.train.distill_block_turns
+                spans = result.tokens.turn_spans
+                if W > 0 and len(spans) > W:
+                    doc_block_ids = self.tokenizer.encode(
+                        "\n\n## Task guidance\n" + doc + "\n", add_special_tokens=False
+                    )
+                    fits = (
+                        len(teacher_prompt_ids)
+                        + len(result.tokens.response_ids)
+                        + len(doc_block_ids)
+                        + 8
+                        <= self.cfg.train.rollout_max_model_len
+                    )
+                    if fits:
+                        output.extra_fields["teacher_block_starts"] = [
+                            spans[m][1] for m in range(W - 1, len(spans) - 1, W)
+                        ]
+                        output.extra_fields["teacher_doc_ids"] = doc_block_ids
+                    # 不合长时静默退回单次打分(等价旧机制,非错误)
             else:
                 output.extra_fields["doc_missing"] = 1  # overflow degraded to bare
 
@@ -486,9 +518,14 @@ class TraceAgentLoop(AgentLoopBase):
     async def _student_rollout(
         self, adapter, sampling_params: dict[str, Any], response_length: int, route: str
     ) -> EpisodeResult:
+        # Per-EPISODE routing key (2026-07-24, user ruling): the rollout_n
+        # copies of a task must NOT share one replica — long-tail tasks starved
+        # the other replica (measured idle). Unique suffix per episode; the
+        # retry below reuses it so a retried episode stays on its replica.
+        epi_route = f"{route}:s{uuid4().hex[:6]}"
         result = await run_episode(
             adapter=adapter,
-            generate=EngineGenerate(self.server_manager, self.tokenizer, request_id=route),
+            generate=EngineGenerate(self.server_manager, self.tokenizer, request_id=epi_route),
             tokenizer=self.tokenizer,
             delta=self.delta,
             guidance="",
@@ -504,7 +541,7 @@ class TraceAgentLoop(AgentLoopBase):
             )
             result = await run_episode(
                 adapter=adapter,
-                generate=EngineGenerate(self.server_manager, self.tokenizer, request_id=route),
+                generate=EngineGenerate(self.server_manager, self.tokenizer, request_id=epi_route),
                 tokenizer=self.tokenizer,
                 delta=self.delta,
                 guidance="",

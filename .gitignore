@@ -1,18 +1,16 @@
-# experiment artifacts & data (source code only in git)
+# 运行产物(留在服务器,不进仓)
 runs/
-checkpoints/
-data/
-*.parquet
 swanlog/
-wandb/
-
-# python
+logs/
+*.log
+# 派生配置(run_a800_4b.sh 运行时从 trace.yaml sed 生成)
+configs/*.gen.yaml
+# 备份文件
+*.bak*
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.egg-info/
 .pytest_cache/
-dist/
-build/
-
-# os / editor
+# 系统
 .DS_Store

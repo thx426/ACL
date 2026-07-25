@@ -261,9 +261,51 @@ def distillation_loss(
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
     )
+    # ---- trace-opd K1/K2 (codex-reviewed 2026-07-24) ----------------------
+    # Layout canonicalization first (review HIGH-3): everything below assumes
+    # padded [B, R]; nested inputs are converted ONCE here. (Both registered
+    # loss fns currently return padded, so this is a robustness contract.)
+    if distillation_losses.is_nested:
+        distillation_losses = distillation_losses.to_padded_tensor(0.0)
+    _mask_pad = (
+        response_mask.to_padded_tensor(False) if response_mask.is_nested else response_mask
+    ).float()
+    # K2's weight must reflect the RAW divergence, not the K1-compressed value
+    # (review medium): snapshot before any transform. Finite guard: +inf/NaN
+    # from degenerate logprobs must not reach backward (review medium) — the
+    # old hard clamp handled them implicitly; keep them bounded here.
+    distillation_losses = torch.nan_to_num(distillation_losses, nan=0.0, posinf=1e6, neginf=-1e6)
+    base_kl = distillation_losses.detach().abs()
+
     if loss_config.loss_max_clamp is not None:
-        # clamping min is for k1 loss which can be negative
-        distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+        c = loss_config.loss_max_clamp
+        if getattr(loss_config, "loss_soft_cap", False):
+            # K1: soft compression above the cap — c + log1p(x - c) keeps the
+            # ordering of decision-fork spikes (measured KL>=10) instead of
+            # flattening them all to c. Gradient is continuous at c.
+            distillation_losses = (
+                distillation_losses.clamp(max=c)
+                + torch.log1p(torch.relu(distillation_losses - c))
+            ).clamp(min=-c)
+        else:
+            # clamping min is for k1 loss which can be negative
+            distillation_losses = distillation_losses.clamp(min=-c, max=c)
+
+    kl_weight_alpha = getattr(loss_config, "kl_weight_alpha", 0.0) or 0.0
+    if kl_weight_alpha > 0:
+        # K2: signal-adaptive weighting w ∝ |raw KL|^alpha (detached).
+        # Normalized to mean≈1 over this MICRO-BATCH's response tokens (the
+        # loss fn is invoked per micro-batch; global-batch normalization would
+        # need an all-reduce — documented choice), then capped AFTER the
+        # normalization so kl_weight_cap truly bounds the final per-token
+        # multiplier (review HIGH-2: pre-normalization capping let sparse
+        # spikes reach 100x). Post-cap mean may dip slightly below 1 on very
+        # sparse batches — accepted (conservative direction).
+        cap = getattr(loss_config, "kl_weight_cap", 10.0)
+        w = base_kl.pow(kl_weight_alpha)
+        mean_w = (w * _mask_pad).sum() / _mask_pad.sum().clamp(min=1.0)
+        w = (w / mean_w.clamp(min=1e-6)).clamp(max=cap)
+        distillation_losses = distillation_losses * w
 
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
