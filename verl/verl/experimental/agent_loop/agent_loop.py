@@ -1039,6 +1039,25 @@ class AgentLoopWorker:
         # tensors are re-aligned to the student's (prompt + response) layout;
         # the prompt segment is zero-filled and is excluded from the loss by
         # response_mask.
+        # CD-006 R11a (2026-07-25): with TRACE_TEACHER_SCORING_BACKEND=fsdp the
+        # vLLM prompt_logprobs call below is skipped entirely; the privileged
+        # prefix rides to the trainer inside extra_fields (already shipped as
+        # non_tensor "tool_extra_fields" by _postprocess) and update_actor
+        # scores it on the FSDP engine with identical row semantics.
+        if (
+            os.environ.get("TRACE_TEACHER_SCORING_BACKEND", "vllm").strip().lower() == "fsdp"
+            and self.distillation_enabled
+            and not validate
+        ):
+            _tp = output.extra_fields.pop("teacher_prompt_ids", None)
+            output.extra_fields.pop("teacher_routing_key", None)
+            output.extra_fields.pop("teacher_doc_ids", None)  # K3 not on fsdp backend
+            _tbs = output.extra_fields.pop("teacher_block_starts", None)
+            if _tp is not None:
+                output.extra_fields["teacher_prefix_ids"] = [int(x) for x in _tp]
+                if _tbs:
+                    output.extra_fields["teacher_block_starts"] = list(_tbs)
+            return
         teacher_prompt_ids = output.extra_fields.pop("teacher_prompt_ids", None)
         # Optional sticky-routing key from the agent loop (trace-opd): scoring
         # requests for the same task pin to the task's rollout replica, so the

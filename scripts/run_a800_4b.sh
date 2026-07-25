@@ -37,6 +37,13 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # 可等超 10s,EngineCore 便判定引擎已死并自杀(step-9 事故:GPU5 实例死亡→任务永久 hang→
 # 主循环死锁)。该机 nvidia-smi 正常、无 Xid、显存干净归 0 ⇒ 非硬件楔死,是超时误杀。
 export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-60000}
+# CD-006 R11a(2026-07-25):self-teacher 打分后端。fsdp = 在训练引擎上打分,
+# 彻底绕开 vLLM prompt_logprobs 的预算外分配缺陷(官方 issue #5907,rollout 尾部
+# 76-81GB 尖峰与基线爬升的共同根因);vllm = 原路径。等价性已验证后默认 fsdp。
+export TRACE_TEACHER_SCORING_BACKEND=${TRACE_TEACHER_SCORING_BACKEND:-vllm}
+# torch allocator 超 85% 主动回收 unused blocks(纵深防御,主要护 vLLM 进程侧驻留;
+# 不可用 expandable_segments——与 vLLM CuMemAllocator 冲突为实证事故)
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.85}
 MINFREE=$(nvidia-smi -i $CARDS --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
 [[ $MINFREE -lt 70000 ]] && { echo "FATAL 某卡剩余仅 ${MINFREE}MiB,疑有残留进程"; exit 1; }
 # 通信后端强制 gloo:绕开该机不可靠的 NVLink/NCCL(memory a800-no-inter-gpu-comm)

@@ -703,6 +703,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        # CD-006 R11a (2026-07-25, user-approved): self-teacher top-k scoring on
+        # the TRAINING engine instead of vLLM prompt_logprobs (vLLM issue #5907:
+        # logprobs allocations are outside the gpu_memory_utilization budget and
+        # unprotected — root cause of the rollout-tail VRAM spikes and the
+        # creeping torch-side baseline). Weights here equal what vLLM would have
+        # scored with (pre-optimizer-step). Enabled via
+        # TRACE_TEACHER_SCORING_BACKEND=fsdp; default keeps the vLLM path.
+        from verl.trainer.distillation.teacher_topk_fsdp import (
+            compute_teacher_topk_fsdp,
+            teacher_scoring_backend,
+        )
+        if teacher_scoring_backend() == "fsdp" and "teacher_logprobs" not in data.keys():
+            data = compute_teacher_topk_fsdp(data, self.actor.engine)
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
