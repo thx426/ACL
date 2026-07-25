@@ -109,6 +109,7 @@ say "chunked-prefill 预算 rollout_max_num_batched_tokens=$NBT  ($NBT_WHY)"
 CONFIG=$T/configs/trace.yaml
 GEN=$T/configs/trace_a800_4b.gen.yaml
 sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo 后端(零 NCCL)|" \
+    -e "s|^  ulysses_sp: .*|  ulysses_sp: ${ULYSSES_SP:-2}             # CD-006 2026-07-26 开启序列并行。step-16 因 22k token 序列的全词表 logits(seqlen x 151936 x 4B = 13.5GiB)在训练前向 OOM;SP 把序列切到 2 卡,单卡 logits 减半,并由 launch_train.py 联动 use_remove_padding=True + FA2(消除 padding 浪费)。flash-attn 2.8.3 已装并过 varlen 冒烟。ULYSSES_SP=1 可一键回退|" \
     -e 's|^  rollout_tp: .*|  rollout_tp: 1             # 单卡 ⇒ TP1|' \
     -e 's|^  rollout_gpu_mem: .*|  rollout_gpu_mem: 0.40     # CD-006 2026-07-25 二次上调(0.30→0.40):step-5 崩因是训练后 torch 未归还足够物理显存,vLLM wake_up 拿不到 KV 池(cumem_allocator OOM)。降 4GB 需求换余量|' \
     -e "s|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: $NBT   # $NBT_WHY|" \
