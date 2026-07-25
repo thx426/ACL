@@ -117,6 +117,12 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    # Same empty-batch hazard as the mass diagnostics below: once the agent-loop
+    # guard cancels a stuck prompt, its replicas arrive with an empty response
+    # and the mask selects nothing. min()/max() raise on that and kill the run,
+    # so report the range as absent instead.
+    if distillation_losses_response.numel() == 0:
+        return {}
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
