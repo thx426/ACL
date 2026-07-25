@@ -96,6 +96,7 @@ GEN=$T/configs/trace_a800_4b.gen.yaml
 sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo 后端(零 NCCL)|" \
     -e 's|^  rollout_tp: .*|  rollout_tp: 1             # 单卡 ⇒ TP1|' \
     -e 's|^  rollout_gpu_mem: .*|  rollout_gpu_mem: 0.40     # CD-006 2026-07-25 二次上调(0.30→0.40):step-5 崩因是训练后 torch 未归还足够物理显存,vLLM wake_up 拿不到 KV 池(cumem_allocator OOM)。降 4GB 需求换余量|' \
+    -e 's|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: 4096   # CD-006 2026-07-25 恢复 h3 铁稳值(2048 -> 4096)。降半的成因是 vLLM self-teacher 打分每 chunk 物化全 vocab logits(本值 x 151936 x 2B,feedback P0 的 OOM 根因);R11 把打分移到训练引擎后该成因消失,且 27B 已下线不再共存。目的:长序列 prefill 的 chunk 数减半,缓解 (72) 实测的 rollout 吞吐下降。**回退 vllm 后端时必须同步改回 2048**|' \
     -e "s|^  ppo_max_token_len_per_gpu: .*|  ppo_max_token_len_per_gpu: $TOKLEN      # 执行层,不改训练数学|" \
     -e "s|^  log_prob_max_token_len_per_gpu: .*|  log_prob_max_token_len_per_gpu: $TOKLEN  # 同上|" \
     -e 's|^  distill_block_turns: .*|  distill_block_turns: 0    # K3 关(对齐 v1)|' \
@@ -120,7 +121,10 @@ grep -E "^  n_gpus:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  l
 FUSED_OVR="actor_rollout_ref.actor.optim.override_optimizer_config={fused:true}"
 VAL_OVR=""
 [[ "$SKIP_VAL" == "1" ]] && VAL_OVR="trainer.val_before_train=False trainer.test_freq=-1" && say "跳过 val(测试模式)"
-export EXTRA_OVERRIDES="actor_rollout_ref.actor.strategy=fsdp actor_rollout_ref.ref.strategy=fsdp actor_rollout_ref.actor.fsdp_config.optimizer_offload=True $SHARD_OVR $FUSED_OVR $VAL_OVR"
+# vLLM 引擎统计(纯观测,不改计算路径):verl 默认 disable_log_stats=True,把吞吐/KV 占用/
+# preemption 全部关掉了,(72) 的 decode 机理只能靠推断。打开后可直接实测,并量化 R11 的收益。
+STATS_OVR="actor_rollout_ref.rollout.disable_log_stats=False"
+export EXTRA_OVERRIDES="actor_rollout_ref.actor.strategy=fsdp actor_rollout_ref.ref.strategy=fsdp actor_rollout_ref.actor.fsdp_config.optimizer_offload=True $SHARD_OVR $FUSED_OVR $VAL_OVR $STATS_OVR"
 
 export PYTHONPATH=$T/src:$T/verl:${PYTHONPATH:-}
 export SWANLAB_API_KEY=58KT7T652vKUKobNhHb50
