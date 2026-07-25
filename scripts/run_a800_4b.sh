@@ -43,7 +43,10 @@ export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-60000}
 export TRACE_TEACHER_SCORING_BACKEND=${TRACE_TEACHER_SCORING_BACKEND:-vllm}
 # torch allocator 超 85% 主动回收 unused blocks(纵深防御,主要护 vLLM 进程侧驻留;
 # 不可用 expandable_segments——与 vLLM CuMemAllocator 冲突为实证事故)
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.85}
+# 序列长度在 6k→22k 间剧烈变动((72)/(74)),分配器碎片是主要敌人;step-16 OOM 时卡上已被
+# 占用 68.39GiB 却拿不出 12.9GiB 连续块。expandable_segments 用可扩展虚拟段消化这种变长,
+# 是对症解;原先的 garbage_collection_threshold:0.85 反而推迟回收,已换掉(它从未被验证过)。
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 MINFREE=$(nvidia-smi -i $CARDS --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
 [[ $MINFREE -lt 70000 ]] && { echo "FATAL 某卡剩余仅 ${MINFREE}MiB,疑有残留进程"; exit 1; }
 # 通信后端强制 gloo:绕开该机不可靠的 NVLink/NCCL(memory a800-no-inter-gpu-comm)

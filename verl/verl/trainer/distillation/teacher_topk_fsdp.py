@@ -170,9 +170,13 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
 
     module = _unwrap_module(engine)
     if not _LOGGED_BACKEND:
-        # warning level on purpose: worker-side INFO is not reliably emitted
-        # (observed with memory_utils), and this line is the smoke-test proof
-        # that the fsdp path is actually live on the trainer side (codex M5).
+        # This line is the smoke-test proof that the fsdp path is actually live
+        # on the trainer side (codex M5). The step-16 run showed neither this
+        # probe nor vLLM's own stats reaching the driver log, so logging levels
+        # cannot be trusted inside a Ray worker at all -- print to stdout, which
+        # Ray does forward, and keep the logger call for structured consumers.
+        print(f"teacher_topk_fsdp ACTIVE: backend=fsdp topk={topk} n={n} (codex M5 probe)",
+              flush=True)
         logger.warning("teacher_topk_fsdp ACTIVE: backend=fsdp topk=%s n=%s (codex M5 probe)",
                        topk, n)
         _LOGGED_BACKEND = True

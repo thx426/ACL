@@ -1353,7 +1353,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits, DTensor):
                     logits = logits.full_tensor()
-                logits = logits / temperature.clamp(min=1e-8).to(logits.dtype)
+                # trace-opd (CD-006 2026-07-25): the division allocates a second
+                # full-size logits tensor -- seqlen x 151936. At the 22k-token
+                # sequences this run now produces that is 6.8GiB of pure waste,
+                # and it is what OOMs step-16. Sampling runs at temperature 1.0,
+                # so the division is a no-op we can skip outright.
+                _temp = temperature.clamp(min=1e-8).to(logits.dtype)
+                if not bool(torch.all(_temp == 1)):
+                    logits = logits / _temp
 
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
