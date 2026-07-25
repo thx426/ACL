@@ -114,11 +114,12 @@ def compute_teacher_topk_fsdp(data, engine, topk: int = 64, chunk: int = 2048):
             P = int(prompts[i].numel())
             R = int(resp.numel())
             if prefix is None:
-                # bare-teacher sample (research failed => neutral): zero rows,
-                # same semantics as the vLLM path emitting nothing => KL≈0.
-                out_ids.append(torch.zeros((P + R, topk), dtype=torch.int32))
-                out_lps.append(torch.zeros((P + R, topk), dtype=torch.float32))
-                continue
+                # bare-teacher sample (research failed): the vLLM path scores
+                # under the BARE student prompt (teacher == student weights &
+                # prefix => per-token KL ~ 0, a neutral sample). Zero tensors
+                # would be WRONG here: logprob 0 == prob 1.0 and the forward
+                # KL would explode. Score under the bare prompt instead.
+                prefix = prompts[i]
             if ex.get("teacher_block_starts") and not _K3_WARNED:
                 logger.warning("teacher_topk_fsdp: K3 block starts present but K3 is "
                                "not implemented on the fsdp backend — single-prefix scoring")
