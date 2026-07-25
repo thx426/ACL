@@ -389,14 +389,29 @@ def rearrange_micro_batches(
     # killing the run (long trajectories cluster exactly when training drifts,
     # i.e. when the curves matter most). Memory pressure from such a lone
     # oversized micro-batch surfaces as a loud OOM, not a silent change.
+    #
+    # CD-006 2026-07-25: the budget must NOT be raised to max_seq_len. Doing so
+    # shrinks num_micro_batches for the WHOLE batch, so every micro-batch grows
+    # — with use_remove_padding=False each one then pads to the batch maximum
+    # and the peak tensor lands at ~1.3x the longest sequence instead of ~1.0x.
+    # That inflation is what killed the 4B run at step 5 (longest seq 5785 →
+    # 75.8GB reserved → vLLM wake_up could not get its 21.2GB back from the
+    # caching allocator → CUDA OOM in cumem_allocator.cpp:139). Keeping the
+    # budget fixed lets the balanced partitioner give oversized samples their
+    # own micro-batch, which is exactly what the comment above promises.
+    # Gradient-accumulation math is unchanged (mini_batch still defines the
+    # update boundary); only the packing layout differs.
     if max_token_len < max_seq_len:
+        n_oversized = int((seq_len_effective > max_token_len).sum())
         logger.warning(
-            "max_token_len=%s below longest sequence %s — raising the budget for "
-            "this batch so the oversized sample(s) ride in their own micro-batch",
+            "max_token_len=%s below longest sequence %s — %s oversized sample(s) "
+            "ride in their own micro-batch; packing budget stays at %s so the "
+            "rest of the batch is not inflated",
             max_token_len,
             int(max_seq_len),
+            n_oversized,
+            max_token_len,
         )
-        max_token_len = int(max_seq_len)
 
     # Validate force_group_size
     batch_size = len(seq_len_effective)

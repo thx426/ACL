@@ -394,21 +394,42 @@ class TraceAgentLoop(AgentLoopBase):
 
         doc: str | None = None
         research_fields: dict[str, Any] = {}
+        # 2026-07-25 (user-approved): OVERLAP research with the student rollout.
+        # The student episode is BARE — `_student_rollout` takes no document; only
+        # the teacher scoring below needs `doc`. Awaiting research *before* the
+        # rollout serialized the two and left ~half the batch blocked: measured
+        # concurrency 21 vs a structural ceiling of ~112 (4 tasks still in research
+        # blocked their 4x8=32 bare rollouts). Kicking research off as a task and
+        # awaiting it only where `doc` is first needed keeps identical semantics
+        # (policy weights are frozen within a step; shared_task still de-dupes one
+        # session per (step, task)) while letting both phases run concurrently.
+        research_fut = None
+        t_research0 = 0.0
         if self.cfg.research.enabled and not validate:
-            t0 = time.time()
+            t_research0 = time.time()
             # Shared across the rollout_n copies of this task in this step:
             # exactly one research session runs (and archives) per (step,
             # task); every copy distills against the same document.
-            doc, research_fields = await shared_task(
-                self.research_tasks,
-                (global_step, adapter.task_id),
-                lambda: self._research(adapter, global_step, route),
+            research_fut = asyncio.ensure_future(
+                shared_task(
+                    self.research_tasks,
+                    (global_step, adapter.task_id),
+                    lambda: self._research(adapter, global_step, route),
+                )
             )
-            metrics.tool_calls += time.time() - t0
 
         t0 = time.time()
         result = await self._student_rollout(adapter, sampling_params, response_length, route)
         metrics.generate_sequences += time.time() - t0
+
+        if research_fut is not None:
+            # Only the *blocking* remainder is charged here; the part that ran
+            # under the rollout is free. (Pre-overlap this metric was the full
+            # research wall time — expect it to drop sharply.)
+            t_block0 = time.time()
+            doc, research_fields = await research_fut
+            metrics.tool_calls += time.time() - t_block0
+            del t_research0
 
         traj = result.trajectory
         env_steps = sum(1 for s in traj.steps if s.acted)

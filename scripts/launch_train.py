@@ -177,7 +177,12 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
         "actor_rollout_ref.actor.fsdp_config.entropy_checkpointing=True",
         "actor_rollout_ref.actor.fsdp_config.entropy_from_logits_with_chunking=True",
-        'actor_rollout_ref.actor.checkpoint.save_contents=["model","optimizer","extra","hf_model"]',
+        # CD-006 2026-07-25 用户裁定:去掉 hf_model。它需要 rank0 全量 gather + 单线程写 8GB,
+        # 是 201GB/4分钟保存耗时的大头;需要 HF 格式时用 `python -m verl.model_merger` 离线转。
+        'actor_rollout_ref.actor.checkpoint.save_contents=["model","optimizer","extra"]',
+        # 滚动只留最近 3 个 ckpt(3x201GB≈603GB 恒定),避免 444 步吃掉 17.7TB。
+        # PG-5 的峰值 ckpt 存档需另行 pin 到不受清理的目录(待口径)。
+        "trainer.max_actor_ckpt_to_keep=3",
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={t.rollout_tp}",

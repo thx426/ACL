@@ -758,6 +758,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return metrics or {}
 
         set_expandable_segments(False)
+
+        # CD-006 2026-07-25: hand the driver back every reserved-but-free block
+        # BEFORE the first wake_up. vLLM's CuMemAllocator calls cuMemCreate for
+        # physical pages and cannot see anything the torch caching allocator is
+        # still holding. Step 4 (kv_cache) below is already guarded by
+        # aggressive_empty_cache; step 1 (weights) was not — asymmetric, and the
+        # gap only bites when the training-side high-water mark is large, which
+        # is exactly our case (param_offload=False keeps params resident, so the
+        # post-backward reserved pool stays tens of GB). The 4B run died right
+        # here at step 5: 75.8GB reserved, wake_up wanted 21.2GB physical,
+        # "CUDA Error: out of memory at cumem_allocator.cpp:139".
+        aggressive_empty_cache(force_sync=True)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)

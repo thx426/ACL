@@ -186,10 +186,19 @@ class ToolRouter:
             ]
         )
 
-        records: list[EpisodeRecord] = []
-        for res in results:
-            record = await self._make_record(res.trajectory)
-            records.append(record)
+        # 2026-07-25 (user-approved): narrate the k episodes CONCURRENTLY.
+        # `_make_record` awaits `narrate_episode`, i.e. one local-policy LLM call
+        # per episode. Doing that in a serial `for` loop made each experiment
+        # round cost ~4x the narration latency while the k parallel episodes had
+        # already finished — measured duty cycle 32% (per-task in-flight episodes
+        # 1.2 vs k=4), which capped research-phase concurrency at ~19 even though
+        # the launch peak reached 189. Narrations are independent (each reads only
+        # its own trajectory) and `gather` preserves order, so this is a pure
+        # scheduling change with identical results.
+        records: list[EpisodeRecord] = list(
+            await asyncio.gather(*[self._make_record(res.trajectory) for res in results])
+        )
+        for res, record in zip(results, records, strict=True):
             st.episodes[res.trajectory.episode_id] = record
             if counts_as_attempt(res.trajectory.outcome):
                 st.episodes_consumed += 1

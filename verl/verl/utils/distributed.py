@@ -85,7 +85,9 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
     import torch.distributed
 
     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
-    backend = backend or f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
+    # trace-opd(A800): 允许用 VERL_DIST_BACKEND 强制后端(该机卡间 NCCL 不可靠,
+    # 用 cpu:gloo,cuda:gloo 可完全绕开 NVLink/NCCL;见 memory a800-no-inter-gpu-comm)
+    backend = backend or os.environ.get("VERL_DIST_BACKEND") or f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
     if not torch.distributed.is_initialized():
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))

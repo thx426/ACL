@@ -69,6 +69,14 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
 
     from torch.distributed.fsdp import ShardingStrategy
 
+    # trace-opd(A800):VERL_FSDP_NO_SHARD=1 ⇒ 强制 NO_SHARD(等价 DDP)。
+    # 该机卡间 NCCL 不可靠,需全程走 gloo;而 gloo 的 allgather_coalesced 对 CUDA 张量
+    # 段错误(FSDP 分片路径必调),NO_SHARD 则只做梯度 all_reduce(gloo 实测正常)。
+    # 数学上与 FULL_SHARD 等价:两者都用全局平均梯度更新,仅显存/通信量不同。
+    import os as _os
+    if _os.environ.get("VERL_FSDP_NO_SHARD") == "1":
+        return ShardingStrategy.NO_SHARD
+
     if zero3_enable:
         fsdp_strategy = ShardingStrategy.FULL_SHARD
         hsdp_strategy = ShardingStrategy.HYBRID_SHARD
