@@ -121,7 +121,21 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
+            # CD-006 R3 (2026-07-25, user-approved): wall-clock timeout per prompt.
+            # The `except Exception` below catches raised errors but NOT a permanent
+            # hang — e.g. awaiting a vLLM instance whose EngineCore died: the await
+            # never returns, `running` never drains, and the whole training loop
+            # deadlocks silently (observed 2026-07-25, second A800 incident).
+            # On timeout the pending agent loops are cancelled and the prompt falls
+            # into the existing failure path (asyncio.TimeoutError is builtins
+            # TimeoutError on py3.11+, an Exception subclass), releasing the batch.
+            # Default 2700s >> per-task wall p100 (~12 min incl. researcher session);
+            # set TRACE_AGENT_TASK_TIMEOUT_S=0 to disable.
+            _timeout_s = float(os.environ.get("TRACE_AGENT_TASK_TIMEOUT_S", "2700"))
+            if _timeout_s > 0:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=_timeout_s)
+            else:
+                await asyncio.gather(*tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
