@@ -126,6 +126,12 @@ def get_ppo_ray_runtime_env(config=None):
     for key in ("TRACE_TEACHER_SCORING_BACKEND", "TRACE_AGENT_TASK_TIMEOUT_S"):
         if os.environ.get(key):
             runtime_env["env_vars"][key] = os.environ[key]
+    # trace-opd (CD-006 2026-07-25): the caching-allocator GC threshold is a
+    # memory-safety setting, so it must reach the workers by the same explicit
+    # route rather than relying on inheritance. Only forwarded when the launcher
+    # actually set it, so the upstream default stays untouched otherwise.
+    if os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        runtime_env["env_vars"]["PYTORCH_CUDA_ALLOC_CONF"] = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
     for key in ("TRACE_DISTILL_MICROSCOPE_DIR", "TRACE_DISTILL_SAMPLE_EVERY"):
         if os.environ.get(key):
             runtime_env["env_vars"][key] = os.environ[key]
