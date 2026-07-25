@@ -90,13 +90,25 @@ for p in 18888 18889; do
   [[ "$code" == "200" ]] && say "researcher 端点 $p OK" || { echo "FATAL 端点 $p 不通($code)"; exit 1; }
 done
 
+# ---- chunked-prefill 预算与打分后端联锁 ----
+# 打分在 vLLM 侧时,每 chunk 物化全 vocab logits(本值 x 151936 x 2B)是 feedback P0 的 OOM
+# 根因,必须降半到 2048;R11 把打分移到训练引擎后该成因消失,恢复 h3 铁稳值 4096(长序列
+# prefill 的 chunk 数减半,缓解 (72) 实测的 rollout 吞吐下降)。联锁写在这里而不是靠人记住:
+# 回退 backend 时预算自动跟随,漏改就会当场 OOM。
+if [[ "${TRACE_TEACHER_SCORING_BACKEND:-vllm}" == "fsdp" ]]; then
+  NBT=4096; NBT_WHY="R11 fsdp 打分:vLLM 不再物化打分 logits,恢复 h3 铁稳值"
+else
+  NBT=2048; NBT_WHY="vLLM 侧打分:必须降半压制 logits 缓冲(feedback P0 OOM 根因)"
+fi
+say "chunked-prefill 预算 rollout_max_num_batched_tokens=$NBT  ($NBT_WHY)"
+
 # ---- 派生配置:单卡 + 三件套全关(= v1 基线) ----
 CONFIG=$T/configs/trace.yaml
 GEN=$T/configs/trace_a800_4b.gen.yaml
 sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo 后端(零 NCCL)|" \
     -e 's|^  rollout_tp: .*|  rollout_tp: 1             # 单卡 ⇒ TP1|' \
     -e 's|^  rollout_gpu_mem: .*|  rollout_gpu_mem: 0.40     # CD-006 2026-07-25 二次上调(0.30→0.40):step-5 崩因是训练后 torch 未归还足够物理显存,vLLM wake_up 拿不到 KV 池(cumem_allocator OOM)。降 4GB 需求换余量|' \
-    -e 's|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: 4096   # CD-006 2026-07-25 恢复 h3 铁稳值(2048 -> 4096)。降半的成因是 vLLM self-teacher 打分每 chunk 物化全 vocab logits(本值 x 151936 x 2B,feedback P0 的 OOM 根因);R11 把打分移到训练引擎后该成因消失,且 27B 已下线不再共存。目的:长序列 prefill 的 chunk 数减半,缓解 (72) 实测的 rollout 吞吐下降。**回退 vllm 后端时必须同步改回 2048**|' \
+    -e "s|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: $NBT   # $NBT_WHY|" \
     -e "s|^  ppo_max_token_len_per_gpu: .*|  ppo_max_token_len_per_gpu: $TOKLEN      # 执行层,不改训练数学|" \
     -e "s|^  log_prob_max_token_len_per_gpu: .*|  log_prob_max_token_len_per_gpu: $TOKLEN  # 同上|" \
     -e 's|^  distill_block_turns: .*|  distill_block_turns: 0    # K3 关(对齐 v1)|' \
