@@ -477,15 +477,24 @@ def compute_forward_kl_topk(
     # Log amount of mass in the top-k log probabilities for both student and teacher.
     student_mass = student_mass[response_mask_bool]
     teacher_mass = teacher_mass[response_mask_bool]
-    distillation_metrics = {
-        "distillation/student_mass": student_mass.mean().item(),
-        "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),
-        "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass.max()),
-        "distillation/teacher_mass": teacher_mass.mean().item(),
-        "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass.min()),
-        "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
-        **overlap_metrics,
-    }
+    # A micro-batch can carry no valid response token at all -- the agent-loop
+    # wall-clock guard cancels a stuck prompt and its replicas arrive with an
+    # empty response. min()/max() raise on an empty tensor and take the whole
+    # run down with them, which is how a single hung prompt killed step-17.
+    # These are diagnostics only, so report them as absent and let training
+    # proceed on the remaining samples.
+    if student_mass.numel() == 0:
+        distillation_metrics = dict(overlap_metrics)
+    else:
+        distillation_metrics = {
+            "distillation/student_mass": student_mass.mean().item(),
+            "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),
+            "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass.max()),
+            "distillation/teacher_mass": teacher_mass.mean().item(),
+            "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass.min()),
+            "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
+            **overlap_metrics,
+        }
 
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)
