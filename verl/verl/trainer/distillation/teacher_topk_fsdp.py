@@ -170,8 +170,11 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
 
     module = _unwrap_module(engine)
     if not _LOGGED_BACKEND:
-        logger.info("teacher_topk_fsdp ACTIVE: backend=fsdp topk=%s n=%s (codex M5 probe)",
-                    topk, n)
+        # warning level on purpose: worker-side INFO is not reliably emitted
+        # (observed with memory_utils), and this line is the smoke-test proof
+        # that the fsdp path is actually live on the trainer side (codex M5).
+        logger.warning("teacher_topk_fsdp ACTIVE: backend=fsdp topk=%s n=%s (codex M5 probe)",
+                       topk, n)
         _LOGGED_BACKEND = True
 
     was_training = module.training
