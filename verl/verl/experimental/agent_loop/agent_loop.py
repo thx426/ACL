@@ -1047,16 +1047,28 @@ class AgentLoopWorker:
         if (
             os.environ.get("TRACE_TEACHER_SCORING_BACKEND", "vllm").strip().lower() == "fsdp"
             and self.distillation_enabled
+            and getattr(self, "self_teacher", False)  # codex H4: fsdp backend is
+            # self-teacher only; an external-teacher config must keep the vLLM
+            # path (otherwise the teacher would be silently replaced by policy)
             and not validate
         ):
             _tp = output.extra_fields.pop("teacher_prompt_ids", None)
             output.extra_fields.pop("teacher_routing_key", None)
             output.extra_fields.pop("teacher_doc_ids", None)  # K3 not on fsdp backend
             _tbs = output.extra_fields.pop("teacher_block_starts", None)
+            # codex H1: explicit provenance so a prefix lost in transit fails
+            # loud on the trainer side instead of silently degrading to bare.
+            output.extra_fields["teacher_mode"] = "privileged" if _tp is not None else "bare"
+            # codex M2: K rides with the sample; trainer asserts consistency.
+            output.extra_fields["teacher_topk"] = int(self.self_teacher_num_logprobs)
             if _tp is not None:
                 output.extra_fields["teacher_prefix_ids"] = [int(x) for x in _tp]
                 if _tbs:
                     output.extra_fields["teacher_block_starts"] = list(_tbs)
+            if not getattr(self, "_trace_fsdp_backend_logged", False):
+                logger.info("teacher scoring backend=fsdp (rollout side): deferring "
+                            "to trainer, no vLLM prompt_logprobs call (codex M5 probe)")
+                self._trace_fsdp_backend_logged = True
             return
         teacher_prompt_ids = output.extra_fields.pop("teacher_prompt_ids", None)
         # Optional sticky-routing key from the agent loop (trace-opd): scoring

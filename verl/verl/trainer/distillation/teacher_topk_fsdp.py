@@ -1,26 +1,44 @@
 # -*- coding: utf-8 -*-
-"""R11a: self-teacher top-k scoring on the TRAINING engine (FSDP), replacing the
-vLLM prompt_logprobs path (vLLM issue #5907: logprobs allocations live outside
-the gpu_memory_utilization budget with no scheduler protection — the root cause
-of both the rollout-tail VRAM spikes and the creeping baseline).
+"""R11a v2: self-teacher top-k scoring on the TRAINING engine (FSDP backend).
 
-This module is imported by engine_workers.update_actor. Semantics are a strict
-replica of the vLLM path (agent_loop._compute_teacher_logprobs single-call):
+Replaces the vLLM prompt_logprobs path (vllm issue #5907: logprobs allocations
+live outside the gpu_memory_utilization budget — root cause of the rollout-tail
+VRAM spikes and the creeping vLLM-process baseline).
 
-  * scored sequence  = teacher_prefix_ids + response_ids       (actual tokens)
-  * autoregressive row i predicts token i+1  ==  vLLM's "row i is the
-    distribution at position i predicting token i+1" (extract_prompt_logprobs
-    drops the leading None row and appends one dummy row)
-  * rows [T-1 : T+R-1] predict the R response tokens (T = teacher prefix len)
-  * per-sample layout written to the batch:  (P-1) zero rows | R valid rows |
-    1 zero dummy row, P = student BARE prompt length — byte-compatible with
-    what the loss side expects (no_padding_2_padding reads rows [P-1 : P+R-1])
-  * top-64 by logprob, fp32 log_softmax (vLLM computes logprobs on raw logits;
-    scoring temperature is 1.0 so no temperature division here either)
+Row semantics are a strict replica of the vLLM single-call path
+(agent_loop._compute_teacher_logprobs + extract_prompt_logprobs):
+  * scored sequence = teacher_prefix_ids + response_ids (actual tokens)
+  * autoregressive row i predicts token i+1; rows [T-1 : T+R-1] predict the R
+    response tokens (T = teacher prefix length)
+  * per-sample layout: (P-1) zero rows | R valid rows | 1 zero dummy row,
+    P = student BARE prompt length (loss reads rows [P-1 : P+R-1])
+  * top-K by logprob (rank order == vLLM ranks), fp32 logsumexp, temperature 1.0
 
-Weights: update_actor runs BEFORE the optimizer step of this training step, so
-the scoring weights equal the weights vLLM would have used (post update_weights
-of the previous step). Same model, same prefix, same tokens => same math.
+v2 incorporates the codex adversarial review (task-ms0edrml-9d9z87):
+  H1  explicit teacher_mode provenance ("privileged"|"bare") asserted here —
+      a privileged sample whose prefix got lost in transit now fails loud
+      instead of silently degrading to a bare (KL~0) teacher.
+  H2  scoring runs inside engine.eval_mode() (offload/mode contract). Note on
+      root reshard: with param_offload=False the ctx is a no-op by design and
+      the root FSDP handle stays unsharded after our forward — the immediately
+      following train forward reuses it, so we accept the transient residency
+      (validated in smoke; revisit if peaks regress).
+  H3  chunks compute topk+logsumexp directly on the fp32 chunk — the full
+      [chunk, V] log_softmax output is never materialized; intermediates are
+      freed per chunk; a hard sequence-budget guard (40960 = max_model_len).
+  H4  enforced upstream: the agent-loop branch only activates for self_teacher.
+  M1  dense NO_PADDING batches (all-equal lengths -> torch.stack) need no mask.
+  M2  K comes from the rollout side (teacher_topk in extra_fields), asserted
+      batch-consistent; no hard-coded 64.
+  M3  weights-equality with the vLLM path holds only for sync training with a
+      single optimizer update per generation batch (current profile). Guarded
+      by the caller keeping this backend off otherwise.
+  M4  all structural validation runs BEFORE the first forward, so a malformed
+      batch fails on every rank prior to any FSDP collective.
+  L1  R == 0 is rejected loudly.
+
+Weights: update_actor runs BEFORE this step's optimizer update, so scoring
+weights equal what vLLM would have used. Same model, same prefix, same tokens.
 """
 import logging
 import os
@@ -29,7 +47,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_K3_WARNED = False
+MAX_TEACHER_SEQ = 40960  # == rollout max_model_len; anything longer is a bug
+_LOGGED_BACKEND = False
 
 
 def teacher_scoring_backend() -> str:
@@ -37,122 +56,154 @@ def teacher_scoring_backend() -> str:
 
 
 def _unwrap_module(engine):
-    """Best-effort handle to the forward-able (FSDP-wrapped) module."""
-    for attr in ("module", "model", "actor_module", "module_fsdp"):
+    for attr in ("module", "model", "actor_module"):
         m = getattr(engine, attr, None)
         if m is not None and callable(getattr(m, "forward", None)):
             return m
     raise RuntimeError(
-        "teacher_topk_fsdp: cannot locate the model module on engine "
-        f"{type(engine).__name__}; tried .module/.model/.actor_module"
+        f"teacher_topk_fsdp: cannot locate model module on {type(engine).__name__}"
     )
 
 
 def _per_sample_actual(data, key: str):
-    """Return list[1D LongTensor] of ACTUAL (unpadded) tokens for `key`.
-
-    Supports both nested/jagged tensors (NO_PADDING pad mode) and padded
-    tensors (falls back to the matching attention mask)."""
+    """list[1D LongTensor] of ACTUAL tokens for `key` (nested, dense-equal-length,
+    or padded-with-mask)."""
     t = data[key]
     if getattr(t, "is_nested", False):
         return [x.to(torch.long) for x in t.unbind()]
-    # padded fallback: derive lengths from masks
+    # dense: either NO_PADDING with all-equal actual lengths (no mask shipped —
+    # codex M1), or a padded layout with an attention mask.
+    am = data.get("attention_mask", None)
+    if am is None:
+        return [row.to(torch.long) for row in t]
     if key == "responses":
-        mask = data.get("response_attention_mask")
-        if mask is None:
-            am = data["attention_mask"]  # [b, P+R]
-            plen = data["prompts"].shape[1]
-            mask = am[:, plen:]
-        return [row[m.bool()].to(torch.long) for row, m in zip(t, mask)]
-    if key == "prompts":
-        am = data["attention_mask"]
-        plen = t.shape[1]
-        pm = am[:, :plen]
-        return [row[m.bool()].to(torch.long) for row, m in zip(t, pm)]
-    raise KeyError(key)
+        plen = data["prompts"].shape[1]
+        mask = am[:, plen:]
+    elif key == "prompts":
+        mask = am[:, : t.shape[1]]
+    else:
+        raise KeyError(key)
+    return [row[m.bool()].to(torch.long) for row, m in zip(t, mask)]
+
+
+def _score_rows_topk(rows: torch.Tensor, topk: int, chunk: int):
+    """top-K ids/logprobs for each row WITHOUT materializing full log_softmax.
+    logprob(top_j) = logit(top_j) - logsumexp(row)  (fp32, temperature 1.0)."""
+    R = rows.shape[0]
+    ids = torch.empty((R, topk), dtype=torch.int32)
+    lps = torch.empty((R, topk), dtype=torch.float32)
+    for s in range(0, R, chunk):
+        e = min(s + chunk, R)
+        ch = rows[s:e].float()                        # [c, V] fp32 (only copy)
+        v_logit, ix = torch.topk(ch, k=topk, dim=-1)  # rank-ordered
+        lz = torch.logsumexp(ch, dim=-1, keepdim=True)
+        lps[s:e] = (v_logit - lz).cpu()
+        ids[s:e] = ix.to(torch.int32).cpu()
+        del ch, v_logit, ix, lz                       # codex H3: free per chunk
+    return ids, lps
 
 
 @torch.no_grad()
-def compute_teacher_topk_fsdp(data, engine, topk: int = 64, chunk: int = 2048):
+def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     """Fill data["teacher_ids"/"teacher_logprobs"] by scoring on the FSDP engine.
-
-    Fail-loud by design (project discipline): any structural mismatch raises —
-    a silently wrong teacher is worse than a lost step."""
-    # TQ path: AgentLoopOutput.as_dict() ships the whole extra_fields dict per
-    # sample (NonTensorStack under key "extra_fields"); the non-TQ DataProto
-    # path ships it as "tool_extra_fields". Support both.
+    Fail-loud by design: a silently wrong teacher is worse than a lost step."""
+    global _LOGGED_BACKEND
     tef = data.get("extra_fields", None)
     if tef is None:
         tef = data.get("tool_extra_fields", None)
     if tef is None:
-        raise RuntimeError("teacher_topk_fsdp: extra_fields/tool_extra_fields missing from batch")
-    # NonTensorStack / numpy object array / list — normalize to list[dict]
+        raise RuntimeError("teacher_topk_fsdp: extra_fields missing from batch — "
+                           "TQ did not ship the rollout extras")
     if hasattr(tef, "tolist"):
         tef = tef.tolist()
     extras = list(tef)
 
-    prompts = _per_sample_actual(data, "prompts")     # student BARE prompts (P_i)
-    responses = _per_sample_actual(data, "responses")  # actual response tokens (R_i)
+    prompts = _per_sample_actual(data, "prompts")
+    responses = _per_sample_actual(data, "responses")
     n = len(responses)
     if not (len(extras) == len(prompts) == n):
-        raise RuntimeError(
-            f"teacher_topk_fsdp: batch misaligned extras={len(extras)} prompts={len(prompts)} responses={n}"
-        )
+        raise RuntimeError(f"teacher_topk_fsdp: misaligned batch extras={len(extras)} "
+                           f"prompts={len(prompts)} responses={n}")
+
+    # ---- codex M4: full structural validation BEFORE any forward ----------
+    topk = None
+    plan = []  # (prefix_tensor, response_tensor, P, R)
+    k3_warned = False
+    for i in range(n):
+        ex = extras[i] or {}
+        mode = ex.get("teacher_mode", None)
+        if mode not in ("privileged", "bare"):
+            raise RuntimeError(f"teacher_topk_fsdp: sample {i} has teacher_mode={mode!r} "
+                               "— provenance lost in transit (codex H1)")
+        k = ex.get("teacher_topk", None)
+        if k is None:
+            raise RuntimeError(f"teacher_topk_fsdp: sample {i} missing teacher_topk")
+        k = int(k)
+        if topk is None:
+            topk = k
+        elif topk != k:
+            raise RuntimeError(f"teacher_topk_fsdp: inconsistent topk {topk} vs {k}")
+        prefix = ex.get("teacher_prefix_ids", None)
+        if mode == "privileged" and prefix is None:
+            raise RuntimeError(f"teacher_topk_fsdp: sample {i} is 'privileged' but "
+                               "teacher_prefix_ids is missing (codex H1)")
+        if mode == "bare":
+            # vLLM-path semantics: research failed => score under the BARE
+            # student prompt (teacher == student => per-token KL ~ 0, neutral).
+            prefix = prompts[i]
+        else:
+            prefix = torch.as_tensor(list(prefix), dtype=torch.long)
+        if ex.get("teacher_block_starts") and not k3_warned:
+            logger.warning("teacher_topk_fsdp: K3 block starts present — K3 is not "
+                           "implemented on the fsdp backend, single-prefix scoring")
+            k3_warned = True
+        resp = responses[i]
+        P, R, T = int(prompts[i].numel()), int(resp.numel()), int(prefix.numel())
+        if R <= 0:
+            raise RuntimeError(f"teacher_topk_fsdp: sample {i} has empty response (codex L1)")
+        if P <= 0 or T <= 0:
+            raise RuntimeError(f"teacher_topk_fsdp: sample {i} degenerate P={P} T={T}")
+        if T + R > MAX_TEACHER_SEQ:
+            raise RuntimeError(f"teacher_topk_fsdp: sample {i} teacher seq {T + R} "
+                               f"exceeds budget {MAX_TEACHER_SEQ} (codex H3 guard)")
+        plan.append((prefix, resp, P, R))
 
     module = _unwrap_module(engine)
-    device = next(module.parameters()).device
-    was_training = module.training
-    module.eval()
+    if not _LOGGED_BACKEND:
+        logger.info("teacher_topk_fsdp ACTIVE: backend=fsdp topk=%s n=%s (codex M5 probe)",
+                    topk, n)
+        _LOGGED_BACKEND = True
 
-    global _K3_WARNED
+    was_training = module.training
     out_ids, out_lps = [], []
-    try:
-        for i in range(n):
-            ex = extras[i] or {}
-            prefix = ex.get("teacher_prefix_ids", None)
-            resp = responses[i]
-            P = int(prompts[i].numel())
-            R = int(resp.numel())
-            if prefix is None:
-                # bare-teacher sample (research failed): the vLLM path scores
-                # under the BARE student prompt (teacher == student weights &
-                # prefix => per-token KL ~ 0, a neutral sample). Zero tensors
-                # would be WRONG here: logprob 0 == prob 1.0 and the forward
-                # KL would explode. Score under the bare prompt instead.
-                prefix = prompts[i]
-            if ex.get("teacher_block_starts") and not _K3_WARNED:
-                logger.warning("teacher_topk_fsdp: K3 block starts present but K3 is "
-                               "not implemented on the fsdp backend — single-prefix scoring")
-                _K3_WARNED = True
-            pfx = torch.as_tensor(list(prefix), dtype=torch.long)
-            T = int(pfx.numel())
-            seq = torch.cat([pfx, resp.cpu()]).to(device).unsqueeze(0)   # [1, T+R]
-            logits = module(input_ids=seq, use_cache=False).logits[0]     # [T+R, V]
-            rows = logits[T - 1 : T + R - 1]                              # predict R response tokens
-            if rows.shape[0] != R:
-                raise RuntimeError(f"teacher_topk_fsdp: sample {i} rows {rows.shape[0]} != R {R}")
-            ids_i = torch.empty((R, topk), dtype=torch.int32)
-            lps_i = torch.empty((R, topk), dtype=torch.float32)
-            for s in range(0, R, chunk):
-                e = min(s + chunk, R)
-                lp = torch.log_softmax(rows[s:e].float(), dim=-1)         # fp32, raw logits (temp=1.0)
-                v, ix = torch.topk(lp, k=topk, dim=-1)                    # rank-ordered == vLLM ranks
-                ids_i[s:e] = ix.to(torch.int32).cpu()
-                lps_i[s:e] = v.cpu()
-            del logits, rows
-            # sentinel parity with the vLLM path
-            if R > 0 and not (lps_i[0] < 0).any():
-                raise RuntimeError("teacher_topk_fsdp: first response row looks like a dummy row")
-            zid = torch.zeros((P - 1, topk), dtype=torch.int32)
-            zlp = torch.zeros((P - 1, topk), dtype=torch.float32)
-            did = torch.zeros((1, topk), dtype=torch.int32)
-            dlp = torch.zeros((1, topk), dtype=torch.float32)
-            out_ids.append(torch.cat([zid, ids_i, did], dim=0))           # [P+R, topk]
-            out_lps.append(torch.cat([zlp, lps_i, dlp], dim=0))
-    finally:
-        if was_training:
-            module.train()
-        torch.cuda.empty_cache()
+    # codex H2: run under the engine's eval contract (offload load/unload, mode).
+    with engine.eval_mode(zero_grad_on_exit=False):
+        module.eval()
+        try:
+            device = next(module.parameters()).device
+            for i, (prefix, resp, P, R) in enumerate(plan):
+                T = int(prefix.numel())
+                seq = torch.cat([prefix.cpu(), resp.cpu()]).to(device).unsqueeze(0)
+                logits = module(input_ids=seq, use_cache=False).logits[0]
+                rows = logits[T - 1 : T + R - 1]
+                if rows.shape[0] != R:
+                    raise RuntimeError(f"teacher_topk_fsdp: sample {i} rows "
+                                       f"{rows.shape[0]} != R {R}")
+                ids_i, lps_i = _score_rows_topk(rows, topk, chunk)
+                del logits, rows
+                if not (lps_i[0] < 0).any():
+                    raise RuntimeError("teacher_topk_fsdp: first response row looks "
+                                       "like a dummy row — alignment is off")
+                zid = torch.zeros((P - 1, topk), dtype=torch.int32)
+                zlp = torch.zeros((P - 1, topk), dtype=torch.float32)
+                did = torch.zeros((1, topk), dtype=torch.int32)
+                dlp = torch.zeros((1, topk), dtype=torch.float32)
+                out_ids.append(torch.cat([zid, ids_i, did], dim=0))
+                out_lps.append(torch.cat([zlp, lps_i, dlp], dim=0))
+        finally:
+            if was_training:
+                module.train()
+            torch.cuda.empty_cache()
 
     data["teacher_ids"] = torch.nested.nested_tensor(out_ids, layout=torch.jagged)
     data["teacher_logprobs"] = torch.nested.nested_tensor(out_lps, layout=torch.jagged)

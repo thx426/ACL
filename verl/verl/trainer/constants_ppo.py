@@ -120,6 +120,12 @@ def get_ppo_ray_runtime_env(config=None):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
     # trace-opd distillation microscope: workers sample per-token distillation
     # quantities to this directory when set (see trainer/distillation/losses.py).
+    # trace-opd R11 (codex M5): the teacher-scoring backend switch and the
+    # agent-loop hang-guard timeout must reach every Ray worker explicitly —
+    # process-inheritance is not guaranteed for existing/remote clusters.
+    for key in ("TRACE_TEACHER_SCORING_BACKEND", "TRACE_AGENT_TASK_TIMEOUT_S"):
+        if os.environ.get(key):
+            runtime_env["env_vars"][key] = os.environ[key]
     for key in ("TRACE_DISTILL_MICROSCOPE_DIR", "TRACE_DISTILL_SAMPLE_EVERY"):
         if os.environ.get(key):
             runtime_env["env_vars"][key] = os.environ[key]
