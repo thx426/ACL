@@ -178,8 +178,11 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # A tail sample longer than the budget rides in its own micro-batch
         # (verl 6d77dc7 clamps instead of asserting).
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={t.ppo_max_token_len_per_gpu}",
-        "actor_rollout_ref.actor.strategy=fsdp2",
-        "actor_rollout_ref.actor.fsdp_config.param_offload=True",
+        f"actor_rollout_ref.actor.strategy={t.fsdp_strategy}",
+        f"actor_rollout_ref.ref.strategy={t.fsdp_strategy}",
+        f"actor_rollout_ref.actor.fsdp_config.param_offload={t.param_offload}",
+        f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={t.reshard_after_forward}",
+        *([f"actor_rollout_ref.actor.fsdp_config.fsdp_size={t.fsdp_size}"] if t.fsdp_size else []),
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
         "actor_rollout_ref.actor.fsdp_config.entropy_checkpointing=True",
         "actor_rollout_ref.actor.fsdp_config.entropy_from_logits_with_chunking=True",

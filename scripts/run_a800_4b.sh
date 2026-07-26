@@ -41,13 +41,12 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # 但 2026-07-26 02:36 在 22k 序列 + chunked-prefill 4096 下**连 60s 也被突破**
 # (`RPC call to sample_tokens timed out`),疑为 step-17 那次 45 分钟卡死的真凶。
 # 提到 300s:正常 sample_tokens 远快于此,阈值只防误杀、不影响性能。
-export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-300000}
+# VLLM_RPC_TIMEOUT / 打分后端 / FSDP 拓扑均已迁入配置(train.*),由 launcher 写入 env。
 # CD-006 R11a(2026-07-25):self-teacher 打分后端。fsdp = 在训练引擎上打分,
 # 彻底绕开 vLLM prompt_logprobs 的预算外分配缺陷(官方 issue #5907,rollout 尾部
 # 76-81GB 尖峰与基线爬升的共同根因);vllm = 原路径(回退用)。
 # CD-005 2026-07-26 收编时切默认 fsdp:生产冒烟已过(overlap 0.850 在 vLLM 基线带内、
 # teacher_mass 0.99880、rollout 尾部尖峰 81.2→47.2GB 根除),requirements §1 定版主线。
-export TRACE_TEACHER_SCORING_BACKEND=${TRACE_TEACHER_SCORING_BACKEND:-fsdp}
 # torch allocator 超 85% 主动回收 unused blocks(纵深防御,主要护 vLLM 进程侧驻留;
 # 不可用 expandable_segments——与 vLLM CuMemAllocator 冲突为实证事故)
 # ⚠ 不要在这里设 expandable_segments:True —— 2026-07-26 实测它与 vLLM 的 memory pool 互斥,
@@ -58,38 +57,9 @@ export TRACE_TEACHER_SCORING_BACKEND=${TRACE_TEACHER_SCORING_BACKEND:-fsdp}
 # 分配器保持 PyTorch 默认。garbage_collection_threshold 亦不再设(推迟回收,未验证有益)。
 MINFREE=$(nvidia-smi -i $CARDS --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
 [[ $MINFREE -lt 70000 ]] && { echo "FATAL 某卡剩余仅 ${MINFREE}MiB,疑有残留进程"; exit 1; }
-# 通信后端强制 gloo:绕开该机不可靠的 NVLink/NCCL(memory a800-no-inter-gpu-comm)
-# ── 训练拓扑:MODE=noshard(默认,零 NCCL)| MODE=shard2(fsdp_size=2,最小化 NCCL)──
-MODE=${MODE:-noshard}
-SKIP_VAL=${SKIP_VAL:-0}   # 1=跳过训前/周期 val(测试迭代用,省 5-13 分钟)
-if [[ "$MODE" == "noshard" ]]; then
-  export VERL_DIST_BACKEND="cpu:gloo,cuda:gloo"   # 全程 gloo,不碰 NVLink
-  export VERL_FSDP_NO_SHARD=1                     # 不分片,每步仅 1 次梯度 all_reduce
-  TOKLEN=${TOKLEN:-1024}                          # NO_SHARD 每卡 64G 固定开销,激活预算极小
-  SHARD_OVR="actor_rollout_ref.actor.fsdp_config.param_offload=True"
-  say "拓扑=NO_SHARD + 全 gloo(零 NCCL);token 预算 $TOKLEN"
-else
-  # CD-006 2026-07-25:param_offload 由 False 改回 True。当初关它是为躲 MODE=noshard 下的
-  # CPU OOM(NO_SHARD 每卡持完整参数,8x56GB=448GB);切到 fsdp_size=2 后参数已分片,
-  # offload 量降到每卡约 4GB、8 卡共 ~32GB(机器余 792GB),前提已变而开关未复评 —— 这是
-  # 显存基线高出十几 GB 的主因,也是 verl `resume weights 前不清缓存` 那个 bug 被撞穿的前提。
-  # v1(跑过 step-13 起飞)正是 param_offload=True。offload 走 PCIe,不增加卡间通信。
-  unset VERL_DIST_BACKEND VERL_FSDP_NO_SHARD      # 走默认 cuda:nccl
-  TOKLEN=${TOKLEN:-8192}
-  # fsdp_size=2 ⇒ mesh(ddp=4, fsdp=2):只在 2 卡组内分片,显存降到 ~1/2
-  # CD-006 2026-07-25 用户裁定 reshard_after_forward False→True:
-  #   verl 把该值直接当 zero3_enable(transformer_impl.py:397),2维 mesh 下
-  #   False ⇒ _HYBRID_SHARD_ZERO2、True ⇒ HYBRID_SHARD(ZeRO-3)。
-  #   ZeRO-2 的 forward 后【不 reshard】,完整 8GB 参数常驻到 backward 结束;
-  #   ZeRO-3 用完即 reshard,那 8GB 消失 ⇒ 预估省 ~7GB(fsdp_size=4 只省 ~2GB,
-  #   因为它切不动这个常驻 full)。代价:backward 需重新 all-gather,
-  #   通信【次数】+50%(~72→~108/步),远低于 ulysses 的 80 倍。数学等价。
-  # reshard_after_forward=False ⇒ ZeRO-2 式,前向 all_gather 后保留,**反向不再重复 all_gather**
-  #   (这是把 NCCL 通信量砍半的关键旋钮)
-  # 更大的 TOKLEN ⇒ 微批更少 ⇒ **通信轮数成比例减少**(FSDP 每微批反向都要通信)
-  SHARD_OVR="actor_rollout_ref.actor.fsdp_config.fsdp_size=2 actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True actor_rollout_ref.actor.fsdp_config.param_offload=False actor_rollout_ref.actor.fsdp_config.entropy_from_logits_chunk_size=512"
-  say "拓扑=fsdp_size2 + NCCL(仅 2 卡组内分片,ZeRO-2 免重复 all_gather);token 预算 $TOKLEN"
-fi
+# 训练拓扑(fsdp_strategy / fsdp_size / param_offload / reshard_after_forward /
+# fsdp_mode / dist_backend)已全部迁入 configs/profiles/machine-a800.yaml —— 它们是
+# 机制参数,过去只存在于本脚本的 shell 变量里,换一条启动路径就换一套行为。
 say "用 GPU $CARDS ($NGPU 卡),后端=gloo(零 NCCL),最小剩余 ${MINFREE}MiB"
 
 # ---- 远程 researcher(A800→zkgy→35B 二级隧道) ----
@@ -102,50 +72,17 @@ for p in 18888 18889; do
   [[ "$code" == "200" ]] && say "researcher 端点 $p OK" || { echo "FATAL 端点 $p 不通($code)"; exit 1; }
 done
 
-# ---- chunked-prefill 预算与打分后端联锁 ----
-# 打分在 vLLM 侧时,每 chunk 物化全 vocab logits(本值 x 151936 x 2B)是 feedback P0 的 OOM
-# 根因,必须降半到 2048;R11 把打分移到训练引擎后该成因消失,恢复 h3 铁稳值 4096(长序列
-# prefill 的 chunk 数减半,缓解 (72) 实测的 rollout 吞吐下降)。联锁写在这里而不是靠人记住:
-# 回退 backend 时预算自动跟随,漏改就会当场 OOM。
-if [[ "${TRACE_TEACHER_SCORING_BACKEND:-fsdp}" == "fsdp" ]]; then
-  NBT=4096; NBT_WHY="R11 fsdp 打分:vLLM 不再物化打分 logits,恢复 h3 铁稳值"
-else
-  NBT=2048; NBT_WHY="vLLM 侧打分:必须降半压制 logits 缓冲(feedback P0 OOM 根因)"
-fi
-say "chunked-prefill 预算 rollout_max_num_batched_tokens=$NBT  ($NBT_WHY)"
-
-# ---- 派生配置(= v1 基线) ----
+# ---- 配置:模板 + 机器 profile(不再 sed 派生)----
+# 机器差异全部写在 configs/profiles/machine-a800.yaml(卡数/并行/显存/端点/拓扑),
+# 硬约束一与二的完整说明也在那里。启动脚本不再改写配置——sed 派生曾无条件覆盖
+# yaml 里的值,谁在配置文件里设了什么都会被悄悄改回默认(MIX_RL、TOKLEN 两次同型事故)。
+# 消融臂用臂 profile 或 --set,并务必配不同的 --run-name(臂进 objective fingerprint,
+# 同名 resume 会被 launcher 拦下):
+#   bash scripts/run_a800_4b.sh --profile $T/configs/profiles/arm-a3-mixed.yaml \
+#        --run-name trace_opd_4b_a3
 CONFIG=$T/configs/trace.yaml
-GEN=$T/configs/trace_a800_4b.gen.yaml
-# ⚠⚠ 硬约束一(2026-07-26 07:06 实证,requirements §3-C):A800(驱动 525)上
-# **不可用 ulysses_sp>1 / flash-attn**。启用 SP=2(联动 rmpad+FA2)后 vLLM 报
-# `CUDA error: an illegal memory access` → 六卡同时 NVRM Xid 31 MMU Fault →
-# nvidia-smi 连续 5 分钟无响应;六卡同发 = 系统性 kernel 越界,与该机卡间通信
-# 不可靠的历史顽疾同源(SP 走 all-to-all)。回退须【卸载 flash-attn】,只设
-# SP=1 不够——vLLM 会自动选用已装的 flash-attn 且 0.19.1 无后端开关。
-# SP=2 显存收益本就很小(峰值 66481 vs 单靠 temperature 恒等修复推算 67369),
-# 长序列 OOM 由 617817c(跳过 temperature 恒等复制)独立承担。默认定版 SP=1。
-sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo 后端(零 NCCL)|" \
-    -e "s|^  ulysses_sp: .*|  ulysses_sp: ${ULYSSES_SP:-1}             # A800 硬约束一:SP>1/flash-attn 触发六卡 MMU Fault(见上方注释),定版 1|" \
-    -e 's|^  rollout_tp: .*|  rollout_tp: 1             # 单卡 ⇒ TP1|' \
-    -e 's|^  rollout_gpu_mem: .*|  rollout_gpu_mem: 0.40     # CD-006 2026-07-25 二次上调(0.30→0.40):step-5 崩因是训练后 torch 未归还足够物理显存,vLLM wake_up 拿不到 KV 池(cumem_allocator OOM)。降 4GB 需求换余量|' \
-    -e "s|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: $NBT   # $NBT_WHY|" \
-    -e "s|^  ppo_max_token_len_per_gpu: .*|  ppo_max_token_len_per_gpu: $TOKLEN      # 执行层,不改训练数学|" \
-    -e "s|^  log_prob_max_token_len_per_gpu: .*|  log_prob_max_token_len_per_gpu: $TOKLEN  # 同上|" \
-    -e 's|^  test_freq: .*|  test_freq: 10             # CD-006 2026-07-25 用户裁定开评测:每 10 步一次 val(seen+unseen 两 split, greedy)|' \
-    -e 's|^  save_freq: .*|  save_freq: 5|' \
-    -e '/^  researcher:/,/max_concurrency:/{
-        s|^    sidecar_sleep: .*|    sidecar_sleep: false|
-        s|^    dp_size: .*|    dp_size: 0|
-        s|^    model: "${TRACE_RESEARCHER_MODEL}".*|&\n    api_key_env: TRACE_RESEARCHER_API_KEY|
-    }' "$CONFIG" > "$GEN"
-say "派生配置: $GEN"
-grep -E "^  n_gpus:|^  ulysses_sp:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  log_prob_max_token|^  lr:|^  test_freq:|^  mix_rl_weight:|^  mix_sft_weight:|^  mix_sft_rollouts:|sidecar_sleep:|dp_size:|api_key_env:" "$GEN" | sed 's/^/    /'
-# 上面 sed 只派生【机器相关】的部署参数(卡数/并行/显存/端点)——同一份主 yaml 要在
-# 两台机器上跑。【实验设计参数】不在这里派生:混合目标的消融臂权重定义了这个 run 在
-# 优化什么目标,属于配置真源,改 configs/trace.yaml,或按需在启动时显式覆盖:
-#   bash scripts/run_a800_4b.sh --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5
-# --set 走与配置文件相同的校验,并记入 launch manifest 的 config_overrides(可追溯)。
+PROFILE=$T/configs/profiles/machine-a800.yaml
+say "配置: 模板 $CONFIG + profile $PROFILE(解析后写入 <run_dir>/effective_config.yaml)"
 
 # ---- 单卡显存:optimizer 状态 offload 到 CPU(468G RAM) ----
 # 单卡不再有 FSDP 4 路分片:模型状态从 12GB/卡 涨到 48GB,不 offload 必 OOM
@@ -153,13 +90,14 @@ grep -E "^  n_gpus:|^  ulysses_sp:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max
 # 数学等价标准 DDP;配 gloo 后端后全程零 NCCL
 # fused AdamW:消除 _foreach_sqrt 的 16GB 临时张量(三次 OOM 的真凶),
 # 数学与默认 foreach 实现完全等价(同一 AdamW,融合进单个 CUDA kernel),且更快。
+# fused AdamW:消除 _foreach_sqrt 的 16GB 临时张量(三次 OOM 的真凶),数学等价且更快。
 FUSED_OVR="actor_rollout_ref.actor.optim.override_optimizer_config={fused:true}"
-VAL_OVR=""
-[[ "$SKIP_VAL" == "1" ]] && VAL_OVR="trainer.val_before_train=False trainer.test_freq=-1" && say "跳过 val(测试模式)"
+# 跳过 val 用配置覆盖,不再另设 SKIP_VAL —— 它与 train.val_before_train 是两套真源:
+#   bash scripts/run_a800_4b.sh --set train.val_before_train=false --set train.test_freq=-1
 # vLLM 引擎统计(纯观测,不改计算路径):verl 默认 disable_log_stats=True,把吞吐/KV 占用/
 # preemption 全部关掉了,(72) 的 decode 机理只能靠推断。打开后可直接实测,并量化 R11 的收益。
 STATS_OVR="actor_rollout_ref.rollout.disable_log_stats=False"
-export EXTRA_OVERRIDES="actor_rollout_ref.actor.strategy=fsdp actor_rollout_ref.ref.strategy=fsdp actor_rollout_ref.actor.fsdp_config.optimizer_offload=True $SHARD_OVR $FUSED_OVR $VAL_OVR $STATS_OVR"
+export EXTRA_OVERRIDES="$FUSED_OVR $STATS_OVR"
 
 export PYTHONPATH=$T/src:$T/verl:${PYTHONPATH:-}
 export SWANLAB_API_KEY=58KT7T652vKUKobNhHb50
@@ -173,5 +111,6 @@ mkdir -p $W/logs
 say "启动 → $LOG"
 cd $T
 # "$@" 透传给 launcher:--set section.key=value(配置覆盖,可重复)与 verl override 都走这里
-nohup $PY $T/scripts/launch_train.py --config "$GEN" --run-name "$RUN_NAME" $EXTRA_OVERRIDES "$@" > "$LOG" 2>&1 &
+nohup $PY $T/scripts/launch_train.py --config "$CONFIG" --profile "$PROFILE" \
+      --run-name "$RUN_NAME" $EXTRA_OVERRIDES "$@" > "$LOG" 2>&1 &
 echo "PID=$! LOG=$LOG"

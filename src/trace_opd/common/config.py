@@ -207,6 +207,15 @@ class TrainCfg:
     agent_task_timeout_s: int = 2700        # R3 hang guard;0=禁用
     fsdp_mode: str = "shard"                # shard | noshard(NO_SHARD≈DDP,
                                             # 为卡间通信不可靠的机器保留)
+    fsdp_strategy: str = "fsdp2"            # fsdp2 | fsdp(=FSDP1,NO_SHARD 逃生通道要它)
+    fsdp_size: int = 0                      # 0=全分片;>0=仅在该大小的组内分片
+                                            # (mesh(ddp=n/fsdp_size, fsdp=fsdp_size),
+                                            # 显存与通信量的折中)
+    param_offload: bool = True              # 参数下沉 CPU。关掉会让训练后的显存高水位
+                                            # 不归还,vLLM wake_up 拿不到物理页(07-25 事故)
+    reshard_after_forward: bool = True      # verl 直接把它当 zero3_enable:True=用完即
+                                            # reshard(ZeRO-3),False=保留到 backward(ZeRO-2,
+                                            # 省一次 all_gather 但常驻完整参数)
     dist_backend: str = ""                  # 空=verl 默认(nccl);
                                             # "cpu:gloo,cuda:gloo"=全程绕开 NCCL
     total_epochs: int = 2
@@ -334,6 +343,17 @@ def _validate(cfg: "Config") -> None:
         problems.append(
             f"train.teacher_scoring_backend={cfg.train.teacher_scoring_backend!r} "
             "must be 'fsdp' or 'vllm'"
+        )
+    if (
+        cfg.train.teacher_scoring_backend == "vllm"
+        and cfg.train.rollout_max_num_batched_tokens > 2048
+    ):
+        problems.append(
+            f"train.teacher_scoring_backend=vllm with rollout_max_num_batched_tokens="
+            f"{cfg.train.rollout_max_num_batched_tokens}: scoring on the rollout engine "
+            "materialises a full-vocabulary logits buffer per prefill chunk "
+            "(chunk x vocab x 2B), which OOMed the smoke run at 4096. Either keep the "
+            "fsdp backend, or drop the budget to 2048 when falling back to vllm."
         )
     if cfg.train.fsdp_mode not in ("shard", "noshard"):
         problems.append(f"train.fsdp_mode={cfg.train.fsdp_mode!r} must be 'shard' or 'noshard'")

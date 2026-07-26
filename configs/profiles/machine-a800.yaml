@@ -21,6 +21,10 @@ train:
   rollout_gpu_mem: 0.40
   ppo_max_token_len_per_gpu: 8192
   log_prob_max_token_len_per_gpu: 8192
+  # NBT 与打分后端联锁:vLLM 侧打分时每 prefill chunk 物化全 vocab logits
+  # (chunk × vocab × 2B),4096 是冒烟 OOM 根因;R11 把打分移走后成因消失,
+  # 恢复 h3 铁稳值。回退 backend 时必须同时降到 2048——配置校验会拦住漏改。
+  rollout_max_num_batched_tokens: 4096
   # MODE=noshard 时的逃生通道(卡间通信不可靠):NO_SHARD ≈ DDP,每步仅一次梯度
   # all_reduce,配全 gloo 后端可完全绕开 NVLink/NCCL。当前主线用 shard2 + NCCL。
   fsdp_mode: shard

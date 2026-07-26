@@ -31,7 +31,14 @@ _RESEARCH = (
     "research_episodes",
 )
 # Mixed objective, SFT arm (docs/mixed-objective-design.md).
-_MIXED_SFT = ("sft_role", "sft_won", "sft_accepted", "sft_dropped_ref")
+_MIXED_SFT = (
+    "sft_role", "sft_won", "sft_accepted", "sft_dropped_ref",
+    # An expert slot that could not produce supervision. Kept as a slot (masked
+    # to nothing) rather than re-used as a bare rollout: research failure
+    # correlates with task difficulty, so converting it would feed the SFT arms
+    # extra on-policy data on exactly the hard tasks.
+    "sft_missing_no_doc", "sft_missing_env_error",
+)
 
 
 def build_curve_metrics(

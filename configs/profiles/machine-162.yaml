@@ -13,6 +13,7 @@ train:
   rollout_gpu_mem: 0.7
   # R11 把打分的全词表 logits 挪进训练阶段,与训练前向自身的 logits 叠加,
   # 故打包预算保持模板值;NBT 与打分后端的联锁由 launcher 按 backend 处理。
+  rollout_max_num_batched_tokens: 4096   # 与 fsdp 打分后端联锁(见 machine-a800 注释)
   fsdp_mode: shard          # 该机 NCCL 可靠,无需 NO_SHARD 逃生通道
   dist_backend: ""          # verl 默认(nccl)
 

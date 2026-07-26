@@ -44,6 +44,7 @@ import math
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -464,31 +465,37 @@ class TraceAgentLoop(AgentLoopBase):
             metrics.tool_calls += time.time() - t_block0
             research_awaited = True
 
+        expert_missing = ""
         if is_expert:
             await await_research()
             if not doc:
-                # Research failed — an expert copy has nothing to imitate, so it
-                # contributes as an ordinary on-policy sample instead.
-                is_expert = False
+                # Research failed, so there is nothing to imitate. The slot stays
+                # an expert slot: turning it into an extra bare rollout would
+                # hand the batch more on-policy data exactly on the tasks where
+                # research fails — which correlates with task difficulty, so the
+                # SFT arms would quietly train on a different, easier-skewed
+                # sample than the arms they are compared against. It contributes
+                # nothing instead, and says so on a curve.
+                expert_missing = "no_doc"
 
         t0 = time.time()
         result = None
-        if is_expert:
+        if is_expert and not expert_missing:
             result = await self._expert_rollout(
                 adapter, doc, sampling_params, response_length, route
             )
             if not result.tokens.response_ids:
-                # An environment fault before the first generation leaves nothing
-                # to imitate — and an empty response is a shape the trainer
-                # cannot take (as_dict writes rm_scores[-1]). Fall back to the
-                # student path, which retries the fault and fails loud twice
-                # over rather than emitting a degenerate row.
+                # An environment fault before the first generation. An empty
+                # response is a shape the trainer cannot take (as_dict writes
+                # rm_scores[-1]), so this slot needs SOME tokens — but for the
+                # same reason as above it must not become a bare training
+                # sample. It is re-rolled bare and then masked out entirely.
                 logger.warning(
-                    "expert episode for %s produced no tokens (%s); falling back to a bare rollout",
+                    "expert episode for %s produced no tokens (%s); the slot contributes nothing",
                     adapter.task_id,
                     result.trajectory.error,
                 )
-                is_expert = False
+                expert_missing = "env_error"
                 result = None
         if result is None:
             result = await self._student_rollout(adapter, sampling_params, response_length, route)
@@ -500,7 +507,17 @@ class TraceAgentLoop(AgentLoopBase):
         traj = result.trajectory
         env_steps = sum(1 for s in traj.steps if s.acted)
         tokens = result.tokens
-        if is_expert:
+        if is_expert and expert_missing:
+            # The slot exists but has no supervision to offer: zero mask keeps it
+            # out of SFT, and sample_role="sft" keeps it out of the on-policy
+            # terms, the GRPO group, and every behaviour metric.
+            tokens = replace(tokens, response_mask=[0] * len(tokens.response_ids))
+            expert_fields = {
+                "sample_role": "sft", "sft_role": 1, "sft_won": 0,
+                "sft_accepted": 0, "sft_dropped_ref": 0,
+                f"sft_missing_{expert_missing}": 1,
+            }
+        elif is_expert:
             tokens, expert_fields = build_expert_sample(
                 adapter=adapter,
                 tokenizer=self.tokenizer,
