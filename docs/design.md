@@ -151,7 +151,19 @@ step-16 OOM 触发点,逐位等价);`rollout_max_num_batched_tokens` 与后端�
 (fsdp→4096 恢复 h3 铁稳值,vllm 回退→2048)。开关默认 fsdp(脚本层),
 `vllm` 保留为回退路径。
 
-### 6.3 信号增强三件套 K1/K2/K3:已移除(2026-07-26 用户裁定)
+### 6.3 混合目标 OPD × RL × SFT(2026-07-26 用户需求;默认全关)
+
+设计真源:**`docs/mixed-objective-design.md`**。一句话:总损失
+`L = OPD + mix_rl_weight × RL + mix_sft_weight × SFT`,两权重默认 0 ⇒ 与纯 OPD 逐字节
+一致。动机是弱模型(1.7B)上 self-teacher 对 student 自身错误前缀打分时,文档的语义
+抓地力迅速衰减、KL 起不来(CD-006 五环因果链 + framing 探针的 on-policy 天花板;
+SDAR 在同基座同环境复现同一现象)。RL = GRPO(轨迹 won);SFT = 每任务额外 4 条
+**带文档** rollout 的成功轨迹,重放到裸 prompt 后做 CE。**定位是正式的可开关可消融
+机制(A0-A3 臂),不是 1.7B 补丁**——PG-4 的"锚/RL 联合留后续"与 CD-003 的"真修复=
+冻结 teacher + 锚"在此落地,故触及 PG-1/PG-5 的"第一轮纯 OPD",进完成报告
+Proposed Global Decisions 报备 master。
+
+### 6.4 信号增强三件套 K1/K2/K3:已移除(2026-07-26 用户裁定)
 
 CD-006 在 1.7B v2 时代实验过的 loss/打分侧三改动(K1 clamp 软化、K2 KL^α
 自适应加权、K3 分块保鲜打分)按用户裁定**从机制中整体移除(非关闭)**:
