@@ -138,13 +138,25 @@ OPD 应保留争夺主干的资格,这正是消融要回答的问题。
 
 ### 3.2 SFT 样本的 bare 化重放(`core/episode.py::replay_bare_tokens`)
 
+**先厘清两种"轨迹"的区别(否则极易混淆)**:
+- **OPD 的 teacher 与 student 共用同一条轨迹**——学生自己 rollout 出来的那条。teacher 取
+  `[system+doc] + 学生已生成的前 t 个 token`,student 取 `[system] + 同样这 t 个 token`,
+  两者对**同一位置 t+1** 给分布,KL 就在这些位置上算。即 **teacher 被迫在学生的前缀
+  (含错误前缀)上表态**——这正是弱模型失效的机理入口。
+- **SFT 臂的 expert rollout 是另一条完全不同的轨迹**:policy 带着 doc 自己走出来的、成功的
+  那条。它的价值恰恰在于**不是**学生的轨迹——它落在学生 on-policy 分布够不着的正确中段
+  状态上(framing 探针证明的 on-policy-only 天花板的解法)。
+
 guided 轨迹是 doc 条件下产生的,直接拿来 SFT 会教出"有 doc 时做对",与内化目标相反
-(PACT 明确:必须剥离特权上下文)。**关键实现事实:重放无需重新 tokenize**——
-guidance 只存在于 system message,即只存在于 `prompt_ids`;response 流(生成 token +
-turn glue + observation)自第二轮起 append-only 构建,在两种 prompt 下**逐 token 相同**。
-故重放 = 把 guided 的 response 流原样接到**重新渲染的裸首轮 prompt** 上,并断言两个
-prompt 的生成前缀尾部一致(与特权 teacher prefix 同款不变量)。该恒等式由
-`test_replay_response_is_byte_identical_to_a_bare_rollout_of_the_same_text` 锁死。
+(PACT 明确:必须剥离特权上下文)。**重放无需重新 tokenize**,依据是:guidance 只存在于
+system message(即只存在于 `prompt_ids`);而 response 流的每一段——生成 token(模型输出)、
+turn glue 与 post_obs(模板常量)、observation(环境返回)——**没有一段依赖 system 里
+有没有 doc**。所以 guided 轨迹的 response 流接到裸 prompt 后,仍是一个合法的、与学生
+rollout 同构的序列。故重放 = 原样接到**重新渲染的裸首轮 prompt** 上,并断言两个 prompt 的
+生成前缀尾部一致(与特权 teacher prefix 同款不变量)。
+`test_replay_response_is_byte_identical_to_a_bare_rollout_of_the_same_text` 锁的正是
+"构流不依赖 system prompt"这条性质(固定生成文本、对比两种 prompt 下的构流结果),
+**不是**"guided 与 bare 会走出同一条轨迹"——真如此的话 doc 就毫无价值了。
 
 ### 3.3 三道过滤(`core/expert.py::build_expert_sample`,verl-free 故可单测)
 
@@ -203,6 +215,29 @@ trace_opd 侧:
 
 测试:`tests/test_mixed_objective.py`(11)+ `test_viz_index.py` 隔离用例 + 
 `test_vendored_verl.py` 两条执行路径断言;全量 **152/152**。
+
+## 4.5 开关契约:关闭一个臂 = 不产生该臂的任何计算/存储(用户要求,非"系数置 0")
+
+**每个臂独立可关,且关闭时该臂特有的开销全部消失**,而不是"照跑再乘 0"。逐项:
+
+| 臂 | 关闭时不发生的事 | 由什么 gate |
+|---|---|---|
+| **SFT** | ①**不多跑 4/12 的 rollout**(最大一笔,约 1/3 的 rollout 墙钟)②agent loop 不发副本号、不进 expert 分支、不做重放与过滤 ③**TQ 不分配也不传输 `sft_mask`**(否则每行一个全零 [R] 张量,每 step 数十 MB 纯浪费)④loss 不调 `sft_ce_loss` ⑤`distillation_only` 保持 True(verl 因此跳过 `log_probs` 计算) | ①launcher 的 `rollout.n` 表达式;②`sft_arm` 短路(权重是第二个条件);③**`sample_role` 标记只在该臂开启时盖章**,TQ 侧以"该字段是否存在"为开关;④⑤系数判定 |
+| **RL** | ①不调 `ppo_loss` ②不做 `global_batch_info` 快照/恢复 ③`distillation_only` 保持 True | 系数判定 |
+
+**两笔属于 verl 主循环、无条件发生的既有开销**(改动前的纯 OPD 也在付,不由本机制引入,
+但如实记录):
+- `_compute_advantage`(step 7)每步都算 GRPO advantage。CPU 侧张量操作(毫秒级),且
+  `advantages` 还供曲线使用 ⇒ 不值得关。
+- `_compute_old_log_prob`(step 4)是**整批一次额外前向**(`log_prob_max_token_len_per_gpu`
+  就是给它的预算)。纯 OPD 不需要 `old_log_probs`,但该阶段**顺带产出 `actor/entropy` 曲线**
+  ——崩塌监控的关键信号 ⇒ 关掉会失去它。若将来要省这一趟前向,须先把 entropy 曲线改由
+  训练前向承担(`calculate_entropy=True` 已开),属独立优化课题,**不在本机制范围**。
+
+**一条工程教训入档**:新增 per-token 字段必须同步 `construct_minimal_padding_template`
+——它 clone 源行全部字段后只覆盖一份固定清单,漏掉的字段会让合成的 padding 行携带
+别的行的全长张量。`sft_mask` 因此曾会崩溃或虚增 `sft/expert_tokens`(已修 + 形状断言
++ vendored 断言防回归)。
 
 ## 5. 观察与判据
 
