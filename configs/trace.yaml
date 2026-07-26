@@ -246,10 +246,11 @@ train:
                             # 调大须同步调小 27B 侧 GPU_MEM(serve_researcher.sh)
   rollout_temperature: 1.0
   # --- OPD 信号增强三件套(2026-07-24 用户定稿;详见 docs/experiments/cd006-signal-enhancement-final.md)---
-  distill_block_turns: 4    # K3 分块保鲜打分块宽 W(0=关):每 W 轮一块,块首插一份全量 doc,
+  distill_block_turns: 0    # 【待 CD-005 移除·requirements 3-D】K3 分块保鲜打分。fsdp 打分后端不支持,
+                            # 开启只会静默降级;实测开销占步时 2/3(33.0→12.4 分钟)。
                             # 块 1 免插(与旧 teacher 字节一致);半衰期实测 ≥8 轮,W=4 取 100% 区
-  distill_loss_soft_cap: true   # K1:loss 超 clamp 改 c+log1p(x-c) 软压缩,保决策尖峰有序
-  distill_kl_weight_alpha: 1.0  # K2:|KL|^α 自适应 token 加权(0=关);批内归一保尺度
+  distill_loss_soft_cap: false   # 【待 CD-005 移除·requirements 3-D】K1 clamp 软化。
+  distill_kl_weight_alpha: 0.0  # 【待 CD-005 移除·requirements 3-D】K2 KL^α 加权,1.7B v2 判定 no-op。
   distill_kl_weight_cap: 10.0   # K2 单 token 权重上限  # 训练 rollout 采样温度 | h3 定版
   distill_topk: 64          # forward_kl_topk 的 k | h3 定版(verl 官方推荐区间)
   distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
