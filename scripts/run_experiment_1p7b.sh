@@ -142,6 +142,25 @@ else
     export TRACE_RESEARCHER_ENDPOINT=http://127.0.0.1:$PORT_27B/v1
     export TRACE_RESEARCHER_MODEL=$SERVED_27B
 fi
+# ---- 混合目标消融臂(docs/mixed-objective-design.md;默认全关 = A0 纯 OPD)-----
+# MIX_RL / MIX_SFT 是两个臂的权重。A0=0/0(默认,与历史 run 逐字节一致)、
+# A1=1.0/0、A2=0/0.5、A3=1.0/0.5。SFT 臂开启时 launcher 自动把 rollout.n
+# 从 8 抬到 8+mix_sft_rollouts(带文档的 expert 副本),bare 组仍是 8。
+# 关闭的臂不产生该臂的任何计算/存储(不是把系数乘 0),细节见设计文档 §4.5。
+MIX_RL=${MIX_RL:-0.0}
+MIX_SFT=${MIX_SFT:-0.0}
+if [[ "$MIX_RL" != "0.0" || "$MIX_SFT" != "0.0" ]]; then
+    GEN_CONFIG="${CONFIG%.yaml}_mix.gen.yaml"
+    sed -e "s|^  mix_rl_weight: .*|  mix_rl_weight: $MIX_RL     # 消融臂(启动脚本 MIX_RL)|" \
+        -e "s|^  mix_sft_weight: .*|  mix_sft_weight: $MIX_SFT    # 消融臂(启动脚本 MIX_SFT)|" \
+        "$CONFIG" > "$GEN_CONFIG"
+    CONFIG=$GEN_CONFIG
+    grep -E "^  mix_(rl|sft)_weight:|^  mix_sft_rollouts:" "$CONFIG" | sed 's/^/    /'
+    say "混合目标: RL=$MIX_RL  SFT=$MIX_SFT  → 派生配置 $CONFIG"
+else
+    say "混合目标: 全关(A0 纯 OPD,与历史 run 同口径)"
+fi
+
 [[ -z "${SWANLAB_API_KEY:-}" ]] && say "提示:SWANLAB_API_KEY 未设,曲线走 offline 模式"
 
 # ---- [4] 启动训练(nohup + 存活确认)---------------------------------------

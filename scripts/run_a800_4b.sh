@@ -132,6 +132,8 @@ sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo
     -e "s|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: $NBT   # $NBT_WHY|" \
     -e "s|^  ppo_max_token_len_per_gpu: .*|  ppo_max_token_len_per_gpu: $TOKLEN      # 执行层,不改训练数学|" \
     -e "s|^  log_prob_max_token_len_per_gpu: .*|  log_prob_max_token_len_per_gpu: $TOKLEN  # 同上|" \
+    -e "s|^  mix_rl_weight: .*|  mix_rl_weight: ${MIX_RL:-0.0}     # 混合目标消融臂(启动脚本 MIX_RL;0=关,不产生该臂任何计算)|" \
+    -e "s|^  mix_sft_weight: .*|  mix_sft_weight: ${MIX_SFT:-0.0}    # 同上 MIX_SFT;>0 时 launcher 自动把 rollout.n 抬到 8+mix_sft_rollouts|" \
     -e 's|^  test_freq: .*|  test_freq: 10             # CD-006 2026-07-25 用户裁定开评测:每 10 步一次 val(seen+unseen 两 split, greedy)|' \
     -e 's|^  save_freq: .*|  save_freq: 5|' \
     -e '/^  researcher:/,/max_concurrency:/{
@@ -140,7 +142,10 @@ sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo
         s|^    model: "${TRACE_RESEARCHER_MODEL}".*|&\n    api_key_env: TRACE_RESEARCHER_API_KEY|
     }' "$CONFIG" > "$GEN"
 say "派生配置: $GEN"
-grep -E "^  n_gpus:|^  ulysses_sp:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  log_prob_max_token|^  lr:|^  test_freq:|sidecar_sleep:|dp_size:|api_key_env:" "$GEN" | sed 's/^/    /'
+grep -E "^  n_gpus:|^  ulysses_sp:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  log_prob_max_token|^  lr:|^  test_freq:|^  mix_rl_weight:|^  mix_sft_weight:|^  mix_sft_rollouts:|sidecar_sleep:|dp_size:|api_key_env:" "$GEN" | sed 's/^/    /'
+# 混合目标消融臂(docs/mixed-objective-design.md):A0=0/0(默认,与历史 run 同口径)、
+# A1=1.0/0(+RL)、A2=0/0.5(+SFT)、A3=1.0/0.5(全混)。关闭的臂不产生任何计算/存储。
+say "混合目标: RL=${MIX_RL:-0.0}  SFT=${MIX_SFT:-0.0}$([[ "${MIX_SFT:-0.0}" != "0.0" ]] && echo "  (rollout.n 自动 8→12)")"
 
 # ---- 单卡显存:optimizer 状态 offload 到 CPU(468G RAM) ----
 # 单卡不再有 FSDP 4 路分片:模型状态从 12GB/卡 涨到 48GB,不 offload 必 OOM
