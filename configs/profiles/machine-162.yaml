@@ -1,0 +1,28 @@
+# 机器 profile:zkgy 162(10.77.110.162,4 卡混合 A800+A100,驱动 550)
+#
+# 只写与 configs/trace.yaml 模板的差异。用法:
+#   --config configs/trace.yaml --profile configs/profiles/machine-162.yaml
+#
+# 该机驱动 550,ulysses_sp>1 与 flash-attn 可用(A800 8 卡那台驱动 525 不可用,
+# 见 machine-a800.yaml 的硬约束一)。2026-07-26 起 4B 主线在此。
+
+train:
+  n_gpus: 4
+  rollout_tp: 2             # 4 卡 ⇒ 2 个 rollout replica
+  ulysses_sp: 2             # 驱动 550 可用;launcher 联动 rmpad=True + FA2
+  rollout_gpu_mem: 0.7
+  # R11 把打分的全词表 logits 挪进训练阶段,与训练前向自身的 logits 叠加,
+  # 故打包预算保持模板值;NBT 与打分后端的联锁由 launcher 按 backend 处理。
+  fsdp_mode: shard          # 该机 NCCL 可靠,无需 NO_SHARD 逃生通道
+  dist_backend: ""          # verl 默认(nccl)
+
+roles:
+  researcher:
+    # 外部 35B-A3B 双端点(经隧道,本机零 GPU 占用)。endpoint 是端口的唯一真源:
+    # 需要端口的脚本从这里解析,不另设 external_ports,否则两者会漂移。
+    mode: external_pool
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: "qwen3.6-35b-a3b"
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    sidecar_sleep: false    # 别人的服务,本 run 不驱动它睡醒
+    dp_size: 0              # 两个独立副本,没有共享调度器

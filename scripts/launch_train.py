@@ -37,10 +37,16 @@ import time
 import urllib.request
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "trace_opd" / "src"))
 
-from trace_opd.common.config import Config, load_config  # noqa: E402
+from trace_opd.common.config import (  # noqa: E402
+    Config,
+    load_config,
+    objective_fingerprint,
+)
 
 
 def preflight_researcher(cfg: Config) -> None:
@@ -251,27 +257,79 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument(
+        "--profile", dest="profiles", action="append", default=[], metavar="FILE",
+        help="derive this run from the config template with a profile stating only "
+             "what differs (repeatable, applied in order). See configs/profiles/.",
+    )
+    parser.add_argument(
         "--set", dest="overrides", action="append", default=[], metavar="section.key=value",
-        help="override a trace.yaml setting for this run, e.g. "
-             "--set train.mix_rl_weight=1.0 (repeatable). Goes through the same "
-             "validation as the file and is recorded in the launch manifest.",
+        help="override a config setting for this run, e.g. "
+             "--set train.mix_rl_weight=1.0 (repeatable, applied after profiles). "
+             "Goes through the same validation as the file and is recorded in the "
+             "launch manifest.",
     )
     args, passthrough = parser.parse_known_args()
     if not args.config:
         raise SystemExit("--config (or TRACE_CONFIG) is required")
     config_path = Path(args.config).resolve()
-    cfg = load_config(config_path, overrides=args.overrides)
+    profiles = [Path(p).resolve() for p in args.profiles]
+    cfg = load_config(config_path, overrides=args.overrides, profiles=profiles)
+    for profile in profiles:
+        print(f"[launch] profile: {profile}")
     if args.overrides:
         print(f"[launch] config overrides: {' '.join(args.overrides)}")
     if args.run_name:
         cfg.run.name = args.run_name
         cfg.train.experiment_name = args.run_name  # tracking name follows the run
+        # Keep the raw snapshot in step with the dataclass — it is what gets
+        # written out below and read back by every worker.
+        cfg.raw.setdefault("run", {})["name"] = args.run_name
+        cfg.raw.setdefault("train", {})["experiment_name"] = args.run_name
 
     runs_root = Path(cfg.run.runs_root)
     if not runs_root.is_absolute():
         runs_root = REPO / "trace_opd" / runs_root
     run_dir = runs_root / cfg.run.name
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve template + profiles + overrides ONCE, write the result, and point
+    # every consumer at that file. Before this, the agent-loop workers re-read
+    # the template from TRACE_CONFIG and never saw --set: a run launched as
+    # `--set train.mix_sft_weight=0.5` had the trainer expecting expert samples
+    # while the workers produced none. Two readers of "the config" that resolve
+    # it differently is the same class of failure as an env var shadowing a file.
+    fingerprint = objective_fingerprint(cfg)
+    effective_path = run_dir / "effective_config.yaml"
+    header = (
+        "# RESOLVED CONFIG — written by launch_train.py, read by every worker.\n"
+        "# Do not edit: it is regenerated at each launch from\n"
+        f"#   template : {config_path}\n"
+        + "".join(f"#   profile  : {p}\n" for p in profiles)
+        + "".join(f"#   --set    : {o}\n" for o in args.overrides)
+        + f"# objective fingerprint: {fingerprint}\n"
+    )
+    effective_path.write_text(
+        header + yaml.safe_dump(cfg.raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    # Resuming into a run directory whose objective differs means continuing one
+    # experiment's checkpoint under another's objective — every ablation arm
+    # shares a default run name, so it is one forgotten flag away.
+    stamp_path = run_dir / "objective_fingerprint.txt"
+    if stamp_path.exists():
+        previous = stamp_path.read_text(encoding="utf-8").strip()
+        if previous != fingerprint and cfg.train.resume_mode != "disable":
+            raise SystemExit(
+                f"[launch] FATAL: {run_dir} was created with objective fingerprint "
+                f"{previous}, this launch resolves to {fingerprint}. Resuming would "
+                "continue one experiment's checkpoints under another's objective.\n"
+                "         Use a different --run-name for this arm, or set "
+                "train.resume_mode=disable if you really mean to restart here."
+            )
+    else:
+        stamp_path.write_text(fingerprint + "\n", encoding="utf-8")
+    print(f"[launch] objective fingerprint: {fingerprint}")
 
     if not args.dry_run and not args.skip_preflight:
         preflight_researcher(cfg)
@@ -293,13 +351,36 @@ def main() -> int:
     )
     env.update(
         {
-            "TRACE_CONFIG": str(config_path),
+            # The RESOLVED config, not the template: workers must see the same
+            # profiles and --set overrides the trainer was launched with.
+            "TRACE_CONFIG": str(effective_path),
             "TRACE_RUN_DIR": str(run_dir),
             "TRACE_AGENT_WORKERS": str(cfg.train.agent_num_workers),
             "PYTHONPATH": pythonpath,
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",   # mixed-GPU host discipline
             "HYDRA_FULL_ERROR": "1",
         }
+    )
+    # Settings that reach verl through the environment because verl reads them
+    # there. The CONFIG is the source of truth; these are transport, so they are
+    # written unconditionally rather than defaulted with `${VAR:-...}` in a shell
+    # script — one launch path forgetting the export is how the fsdp scoring
+    # backend silently reverted to vLLM on the 162 line (CD-006 requirement 3-F).
+    env["TRACE_TEACHER_SCORING_BACKEND"] = cfg.train.teacher_scoring_backend
+    env["TRACE_AGENT_TASK_TIMEOUT_S"] = str(cfg.train.agent_task_timeout_s)
+    env["VLLM_RPC_TIMEOUT"] = str(cfg.train.vllm_rpc_timeout_ms)
+    if cfg.train.dist_backend:
+        env["VERL_DIST_BACKEND"] = cfg.train.dist_backend
+    else:
+        env.pop("VERL_DIST_BACKEND", None)
+    if cfg.train.fsdp_mode == "noshard":
+        env["VERL_FSDP_NO_SHARD"] = "1"
+    else:
+        env.pop("VERL_FSDP_NO_SHARD", None)
+    print(
+        f"[launch] teacher scoring backend = {cfg.train.teacher_scoring_backend}"
+        f" | fsdp_mode = {cfg.train.fsdp_mode}"
+        f" | dist_backend = {cfg.train.dist_backend or 'verl default'}"
     )
     if cfg.train.distill_microscope:
         # Per-token distillation sampling (verl patch 6f3d089); forwarded to
@@ -318,7 +399,7 @@ def main() -> int:
         if role.sidecar_sleep:
             sidecar_url = sidecar_root(role.endpoint)
             env["TRACE_SIDECAR_URL"] = sidecar_url
-            env.setdefault("TRACE_SIDECAR_SLEEP_LEVEL", "1")  # weights -> CPU RAM
+            env["TRACE_SIDECAR_SLEEP_LEVEL"] = str(role.sidecar_sleep_level)
             print(f"[launch] sidecar sleep/wake enabled: {sidecar_url}")
 
     cmd = build_command(cfg, run_dir) + list(passthrough)
@@ -327,10 +408,14 @@ def main() -> int:
 
     manifest = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "config_path": str(config_path),
-        # Already reflects --set, so this snapshot is what actually ran.
-        "config": cfg.raw,
+        "config_template": str(config_path),
+        "config_profiles": [str(p) for p in profiles],
         "config_overrides": list(args.overrides),
+        # The file every process actually read, and a hash of the settings that
+        # define what this run optimises (resume checks it, see above).
+        "effective_config": str(effective_path),
+        "objective_fingerprint": fingerprint,
+        "config": cfg.raw,
         "overrides": list(passthrough),
         "cmd": cmd,
         "run_dir": str(run_dir),

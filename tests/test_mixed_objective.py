@@ -272,3 +272,118 @@ def test_override_refuses_to_descend_into_a_non_mapping(tmp_path):
 
     with pytest.raises(ValueError, match="train.lr is not a mapping"):
         apply_overrides({"train": {"lr": 1e-6}}, ["train.lr.nested=1"])
+
+
+# --------------------------------------------- config template + profiles
+
+
+# A template must declare every key a profile may set — that is what makes an
+# undeclared key a typo rather than a new setting.
+_TEMPLATE_YAML = """
+run: {name: t, runs_root: runs, tape: false}
+research: {enabled: true}
+narration: {backend: engine}
+roles:
+  researcher: {endpoint: "http://x:1/v1", model: m}
+alfworld: {data_root: /d, worker_python: /p}
+train:
+  model_path: /m
+  train_file: /t.parquet
+  val_files: [/v1.parquet]
+  n_gpus: 2
+  mix_rl_weight: 0.0
+  mix_sft_weight: 0.0
+  mix_sft_rollouts: 4
+  teacher_scoring_backend: fsdp
+eval: {}
+"""
+
+
+def _write_template(tmp_path, name="template.yaml"):
+    from pathlib import Path
+
+    root = Path(tmp_path)
+    root.mkdir(parents=True, exist_ok=True)
+    template = root / name
+    template.write_text(_TEMPLATE_YAML)
+    return template
+
+
+def _template_and_profile(tmp_path, profile_body):
+    from pathlib import Path
+
+    from trace_opd.common.config import load_config
+
+    template = _write_template(tmp_path)
+    profile = Path(tmp_path) / "profile.yaml"
+    profile.write_text(profile_body)
+    return load_config(template, profiles=[profile])
+
+
+def test_profile_states_only_the_difference(tmp_path):
+    """The template carries the mechanism's defaults; a profile says what this
+    experiment changes. Everything it does not mention keeps following the
+    template, which is how a default improved in the mechanism reaches every
+    existing experiment without editing them."""
+    cfg = _template_and_profile(tmp_path, "train:\n  mix_sft_weight: 0.5\n")
+    assert cfg.train.mix_sft_weight == 0.5
+    assert cfg.train.mix_rl_weight == 0.0          # untouched
+    assert cfg.train.teacher_scoring_backend == "fsdp"  # still the template's
+
+
+def test_profile_cannot_invent_a_setting(tmp_path):
+    """A key the template does not define is a typo or a setting the mechanism
+    has since renamed — either way it must fail at startup, not become a value
+    nothing reads."""
+    with pytest.raises(ValueError, match="not defined in the config template"):
+        _template_and_profile(tmp_path, "train:\n  mix_sft_wieght: 0.5\n")
+
+
+def test_profiles_apply_in_order_and_set_wins(tmp_path):
+    from pathlib import Path
+
+    from trace_opd.common.config import load_config
+
+    template = _write_template(tmp_path, "t.yaml")
+    root = Path(tmp_path)
+    first = root / "a.yaml"
+    first.write_text("train:\n  mix_rl_weight: 1.0\n  mix_sft_weight: 0.25\n")
+    second = root / "b.yaml"
+    second.write_text("train:\n  mix_sft_weight: 0.5\n")
+    cfg = load_config(
+        template, profiles=[first, second], overrides=["train.mix_rl_weight=2.0"]
+    )
+    assert cfg.train.mix_sft_weight == 0.5   # later profile wins
+    assert cfg.train.mix_rl_weight == 2.0    # --set beats every profile
+
+
+def test_objective_fingerprint_separates_the_arms(tmp_path):
+    """Arms share a default run name, so resuming the wrong one is a forgotten
+    flag away. The fingerprint is what the launcher refuses on."""
+    from trace_opd.common.config import objective_fingerprint
+
+    a0 = _template_and_profile(tmp_path / "a0", "train:\n  mix_rl_weight: 0.0\n")
+    a3 = _template_and_profile(tmp_path / "a3", "train:\n  mix_rl_weight: 1.0\n")
+    same = _template_and_profile(tmp_path / "same", "train:\n  mix_rl_weight: 0.0\n")
+    assert objective_fingerprint(a0) != objective_fingerprint(a3)
+    assert objective_fingerprint(a0) == objective_fingerprint(same)
+    # A machine-only difference must NOT change it: resuming on other hardware
+    # is legitimate, resuming under another objective is not.
+    other_machine = _template_and_profile(tmp_path / "m", "train:\n  n_gpus: 8\n")
+    assert objective_fingerprint(other_machine) == objective_fingerprint(
+        _template_and_profile(tmp_path / "m2", "train:\n  n_gpus: 2\n")
+    )
+
+
+def test_repo_profiles_all_derive_cleanly():
+    """The shipped profiles must actually apply to the shipped template —
+    otherwise the first person to use one finds out at launch time."""
+    from pathlib import Path
+
+    from trace_opd.common.config import load_config
+
+    root = Path(__file__).resolve().parents[1] / "configs"
+    template = root / "trace.yaml"
+    for profile in sorted((root / "profiles").glob("*.yaml")):
+        cfg = load_config(template, profiles=[profile])
+        assert cfg.train.model_path is not None, profile

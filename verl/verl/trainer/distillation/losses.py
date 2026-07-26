@@ -393,11 +393,23 @@ def distillation_loss(
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
+        batch_info = dict(config.global_batch_info)
+        if not batch_info:
+            # trace-opd mixed objective: a micro-batch can legitimately hold no
+            # on-policy token at all — expert rows carry an all-zero
+            # response_mask, and the balanced partitioner groups by workload
+            # without regard to role, so an all-expert micro-batch is reachable.
+            # With no global count supplied, agg_loss's token-mean divides by
+            # loss_mask.sum(), i.e. by that zero, and hands a NaN to backward.
+            # Passing the clamped count keeps the denominator identical whenever
+            # the mask is non-empty and makes such a micro-batch contribute
+            # exactly 0, which is what it has to say.
+            batch_info = {"batch_num_tokens": response_mask.sum().clamp(min=1)}
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
-            **config.global_batch_info,
+            **batch_info,
         )
 
     return distillation_loss, distillation_metrics

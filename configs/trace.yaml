@@ -47,11 +47,20 @@ roles:
   researcher:               # research.backend=external 时使用
     endpoint: "${TRACE_RESEARCHER_ENDPOINT}"   # 例 http://127.0.0.1:8302/v1(162 单机;跨机走 SSH 隧道)
     model: "${TRACE_RESEARCHER_MODEL}"         # 例 Qwen3.6-27B
+    api_key_env: ""          # 需要鉴权时填**环境变量名**(如 TRACE_RESEARCHER_API_KEY);
+                            # 口令本身永不进配置文件
+    mode: local_sidecar      # local_sidecar = 本 run 起服并驱动其睡/醒
+                            # external_pool = 别人跑的端点(endpoint 可列多个,
+                            # PooledClient 会话粘性+均衡+故障切换)。这一项取代了
+                            # 脚本里的 EXTERNAL_RESEARCHER/REMOTE_RESEARCHER 开关;
+                            # 端口不另设配置项——endpoint 是唯一真源,需要端口的
+                            # 脚本从它解析,否则两者会漂移
     sidecar_sleep: true     # 162 单机分时复用(用户定):研究/rollout 阶段 27B 唤醒,
                             # 训练阶段 verl 经 /sleep?level=1 令其权重下沉 CPU RAM、
                             # KV 释放,FSDP 拿满 4 卡(verl sidecar patch,1e03590)。
                             # 27B 起服需 --enable-sleep-mode + VLLM_SERVER_DEV_MODE=1
                             # (serve_researcher.sh 已固化);27B 部署在独立机器时改 false
+    sidecar_sleep_level: 1  # 1=权重下沉 CPU RAM(可快速唤醒)| 2=丢弃权重
     dp_size: 2              # 27B server 的 vLLM data-parallel 实例数(DP2×TP2 部署)。
                             # >0 ⇒ 客户端按 crc32(task_id) % dp_size 发
                             # X-data-parallel-rank 头,把同任务多轮会话钉在同一
@@ -272,6 +281,22 @@ train:
                             # 用户明确以 val 墙钟 ≈6.6h 的代价换拐点分辨率)
   save_freq: 20             # 每 20 step 存 checkpoint(含 hf_model)| 与 test_freq
                             # 联动(每个 val 点都有对应 ckpt,峰值可回溯)
+  # --- 从环境变量迁入(CD-006 requirements §3-F;用户 2026-07-26 裁定)---------
+  # 这些原先只存在于启动脚本的 export,而代码侧另有一套 fallback 默认——两套真源,
+  # 换一条启动路径就静默换一种行为(`run_a800_4b.sh` 设了 fsdp 打分,而 162 主线用的
+  # `run_experiment.sh` 没设,代码 fallback 是 vllm ⇒ 打分悄悄退回 R11 刚根治的路径)。
+  # 现在配置是唯一真源,launcher 从这里写 env,env 降级为纯进程间传递。
+  teacher_scoring_backend: fsdp   # fsdp = 打分在训练引擎(主线,根治 vLLM #5907 的
+                                  # 预算外分配:rollout 尾部 81.2→47.2GB);vllm = 回退路径
+  vllm_rpc_timeout_ms: 300000     # EngineCore↔worker RPC 超时。默认 10s 会在长序列 +
+                                  # 深 GPU 队列下把一次 sample_tokens 误判成"引擎已死",
+                                  # 该实例后续全灭、任务永久 hang(07-25 两次事故)
+  agent_task_timeout_s: 2700      # R3 hang guard:单 prompt 墙钟上限,超时取消副本并
+                                  # 落既有 failure 分支放行 batch。0=禁用
+  fsdp_mode: shard                # shard | noshard。noshard ≈ DDP(每步仅一次梯度
+                                  # all_reduce),为卡间通信不可靠的机器保留的逃生通道
+  dist_backend: ""                # 空 = verl 默认(nccl);"cpu:gloo,cuda:gloo" = 全程
+                                  # 绕开 NVLink/NCCL(同上,A800 那台的历史需要)
   val_before_train: true    # step-0 val = 训前基线(三件套之①)
   resume_mode: auto         # 自动从最近 checkpoint 续;checkpoint 绑定 run 目录,与研究
                             # 归档/rollout dump 同处,断点恢复同源 | h3 定版

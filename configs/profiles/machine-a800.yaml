@@ -1,0 +1,36 @@
+# 机器 profile:A800-SXM 8 卡(10.10.252.11,驱动 525)
+#
+# ⚠⚠ 硬约束一(2026-07-26 07:06 实证):该机**不可用 ulysses_sp>1 / flash-attn**。
+# 启用 SP=2(联动 rmpad + FA2)后 vLLM 报 illegal memory access → **六张卡同时**
+# NVRM Xid 31 MMU Fault → nvidia-smi 连续 5 分钟无响应。六卡同发 = 系统性 kernel
+# 越界,与该机卡间通信不可靠的历史顽疾同源(SP 走 all-to-all)。
+# 回退**须卸载 flash-attn**:只设 SP=1 不够,vLLM 会自动选用已安装的 flash-attn,
+# 且 vLLM 0.19.1 无 VLLM_ATTENTION_BACKEND 开关可强制切换。
+# 长序列 OOM 由「跳过 temperature 恒等复制」(verl f88db6c)独立承担,SP 的显存
+# 收益本就很小(峰值 66481 vs 单靠该修复推算的 67369)。
+#
+# ⚠ 硬约束二:切勿设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# ——与 vLLM 的 memory pool 互斥,引擎直接起不来(pytorch#147851)。
+#
+# 2026-07-26 起该机停机待命,主线在 162。
+
+train:
+  n_gpus: 8
+  rollout_tp: 1
+  ulysses_sp: 1             # 硬约束一,不可调高
+  rollout_gpu_mem: 0.40
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  # MODE=noshard 时的逃生通道(卡间通信不可靠):NO_SHARD ≈ DDP,每步仅一次梯度
+  # all_reduce,配全 gloo 后端可完全绕开 NVLink/NCCL。当前主线用 shard2 + NCCL。
+  fsdp_mode: shard
+  dist_backend: ""
+
+roles:
+  researcher:
+    mode: external_pool
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: "qwen3.6-35b-a3b"
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    sidecar_sleep: false
+    dp_size: 0

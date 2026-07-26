@@ -8,6 +8,7 @@ roots, interpreter paths) live in env vars, not in the yaml.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -44,15 +45,26 @@ class RoleCfg:
     # Single-machine time-slicing: the trainer drives this server through the
     # rollout sleep/wake rhythm (verl sidecar patch). Researcher role only.
     sidecar_sleep: bool = False
+    # Depth of that sleep: 1 parks the weights in host RAM, 2 discards them.
+    sidecar_sleep_level: int = 1
     # vLLM data-parallel size of the server. >0 turns on client-side sticky
     # routing via the X-data-parallel-rank header (crc32(route_key) % dp_size)
     # so multi-turn sessions hit one engine's prefix cache. 0 = no header.
     dp_size: int = 0
+    # How this role is served, stated once instead of inferred from the
+    # combination of endpoint/sidecar_sleep/dp_size (CD-006 requirement 3-F):
+    #   local_sidecar — a server this run starts and drives through sleep/wake
+    #   external_pool — endpoints someone else runs; `endpoint` may list several
+    # The launcher and the run scripts both read this instead of each carrying
+    # their own environment switch (EXTERNAL_RESEARCHER / REMOTE_RESEARCHER).
+    # Ports are NOT a separate setting: `endpoint` is the source of truth and a
+    # script that needs the port parses it from there, or the two drift.
+    mode: str = "local_sidecar"
 
     _KNOWN_KEYS = {
         "endpoint", "model", "api_key_env", "max_concurrency",
         "temperature", "max_tokens", "timeout_s", "extra_body", "sidecar_sleep",
-        "dp_size",
+        "sidecar_sleep_level", "dp_size", "mode",
     }
 
     @staticmethod
@@ -71,7 +83,9 @@ class RoleCfg:
             timeout_s=float(d.get("timeout_s", 300.0)),
             extra_body=dict(d.get("extra_body", {}) or {}),
             sidecar_sleep=bool(d.get("sidecar_sleep", False)),
+            sidecar_sleep_level=int(d.get("sidecar_sleep_level", 1)),
             dp_size=int(d.get("dp_size", 0)),
+            mode=str(d.get("mode", "local_sidecar") or "local_sidecar"),
         )
 
 
@@ -181,6 +195,20 @@ class TrainCfg:
                                       # to <run>/microscope/ for the analysis
                                       # suite (docs/analysis-design.md; ~MBs/step)
     distill_sample_every: int = 4     # deterministic 1/N trajectory sample rate
+    # --- 从环境变量迁入(CD-006 requirement 3-F;用户 2026-07-26 裁定)---------
+    # 这些原先散落在启动脚本的 export 里,而代码侧另有一套 fallback 默认值。
+    # 两套真源 = 换一条启动路径就静默换一种行为:`run_a800_4b.sh` 设了
+    # `TRACE_TEACHER_SCORING_BACKEND=fsdp`,而 162 主线用的 `run_experiment.sh`
+    # 没设,代码 fallback 是 "vllm" ⇒ 打分会悄悄退回 R11 刚根治掉的 vLLM 路径。
+    # 现在配置是唯一真源,launcher 从这里写 env,env 降级为纯进程间传递。
+    teacher_scoring_backend: str = "fsdp"   # fsdp | vllm(回退路径)
+    vllm_rpc_timeout_ms: int = 300000       # EngineCore↔worker RPC 超时;默认
+                                            # 10s 会在长序列下误判"引擎已死"
+    agent_task_timeout_s: int = 2700        # R3 hang guard;0=禁用
+    fsdp_mode: str = "shard"                # shard | noshard(NO_SHARD≈DDP,
+                                            # 为卡间通信不可靠的机器保留)
+    dist_backend: str = ""                  # 空=verl 默认(nccl);
+                                            # "cpu:gloo,cuda:gloo"=全程绕开 NCCL
     total_epochs: int = 2
     test_freq: int = 10
     save_freq: int = 10
@@ -302,9 +330,39 @@ def _validate(cfg: "Config") -> None:
             problems.append(
                 "train.mix_sft_weight>0 requires research.enabled (expert rollouts need a document)"
             )
+    if cfg.train.teacher_scoring_backend not in ("fsdp", "vllm"):
+        problems.append(
+            f"train.teacher_scoring_backend={cfg.train.teacher_scoring_backend!r} "
+            "must be 'fsdp' or 'vllm'"
+        )
+    if cfg.train.fsdp_mode not in ("shard", "noshard"):
+        problems.append(f"train.fsdp_mode={cfg.train.fsdp_mode!r} must be 'shard' or 'noshard'")
+    if cfg.train.vllm_rpc_timeout_ms < 1000:
+        problems.append(
+            f"train.vllm_rpc_timeout_ms={cfg.train.vllm_rpc_timeout_ms} is below 1s — "
+            "a short RPC timeout makes EngineCore declare a live engine dead"
+        )
+    if cfg.train.agent_task_timeout_s < 0:
+        problems.append(f"train.agent_task_timeout_s={cfg.train.agent_task_timeout_s} must be >= 0 (0 disables)")
     for name, role in cfg.roles.items():
         if role.dp_size < 0:
             problems.append(f"roles.{name}.dp_size must be >= 0 (0 disables routing)")
+        if role.mode not in ("local_sidecar", "external_pool"):
+            problems.append(
+                f"roles.{name}.mode={role.mode!r} must be 'local_sidecar' or 'external_pool'"
+            )
+        if role.mode == "external_pool":
+            # Someone else runs these endpoints: this run must not try to drive
+            # them through sleep/wake, and dp routing is a single-server notion.
+            if not role.endpoint.strip():
+                problems.append(f"roles.{name}.mode=external_pool requires a non-empty endpoint")
+            if role.sidecar_sleep:
+                problems.append(f"roles.{name}: external_pool cannot use sidecar_sleep")
+            if role.dp_size > 0:
+                problems.append(
+                    f"roles.{name}: external_pool cannot use dp_size>0 "
+                    "(independent servers, no shared scheduler)"
+                )
     if cfg.train.train_batch_size % cfg.train.agent_num_workers != 0:
         problems.append(
             f"train.train_batch_size={cfg.train.train_batch_size} must be divisible "
@@ -403,9 +461,75 @@ def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any
     return data
 
 
-def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
+def merge_profile(base: dict[str, Any], overlay: dict[str, Any], source: str = "profile") -> dict[str, Any]:
+    """Deep-merge an experiment profile onto the default template.
+
+    ``configs/trace.yaml`` is the mechanism's default template: every key, with
+    its recommended value and the reasoning behind it, evolving as the mechanism
+    does. A concrete experiment derives from it with a profile that states ONLY
+    what differs — the machine's GPU topology, an ablation arm, a smoke run's
+    step count. The template keeps improving underneath every profile, and a
+    profile stays short enough to read as a description of the experiment.
+
+    A key the template does not define is an error rather than a new setting:
+    that is what turns a typo, or a key the mechanism has since renamed, into a
+    startup failure instead of a value nothing reads. (The ``roles`` section is
+    the exception — a profile may introduce a role the template does not list.)
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        if key not in base:
+            raise ValueError(
+                f"{source}: key {key!r} is not defined in the config template — "
+                "a profile states differences from the template, it cannot invent settings"
+            )
+        if isinstance(value, dict) and isinstance(base[key], dict):
+            nested = f"{source}.{key}"
+            if key == "roles":
+                # A profile may add a role; within a role the template rules.
+                merged[key] = dict(base[key])
+                for role, role_cfg in value.items():
+                    if role in base[key] and isinstance(role_cfg, dict) and isinstance(base[key][role], dict):
+                        merged[key][role] = merge_profile(base[key][role], role_cfg, f"{nested}.{role}")
+                    else:
+                        merged[key][role] = role_cfg
+            else:
+                merged[key] = merge_profile(base[key], value, nested)
+        else:
+            merged[key] = value
+    return merged
+
+
+def objective_fingerprint(cfg: "Config") -> str:
+    """Short hash of the settings that define WHAT this run optimises.
+
+    Resuming into a run directory whose fingerprint differs means continuing one
+    experiment's checkpoint under another experiment's objective — the ablation
+    arms all default to the same run name, so this is one forgotten flag away.
+    Deliberately narrow: it covers the objective and the batch composition that
+    feeds it, not the machine (resuming on different hardware is legitimate).
+    """
+    t = cfg.train
+    material = "|".join(
+        str(x) for x in (
+            t.model_path, t.mix_rl_weight, t.mix_sft_weight, t.mix_sft_rollouts,
+            t.rollout_n, t.train_batch_size, t.distill_topk, t.lr,
+            t.teacher_scoring_backend, cfg.research.enabled,
+        )
+    )
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
+
+
+def load_config(
+    path: str | Path,
+    overrides: list[str] | None = None,
+    profiles: list[str | Path] | None = None,
+) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     data = _expand(raw)
+    for profile in profiles or []:
+        overlay = _expand(yaml.safe_load(Path(profile).read_text(encoding="utf-8")) or {})
+        data = merge_profile(data, overlay, source=str(profile))
     if overrides:
         data = apply_overrides(data, overrides)
     unknown = set(data) - _KNOWN_SECTIONS

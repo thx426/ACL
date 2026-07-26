@@ -1,0 +1,7 @@
+# 消融臂 profile:A1-RL(mixed objective,docs/mixed-objective-design.md §6)
+# 用法:--profile configs/profiles/arm-a1-rl.yaml --run-name <run>_a1
+# ⚠ 每个臂必须用不同的 --run-name:臂进 objective fingerprint,同名 resume 会被
+#   launcher 拦下(否则是拿另一个臂的 checkpoint 继续跑另一个目标)。
+train:
+  mix_rl_weight: 1.0
+  mix_sft_weight: 0.0
