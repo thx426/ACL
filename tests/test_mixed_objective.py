@@ -145,7 +145,7 @@ eval: {}
 """
 
 
-def _load(tmp_path, train_extra="", research_enabled="true"):
+def _load(tmp_path, train_extra="", research_enabled="true", overrides=None):
     import importlib.util
     from pathlib import Path
 
@@ -155,7 +155,7 @@ def _load(tmp_path, train_extra="", research_enabled="true"):
     path.mkdir(parents=True, exist_ok=True)
     cfg_path = path / "c.yaml"
     cfg_path.write_text(_YAML % (research_enabled, train_extra))
-    cfg = load_config(cfg_path)
+    cfg = load_config(cfg_path, overrides=overrides)
 
     launcher = Path(__file__).resolve().parents[1] / "scripts" / "launch_train.py"
     spec = importlib.util.spec_from_file_location("launch_train_mixed", launcher)
@@ -213,3 +213,43 @@ async def test_expert_sample_refuses_an_episode_with_no_response():
     )
     with pytest.raises(ValueError, match="no response tokens"):
         _sample(empty)
+
+
+# ------------------------------------------------- config override channel
+
+
+def test_override_selects_an_arm_without_touching_the_config_file(tmp_path):
+    """Ablation arms are experiment design, not machine setup: they live in the
+    config file, and a run picks one with an explicit, recorded override rather
+    than a launcher rewriting the file behind the user's back."""
+    cfg, module = _load(
+        tmp_path,
+        overrides=["train.mix_rl_weight=1.0", "train.mix_sft_weight=0.5"],
+    )
+    assert (cfg.train.mix_rl_weight, cfg.train.mix_sft_weight) == (1.0, 0.5)
+    # The raw snapshot the launch manifest stores must show what actually ran.
+    assert cfg.raw["train"]["mix_rl_weight"] == 1.0
+    cmd = module.build_command(cfg, tmp_path / "run")
+    assert "actor_rollout_ref.rollout.n=12" in cmd
+    assert "+distillation.distillation_loss.rl_loss_coef=1.0" in cmd
+
+
+def test_override_without_one_leaves_the_file_value_alone(tmp_path):
+    """The failure this replaced: a launcher that rewrote both keys every run
+    silently reset a weight set in the config file back to zero."""
+    cfg, _ = _load(tmp_path, ", mix_sft_weight: 0.5", overrides=["train.mix_rl_weight=1.0"])
+    assert cfg.train.mix_sft_weight == 0.5
+
+
+def test_override_goes_through_the_same_validation_as_the_file(tmp_path):
+    with pytest.raises(ValueError, match="mix_rl_weight"):
+        _load(tmp_path, overrides=["train.mix_rl_weight=-1.0"])
+
+
+def test_override_rejects_a_typo_instead_of_ignoring_it(tmp_path):
+    with pytest.raises(ValueError, match="mix_rl_wieght"):
+        _load(tmp_path, overrides=["train.mix_rl_wieght=1.0"])
+    with pytest.raises(ValueError, match="unknown section"):
+        _load(tmp_path, overrides=["trian.mix_rl_weight=1.0"])
+    with pytest.raises(ValueError, match="must name a section"):
+        _load(tmp_path, overrides=["mix_rl_weight=1.0"])

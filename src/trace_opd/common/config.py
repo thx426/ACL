@@ -364,9 +364,42 @@ def _validate(cfg: "Config") -> None:
         raise ValueError("invalid config:\n  - " + "\n  - ".join(problems))
 
 
-def load_config(path: str | Path) -> Config:
+def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
+    """Apply ``section.key=value`` overrides onto a parsed config dict.
+
+    For settings that describe the EXPERIMENT rather than the machine — the
+    mixed-objective ablation weights above all. Those belong in the config file
+    (it is the single source of truth, and the launch manifest snapshots it), but
+    running four ablation arms off one file needs a way to say which arm without
+    editing the file for every run and remembering to edit it back.
+
+    Applied to the raw dict before the dataclasses are built, so the override
+    goes through the same unknown-key rejection and the same validation as a
+    value written in the file, and the manifest's config snapshot shows what
+    actually ran. Values are parsed as YAML, so ``0.5`` is a float and ``true``
+    is a bool, exactly as if they had been typed into the file.
+    """
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"config override {item!r} is not of the form section.key=value")
+        path, _, value = item.partition("=")
+        section, _, key = path.strip().partition(".")
+        if not key:
+            raise ValueError(f"config override {item!r} must name a section, e.g. train.mix_rl_weight=1.0")
+        if section not in _KNOWN_SECTIONS:
+            raise ValueError(f"config override {item!r}: unknown section {section!r}")
+        target = data.setdefault(section, {})
+        if not isinstance(target, dict):
+            raise ValueError(f"config override {item!r}: section {section!r} is not a mapping")
+        target[key] = yaml.safe_load(value)
+    return data
+
+
+def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     data = _expand(raw)
+    if overrides:
+        data = apply_overrides(data, overrides)
     unknown = set(data) - _KNOWN_SECTIONS
     if unknown:
         raise ValueError(f"unknown top-level config sections {sorted(unknown)}")

@@ -250,6 +250,10 @@ train:
   # 4B 仅靠 OPD 即可内化(step-9 起飞实证);1.7B 上 self-teacher 在 student 错误
   # 前缀下丢失文档语义抓地力,KL 信号起不来 —— 给它 RL 锚与 SFT 锚。也是正式消融
   # 开关:A0 纯 OPD(0/0)/A1 +RL(1/0)/A2 +SFT(0/0.5)/A3 全混(1/0.5)。
+  # 本文件是这三个值的真源。跑不同臂时改这里,或在启动命令上显式覆盖:
+  #   --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5
+  # 覆盖走与本文件相同的校验,并记入 launch manifest 的 config_overrides;
+  # 启动脚本不会 sed 改写这三个键(它只派生机器相关的部署项)。
   mix_rl_weight: 0.0        # GRPO(轨迹 won 为 reward,组内标准化)权重
   mix_sft_weight: 0.0       # 专家轨迹 CE 权重;>0 时需 research.enabled
   mix_sft_rollouts: 4       # 每任务额外带文档 rollout 数(verl rollout.n 自动

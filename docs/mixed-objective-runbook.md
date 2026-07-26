@@ -18,24 +18,41 @@ python3 -m pytest tests/ -q | tail -2     # 期望 154 passed
 
 ## 1. 怎么开臂
 
-两个启动脚本都已接通,**只用环境变量,不要手改 yaml**(手改会与脚本的 sed 派生打架):
+**`configs/trace.yaml` 是这三个值的真源**(`mix_rl_weight` / `mix_sft_weight` /
+`mix_sft_rollouts`)。臂是实验设计参数——它定义这个 run 在优化什么目标,所以它跟
+`n_gpus`/`rollout_tp` 那类机器参数不同:**启动脚本不会 sed 改写它们**。
 
-```bash
-# A800(4B 主线所在机器)
-MIX_RL=0.0 MIX_SFT=0.0  bash scripts/run_a800_4b.sh     # A0 纯 OPD(默认,可省略)
-MIX_RL=1.0 MIX_SFT=0.0  bash scripts/run_a800_4b.sh     # A1 +RL
-MIX_RL=0.0 MIX_SFT=0.5  bash scripts/run_a800_4b.sh     # A2 +SFT
-MIX_RL=1.0 MIX_SFT=0.5  bash scripts/run_a800_4b.sh     # A3 全混
+两种改法,任选:
 
-# 162(1.7B 线,同样两个变量)
-MIX_RL=1.0 MIX_SFT=0.5 RUN_NAME=trace_opd_1p7b_a3 bash scripts/run_experiment_1p7b.sh
+**(a) 改配置文件**——这个臂要长期跑时用:
+```yaml
+train:
+  mix_rl_weight: 1.0
+  mix_sft_weight: 0.5
 ```
 
-启动日志会回显 `混合目标: RL=… SFT=…`,派生 yaml 里也能看到三个 `mix_*` 键——
-**开跑前先在日志里对一眼**,这是最便宜的防误配手段。
+**(b) 启动时显式覆盖**——同一份 yaml 轮流跑几个臂时用(推荐):
+```bash
+# A800(4B 主线所在机器)
+bash scripts/run_a800_4b.sh                                                        # A0 纯 OPD(=文件里的值)
+bash scripts/run_a800_4b.sh --set train.mix_rl_weight=1.0                          # A1 +RL
+bash scripts/run_a800_4b.sh --set train.mix_sft_weight=0.5                         # A2 +SFT
+bash scripts/run_a800_4b.sh --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5   # A3 全混
 
-`mix_sft_rollouts` 默认 4(每任务额外的带文档 rollout 数),需要调就改 yaml;
-SFT 臂开启时 launcher **自动**把 `rollout.n` 从 8 抬到 12(bare 组仍是 8,expert 是加出来的)。
+# 162(1.7B 线,同一套写法)
+RUN_NAME=trace_opd_1p7b_a3 bash scripts/run_experiment_1p7b.sh \
+    --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5
+```
+
+`--set` 的三条保证:①走**与配置文件完全相同的校验**(负权重、缺 expert rollout、
+research 未启用都会拦);②**打字错误会报错而不是静默失效**(`mix_rl_wieght` 会被
+未知键检查抓住);③写进 **launch manifest 的 `config_overrides` 字段**,且 manifest
+里的 config 快照是**实际生效的值**——半年后能查出某个 run 是哪个臂。
+
+启动日志会打印 `[launch] config overrides: …`——**开跑前对一眼**,最便宜的防误配。
+
+`mix_sft_rollouts` 默认 4(每任务额外的带文档 rollout 数);SFT 臂开启时 launcher
+**自动**把 `rollout.n` 从 8 抬到 12(bare 组仍是 8,expert 是加出来的)。
 
 ## 2. 建议的实验序列
 
@@ -93,8 +110,8 @@ SFT 臂开启时 launcher **自动**把 `rollout.n` 从 8 抬到 12(bare 组仍�
 | 起不来 / config 校验报错 | 校验会明确拦三种误配:负权重、`mix_sft_weight>0` 但 `mix_sft_rollouts=0`、`mix_sft_weight>0` 但 research 未启用 | 按报错改 |
 | `sft_mask ... does not match the response layout` | 这是我们加的 fail-loud 断言:某行的 `sft_mask` 与其 responses 长度不一致 | **立即停并回报完整 traceback**——这是结构性问题,不要绕过 |
 | `sft_loss_coef > 0 but the batch carries no 'sft_mask' field` | rollout 侧没盖 `sample_role`(agent loop 与 verl 版本不匹配?) | 确认 vendored verl 是本次导出物(`verl/VENDORED.md` HEAD 应为 `c7c2194` 之后) |
-| loss 尺度与历史 run 对不上 | 只在开 RL 臂时才可能——我们已把 OPD 项归一化钉死在纯 OPD 口径,若仍不符请回报 | `MIX_RL=0.0` 复现 |
-| 想立刻回到已知良好状态 | — | `MIX_RL=0.0 MIX_SFT=0.0` 重启 = A0 = 与历史 run 同口径 |
+| loss 尺度与历史 run 对不上 | 只在开 RL 臂时才可能——我们已把 OPD 项归一化钉死在纯 OPD 口径,若仍不符请回报 | 去掉 `--set train.mix_rl_weight=…` 复现 |
+| 想立刻回到已知良好状态 | — | 不带任何 `--set` 重启(配置文件里两个权重为 0)= A0 = 与历史 run 同口径 |
 
 ## 6. 分析链路的适配(已就位,无需你们改)
 

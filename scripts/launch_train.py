@@ -250,11 +250,19 @@ def main() -> int:
                         help="override run.name (e.g. smoke runs get their own dir)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument(
+        "--set", dest="overrides", action="append", default=[], metavar="section.key=value",
+        help="override a trace.yaml setting for this run, e.g. "
+             "--set train.mix_rl_weight=1.0 (repeatable). Goes through the same "
+             "validation as the file and is recorded in the launch manifest.",
+    )
     args, passthrough = parser.parse_known_args()
     if not args.config:
         raise SystemExit("--config (or TRACE_CONFIG) is required")
     config_path = Path(args.config).resolve()
-    cfg = load_config(config_path)
+    cfg = load_config(config_path, overrides=args.overrides)
+    if args.overrides:
+        print(f"[launch] config overrides: {' '.join(args.overrides)}")
     if args.run_name:
         cfg.run.name = args.run_name
         cfg.train.experiment_name = args.run_name  # tracking name follows the run
@@ -320,7 +328,9 @@ def main() -> int:
     manifest = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "config_path": str(config_path),
+        # Already reflects --set, so this snapshot is what actually ran.
         "config": cfg.raw,
+        "config_overrides": list(args.overrides),
         "overrides": list(passthrough),
         "cmd": cmd,
         "run_dir": str(run_dir),

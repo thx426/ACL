@@ -132,8 +132,6 @@ sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo
     -e "s|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: $NBT   # $NBT_WHY|" \
     -e "s|^  ppo_max_token_len_per_gpu: .*|  ppo_max_token_len_per_gpu: $TOKLEN      # 执行层,不改训练数学|" \
     -e "s|^  log_prob_max_token_len_per_gpu: .*|  log_prob_max_token_len_per_gpu: $TOKLEN  # 同上|" \
-    -e "s|^  mix_rl_weight: .*|  mix_rl_weight: ${MIX_RL:-0.0}     # 混合目标消融臂(启动脚本 MIX_RL;0=关,不产生该臂任何计算)|" \
-    -e "s|^  mix_sft_weight: .*|  mix_sft_weight: ${MIX_SFT:-0.0}    # 同上 MIX_SFT;>0 时 launcher 自动把 rollout.n 抬到 8+mix_sft_rollouts|" \
     -e 's|^  test_freq: .*|  test_freq: 10             # CD-006 2026-07-25 用户裁定开评测:每 10 步一次 val(seen+unseen 两 split, greedy)|' \
     -e 's|^  save_freq: .*|  save_freq: 5|' \
     -e '/^  researcher:/,/max_concurrency:/{
@@ -143,9 +141,11 @@ sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo
     }' "$CONFIG" > "$GEN"
 say "派生配置: $GEN"
 grep -E "^  n_gpus:|^  ulysses_sp:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  log_prob_max_token|^  lr:|^  test_freq:|^  mix_rl_weight:|^  mix_sft_weight:|^  mix_sft_rollouts:|sidecar_sleep:|dp_size:|api_key_env:" "$GEN" | sed 's/^/    /'
-# 混合目标消融臂(docs/mixed-objective-design.md):A0=0/0(默认,与历史 run 同口径)、
-# A1=1.0/0(+RL)、A2=0/0.5(+SFT)、A3=1.0/0.5(全混)。关闭的臂不产生任何计算/存储。
-say "混合目标: RL=${MIX_RL:-0.0}  SFT=${MIX_SFT:-0.0}$([[ "${MIX_SFT:-0.0}" != "0.0" ]] && echo "  (rollout.n 自动 8→12)")"
+# 上面 sed 只派生【机器相关】的部署参数(卡数/并行/显存/端点)——同一份主 yaml 要在
+# 两台机器上跑。【实验设计参数】不在这里派生:混合目标的消融臂权重定义了这个 run 在
+# 优化什么目标,属于配置真源,改 configs/trace.yaml,或按需在启动时显式覆盖:
+#   bash scripts/run_a800_4b.sh --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5
+# --set 走与配置文件相同的校验,并记入 launch manifest 的 config_overrides(可追溯)。
 
 # ---- 单卡显存:optimizer 状态 offload 到 CPU(468G RAM) ----
 # 单卡不再有 FSDP 4 路分片:模型状态从 12GB/卡 涨到 48GB,不 offload 必 OOM
@@ -172,5 +172,6 @@ LOG=$W/logs/train_4b_a800_${TS}.log
 mkdir -p $W/logs
 say "启动 → $LOG"
 cd $T
-nohup $PY $T/scripts/launch_train.py --config "$GEN" --run-name "$RUN_NAME" $EXTRA_OVERRIDES > "$LOG" 2>&1 &
+# "$@" 透传给 launcher:--set section.key=value(配置覆盖,可重复)与 verl override 都走这里
+nohup $PY $T/scripts/launch_train.py --config "$GEN" --run-name "$RUN_NAME" $EXTRA_OVERRIDES "$@" > "$LOG" 2>&1 &
 echo "PID=$! LOG=$LOG"
