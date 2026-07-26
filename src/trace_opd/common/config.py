@@ -191,6 +191,15 @@ class TrainCfg:
                                       # mix_sft_weight>0 时生效);verl 侧
                                       # rollout.n = rollout_n + 本值,尾部这几
                                       # 个副本走 expert 分支,不参与 OPD/RL
+    # SFT 项的前缀,决定这一项在优化谁(CD-006 requirements §3-G,用户 2026-07-26 裁定):
+    #   doc  —— 保留 expert 生成时的带文档 prompt ⇒ 优化 policy(·|裸+文档) = **OPD 的
+    #           teacher 本身**。分工是「SFT 修老师、OPD 做传导」,直击 CD-003 的病因
+    #           (teacher 在 student 错误前缀下失去抓地力)。
+    #   bare —— 重放到裸 prompt ⇒ 直接教裸 policy。与 OPD 功能重叠,且 A2 首跑实测
+    #           **23.6% 的已接受样本在教「零观察依据下断言物体位置」**——expert 带着
+    #           文档才知道东西在哪,重放到裸条件后这些断言没有依据,而 expert 轨迹里
+    #           没有一条演示「猜错了怎么回退」⇒ 学到自信断言 + 无法恢复。保留作对照臂。
+    mix_sft_prefix: str = "doc"       # doc | bare
     distill_microscope: bool = True   # sample per-token distillation quantities
                                       # to <run>/microscope/ for the analysis
                                       # suite (docs/analysis-design.md; ~MBs/step)
@@ -328,6 +337,10 @@ def _validate(cfg: "Config") -> None:
     if cfg.train.mix_sft_rollouts < 0:
         problems.append(
             f"train.mix_sft_rollouts={cfg.train.mix_sft_rollouts} must be >= 0"
+        )
+    if cfg.train.mix_sft_prefix not in ("doc", "bare"):
+        problems.append(
+            f"train.mix_sft_prefix={cfg.train.mix_sft_prefix!r} must be 'doc' or 'bare'"
         )
     if cfg.train.mix_sft_weight > 0:
         if cfg.train.mix_sft_rollouts < 1:
@@ -548,6 +561,7 @@ def objective_fingerprint(cfg: "Config") -> str:
     material = "|".join(
         str(x) for x in (
             t.model_path, t.mix_rl_weight, t.mix_sft_weight, t.mix_sft_rollouts,
+            t.mix_sft_prefix,
             t.rollout_n, t.train_batch_size, t.distill_topk, t.lr,
             t.teacher_scoring_backend, cfg.research.enabled,
         )

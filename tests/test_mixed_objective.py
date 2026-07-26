@@ -109,12 +109,48 @@ async def test_expert_sample_accepts_a_win_and_zeroes_the_mask_otherwise():
 
 
 @pytest.mark.asyncio
-async def test_expert_sample_drops_a_win_that_talks_about_the_document():
+async def test_doc_prefix_keeps_the_prompt_the_episode_was_generated_under():
+    """The default. The SFT term then optimises policy(.|bare+document), which is
+    the OPD teacher — "SFT strengthens the teacher, OPD carries it across". The
+    alternative teaches the bare policy directly, which overlaps with OPD and
+    leaks: an expert knows where objects are because it read the document."""
+    result = await _episode(DOC, [reply("now win", "do the thing")])
+    tokens, fields = _sample(result, prefix="doc")
+    assert fields["sft_accepted"] == 1
+    assert tokens.prompt_ids == result.tokens.prompt_ids      # untouched
+    assert DOC in TOK.decode(tokens.prompt_ids, skip_special_tokens=False)
+    assert tokens.response_ids == result.tokens.response_ids
+
+    bare_tokens, _ = _sample(result, prefix="bare")
+    assert bare_tokens.prompt_ids != result.tokens.prompt_ids  # re-addressed
+    assert DOC not in TOK.decode(bare_tokens.prompt_ids, skip_special_tokens=False)
+    # Same trajectory either way — only what it is conditioned on differs.
+    assert bare_tokens.response_ids == tokens.response_ids
+
+
+@pytest.mark.asyncio
+async def test_reference_filter_applies_to_the_bare_prefix_only():
+    """Referring to the document is hallucination without it and simply correct
+    with it, so filtering under the doc prefix would drop good samples."""
     result = await _episode(DOC, [reply("the task guidance says to act", "do the thing")])
     assert result.trajectory.won
-    tokens, fields = _sample(result)
-    assert (fields["sft_won"], fields["sft_dropped_ref"], fields["sft_accepted"]) == (1, 1, 0)
-    assert not any(tokens.response_mask)
+
+    _, bare_fields = _sample(result, prefix="bare")
+    assert (bare_fields["sft_dropped_ref"], bare_fields["sft_accepted"]) == (1, 0)
+
+    doc_tokens, doc_fields = _sample(result, prefix="doc")
+    assert (doc_fields["sft_dropped_ref"], doc_fields["sft_accepted"]) == (0, 1)
+    assert any(doc_tokens.response_mask)
+
+
+def test_expert_sample_rejects_an_unknown_prefix():
+    import asyncio
+
+    result = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        _episode(DOC, [reply("now win", "do the thing")])
+    )
+    with pytest.raises(ValueError, match="must be 'doc' or 'bare'"):
+        _sample(result, prefix="both")
 
 
 @pytest.mark.asyncio
@@ -124,9 +160,10 @@ async def test_expert_sample_drops_a_win_that_overflows_the_budget():
     assert (fields["sft_won"], fields["sft_accepted"]) == (1, 0)
 
 
-def _sample(result, max_model_len: int = 40960):
+def _sample(result, max_model_len: int = 40960, prefix: str = "doc"):
     return build_expert_sample(
-        adapter=ScriptedAdapter(), tokenizer=TOK, result=result, max_model_len=max_model_len
+        adapter=ScriptedAdapter(), tokenizer=TOK, result=result,
+        max_model_len=max_model_len, prefix=prefix,
     )
 
 

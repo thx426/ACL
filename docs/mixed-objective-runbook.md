@@ -54,6 +54,12 @@ research 未启用都会拦);②**打字错误会报错而不是静默失效**(`
 `mix_sft_rollouts` 默认 4(每任务额外的带文档 rollout 数);SFT 臂开启时 launcher
 **自动**把 `rollout.n` 从 8 抬到 12(bare 组仍是 8,expert 是加出来的)。
 
+**`mix_sft_prefix` 默认 `doc`**(2026-07-26 裁定):expert 样本以**它生成时的带文档 prompt**
+进 CE ⇒ SFT 优化的是 `policy(·|裸+文档)` = **OPD 的 teacher**,分工是"SFT 修老师、OPD 做
+传导"。`bare`(重放到裸 prompt)是对照臂——A2 首跑实测它有 **23.6% 的已接受样本在教
+"零观察依据下断言物体位置"**,且现有引用过滤结构性地抓不到那一类,**要用必须先换过滤器**。
+详见设计文档 §2.5。
+
 ## 2. 建议的实验序列
 
 用户的动机是 1.7B 起不来,所以**优先级从 1.7B 出发**:
@@ -87,7 +93,8 @@ A3 完全可能因 RL 与 SFT 梯度冲突而失败,而 A1 或 A2 单独成功�
 | 2 | `rollout_extra/sft_won/mean ÷ rollout_extra/sft_role/mean` | **0.9 量级** | <0.5 说明 expert rollout 本身有问题(doc 没注进去?抓 `runs/*/rollouts/step_*/` 里 `sample_role=="sft"` 的 dump 看轨迹) |
 | 3 | `rollout_extra/sft_dropped_ref/mean ÷ rollout_extra/sft_won/mean` | 报数即可 | **这是引用过滤的误杀率,本地无真实数据可校准,我故意做宽了**。>30% 我们收紧词面;≈0 则考虑加强(检测对文档内容的隐式复述) |
 | 4 | `sft/expert_tokens` | >0 | =0 说明没有任何专家样本进 loss,SFT 臂等于没开 |
-| 5 | `sft/loss` | 有限、随训练下降 | NaN/inf 立即停并回报(有 clamp 保护,不该出现) |
+| 5 | `sft/loss` | 有限 | NaN/inf 立即停并回报。**`doc` 前缀下开局就低、几乎不降是预期**——expert 轨迹本就采自 `policy(·│doc)`,只对成功轨迹做 CE 是 filtered BC,teacher 自走成功率越高(实测 87.5%)可转移的概率质量越少。**若确认弱到接近 no-op,那是"该走二期(从 student 错误前缀出发、带 doc、成功恢复的轨迹)"的信号**,不是 bug |
+| 5b | guided 成功率 vs bare 成功率的差 | 不应被 SFT 拉大 | teacher 与 student 是同一组权重,SFT(doc) 存在"有 doc 就照做、没 doc 就摆烂"的失败模式:**guided 涨而 bare 不涨**即是它 |
 | 6 | `critic/score/mean` | **不因开臂而跳变** | 跳变说明 expert 行漏进了行为指标(隔离-3 失效),此时曲线不可信 |
 | 7 | `actor/pg_loss`、advantage 分布、clip 率 | 有值 | **低成功率早期组内全败 ⇒ advantage=0 ⇒ RL 信号稀疏,这是预期不是 bug** |
 | 8 | 显微镜 `mask_mismatch` | 仍为 **0** | 非 0 说明隔离-4 失效,分析链路会读到脏数据 |

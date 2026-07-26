@@ -94,9 +94,9 @@ L_total = w_opd · L_OPD + w_rl · L_RL + w_sft · L_SFT
   vanilla policy loss(verl 上游 `distillation_ppo_loss` 组合路径现成)。
   follow SDAR/SEED:不加 ref-KL 正则第一期(我们无 ref 模型常驻,显存紧;SEED 的 βKL
   是防漂移的二道锚,我们的 OPD 项本身即强正则,一期观察 entropy 曲线再定)。
-- **L_SFT**:guided 成功轨迹上的 token 级 CE(response 生成段,mask 语义同现构流),
-  **bare 上下文形态**(PACT 剥离原则):输入是裸 system prompt + 轨迹 obs/action 流重构,
-  评测同构(PG-3)。
+- **L_SFT**:guided 成功轨迹上的 token 级 CE(response 生成段,mask 语义同现构流)。
+  **前缀由 `mix_sft_prefix` 决定,默认 `doc`** ——这不是同一想法的两种写法,而是**两个不同
+  的优化对象**,详见 §2.5。
 
 **归一化口径(实现中核实,重要)**:`config.global_batch_info` **只由 `ppo_loss` 写入**,
 而纯 OPD 路径从不调用它 ⇒ **现行 OPD 项一直是"每微批 token 平均"**(4B 主线就跑在这个
@@ -108,6 +108,52 @@ L_total = w_opd · L_OPD + w_rl · L_RL + w_sft · L_SFT
    存活 ⇒ 第二个微批起 OPD 项静默换成全局分母(尺度跳 ~微批数 × dp_size),**只在开 RL 的臂
    发生** ⇒ 消融将比较两个不同尺度的 OPD 目标。实现里 OPD 项在 `rl_loss_coef>0` 时对
    **清空后的快照**求值,把各臂钉死在纯 OPD 口径上(A0/A2 与上游 `use_task_rewards` 语义均不受影响)。
+
+### 2.5 SFT 的前缀:在优化谁(2026-07-26 用户裁定,CD-006 §3-G 实证)
+
+| 前缀 | 优化对象 | 后果 |
+|---|---|---|
+| **`doc`(默认)** | `policy(·│裸 + 文档)` = **OPD 的 teacher 本身** | 分工变成 **SFT 修老师、OPD 做传导**,直击 CD-003 的病因 |
+| `bare`(对照臂) | `policy(·│裸)` | 与 OPD 功能重叠;且**系统性泄漏**(见下) |
+
+**为什么 `bare` 是错的——实测,不是推理**。A2 首跑(64 条 expert / 55 条 accepted):
+**23.6% 的已接受样本**在教模型"零观察依据下断言物体位置";HARD 断言 28 次,**57% 发生在
+第 0 步**(裸 prompt 下零线索)。典型原文:`[第0步] "The pencil is on sidetable 1, and the
+desklamp is on desk 1."` ——expert 是**读了文档**才知道东西在哪,重放到裸条件后这些断言
+没有任何依据。更糟的是:**expert 轨迹里没有一条演示"猜错了怎么回退"**(有文档的 expert
+不会猜错),所以裸 policy 学到的是"自信断言 + 无回退能力"的组合,猜错即卡死。
+
+**为什么 `mentions_guidance` 结构性地抓不到它**:泄漏不是"引用文档"("the guidance says…"
+从未出现,词面过滤误杀率实测 0/35),而是**把文档里的事实当作自己的既有认知陈述出来**。
+**我原来过滤的是形式,而泄漏发生在内容。** `bare` 臂要真拿来用,必须先换成
+"无观察依据的位置断言"检测(判据:断言 `<Obj> is on/in <Recep><n>`,而此前没有任何
+observation 出现过对应的 "On the {Recep} {n}, you see … {Obj} …")。
+
+**为什么 `doc` 才对准病因**:CD-006 同时修正了他们先前的一个论证——曾用"teacher 自走成功率
+87.5%,天花板没空间"说明保留文档收益有限。**那个论证测错了东西**:87.5% 衡量"从干净初始
+状态出发自己走";而 OPD 需要的是"**被扔进 student 的错误前缀后,还能靠文档给出正确分布**"
+= CD-003 定的**抓地力**(深度衰减 65.6%@t1-3;framing 探针:错误循环态下任何条件于学生
+上下文的 teacher 都无法纠正)。**坏掉的是后者,而 87.5% 测不到它。**
+
+**关于"会不会加剧 moving self-teacher 正反馈"**:要区分 teacher **变强**与 teacher **漂移**。
+h3 崩塌的病因是 teacher 跟着 student 漂(无锚);而 SFT 用的是**筛选过的成功轨迹**,把 teacher
+钉向"能解出任务"的方向——**这是外部锚**,与 SEED 的 RL 锚同构,只是作用在文档条件上。
+
+**⚠ 三个必须预期/监控的现象**(CD-005 补充):
+1. **`doc` 下 SFT 的作用是间接的**。它训练的是"从干净前缀出发、带 doc、成功"的轨迹,而 OPD
+   打分时 teacher 面对的是"student 错误前缀 + doc"——**SFT 从没在这种前缀上训练过**。改善
+   抓地力只能靠"加强 doc→action 关联"这条间接通路。**直接的数据形态是"从 student 错误前缀
+   出发、带 doc、成功恢复"的轨迹**(framing 探针已证可行:t12 连错 6 次后逐轮注入 doc,
+   teacher 从 0/6 → 6/6)。列为**二期**,触发条件见下条。
+2. **`sft/loss` 开局就低且几乎不降是预期,不是故障**。expert 轨迹本就采自 `policy(·|doc)`
+   分布,只对**成功**轨迹做 CE = filtered behavior cloning(RAFT/RFT),把概率质量从失败的
+   那部分转移过来。**teacher 自走成功率越高,可转移的质量越少**——87.5% 意味着信号本就不强。
+   若实测确认弱到接近 no-op,**那就是走二期(错误前缀恢复轨迹)的信号**,因为那种数据的
+   信号强度不受 teacher 自走成功率限制。
+3. **监控 teacher-student gap 是否被 SFT 拉大**。teacher 与 student 是同一组权重,SFT(doc)
+   让模型在文档条件下更强,存在一个失败模式:**"有 doc 就照做、没 doc 就摆烂"**——gap 扩大、
+   KL 变大但学不动。OPD 的存在正是对抗它(h2 +14.5~27.9pp、h3 蒸后裸 39.6% 都表明 doc 收益
+   可内化),所以风险可控,但**可观测**:`guided 成功率涨而 bare 成功率不涨`就是这个模式。
 
 **系数哲学(消融自由,预设两档)**:
 
@@ -168,8 +214,12 @@ OPD 应保留争夺主干的资格,这正是消融要回答的问题。
   那条。它的价值恰恰在于**不是**学生的轨迹——它落在学生 on-policy 分布够不着的正确中段
   状态上(framing 探针证明的 on-policy-only 天花板的解法)。
 
-guided 轨迹是 doc 条件下产生的,直接拿来 SFT 会教出"有 doc 时做对",与内化目标相反
-(PACT 明确:必须剥离特权上下文)。**重放无需重新 tokenize**,依据是:guidance 只存在于
+**⚠ 本节仅适用于 `mix_sft_prefix=bare`(对照臂)。默认的 `doc` 前缀不做重放**——
+expert 样本直接以其生成时的带文档 prompt 进 CE,实现上是**少做一次替换**。
+有意思的是这条恒等式反过来同样成立:正因为 response 流不依赖 system 里有没有 doc,
+"换 prompt"和"不换"都是合法的构流。
+
+以下是 `bare` 模式的重放。**重放无需重新 tokenize**,依据是:guidance 只存在于
 system message(即只存在于 `prompt_ids`);而 response 流的每一段——生成 token(模型输出)、
 turn glue 与 post_obs(模板常量)、observation(环境返回)——**没有一段依赖 system 里
 有没有 doc**。所以 guided 轨迹的 response 流接到裸 prompt 后,仍是一个合法的、与学生
@@ -182,11 +232,10 @@ rollout 同构的序列。故重放 = 原样接到**重新渲染的裸首轮 pro
 ### 3.3 三道过滤(`core/expert.py::build_expert_sample`,verl-free 故可单测)
 
 1. **未 won** → 拒(模仿失败样本就是在教失败);
-2. **轨迹自述引用文档**(`mentions_guidance`:`task guidance` / `the guidance` /
-   `guidance says` / `guidance document`)→ 拒。bare 条件下这是幻觉式引用(模型引述一份
-   它看不见的文档)。**这是本项目的启发式,尚无实证背书**(见 §1.2 的引用更正),
-   故意做宽:4 条里误杀 1 条只损失一个样本,漏放则污染行为;误杀率由 CD-006 首验回报,
-   本身也应进消融。
+2. **轨迹自述引用文档**(`mentions_guidance`)→ 拒。**仅 `bare` 前缀下执行**:有文档时
+   引用它是轨迹该做的事,过滤反而会丢掉好样本。**而且这个过滤器已被实测证明查错了对象**
+   ——真实泄漏是"把文档事实当自己的认知陈述"而非"引用文档",误杀率 0/35 不是过滤太松,
+   是它查的根本不是这一类(详见 §2.5)。`bare` 臂要用必须先换掉它。
 3. **重放超序列预算** → 拒。
 拒收即 `response_mask` 全 0,并分别计数上报(`sft_won`/`sft_accepted`/`sft_dropped_ref`)。
 
@@ -305,6 +354,10 @@ A3 完全可能因 RL 与 SFT 梯度冲突而失败,同时 A1 或 A2 单独成�
 
 **统计单位是任务,不是轨迹**:每任务 8 条 rollout 共享同一份文档,轨迹之间不独立;
 显著性按任务(必要时按 seed)聚类计算,≥3 seeds。
+
+**SFT 前缀是一个独立的消融维度**(`mix_sft_prefix`,默认 `doc`):`bare` 臂回答"泄漏是否
+真伤泛化",但**它必须先换掉那个查错对象的过滤器**才有意义(§2.5),否则测的是被污染的形态。
+A2 首跑的 `bare` 数据可作历史记录,**不用于判断 SFT 臂是否有效**。
 
 **专家数据是 best-of-4 后再按成功条件化的样本**,不是任务分布上的无偏专家数据。
 容易被文档救活的任务会稳定贡献 SFT,难任务持续贡献零 ⇒ 只看总体成功率可能把"容易任务

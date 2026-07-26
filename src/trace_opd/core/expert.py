@@ -9,6 +9,7 @@ See docs/mixed-objective-design.md §3.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 from .adapter import TaskAdapter
@@ -24,8 +25,27 @@ def build_expert_sample(
     tokenizer,
     result: EpisodeResult,
     max_model_len: int,
+    prefix: str = "doc",
 ) -> tuple[EpisodeTokens, dict[str, Any]]:
     """Turn a document-guided episode into the SFT arm's sample.
+
+    ``prefix`` decides what the SFT term optimises, and the two answers are not
+    variations on one idea — they are different objectives:
+
+    ``doc`` (default) keeps the prompt the episode was generated under, so the
+    term optimises ``policy(·|bare + document)``, which IS the OPD teacher. The
+    division of labour becomes "SFT strengthens the teacher, OPD carries it
+    across", aimed straight at the measured failure: the teacher losing its grip
+    on the document once it is dropped into the student's erroneous prefix.
+
+    ``bare`` re-addresses the trajectory to the document-free prompt, so the term
+    teaches the bare policy directly. That overlaps with what OPD already does,
+    and it leaks: the expert knew where objects were because it had read the
+    document, so under a bare prompt those statements have no basis. Measured on
+    the first A2 run, 23.6% of accepted samples were teaching the model to
+    assert an object's location at step 0 with nothing observed — and no expert
+    trajectory demonstrates recovering from a wrong guess, because an expert
+    with the document never makes one. Kept as a control arm.
 
     A rejected sample still comes back as a well-formed row, just with an
     all-zero response mask, so the loss reads exactly nothing from it. That is
@@ -34,13 +54,12 @@ def build_expert_sample(
     all-zero mask is a shape the trainer already survives — the agent-loop hang
     guard produces it whenever it cancels a prompt.
 
-    Three rejection reasons, each counted onto a curve:
-      * the guided rollout did not solve the task — imitating a failure teaches
-        failure, and expert data is only worth having while it is expert;
-      * the trajectory's own text refers to the guidance document, which the
-        bare policy never sees (see ``mentions_guidance``);
-      * the replay does not fit the sequence budget.
+    Rejection reasons, each counted onto a curve: the rollout did not solve the
+    task; the sample does not fit the sequence budget; and — under ``bare`` only
+    — the trajectory refers to the document in its own words.
     """
+    if prefix not in ("doc", "bare"):
+        raise ValueError(f"build_expert_sample: prefix must be 'doc' or 'bare', got {prefix!r}")
     if not result.tokens.response_ids:
         # Caller contract: an empty response must never reach the trainer — verl
         # writes rm_scores[-1] unconditionally and would die on the index. The
@@ -55,10 +74,26 @@ def build_expert_sample(
         "sft_accepted": 0,
         "sft_dropped_ref": 0,
     }
-    tokens = replay_bare_tokens(adapter=adapter, tokenizer=tokenizer, result=result)
+    if prefix == "doc":
+        # Nothing to rewrite: the episode already carries the prompt this term
+        # optimises. (The same identity that makes the bare replay exact also
+        # makes not replaying exact — the response stream never depended on
+        # what was in the system message.)
+        tokens = replace(
+            result.tokens,
+            prompt_ids=list(result.tokens.prompt_ids),
+            response_ids=list(result.tokens.response_ids),
+            response_mask=list(result.tokens.response_mask),
+            turn_spans=[list(span) for span in result.tokens.turn_spans],
+        )
+    else:
+        tokens = replay_bare_tokens(adapter=adapter, tokenizer=tokenizer, result=result)
 
     rejected = not trajectory.won
-    if not rejected:
+    if not rejected and prefix == "bare":
+        # Only meaningful without the document: with it in the prompt, referring
+        # to it is a correct thing for the trajectory to do, and filtering those
+        # samples would drop the good ones.
         text = "\n".join(f"{step.thought}\n{step.action_raw}" for step in trajectory.steps)
         if mentions_guidance(text):
             fields["sft_dropped_ref"] = 1

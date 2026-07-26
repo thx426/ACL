@@ -276,6 +276,17 @@ train:
   mix_sft_weight: 0.0       # 专家轨迹 CE 权重;>0 时需 research.enabled
   mix_sft_rollouts: 4       # 每任务额外带文档 rollout 数(verl rollout.n 自动
                             # = rollout_n + 本值;仅 mix_sft_weight>0 时生效)
+  mix_sft_prefix: doc       # SFT 项在优化谁(CD-006 §3-G 实证 + 用户 2026-07-26 裁定):
+                            #  doc  = 保留 expert 生成时的带文档 prompt ⇒ 优化
+                            #         policy(·|裸+文档) = **OPD 的 teacher 本身**。
+                            #         分工:SFT 修老师、OPD 做传导,直击 CD-003 病因
+                            #         (teacher 在 student 错误前缀下失去抓地力)。
+                            #  bare = 重放到裸 prompt ⇒ 直接教裸 policy。与 OPD 功能重叠,
+                            #         且 A2 首跑实测 **23.6% 已接受样本在教「零观察依据下
+                            #         断言物体位置」**——expert 是读了文档才知道东西在哪,
+                            #         重放到裸条件后这些断言没依据,而 expert 轨迹里没有
+                            #         一条演示「猜错了怎么回退」⇒ 学到自信断言+无法恢复。
+                            #         保留作对照臂(要用须先换掉只查字面引用的过滤器)。
   distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
                             # <run>/microscope/(verl 6f3d089;~几 MB/step,离线经
                             # analysis.collect 与 rollout dump join 出深度剖面/

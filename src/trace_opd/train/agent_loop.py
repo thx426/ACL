@@ -523,6 +523,7 @@ class TraceAgentLoop(AgentLoopBase):
                 tokenizer=self.tokenizer,
                 result=result,
                 max_model_len=self.cfg.train.rollout_max_model_len,
+                prefix=self.cfg.train.mix_sft_prefix,
             )
 
         output = AgentLoopOutput(
