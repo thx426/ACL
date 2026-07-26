@@ -61,6 +61,16 @@ researcher_alive() {
 }
 
 # ---- [0] 预检 ---------------------------------------------------------------
+# policy 基座的真源是**实验配置的 train.model_path**;POLICY_MODEL 只作后备。
+# 上面那行默认值是 162 专有路径,在 A800 上必然不存在 —— 2026-07-26 A0 首启即被它拦下。
+# 兼容两种写法:配置里写 "${TRACE_MODEL_PATH}" 插值时保持原有的 env 行为(A1 等在跑的
+# run 不受影响);写绝对路径时以配置为准。
+_CFG_MODEL=$("$VENV_TRAIN/bin/python" -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])) or {}; print(((d.get("train") or {}).get("model_path") or ""))' "$CONFIG" 2>/dev/null)
+case "$_CFG_MODEL" in
+    ""|'${'*) : ;;                                  # 空 / 插值 ⇒ 沿用 POLICY_MODEL
+    *) POLICY_MODEL=$_CFG_MODEL ;;
+esac
+
 say "== [0/4] 预检(policy=$POLICY_MODEL) =="
 [[ -d $TRACE_REPO/trace_opd ]]            || die "repo 不在 $TRACE_REPO"
 [[ -x $VENV_TRAIN/bin/python ]]           || die "训练 venv 缺失: $VENV_TRAIN"

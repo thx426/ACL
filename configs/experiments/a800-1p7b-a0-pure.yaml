@@ -1,0 +1,375 @@
+# =============================================================================
+# 实验配置:A800-SXM 8 卡 · 4B · A0(纯 OPD)
+#   由 config_tool new 从 configs/trace.yaml 完整复制。**本文件即该实验的全部定义。**
+#
+# =============================================================================
+# [A800-A0] 1.7B 纯 OPD 对照臂 —— 派生自 a800-1p7b-a1-rl.yaml,**只改 mix_rl_weight**
+#
+# 三臂同时在跑,唯一变量是"加哪个锚":
+#   A0(本文件, A800 卡 4-7): OPD 1.0 + RL 0.0 + SFT 0.0   ← 基线
+#   A1(a800-1p7b-a1-rl,卡 0-3): OPD 1.0 + RL 1.0 + SFT 0.0
+#   A2-doc(162-1p7b-a2doc, 162 卡 0/1): OPD 1.0 + RL 0.0 + SFT 0.5(doc 前缀)
+#
+# 与历史 run trace_opd_1p7b_v2(也是纯 OPD)的区别:v2 带 K3 锯齿
+# (distill_block_turns=4 / sample_every=4),本臂无 —— K1/K2/K3 已由 CD-005 移除。
+# 故 A0 是与 A1/A2-doc **严格同代码同配置**的基线,而 v2 不是。
+#
+# 派生时间 2026-07-26。除上述四处外与 A1 逐字节相同。
+# =============================================================================
+
+# ⚠⚠ 该机硬约束一(2026-07-26 实证):**不可用 ulysses_sp>1 / flash-attn**。
+#   启用 SP=2(联动 rmpad+FA2)后 vLLM 报 illegal memory access → **六卡同时**
+#   NVRM Xid 31 MMU Fault → nvidia-smi 连续 5 分钟无响应。六卡同发 = 系统性 kernel
+#   越界,与该机卡间通信不可靠的历史顽疾同源(SP 走 all-to-all)。
+#   **回退须卸载 flash-attn**:只设 SP=1 不够——vLLM 会自动选用已装的 flash-attn,
+#   且 vLLM 0.19.1 无 VLLM_ATTENTION_BACKEND 开关可强制切换。
+#   长序列 OOM 由 verl f88db6c(跳过 temperature 恒等复制)独立承担,SP 的显存收益
+#   本就很小(峰值 66481 vs 单靠该修复推算的 67369)。故本文件 ulysses_sp 保持 1。
+# ⚠ 硬约束二:切勿设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   ——与 vLLM memory pool 互斥,引擎直接起不来(pytorch#147851)。
+#
+# 2026-07-26 起该机停机待命,主线在 162。
+# =============================================================================
+# 以下为模板原文
+# =============================================================================
+# TRACE-OPD 单一配置真源 —— 机制所有阶段的全部超参数都在本文件
+# (launcher 由此生成 verl 命令行;没有第二份参数文件)。
+# ${VAR} 在加载时从环境变量展开(部署事实进 env,不进本文件)。
+# 每项注释:含义 | 默认值依据(h1/h3 = 两个 pilot 的实测定版)。
+# =============================================================================
+
+run:
+  name: trace_opd_a800_1p7b_a0   # [A800-A0] 1.7B **纯 OPD**(无锚),卡 4-7
+  runs_root: runs           # 归档根目录(相对 trace_opd/,服务器上建议配绝对路径)
+  tape: true                # external 角色的 LLM 全量磁带(h1 两次实战立功;≈GB 级/全量 run)
+
+# ---------------------------------------------------------------------------
+# 研究阶段(组件 A):每个训练样本的 researcher 会话
+# ---------------------------------------------------------------------------
+research:
+  enabled: true             # 关掉 = 纯 OPD 消融(teacher=bare,蒸馏信号≈0,一般只作调试)
+  backend: external         # external=外部强模型(起步 27B)| engine=policy 自身(自进化形态,配 text 协议)
+  tool_protocol: fncall     # fncall=vLLM function-calling(27B, qwen3_xml)| text=纯文本工具协议(policy 形态)
+  n_exp: 12                 # 每会话实验(run_experiment)预算上限 | h1 定版;实测中位 4-5,无人顶格
+  k_default: 4              # 每实验默认并行 episodes 数 | h1 定版
+  k_max: 8                  # 单实验 k 上限(软钳制)| h1 定版
+  max_turns: 30             # 会话轮次上限(纯文本思考轮也计)| h1 定版;实测轮数中位 6
+  wrapup_buffer: 2          # 距轮次上限还剩几轮时注入收尾提醒 | h1 定版
+  fetch_raw_limit: 20       # 每会话 fetch_raw 取证次数上限 | h1 定版
+  fetch_raw_max_chars: 16000  # 单次 fetch_raw 字符预算 | h1 定版
+  doc_max_words: 3000       # 经验文档词数上限(超出触发一次软修订)| h1 定版;实测中位 544 词
+  gt: "off"                 # on=专家参考解进 researcher prompt(仅训练集;executor 永不可见)
+                            # | 冒烟阶段 on/off 各跑一组对照后定全量默认(用户裁定)
+  episode_temperature: 1.0  # 研究实验 episodes 采样温度 | 同构原则:= 训练 rollout 温度
+  researcher_max_tokens: 8192  # researcher 单轮生成上限(27B 思考 ON 需余量)| h1 定版
+  session_timeout_s: 3600   # 单会话硬超时(防单任务卡死整个 step;超时降级 doc=None)| 新防御项
+
+# ---------------------------------------------------------------------------
+# 叙述阶段:实验 episode → 忠实自然语言叙述(researcher 的主要输入)
+# ---------------------------------------------------------------------------
+narration:
+  backend: engine           # engine=policy 同模型自叙(用户定的默认)| external=强模型 | none=机械日志
+                            # 参考:h1 离线消融 4B 保真 0.544 vs 27B 0.685(实体编号丢失+低频虚构)
+  max_words: 1000            # 叙述词数上限;生成预算=max(1000, max_words*3) | h1 定版
+  temperature: 0.3          # 转写类任务低温 | h1 定版
+
+# ---------------------------------------------------------------------------
+# external 后端角色连接(engine 后端角色不需要连接配置)
+# ---------------------------------------------------------------------------
+roles:
+  researcher:               # research.backend=external 时使用
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"   # [A800] 到第三台机 35B 的隧道池
+    model: qwen3.6-35b-a3b     # [A800] 端点声明的 served-model-name
+    api_key_env: TRACE_RESEARCHER_API_KEY   # [A800] 只声明变量名,口令不入配置
+                            # 口令本身永不进配置文件
+    mode: external_pool        # [A800] 外部池:四张卡全留给训练,不起本地 27B
+                            # external_pool = 别人跑的端点(endpoint 可列多个,
+                            # PooledClient 会话粘性+均衡+故障切换)。这一项取代了
+                            # 脚本里的 EXTERNAL_RESEARCHER/REMOTE_RESEARCHER 开关;
+                            # 端口不另设配置项——endpoint 是唯一真源,需要端口的
+                            # 脚本从它解析,否则两者会漂移
+    sidecar_sleep: false       # [A800] 远程池不适用 sleep/wake(校验强制这套组合)
+                            # 训练阶段 verl 经 /sleep?level=1 令其权重下沉 CPU RAM、
+                            # KV 释放,FSDP 拿满 4 卡(verl sidecar patch,1e03590)。
+                            # 27B 起服需 --enable-sleep-mode + VLLM_SERVER_DEV_MODE=1
+                            # (serve_researcher.sh 已固化);27B 部署在独立机器时改 false
+    sidecar_sleep_level: 1  # 1=权重下沉 CPU RAM(可快速唤醒)| 2=丢弃权重
+    dp_size: 0                 # [A800] 独立副本池自己做 session-sticky 均衡
+                            # >0 ⇒ 客户端按 crc32(task_id) % dp_size 发
+                            # X-data-parallel-rank 头,把同任务多轮会话钉在同一
+                            # engine 的 prefix cache 上(vLLM 该头优先于 least-loaded,
+                            # CD-006 源码+实测双证;实测无亲和时命中率仅 65.3%,
+                            # 多轮 prompt 2k→16.5k 反复全量 prefill)。0=不发头
+                            # (向后兼容);偏斜观测见 design §10-6(>1.5× 再议加权)
+    max_concurrency: 64     # 全局并发上限(自动按 train.agent_num_workers 折算到各 worker 进程)
+                            # 与 A1 保持一致:三个 run 共用同一个外部 35B 池(A800→162→第三台
+                            # 机,两级隧道),但用户 2026-07-26 确认该池吞吐充裕。保持同值是为了
+                            # 让 A0/A1 之间**只有 mix_rl_weight 一个变量**。
+                            # | h1 定版(27B decode 为 memory-bound);服务端还有排队背压。
+                            # 单机共存下 27B KV 池比 h1 独占小(≈2×17GB vs 2×41GB),但
+                            # qwen3_5 hybrid 架构 KV 密度低(h1 实证 128 并发×64k 稳);
+                            # 冒烟观测 vLLM preemption 计数后再定是否下调
+    temperature: 0.7        # 研究分析采样温度 | h1 定版
+    max_tokens: 8192        # 与 research.researcher_max_tokens 一致
+    timeout_s: 600          # 单轮上限 | h1 定版(思考 ON 时代的值,关思考后余量充裕)
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+                            # **用户指令 2026-07-23:researcher 必须 non-thinking**
+                            # ——理由:researcher 会话轨迹(research/*/session.jsonl)
+                            # 是未来 researcher SFT 冷启动的数据源(design.md §11),
+                            # SFT 数据必须是 non-thinking 分布;若带 thinking,SFT 时
+                            # 即使剥掉 reasoning,其 content 仍是"思考之后"的产物,
+                            # 与 non-thinking 推理分布不匹配。
+                            # CD-006 实测(27B,tools 场景,2026-07-23):
+                            #   开关未设 ⇒ reasoning 691 字符 / completion 254 token
+                            #   enable_thinking=false ⇒ reasoning 0 / completion 44 token
+                            #   两者 tool_calls 均正常产生 ⇒ **开关有效且不损功能**,
+                            #   并顺带减少 83% 生成量(直接缓解 27B 延迟)。
+                            # 注:docs/infra/README.md 旧记"tools 场景固有零思考、
+                            # 显式开关无效"经此实测证伪,已更正该档案。
+  narrator_external:        # 仅 narration.backend=external 时使用(对照臂)
+    endpoint: "${TRACE_NARRATOR_ENDPOINT}"
+    model: "${TRACE_NARRATOR_MODEL}"
+    max_concurrency: 48
+    temperature: 0.3
+    max_tokens: 1600
+    timeout_s: 300
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}  # 思考模型转写必关思考(h1 实证)
+
+# ---------------------------------------------------------------------------
+# episode 协议参数(训练/研究实验/评测同构共用,PG-3;core/protocol.py 由此配置)
+# ---------------------------------------------------------------------------
+episode:
+  max_env_steps: 30         # 每 episode 环境步预算 | 用户裁定 2026-07-23(原 50):
+                            # 提速目的;CD-006 用 h3 真实分布验证 cap=30 保住训后
+                            # 94.2% 的成功(中位仅 11 步),失败 episode 不再烧满
+                            # 预算(预计 step 墙钟 −50%,KV 需求 −40%)。触及 §4
+                            # 的 50 步口径,由 CD-006 在 completion report 走
+                            # Proposed Global Decisions;最终评测拟另跑一组 50 与
+                            # pilot 严格可比(改本值即可,无需动代码)。
+                            # 注意:GT walkthrough 提取上限独立为 50(protocol.
+                            # GT_EXTRACT_MAX_STEPS)——专家参考解不受训练预算截断
+  max_assistant_turns: 40   # 会话轮上限 = 步预算 + 格式失败余量 | 随 max_env_steps
+                            # 联动(原 60=50+10;加载时强校验 turns > steps)
+
+# ---------------------------------------------------------------------------
+# 环境(ALFWorld 第一实现;其他环境各自实现 TaskAdapter 后加自己的段)
+# ---------------------------------------------------------------------------
+alfworld:
+  data_root: "${ALFWORLD_DATA}"              # json_2.1.1 数据根
+  worker_python: "${ALFWORLD_WORKER_PYTHON}" # 引擎 venv 解释器(worker 子进程用)
+  spawn_concurrency: 64     # 全局引擎子进程并发 boot 上限(自动按 agent_num_workers 折算)
+                            # | h1 定版(训练机 CPU 80 核;新机酌减)
+  start_timeout_s: 300      # 引擎 boot 超时 | h1 定版
+  step_timeout_s: 120       # 单步执行超时 | h1 定版
+  boot_concurrency: 32      # 数据构建期(build_datasets)引擎 boot 并发 | h3 定版
+
+# ---------------------------------------------------------------------------
+# 训练(组件 B):verl OPD —— launcher 由此生成完整命令行
+# 稳定 profile 出处:CD-003 全量 run 第 4 次启动(铁稳配置,10240 天花板)
+# ---------------------------------------------------------------------------
+train:
+  model_path: "/fs/fast/u2021000902/wushang/model/Qwen/Qwen3-1.7B"
+                            # [A800-A0] 基座绝对路径**写进配置**(不再靠 ${TRACE_MODEL_PATH}
+                            # 插值 + 启动脚本的 env 默认值)。原默认值是 162 专有路径,
+                            # 在本机不存在,2026-07-26 A0 首启即被预检拦下。
+  train_file: "${TRACE_TRAIN_FILE}"    # build_datasets 产出的 train parquet
+  val_files:                            # 训练内 val = test 两 split 裸 greedy(RL 范式)
+    - "${TRACE_VAL_SEEN_FILE}"
+    - "${TRACE_VAL_UNSEEN_FILE}"
+  experiment_name: trace_opd_a800_1p7b_a1
+  project_name: trace_opd
+  n_gpus: 4                 # [A800-A0] 用户指定**卡 4-7**(该机共 8 卡;卡 0-3 归 A1)。
+                            # 卡号由启动时的 CUDA_VISIBLE_DEVICES 给,此处只记录意图。
+                            # 分时:AgentLoop 阶段共存,训练阶段 sidecar_sleep 释放
+                            # | 拓扑详见 design.md §9
+  rollout_tp: 1             # rollout 引擎 TP(4 卡 ⇒ 2 replica)| 用户裁定方向:为长程
+                            # 任务(未来 32k+ 轨迹)预留 KV 余量;TP2 下 4B 权重每卡
+                            # 2GB(TP1 为 8GB),共存卡 GPU0,1 显存更宽。zkgy 混卡纪律:
+                            # TP 组必须落同型号卡对(A800=GPU0,1 / A100=GPU2,3,verl
+                            # 连续分组天然满足)。ALFWorld 当下容量 TP1≈TP2,PCIe
+                            # allreduce 有小吞吐税 —— 冒烟对照 TP1/TP2 step 时间后定版
+  train_batch_size: 16      # 每 step 任务数 = 每 step researcher 会话数 | 用户裁定
+                            # 2026-07-23(32 → 16,与 rollout_n 4 → 8 同时下达:
+                            # 每 step 训练轨迹保持 16×8=128 条,但每任务的蒸馏信号
+                            # 由 4 条增至 8 条,研究会话数减半)。效果:
+                            # 3553/16 ⇒ 222 step/epoch(每 epoch 仅 1 任务轮空),
+                            # 2 epoch = 444 step;test_freq=20 ⇒ 22 个 val 点
+                            # (用户裁定保持 20,换更细的拐点时间分辨率)
+  rollout_n: 8              # 每任务独立 student rollout 条数,n 条共享同一研究
+                            # 文档做蒸馏 | 用户机制升级 2026-07-23(h3 口径 n=1)。
+                            # 研究会话按 (task, step) 去重只跑一次 —— 27B 研究算力
+                            # (step 墙钟大头)不随 n 增,同一文档的蒸馏信号 ×n
+                            # (rollout 温度 1.0,n 条轨迹独立采样、覆盖更宽);
+                            # rollout/训练 token 量 ≈×n:每 step 16 任务 × 8 =
+                            # 128 条轨迹(h3 为 64 条)。约束:train_batch_size %
+                            # agent_num_workers == 0(加载时强校验——interleave
+                            # 副本连续切分,整除保证同任务副本落同一 worker 进程,
+                            # 研究去重才成立;16 % 8 = 0 ✓)。step 墙钟三段分解
+                            # 列冒烟观测项
+  ppo_mini_batch_size: 16   # 单位=任务数,verl 内部自动 ×rollout_n(16×8=128)
+                            # ⇒ 每 step 仍 1 次全批梯度更新(h3 为 64/32=2 次)
+  lr: 1.0e-6                # | h3 定版
+  lr_scheduler_type: constant   # h3 的【实际】调度(其 notes 表格记 cosine 系误记;
+  lr_warmup_steps_ratio: 0.0    # h3 脚本未传调度参数=verl 默认 constant/0;此处显式钉死保可比)
+  # ---- 序列容量参数(用户裁定 2026-07-23:按"任务轨迹包络 × 硬件"设置的
+  # 容量声明,不是机制上限——机制对轨迹长度无假设;包络变大时按 design.md
+  # §6.1 伸缩:rollout 侧 TP/显存配比,训练侧 token 预算 + Ulysses 序列并行 +
+  # 多机,而非让任务迁就配置。三项必须联动(见各自注释)。----
+  response_length: 32768    # episode 响应流预算(训练+研究实验共用;=评测预算,训评
+                            # 同构)| 用户裁定:50 步 episode 永不截断,不因输出长就
+                            # 不训练。h3 曾在 52GB/卡 时代 32k OOM(其 10240 系显存
+                            # 妥协);新分时拓扑训练阶段 ~76GB/卡 —— 32k 稳定性为
+                            # 冒烟第一验证项(过不了则回 16k 逐级探)
+  max_prompt_length: 2048   # 首轮 prompt(scaffold+初始 obs)上限,超长 fail-loud
+                            # (truncation=error,非静默截断)| ALFWorld 实测 <1k;
+                            # 首轮观测大的新环境(如表格类)按其包络调大
+  max_token_len_per_gpu: 34816   # **单序列容量声明**(仅此语义):本值 × ulysses_sp
+                                 # ≥ max_prompt+response=34816(加载强校验)。
+                                 # 2026-07-23 起**不再直接用作微批预算**——那曾把
+                                 # 21.2GiB logits 喂进训练前反向连炸两次(feedback
+                                 # P0);微批打包预算解耦为下面两个独立参数
+  ppo_max_token_len_per_gpu: 8192     # actor 训练前反向的微批**打包预算**/卡 |
+                                 # **用户裁定 2026-07-23(8192 → 16384):训练阶段
+                                 # 显存富余,适当上调提吞吐,前提是绝不 OOM。**
+                                 # 依据 CD-006 smoke7 实测:ppo=8192 时
+                                 # `actor/perf/max_memory_allocated_gb` = **38.98GB**
+                                 # ⇒ FSDP 真实基线 ≈34GB(§9 旧账把 smoke5 OOM 瞬间的
+                                 # 70.84GiB 当基线,那已含 21.2GiB logits,偏保守);
+                                 # 实测斜率(8192→38.98GB,34816→~91GB)≈ **2.0GB/1024
+                                 # token**(含 logits 与 activation)⇒ 16384 推算
+                                 # **≈55GB,余量 ≈25GB**。不取 24576(推算 ~72GB、
+                                 # 余 8GB,边际过薄;OOM 一次要重跑整个 step)。
+                                 # logits 分量 = 本值 × vocab 151936 × 4B(fp32)。
+                                 # 纯打包目标、梯度语义不变(mini_batch 才定全批一更;
+                                 # 微批间梯度累积数学等价);**超预算长尾单条不再崩**:
+                                 # verl 6d77dc7 把 assert 改为该 batch 内自动抬升
+                                 # +警告,超长条独占微批(显存不足则 loud OOM)。
+                                 # cap30 实测 response_length/max=4243,离逼近余量的
+                                 # ~14k 单条很远,长尾风险低
+  log_prob_max_token_len_per_gpu: 8192  # old_log_prob 推理阶段打包预算/卡(纯
+                                 # 推理逐 token 独立,数值等价;此阶段同时产出
+                                 # actor/entropy 曲线故不可跳过)| 随上条同步
+                                 # 12288 → 16384(用户裁定);该阶段无梯度激活、
+                                 # 基线低于训练前反向,故比 ppo 侧更宽松;
+                                 # 12288 已由 smoke5 实证可行,16384 仍在余量内;
+                                 # 同受 6d77dc7 长尾兜底
+  ulysses_sp: 1             # 训练侧 Ulysses 序列并行(§6.1 伸缩阀;1=关,保持
+                            # h3 profile:rmpad=False + sdpa)。>1 时 launcher 自动
+                            # 联动 use_remove_padding=True + flash_attention_2
+                            # (数学等价、实现路径变;Qwen3-4B 支持 rmpad,
+                            # Qwen3.5/3.6 架构不支持——policy 换代时此路不通)。
+                            # 单序列容量 ×sp(sp=2 ⇒ 69632 token)。适用性:只对
+                            # "单条装不下/单条 logits 撑爆"型显存墙;微批打包型
+                            # OOM 用上面的打包预算参数(2026-07-23 校准)。约束:n_gpus %
+                            # sp == 0(加载校验)+ 注意力头数 % sp == 0(verl 启动
+                            # 强校验)。部署前提:venv_train 须有可用 flash-attn
+                            # (162 未验证,列冒烟 SP 首验项;不可用则回退多机)
+  rollout_max_model_len: 40960   # rollout 引擎单序列 ctx,须 ≥ teacher 前缀(scaffold
+                                 # +文档+obs ≈3-4k)+ response_length(teacher 打分
+                                 # 序列最长)| h3 脚本 32k 档原生联动值;启动前有硬校验
+  rollout_max_num_batched_tokens: 2048   # vLLM chunked-prefill 每步 token 预算。
+                            # **同时决定 self-teacher 打分时的 logits 临时显存**:
+                            # 每 chunk 物化全 vocab logits = 本值 × vocab 151936 ×
+                            # 2B(TP all_gather 输出再 +1 份全量)——冒烟 OOM 根因
+                            # (feedback P0)。h3 铁稳值 4096 系独占拓扑;共存拓扑
+                            # 降半 ⇒ 峰值 ≈0.58+0.29 GiB(账见 rollout_gpu_mem)。
+                            # chunk 大小不影响 logprobs 数值(纯分块计算),decode
+                            # 并发预算 2048 仍远高于实际并发,吞吐影响可忽略
+  rollout_gpu_mem: 0.7      # verl vLLM 显存占比(4 卡统一)| 2026-07-24 researcher 迁外部
+                            # 35B 池后 27B 下线、四卡归 policy 独占,0.35→0.7(CD-006 决策:训练阶段引擎 sleep 释放 KV 池,占比只影响 rollout 阶段;
+                            # KV 扩容提 rollout 吞吐;训练阶段引擎休眠不受影响)。
+                            # 0.35 = 与 27B 共存时的 h3 第 4 次启动铁稳值(回切 27B 时改回)。
+                            # 162 共存预算 —— **CD-006 2026-07-23 实测修订**
+                            # (原账 27B 0.60 + verl 0.35 ≈76-78GB 实测为 78.6GB,
+                            # 且漏算 self-teacher 打分的 logits 临时张量,已 OOM
+                            # 炸掉 rollout replica1,见 experiment-feedback P0):
+                            #   27B(GPU_MEM=0.52 ⇒ 41.6GB 预分配 + ~1.4GB 实测
+                            #        activation 超额 = 43.0GB)
+                            # + verl vLLM(0.35×80 = 28GB,实测 27.3GB)
+                            # + CUDA context / ray WorkerDict ≈1.3GB
+                            # = 71.6GB,余 ~7.5GB 供 **logits 临时张量**
+                            #   (= rollout_max_num_batched_tokens × vocab 151936
+                            #    × 2B;OOM 时值 4096 ⇒ 峰值 ≈2.3GiB,现已参数化
+                            #    并降至 2048 ⇒ 峰值 ≈0.9-1.2GiB,双保险)。
+                            # 训练阶段两引擎皆 sleep,FSDP 可用 ~76GB/卡。
+                            # 调大须同步调小 27B 侧 GPU_MEM(serve_researcher.sh)
+  rollout_temperature: 1.0
+  distill_topk: 64          # forward_kl_topk 的 k | h3 定版(verl 官方推荐区间)
+  # --- 混合目标 OPD × RL × SFT(docs/mixed-objective-design.md;默认全关=纯 OPD)---
+  # 4B 仅靠 OPD 即可内化(step-9 起飞实证);1.7B 上 self-teacher 在 student 错误
+  # 前缀下丢失文档语义抓地力,KL 信号起不来 —— 给它 RL 锚与 SFT 锚。也是正式消融
+  # 开关:A0 纯 OPD(0/0)/A1 +RL(1/0)/A2 +SFT(0/0.5)/A3 全混(1/0.5)。
+  # 本文件是这三个值的真源。跑不同臂时改这里,或在启动命令上显式覆盖:
+  #   --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5
+  # 覆盖走与本文件相同的校验,并记入 launch manifest 的 config_overrides;
+  # 启动脚本不会 sed 改写这三个键(它只派生机器相关的部署项)。
+  mix_opd_weight: 1.0       # OPD 项系数。**两臂全关时它就是 loss 的整体缩放,也就是
+                            # 有效学习率的乘数**——纯 OPD 基线(4B step-9 起飞)是在 1.0
+                            # 上建立的,改它等于改基线。0 = 去掉 OPD 项 = A5 臂
+                            # (回答"OPD 在弱模型上还有没有净贡献")。
+                            # ⚠ 三项聚合口径都是「每微批 token 平均」——见设计文档 §2.6:
+                            # 它在 N 个微批上累加成 N×mean(全局平均则是 1×mean),所以
+                            # 现行 lr=1e-6 的**有效值约为 1e-6×N ≈ 6e-5**,且 N 随序列
+                            # 长度变化 ⇒ 有效 lr 会随训练漂移。改口径需连带调 lr 并重跑基线。
+  mix_rl_weight: 0.0        # [A800-A0] ★ 本臂是**对照基线**:两个锚全关 ⇒ L = OPD 单项。
+                            #   回答「RL 锚是否足以救活弱模型」。归一化口径已由 CD-005
+                            #   14de4e2 修正(task_reward_pg 与 OPD 同口径),否则名义 1.0
+                            #   实际约 1/60,会报出「RL 没用」的算术假象
+  mix_sft_weight: 0.0       # 专家轨迹 CE 权重;>0 时需 research.enabled
+  mix_sft_rollouts: 4       # 每任务额外带文档 rollout 数(verl rollout.n 自动
+                            # = rollout_n + 本值;仅 mix_sft_weight>0 时生效)
+  mix_sft_prefix: doc       # SFT 项在优化谁(CD-006 §3-G 实证 + 用户 2026-07-26 裁定):
+                            #  doc  = 保留 expert 生成时的带文档 prompt ⇒ 优化
+                            #         policy(·|裸+文档) = **OPD 的 teacher 本身**。
+                            #         分工:SFT 修老师、OPD 做传导,直击 CD-003 病因
+                            #         (teacher 在 student 错误前缀下失去抓地力)。
+                            #  bare = 重放到裸 prompt ⇒ 直接教裸 policy。与 OPD 功能重叠,
+                            #         且 A2 首跑实测 **23.6% 已接受样本在教「零观察依据下
+                            #         断言物体位置」**——expert 是读了文档才知道东西在哪,
+                            #         重放到裸条件后这些断言没依据,而 expert 轨迹里没有
+                            #         一条演示「猜错了怎么回退」⇒ 学到自信断言+无法恢复。
+                            #         保留作对照臂(要用须先换掉只查字面引用的过滤器)。
+  distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
+                            # <run>/microscope/(verl 6f3d089;~几 MB/step,离线经
+                            # analysis.collect 与 rollout dump join 出深度剖面/
+                            # token 显微镜;docs/analysis-design.md §2)
+  distill_sample_every: 4   # 抽样率 1/N(确定性内容哈希,跨 rank 一致)
+  total_epochs: 2           # 全量 3553、batch 16、drop_last ⇒ 222 step/epoch,
+                            # 2 epoch = 444 step(每 epoch 仅 1 任务随 shuffle 轮空)
+  test_freq: 20             # 每 20 step 跑 val(seen140+unseen134 greedy)| 用户裁定
+                            # (2026-07-23 第二次裁定:batch 32→16 后**仍保持 20**
+                            # ——444/20 = 22 个 val 点,每 val 间隔 320 个任务,比
+                            # h3(110/10=11 点、间隔 640)**时间分辨率更细一倍**;
+                            # 用户明确以 val 墙钟 ≈6.6h 的代价换拐点分辨率)
+  save_freq: 20             # 每 20 step 存 checkpoint(含 hf_model)| 与 test_freq
+                            # 联动(每个 val 点都有对应 ckpt,峰值可回溯)
+  # --- 从环境变量迁入(CD-006 requirements §3-F;用户 2026-07-26 裁定)---------
+  # 这些原先只存在于启动脚本的 export,而代码侧另有一套 fallback 默认——两套真源,
+  # 换一条启动路径就静默换一种行为(`run_a800_4b.sh` 设了 fsdp 打分,而 162 主线用的
+  # `run_experiment.sh` 没设,代码 fallback 是 vllm ⇒ 打分悄悄退回 R11 刚根治的路径)。
+  # 现在配置是唯一真源,launcher 从这里写 env,env 降级为纯进程间传递。
+  teacher_scoring_backend: fsdp   # fsdp = 打分在训练引擎(主线,根治 vLLM #5907 的
+                                  # 预算外分配:rollout 尾部 81.2→47.2GB);vllm = 回退路径
+  vllm_rpc_timeout_ms: 300000     # EngineCore↔worker RPC 超时。默认 10s 会在长序列 +
+                                  # 深 GPU 队列下把一次 sample_tokens 误判成"引擎已死",
+                                  # 该实例后续全灭、任务永久 hang(07-25 两次事故)
+  agent_task_timeout_s: 2700      # R3 hang guard:单 prompt 墙钟上限,超时取消副本并
+                                  # 落既有 failure 分支放行 batch。0=禁用
+  fsdp_mode: shard                # shard | noshard。noshard ≈ DDP(每步仅一次梯度
+                                  # all_reduce),为卡间通信不可靠的机器保留的逃生通道
+  dist_backend: ""                # 空 = verl 默认(nccl);"cpu:gloo,cuda:gloo" = 全程
+                                  # 绕开 NVLink/NCCL(同上,A800 那台的历史需要)
+  val_before_train: true    # step-0 val = 训前基线(三件套之①)
+  resume_mode: auto         # 自动从最近 checkpoint 续;checkpoint 绑定 run 目录,与研究
+                            # 归档/rollout dump 同处,断点恢复同源 | h3 定版
+  loggers: [console, swanlab]   # 训练曲线后端(verl tracking 原生支持 swanlab;
+                                # 无 SWANLAB_API_KEY 时 launcher 自动降 SWANLAB_MODE=offline)
+  agent_num_workers: 8      # verl agent-loop worker 进程数(verl 默认);上述全局并发
+                            # 上限(researcher/spawn)按此折算到每进程 | 评审 P1-1 修正
+
+# ---------------------------------------------------------------------------
+# 独立评测器(evalm/run_eval.py;训后正式数字与 base 复测)
+# ---------------------------------------------------------------------------
+eval:
+  response_budget: 32768    # 评测侧 episode token 预算(纯生成无显存问题,测完整能力)| h3 定版
+  temperature: 0.0          # greedy | 评测口径(与 pilot 可比)
