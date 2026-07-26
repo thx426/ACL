@@ -23,12 +23,29 @@ VENV_ALFWORLD=${VENV_ALFWORLD:-$TRACE_REPO/venv_alfworld}
 POLICY_MODEL=${POLICY_MODEL:-/data3/wushang/model/Qwen/Qwen3-1.7B}   # ← 1.7B(原脚本 4B)
 MODEL_27B=${MODEL_27B:-/data3/wushang/model/Qwen/Qwen3.6-27B}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/data3/wushang/data/alfworld_data}
+# swanlab 云端同步:未设则走 offline,曲线只落本地。
+# run_experiment.sh 与 run_a800_4b.sh 早有此行,本脚本派生时漏带(2026-07-26 补)。
+export SWANLAB_API_KEY=${SWANLAB_API_KEY:-58KT7T652vKUKobNhHb50}
+# flash-attn 来自 conda-forge 预编译包(手动提取到 venv),它需要 GCC15 的 libstdc++
+# 才能满足 GLIBCXX_3.4.29 与 CXXABI_1.3.15;系统库只到 3.4.28,故在此预载。
+# ★ 去掉这一行,ulysses_sp>1 会因 flash_attn 导入失败而起不来(2026-07-26 A2 首启实证:
+#   ImportError: libstdc++.so.6: version `GLIBCXX_3.4.29' not found)。
+#   run_experiment.sh 早有此行,本脚本派生时漏带。
+_LDP=${LD_PRELOAD:-/data3/wushang/libcxx_x/un/lib/libstdc++.so.6.0.34}
+# 仅当该库真实存在时才预载:它是 flash-attn(ulysses_sp>1)的前提,
+# 路径为 162 专有;A800 关 SP 时不需要,硬设会让每个子进程刷 ld.so 报错。
+[ -f "$_LDP" ] && export LD_PRELOAD="$_LDP" || unset LD_PRELOAD
 PORT_27B=${PORT_27B:-8302}
 SERVED_27B=${SERVED_27B:-Qwen3.6-27B}
 CONFIG=${CONFIG:-$TRACE_REPO/trace_opd/configs/trace.yaml}
 DATA_OUT=${DATA_OUT:-$TRACE_REPO/trace_opd/data/out}
 LOG_DIR=${LOG_DIR:-$TRACE_REPO/logs}
-RUN_NAME=${RUN_NAME:-trace_opd_1p7b}   # ← full run 名(原脚本用 config run.name)
+# run 名的单一真源是实验配置的 run.name;RUN_NAME 只作显式覆盖(留空即用配置值)。
+# ★ 原默认值 trace_opd_1p7b 会经 --run-name 盖掉配置,而那是个已存在的历史 run
+#   (ckpt=20)——配合 resume_mode=auto 会静默从别的实验续跑。2026-07-26 修。
+CFG_RUN_NAME=$("$VENV_TRAIN/bin/python" -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])) or {}; print((d.get("run") or {}).get("name") or "")' "$CONFIG")
+RUN_NAME=${RUN_NAME:-$CFG_RUN_NAME}
+[[ -n "$RUN_NAME" ]] || die "run 名为空:实验配置缺 run.name,且未给 RUN_NAME"
 SMOKE=${SMOKE:-0}
 SMOKE_N=${SMOKE_N:-32}
 SMOKE_STEPS=${SMOKE_STEPS:-3}
@@ -50,7 +67,30 @@ say "== [0/4] 预检(policy=$POLICY_MODEL) =="
 [[ -x $VENV_INFER/bin/vllm ]]             || die "推理 venv 缺失: $VENV_INFER"
 [[ -x $VENV_ALFWORLD/bin/python ]]        || die "alfworld venv 缺失: $VENV_ALFWORLD"
 [[ -d $POLICY_MODEL ]]                    || die "policy 基座缺失: $POLICY_MODEL"
-[[ -d $MODEL_27B ]]                       || die "researcher 模型缺失: $MODEL_27B"
+# ★ 只有 local_sidecar 才需要本地 27B;external_pool 用外部端点池,不该因它缺失而拒启。
+#   (2026-07-26:A800 上用外部池启动时被这条无条件检查拦下)
+# researcher 形态由**实验配置**决定(roles.researcher.mode),不再靠环境变量:
+#   external_pool = 已有外部端点池(隧道),不起本地 27B,卡全留给训练
+#   local_sidecar = 本机起 27B(原路径,回切预案)
+# 2026-07-26 用户裁定:凡需配置的项一律进配置文件。端点地址也从配置读,
+# endpoint 是唯一真源,端口由它解析(不另设 EXT_PORTS 之类的第二真源)。
+_researcher_mode() {
+    "$VENV_TRAIN/bin/python" -c '
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])) or {}
+r = ((d.get("roles") or {}).get("researcher") or {})
+print(r.get("mode") or "local_sidecar")
+print(r.get("endpoint") or "")
+print(r.get("model") or "")
+' "$1"
+}
+_rm="$(_researcher_mode "$CONFIG")" || die "读取 $CONFIG 的 roles.researcher 失败"
+RESEARCHER_MODE=$(echo "$_rm" | sed -n 1p)
+CFG_ENDPOINT=$(echo "$_rm" | sed -n 2p)
+CFG_MODEL=$(echo "$_rm" | sed -n 3p)
+say "researcher 形态(来自配置): $RESEARCHER_MODE"
+[[ "$RESEARCHER_MODE" == "external_pool" ]] || [[ -d $MODEL_27B ]] \
+    || die "researcher 模型缺失: $MODEL_27B(local_sidecar 模式需要它)"
 [[ -d $ALFWORLD_DATA/json_2.1.1 ]]        || die "ALFWorld 数据缺失: $ALFWORLD_DATA"
 [[ -f $TRACE_REPO/trace_opd/verl/verl/__init__.py ]] \
     || die "vendored verl 缺失(trace_opd/verl/)"
@@ -58,7 +98,10 @@ mkdir -p "$LOG_DIR" "$DATA_OUT"
 
 # GPU 抢占防护(infra 纪律):有大额占用又不是我们的 27B → 疑他人实验。FORCE=1 放行。
 if [[ "$FORCE" != "1" ]] && ! researcher_alive; then
-    max_used=$(nvidia-smi -i 0,1 --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)   # 共享期只查我们的卡0/1
+    # 只查本 run 实际要用的卡(跟随 CUDA_VISIBLE_DEVICES),否则同机并行跑另一个
+    # 实验时会把对方占用的卡误判成"他人实验"而拒绝启动。
+    _CARDS=${CUDA_VISIBLE_DEVICES:-0,1}
+    max_used=$(nvidia-smi -i "$_CARDS" --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)
     if (( max_used > 10240 )); then
         die "GPU 有占用(峰值 ${max_used}MiB)且 :$PORT_27B 无本实验服务——疑他人实验。协调后 FORCE=1 重跑"
     fi
@@ -82,17 +125,17 @@ else
 fi
 
 # ---- [2] researcher 服务 ----------------------------------------------------
-# REMOTE_RESEARCHER=1 → 走外部 35B-A3B 双端点(经隧道,watchdog 守护),
-# 不起 27B、四卡归 policy 独占;默认 0 → 本地 27B(原路径,回切预案)。
-REMOTE_RESEARCHER=${REMOTE_RESEARCHER:-0}
-if [[ "$REMOTE_RESEARCHER" == "1" ]]; then
+if [[ "$RESEARCHER_MODE" == "external_pool" ]]; then
     say "== [2/4] 远程 researcher(35B-A3B 双端点 18888/18889,经隧道)=="
     bash "$TRACE_REPO/trace_opd/scripts/tunnel_watchdog.sh" ensure || true
     RKEY=${TRACE_RESEARCHER_API_KEY:-token-abc123}
-    for lp in 18888 18889; do
+    IFS=',' read -ra _eps <<< "$CFG_ENDPOINT"
+    for _ep in "${_eps[@]}"; do
+        _ep="${_ep// /}"
         curl -sf --max-time 10 -H "Authorization: Bearer $RKEY" \
-            "http://127.0.0.1:$lp/v1/models" | grep -q "qwen3.6-35b-a3b" \
-            || die "远程端点 :$lp 不可用(隧道/远端服务)。看 $LOG_DIR/tunnel_watchdog.log"
+            "${_ep%/}/models" | grep -q "$CFG_MODEL" \
+            || die "端点 $_ep 不可用或未服务 $CFG_MODEL(隧道/远端服务)。看 $LOG_DIR/tunnel_watchdog.log"
+        say "  端点 $_ep OK"
     done
     say "双端点 OK(launcher 预检会再验一遍;单端点亦可跑,池自动故障切换)"
 else
@@ -115,29 +158,28 @@ else
 fi
 curl -sf --max-time 5 "http://127.0.0.1:$PORT_27B/is_sleeping" >/dev/null \
     || die "/is_sleeping 不可达——现存服务未开 sleep-mode。清理后重跑"
-fi   # REMOTE_RESEARCHER
+fi   # RESEARCHER_MODE(来自实验配置)
 
 # ---- [3] 训练环境变量 -------------------------------------------------------
+# 同机并行:每个 run 起**独立** Ray 集群。verl 的 ray.init() 不带 address,
+# Ray 默认会连上本机已有集群 ⇒ 第二个实验的 actor 会被调度到第一个的集群上,
+# 两边抢同一批 GPU/CPU。RAY_ADDRESS=local 强制新建;temp dir 也须分开。
+export RAY_ADDRESS=${RAY_ADDRESS:-local}
+export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/ray_${RUN_NAME}}
+mkdir -p "$RAY_TMPDIR"
 export ALFWORLD_WORKER_PYTHON=$VENV_ALFWORLD/bin/python
 export TRACE_MODEL_PATH=$POLICY_MODEL                              # ← policy 基座 = 1.7B
 export TRACE_TRAIN_FILE=$TRAIN_PARQUET
 export TRACE_VAL_SEEN_FILE=$DATA_OUT/valid_seen.parquet
 export TRACE_VAL_UNSEEN_FILE=$DATA_OUT/valid_unseen.parquet
-if [[ "$REMOTE_RESEARCHER" == "1" ]]; then
-    # 池模式:逗号分隔端点(PooledClient 会话粘性+均衡+故障切换,llm.py)
-    export TRACE_RESEARCHER_ENDPOINT="http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
-    export TRACE_RESEARCHER_MODEL="qwen3.6-35b-a3b"
+if [[ "$RESEARCHER_MODE" == "external_pool" ]]; then
+    # 端点/模型名都来自配置(唯一真源);仍导出 env 是因为模板型配置可能用
+    # ${TRACE_RESEARCHER_ENDPOINT} 插值,写死端点的实验配置不受影响。
+    export TRACE_RESEARCHER_ENDPOINT="$CFG_ENDPOINT"
+    export TRACE_RESEARCHER_MODEL="$CFG_MODEL"
     export TRACE_RESEARCHER_API_KEY="${TRACE_RESEARCHER_API_KEY:-token-abc123}"
-    # 从主 yaml 现场派生远程配置(防两份 yaml 漂移):researcher 段
-    # sidecar_sleep→false、dp_size→0、插入 api_key_env(config 校验强制这套组合)
-    GEN_CONFIG="${CONFIG%.yaml}_remote35b.gen.yaml"
-    sed -e '/^  researcher:/,/max_concurrency:/{
-        s/sidecar_sleep: true/sidecar_sleep: false/
-        s/dp_size: 2/dp_size: 0/
-        s|^    model: "\${TRACE_RESEARCHER_MODEL}".*|&\n    api_key_env: TRACE_RESEARCHER_API_KEY|
-    }' "$CONFIG" > "$GEN_CONFIG"
-    CONFIG=$GEN_CONFIG
-    say "远程 researcher 派生配置: $CONFIG(sidecar off / dp 0 / api_key_env)"
+    # ★ 不再 sed 派生:实验配置是完整副本,researcher 段已自足。
+    #   再改写一次正是 v2.1-fix 要消灭的"配置真源被悄悄丢弃"。
 else
     export TRACE_RESEARCHER_ENDPOINT=http://127.0.0.1:$PORT_27B/v1
     export TRACE_RESEARCHER_MODEL=$SERVED_27B
