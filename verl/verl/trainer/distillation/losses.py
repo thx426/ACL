@@ -223,24 +223,30 @@ def distillation_ppo_loss(
     # use_task_rewards, which is the same term at an implicit weight of 1).
     rl_loss_coef = float(getattr(distillation_loss_config, "rl_loss_coef", 0.0) or 0.0)
 
-    # ``ppo_loss`` fills config.global_batch_info as a side effect, and the
-    # config object outlives the micro-batch loop. With the RL arm on, the
-    # distillation term below would therefore normalise per micro-batch on the
-    # first micro-batch and globally on every one after it — a scale jump of
-    # roughly num_micro_batches x dp_size, and only in the arms that enable RL.
-    # The ablation is meaningless if the arms optimise differently scaled OPD
-    # terms, so pin it to the pure-OPD behaviour (empty info => per-micro-batch
-    # token mean, which is what the 4B mainline trains under today).
-    saved_batch_info = dict(config.global_batch_info)
     if rl_loss_coef > 0.0:
+        # ``ppo_loss`` fills config.global_batch_info as a side effect, and the
+        # config object outlives the micro-batch loop. With the RL arm on, the
+        # distillation term below would therefore normalise per micro-batch on
+        # the first micro-batch and globally on every one after it — a scale
+        # jump of roughly num_micro_batches x dp_size, and only in the arms that
+        # enable RL. The ablation is meaningless if the arms optimise
+        # differently scaled OPD terms, so pin it to the pure-OPD behaviour
+        # (empty info => per-micro-batch token mean, which is what the 4B
+        # mainline trains under today). With the arm off this block is skipped
+        # entirely: no snapshot, no restore, no behaviour change.
+        saved_batch_info = dict(config.global_batch_info)
         config.global_batch_info.clear()
-    try:
+        try:
+            distill_loss, distill_metrics = distillation_loss(
+                config, distillation_config, model_output, data
+            )
+        finally:
+            config.global_batch_info.clear()
+            config.global_batch_info.update(saved_batch_info)
+    else:
         distill_loss, distill_metrics = distillation_loss(
             config, distillation_config, model_output, data
         )
-    finally:
-        config.global_batch_info.clear()
-        config.global_batch_info.update(saved_batch_info)
 
     if (
         not distillation_loss_config.use_task_rewards
@@ -308,6 +314,16 @@ def sft_ce_loss(model_output: dict, data: TensorDict) -> tuple[torch.Tensor, dic
 
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     ce = -log_prob
+    if sft_mask.shape != ce.shape:
+        # ``no_padding_2_padding`` sizes off data["responses"], so a mismatch
+        # means some row's sft_mask no longer matches its own response length —
+        # e.g. a synthesized row that copied the field from a different sample.
+        # Broadcasting would either raise deep inside the multiply or, worse,
+        # quietly inflate the expert-token count that the SFT arm is judged by.
+        raise RuntimeError(
+            f"sft_mask shape {tuple(sft_mask.shape)} does not match the response layout "
+            f"{tuple(ce.shape)} — a row's sft_mask is out of step with its responses"
+        )
     n_expert_tokens = sft_mask.sum()
     sft_loss = (ce * sft_mask).sum() / n_expert_tokens.clamp(min=1)
 

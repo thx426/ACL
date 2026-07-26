@@ -196,12 +196,20 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # on-policy terms (top-k OPD, policy gradient) AND out of every
             # denominator derived from them (batch_num_tokens is a sum over
             # loss_mask), so switching the SFT arm on cannot rescale the OPD loss.
-            # Every row carries both fields so the batch layout stays uniform.
-            response_mask = field["response_mask"]
-            is_expert_sample = (field.get("extra_fields") or {}).get("sample_role") == "sft"
-            field["sft_mask"] = response_mask.clone() if is_expert_sample else torch.zeros_like(response_mask)
-            if is_expert_sample:
-                field["response_mask"] = torch.zeros_like(response_mask)
+            #
+            # The agent loop stamps sample_role on EVERY row exactly when the SFT
+            # arm is on, and that stamp is the switch here: with the arm off no
+            # row carries it, no sft_mask is allocated, and nothing extra is
+            # stored or shipped. With it on every row carries the field, so the
+            # batch layout stays uniform.
+            sample_role = (field.get("extra_fields") or {}).get("sample_role")
+            if sample_role is not None:
+                response_mask = field["response_mask"]
+                if sample_role == "sft":
+                    field["sft_mask"] = response_mask
+                    field["response_mask"] = torch.zeros_like(response_mask)
+                else:
+                    field["sft_mask"] = torch.zeros_like(response_mask)
             # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

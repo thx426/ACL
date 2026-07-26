@@ -112,6 +112,15 @@ def construct_minimal_padding_template(
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
+    # trace-opd mixed objective: sft_mask is a per-token field like response_mask,
+    # so the template's copy of it — cloned from an arbitrary real row above, and
+    # very possibly a full-length expert mask — has to shrink with the sequence.
+    # Left alone it either blows up the SFT loss on a shape mismatch or, when the
+    # widths happen to agree, silently inflates sft/expert_tokens. Only rewritten
+    # when present: with the SFT arm off no row carries the field and the padding
+    # row must not invent one.
+    if "sft_mask" in template_sample:
+        template_sample["sft_mask"] = torch.zeros_like(response_mask)
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

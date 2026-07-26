@@ -439,12 +439,17 @@ class TraceAgentLoop(AgentLoopBase):
         # of a task roll out WITH the document and feed the SFT arm instead of
         # the OPD/RL arms. They need the document before they can start, so they
         # await research first; every other copy keeps the overlap below.
-        is_expert = (
+        # With the arm off this short-circuits on the weight — no replica
+        # counter, no extra rollout, and (below) no sample_role stamp, which is
+        # what keeps the trainer from allocating an sft_mask per row.
+        sft_arm = (
             not validate
             and self.cfg.train.mix_sft_weight > 0
             and self.cfg.train.mix_sft_rollouts > 0
             and research_fut is not None
-            and self._next_replica_index(global_step, adapter.task_id) >= self.cfg.train.rollout_n
+        )
+        is_expert = sft_arm and (
+            self._next_replica_index(global_step, adapter.task_id) >= self.cfg.train.rollout_n
         )
         expert_fields: dict[str, Any] = {}
         research_awaited = False
@@ -522,6 +527,13 @@ class TraceAgentLoop(AgentLoopBase):
                 **expert_fields,
             },
         )
+
+        if sft_arm:
+            # Stamped on every row of the batch, and ONLY when the SFT arm is
+            # on: the trainer keys the whole expert-sample machinery off this
+            # field's presence, so with the arm off it allocates and ships
+            # nothing. Expert rows already carry "sft" from expert_fields.
+            output.extra_fields.setdefault("sample_role", "bare")
 
         if not validate and not is_expert:
             # Teacher scoring joins the task's sticky replica too (verl pops

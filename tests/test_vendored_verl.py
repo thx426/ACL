@@ -114,6 +114,20 @@ def test_mixed_objective_terms_are_wired_and_default_off():
     assert "metrics_batch = batch.select_idxs(on_policy_mask)" in trainer
 
 
+def test_padding_template_shrinks_the_sft_mask_with_the_sequence():
+    # construct_minimal_padding_template clones every field off an arbitrary
+    # real row and then overrides a fixed list. sft_mask is per-token like
+    # response_mask, so leaving it out ships a full-length (possibly expert)
+    # mask on a 1-token padding row: a shape mismatch in the SFT loss, or —
+    # when the widths happen to agree — a silently inflated expert-token count.
+    src = _read("trainer/ppo/padding_utils.py")
+    assert 'if "sft_mask" in template_sample:' in src
+    assert 'template_sample["sft_mask"] = torch.zeros_like(response_mask)' in src
+    # ...and the loss refuses a mask that is out of step with the responses,
+    # so any future field-synthesizing path fails loud instead of miscounting.
+    assert "does not match the response layout" in _read("trainer/distillation/losses.py")
+
+
 def test_microscope_skips_rows_with_no_distillation():
     # 93a0109: an all-zero mask row (expert sample, or a prompt the hang guard
     # cancelled) would make the offline span-vs-mask integrity check misfire.
