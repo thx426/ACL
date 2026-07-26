@@ -218,11 +218,30 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     # trace-opd mixed objective: an explicitly weighted task-reward policy gradient
     # alongside the distillation term (config rejects combining it with
     # use_task_rewards, which is the same term at an implicit weight of 1).
     rl_loss_coef = float(getattr(distillation_loss_config, "rl_loss_coef", 0.0) or 0.0)
+
+    # ``ppo_loss`` fills config.global_batch_info as a side effect, and the
+    # config object outlives the micro-batch loop. With the RL arm on, the
+    # distillation term below would therefore normalise per micro-batch on the
+    # first micro-batch and globally on every one after it — a scale jump of
+    # roughly num_micro_batches x dp_size, and only in the arms that enable RL.
+    # The ablation is meaningless if the arms optimise differently scaled OPD
+    # terms, so pin it to the pure-OPD behaviour (empty info => per-micro-batch
+    # token mean, which is what the 4B mainline trains under today).
+    saved_batch_info = dict(config.global_batch_info)
+    if rl_loss_coef > 0.0:
+        config.global_batch_info.clear()
+    try:
+        distill_loss, distill_metrics = distillation_loss(
+            config, distillation_config, model_output, data
+        )
+    finally:
+        config.global_batch_info.clear()
+        config.global_batch_info.update(saved_batch_info)
+
     if (
         not distillation_loss_config.use_task_rewards
         and not distillation_loss_config.use_policy_gradient
@@ -247,34 +266,33 @@ def distillation_ppo_loss(
     # trace-opd mixed objective: cross-entropy over the expert tokens of the
     # privileged-guided rollouts. Those rows carry an all-zero response_mask
     # (cleared at TQ put time), so they contribute nothing above and nothing to
-    # batch_num_tokens — the OPD/RL terms keep the exact scale they have with the
-    # SFT arm off, and this term is a pure addition.
+    # any denominator derived from it — the OPD/RL terms keep the exact scale
+    # they have with the SFT arm off, and this term is a pure addition.
     sft_loss_coef = float(getattr(distillation_loss_config, "sft_loss_coef", 0.0) or 0.0)
     if sft_loss_coef > 0.0:
-        sft_loss, sft_metrics = sft_ce_loss(config, model_output, data)
+        sft_loss, sft_metrics = sft_ce_loss(model_output, data)
         policy_loss = policy_loss + sft_loss * sft_loss_coef
         policy_metrics.update(sft_metrics)
 
     return policy_loss, policy_metrics
 
 
-def sft_ce_loss(
-    config: ActorConfig,
-    model_output: dict,
-    data: TensorDict,
-) -> tuple[torch.Tensor, dict[str, Any]]:
+def sft_ce_loss(model_output: dict, data: TensorDict) -> tuple[torch.Tensor, dict[str, Any]]:
     """Token-level cross-entropy over expert tokens (trace-opd mixed objective).
 
     ``sft_mask`` marks the assistant-generated tokens of a privileged-guided
-    trajectory that has been replayed under the BARE prompt, i.e. the supervision
-    the policy should be able to produce without the document. Every other row —
-    and every observation token inside an expert row — is masked out.
+    trajectory replayed under the BARE prompt — the supervision the policy should
+    be able to produce without the document. Every other row, and every
+    observation token inside an expert row, is masked out.
 
-    Aggregation deliberately reuses ``loss_agg_mode`` and the same global
-    ``batch_num_tokens`` denominator as the OPD and RL terms, so ``sft_loss_coef``
-    is a per-token weight directly comparable with the other two. A step with no
-    surviving expert trajectory contributes exactly 0 (masked_sum of nothing),
-    never a NaN.
+    Normalisation is a per-micro-batch token mean, deliberately the same shape
+    the distillation term uses (``agg_loss`` token-mean with an empty
+    global_batch_info, which is what the pure-OPD path has always run), so
+    ``sft_loss_coef`` weights one mean against another and means the same thing
+    in every ablation arm. It is computed here rather than through ``agg_loss``
+    for one reason: a micro-batch may hold no expert token at all, and
+    ``agg_loss`` would divide by that zero. Such a micro-batch contributes
+    exactly 0 instead.
     """
     sft_mask = data.get("sft_mask", None)
     if sft_mask is None:
@@ -290,21 +308,13 @@ def sft_ce_loss(
 
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     ce = -log_prob
-    sft_loss = agg_loss(
-        loss_mat=ce,
-        loss_mask=sft_mask,
-        loss_agg_mode=config.loss_agg_mode,
-        **config.global_batch_info,
-    )
     n_expert_tokens = sft_mask.sum()
+    sft_loss = (ce * sft_mask).sum() / n_expert_tokens.clamp(min=1)
+
     metrics = {
         "sft/loss": Metric(value=sft_loss, aggregation=AggregationType.SUM),
         "sft/expert_tokens": Metric(value=n_expert_tokens, aggregation=AggregationType.SUM),
     }
-    if n_expert_tokens > 0:
-        # Mean CE per expert token — unlike sft/loss this is comparable across
-        # steps regardless of how many expert trajectories survived filtering.
-        metrics["sft/ce_per_token"] = (ce.detach()[sft_mask]).mean().item()
     return sft_loss, metrics
 
 

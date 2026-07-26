@@ -78,7 +78,18 @@ L_total = w_opd · L_OPD + w_rl · L_RL + w_sft · L_SFT
   是防漂移的二道锚,我们的 OPD 项本身即强正则,一期观察 entropy 曲线再定)。
 - **L_SFT**:guided 成功轨迹上的 token 级 CE(response 生成段,mask 语义同现构流),
   **bare 上下文形态**(PACT 剥离原则):输入是裸 system prompt + 轨迹 obs/action 流重构,
-  评测同构(PG-3)。聚合口径与 L_OPD 同(SUM/token 口径一致,系数才可解释)。
+  评测同构(PG-3)。
+
+**归一化口径(实现中核实,重要)**:`config.global_batch_info` **只由 `ppo_loss` 写入**,
+而纯 OPD 路径从不调用它 ⇒ **现行 OPD 项一直是"每微批 token 平均"**(4B 主线就跑在这个
+口径上)。因此:
+1. **L_SFT 同样用每微批 token 平均**(分母 = 该微批的 expert token 数,clamp≥1)——
+   三项同族,`w_sft` 才是"一个均值对另一个均值"的权重,且在各臂含义一致;
+   无 expert token 的微批贡献恰为 0(agg_loss 的 token-mean 会在此除零产 NaN,故自算)。
+2. **开 RL 臂会污染 OPD 项的归一化**:`ppo_loss` 的副作用写入 config,而 config 跨微批
+   存活 ⇒ 第二个微批起 OPD 项静默换成全局分母(尺度跳 ~微批数 × dp_size),**只在开 RL 的臂
+   发生** ⇒ 消融将比较两个不同尺度的 OPD 目标。实现里 OPD 项在 `rl_loss_coef>0` 时对
+   **清空后的快照**求值,把各臂钉死在纯 OPD 口径上(A0/A2 与上游 `use_task_rewards` 语义均不受影响)。
 
 **系数哲学(消融自由,预设两档)**:
 
@@ -241,7 +252,8 @@ trace_opd 侧:
   1. `rollout_extra/sft_role/mean` ≈ 4/12 = 0.333(副本发号正确);
   2. `rollout_extra/sft_won/mean ÷ sft_role/mean` ≈ 0.9 量级(文档注入成功率,
      对得上 h1 的 doc 重放 8/8 与 CD-006 的 guided 96%);
-  3. `sft/expert_tokens` > 0 且 `sft/ce_per_token` 有限、随训练下降;
+  3. `sft/expert_tokens` > 0,`sft/loss`(= 每微批 expert token 平均 CE,跨 rank SUM
+     聚合)有限且随训练下降;
   4. `critic/score/mean` **不因开臂而跳变**(隔离-3 生效的判据——对照同 step 的
      A0 臂或开臂前后一步);
   5. `actor/pg_loss`、advantage 分布、clip 率(RL 臂);低成功率早期 GRPO 组内
