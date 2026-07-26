@@ -253,3 +253,22 @@ def test_override_rejects_a_typo_instead_of_ignoring_it(tmp_path):
         _load(tmp_path, overrides=["trian.mix_rl_weight=1.0"])
     with pytest.raises(ValueError, match="must name a section"):
         _load(tmp_path, overrides=["mix_rl_weight=1.0"])
+
+
+def test_override_walks_nested_sections(tmp_path):
+    """roles.researcher.mode is three levels deep. Splitting the path once put a
+    literal "researcher.mode" key under roles, which only surfaced much later as
+    a nonsense error from iterating a string's characters (CD-006 report)."""
+    from trace_opd.common.config import apply_overrides
+
+    data = {"roles": {"researcher": {"model": "m"}}}
+    out = apply_overrides(data, ["roles.researcher.mode=external_pool"])
+    assert out["roles"]["researcher"] == {"model": "m", "mode": "external_pool"}
+    assert "researcher.mode" not in out["roles"]
+
+
+def test_override_refuses_to_descend_into_a_non_mapping(tmp_path):
+    from trace_opd.common.config import apply_overrides
+
+    with pytest.raises(ValueError, match="train.lr is not a mapping"):
+        apply_overrides({"train": {"lr": 1e-6}}, ["train.lr.nested=1"])

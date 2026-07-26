@@ -383,15 +383,23 @@ def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any
         if "=" not in item:
             raise ValueError(f"config override {item!r} is not of the form section.key=value")
         path, _, value = item.partition("=")
-        section, _, key = path.strip().partition(".")
-        if not key:
+        parts = [p for p in path.strip().split(".") if p]
+        if len(parts) < 2:
             raise ValueError(f"config override {item!r} must name a section, e.g. train.mix_rl_weight=1.0")
-        if section not in _KNOWN_SECTIONS:
-            raise ValueError(f"config override {item!r}: unknown section {section!r}")
-        target = data.setdefault(section, {})
-        if not isinstance(target, dict):
-            raise ValueError(f"config override {item!r}: section {section!r} is not a mapping")
-        target[key] = yaml.safe_load(value)
+        if parts[0] not in _KNOWN_SECTIONS:
+            raise ValueError(f"config override {item!r}: unknown section {parts[0]!r}")
+        # Walk the full path rather than splitting once: nested sections are
+        # real (roles.researcher.mode), and treating "researcher.mode" as a
+        # literal key under roles produced a role named "researcher.mode" whose
+        # value was a string — surfacing much later as "unknown keys
+        # ['_','a','e',...]" from iterating that string's characters.
+        target = data
+        for depth, part in enumerate(parts[:-1]):
+            target = target.setdefault(part, {})
+            if not isinstance(target, dict):
+                where = ".".join(parts[: depth + 1])
+                raise ValueError(f"config override {item!r}: {where} is not a mapping")
+        target[parts[-1]] = yaml.safe_load(value)
     return data
 
 
