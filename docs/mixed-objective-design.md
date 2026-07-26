@@ -35,14 +35,21 @@
 - **对我们最关键的两个判决**:
   ① 无 gate 的朴素 GRPO+OPSD 在 **Qwen3-1.7B 上灾难退化(32.0% vs GRPO 基线 46.1%)**
   ——蒸馏梯度无界压垮 RL 信号;SDAR 修复后 **53.9%(+7.8)**。这正是用户 1.7B 观察的文献印证,
-  也给出**外部可比锚点**(同环境同基座:ALFWorld × Qwen3-1.7B)。
+  也给出一个**邻近文献参照**(同环境同基座:ALFWorld × Qwen3-1.7B)。
+  **⚠ 不是可直接判输赢的 baseline**(外部审阅 2026-07-26 核对原文):SDAR 用采样 token 的
+  reverse-KL surrogate + gate 而我们用 top-k forward KL、其 OPD 系数 0.01 而我们 A3 是 1、
+  它含 fixed-reference KL 而我们不启用、response length 512 vs 我们 32768、其 ALFWorld 总分
+  是六类等权平均而我们的 val 是两 split 内按任务平均;skill 来源与训练步数亦不同。
+  **写进论文时只能作"邻近工作参照",不得宣称达到或超过 53.9。**
   ② teacher 负差三来源:skill 质量 / skill 利用失败 / **multi-turn drift(轮深处 gap 变宽)**
   ——与我们深度衰减测量同一现象。λ=0.1 梯度支配、0.001 不足,0.01 甜点;gap gating > entropy gating。
 
 **SEED — Self-Evolving On-Policy Distillation**([arXiv:2607.14777](https://arxiv.org/abs/2607.14777)):
 - `L = L_rl + λ_opd·L_opd`;GRPO(N=8)+ gated token 级 OPD(gate 同 SDAR 形式,β_opd);
-  πθ_old 既收轨迹又当 analyzer 产 hindsight skill,**teacher 随 policy 迭代进化而全程不崩**
-  ——RL 锚 + moving self-teacher 稳定共存的直接文献判决(呼应 CD-003 锚预测)。
+  πθ_old 既收轨迹又当 analyzer 产 hindsight skill,**teacher 随 policy 迭代进化而全程不崩**。
+  **⚠ 不能把稳定性单独归因于 RL 锚**(外部审阅指出):SEED 同时用了 SFT 初始化、gated OPD、
+  GRPO、fixed-reference KL 与同步旧策略快照,原文没有隔离出 RL 单独的稳定作用。
+  它只能说明"RL 锚 + moving teacher 可以共存",不能说明"RL 锚是稳定的原因"。
 - 与我们的差异:SEED 的 skill 是事后 hindsight(从完成轨迹提取);我们的 doc 是任务先验
   (researcher 现场实验产出),信息含量更强。SEED 的 OPD 只在采样 token 上(logp shift),
   我们的 forward_kl_topk 是 top-k 分布蒸馏(信号更密)。
@@ -50,11 +57,19 @@
 ### 1.2 SFT(特权专家轨迹)混合
 
 **PACT — Privileged Trace Co-Training for Multi-Turn Tool-Use Agents**
-([arXiv:2606.16215](https://arxiv.org/abs/2606.16215)):特权轨迹共训的直接先例,三个可移植结论:
+([arXiv:2606.16215](https://arxiv.org/abs/2606.16215)):特权轨迹共训的直接先例,可移植结论:
 - **剥离特权上下文训练裸 policy**(privileged 生成的轨迹,SFT 时 strip 掉特权信息)
   ——强迫学到可泛化行为而非对特权线索的依赖;
-- **过滤 reasoning 中显式引用特权信息的轨迹是 essential**(不过滤则在 unseen 上表现差);
-- 成功过滤(binary success)+ **λ_SFT 先高后衰减**(курriculum:早期 SFT 重、policy 稳定后 RL 接管)。
+- rollout 保持 prompt-only,expert trace 只用于优化;SFT 只监督可控的 reasoning/tool-call 段;
+- 成功过滤(binary success)+ **λ_SFT 先高后衰减**(curriculum:早期 SFT 重、policy 稳定后 RL 接管)。
+
+> **⚠ 引用更正(2026-07-26,外部审阅核对原文后指出)**:本文档此前称"PACT 实证:过滤
+> reasoning 中显式引用特权信息的轨迹是 essential,不过滤则伤 unseen"——**该论断在 PACT
+> 原文中不存在**。PACT 的 leakage 过滤针对的是"不泄漏未来 tool call 的安全 reasoning
+> prefix",不是过滤"the guidance says…"这类自述引用;原文也没有对应的 unseen 消融。
+> 我们的词面过滤(§3.3 第 2 条)因此是**本项目提出的启发式,待自身消融验证**,不是已被
+> PACT 证明的设计。**误引根源:采信了论文的二手摘要(WebFetch 由小模型总结)而未核对
+> 原文——凡要写进设计依据的论文结论,必须回原文核对。**
 
 **权重设计谱系**(供二期参考):CHORD([arXiv:2509.06948](https://arxiv.org/html/2509.06948v2)
 相关工作节)= 全局权重 + token 级权重(up-weight 不确定 expert token、down-weight 大偏离 token);
@@ -70,7 +85,10 @@ L_total = w_opd · L_OPD + w_rl · L_RL + w_sft · L_SFT
 ```
 
 - **L_OPD**(现状,不动):forward_kl_topk(top-64)+ 硬 clamp(10)+ SUM 聚合。
-  `w_opd=1, w_rl=0, w_sft=0` 时**与现行为字节级一致**(4B 主线零感知,默认值)。
+  `w_opd=1, w_rl=0, w_sft=0` 时**不产生任何额外目标计算,训练数学语义与改动前相同**
+  (4B 主线零感知,默认值)。**措辞更正**:此前写"逐字节一致"过强——rollout dump 无条件
+  多了 `sample_role`/`sft_accepted` 两个字段、launcher 命令多两个零系数、manifest 与 viz
+  schema 也变了;参数更新的数值等价性**尚未做同 checkpoint 同 batch 的一步差分验证**。
 - **L_RL**:GRPO——won∈{0,1} 轨迹级 reward,`{uid}_{session_id}` 组内标准化 advantage
   (G=8 bare rollouts,verl `adv_estimator=grpo` **现已在算**,见 §4),PPO-clip
   vanilla policy loss(verl 上游 `distillation_ppo_loss` 组合路径现成)。
@@ -130,8 +148,11 @@ OPD 应保留争夺主干的资格,这正是消融要回答的问题。
   `inject_guidance`(PG-7 GUIDANCE_HEADER 单一真源,与 teacher prompt / 研究会话
   executor episodes 同构)。**这 4 条的 won 率同时兑现 PG-7 的文档质量信号**;
   曲线 `rollout_extra/sft_won/mean ÷ sft_role/mean` = 文档注入成功率。
-- **研究失败(doc=None)**:expert 副本无 doc 可注 ⇒ **降级为普通 bare 副本**
-  (跑一次学生 rollout,正常进 OPD/RL 组)。比产一条空样本更诚实,也不多花 episode。
+- **研究失败(doc=None)/ expert episode 环境错**:该 slot **保持 expert 身份、全零 mask**,
+  什么都不贡献,并上 `sft_missing_no_doc` / `sft_missing_env_error` 曲线。
+  **不再降级为普通 bare 副本**(2026-07-26 外部审阅指出的偏差):研究失败与任务难度相关,
+  转成 bare 会让 SFT 臂在**恰恰是难任务上**多拿 on-policy 数据,与对照臂的样本构成系统性
+  不同——"SFT 臂更稳"就可能只是它多训了几条。
 - **拒收样本为何不置空 response**:`AgentLoopOutput.as_dict` 有
   `rm_scores[-1] = reward_score`,空 response 会 IndexError;全零 mask 则是训练侧
   已经承受过的形态(hang guard 取消 prompt 即产生它,空批防御 commit 已收编)。
@@ -162,8 +183,10 @@ rollout 同构的序列。故重放 = 原样接到**重新渲染的裸首轮 pro
 
 1. **未 won** → 拒(模仿失败样本就是在教失败);
 2. **轨迹自述引用文档**(`mentions_guidance`:`task guidance` / `the guidance` /
-   `guidance says` / `guidance document`)→ 拒。bare 条件下这是幻觉式引用,PACT 实证
-   不过滤会显著伤 unseen 表现。故意宽:4 条里误杀 1 条只损失一个样本,漏放则污染行为;
+   `guidance says` / `guidance document`)→ 拒。bare 条件下这是幻觉式引用(模型引述一份
+   它看不见的文档)。**这是本项目的启发式,尚无实证背书**(见 §1.2 的引用更正),
+   故意做宽:4 条里误杀 1 条只损失一个样本,漏放则污染行为;误杀率由 CD-006 首验回报,
+   本身也应进消融。
 3. **重放超序列预算** → 拒。
 拒收即 `response_mask` 全 0,并分别计数上报(`sft_won`/`sft_accepted`/`sft_dropped_ref`)。
 
@@ -172,7 +195,7 @@ rollout 同构的序列。故重放 = 原样接到**重新渲染的裸首轮 pro
 | # | 位置 | 若不做会怎样 |
 |---|---|---|
 | 隔离-1 | **TQ put 清空 expert 行的 `response_mask`/`loss_mask`**(`agent_loop_tq`) | expert token 进 OPD/PG 分子,且进全局 `batch_num_tokens` 分母 ⇒ **开 SFT 臂会顺带缩放 OPD loss**,A2/A3 臂与 A0 不可比 |
-| 隔离-2 | **独立 GRPO 组**(`_compute_advantage` 给 uid 加 `:sft` 后缀) | expert 行 ~96% won 抬高任务组均值 ⇒ **成功的 bare 行拿到负 advantage**(RL 臂被反向教育) |
+| 隔离-2 | **独立 GRPO 组**(`_compute_advantage` 给 uid 加 `:sft` 后缀) | expert 行 ~96% won 抬高任务组均值 ⇒ **压缩成功 bare 行的正 advantage、放大失败 bare 行的负 advantage**(二元 reward 下组内只要有失败,成功样本的 advantage 必为正;全成功时为 0,不会变负——此处此前写"拿到负 advantage"是错的,外部审阅 2026-07-26 指出) |
 | 隔离-3 | **行为指标只读 on-policy 行**(`_compute_metrics` 的 `on_policy_mask`:`compute_data_metrics` / 方差代理 / `num_turns` / 除 `sft_*` 外的 reward_extra) | **`critic/score/mean` 被抬高**——而它是判停与起飞判据的主曲线。吞吐/计时仍计全部行(确实耗算力) |
 | 隔离-4 | **观测层**:显微镜跳过全零 mask 行;`collect` 不索引 `sample_role=="sft"` 的 dump;viz 全部聚合查询过滤 role(schema 加列 + `PRAGMA user_version` 迁移),但 step 下钻仍列出并打 `expert` 标签 | 显微镜:span-vs-mask 完整性自检**误报 mismatch**(CD-006 每次 resume 的首验判据);viz:score/曲线/完整性审计全被抬高 |
 
@@ -254,15 +277,39 @@ trace_opd 侧:
 
 ## 6. 消融矩阵(论文 C 系 claims 的机制扩展)
 
-| 臂 | w_opd | w_rl | w_sft | 回答什么 |
-|---|---|---|---|---|
-| A0 纯 OPD(现状) | 1 | 0 | 0 | 基线;4B 已实证,1.7B 已实证失败 |
-| A1 OPD+RL | 1 | 1 | 0 | RL 锚是否足以救活弱模型(且验证 SEED 稳定性判决) |
-| A2 OPD+SFT | 1 | 0 | 0.5 | 专家分布注入是否独立有效(S7 判决) |
-| A3 全混 | 1 | 1 | 0.5 | 完整机制;与 SDAR 1.7B ALFWorld 53.9% 外部锚点可比 |
-| A4 纯 RL(可选) | 0 | 1 | 0 | GRPO 裸基线(对齐 SDAR 表的 GRPO 46.1%) |
+| 臂 | w_opd | w_rl | w_sft | 回答什么 | 必跑? |
+|---|---|---|---|---|---|
+| A0 纯 OPD | 1 | 0 | 0 | 基线 | **必跑,且必须与其他臂配对重跑**(见下) |
+| A1 OPD+RL | 1 | 1 | 0 | RL 锚是否足以救活弱模型 | 必跑 |
+| A2 OPD+SFT | 1 | 0 | 0.5 | 专家分布注入是否独立有效(S7 判决) | 必跑 |
+| A3 全混 | 1 | 1 | 0.5 | 完整机制 | 必跑 |
+| **A4 纯 RL** | 0 | 1 | 0 | GRPO 裸基线 | **必跑**(见下,原列为"可选"是错的) |
+| **A5 RL+SFT(无 OPD)** | 0 | 1 | 0.5 | **OPD 在弱模型上是否还有净贡献** | 必跑 |
 
-优先级:1.7B 上 A3(用户当前痛点直取)→ A1/A2 拆解归因;4B 上 A0 继续(主线不动)。
+A0-A3 构成"OPD 恒为 1、RL×SFT 做 2×2 因子实验",可估计 RL 增量(A1−A0)、SFT 增量
+(A2−A0)与交互(A3−A2−A1+A0)。**但只有这四臂答不了三个问题**(外部审阅 2026-07-26):
+- **A4 必跑**:没有纯 RL 基线,就无法说"混合优于单纯 RL",而那是 SDAR/SEED 那一支的主张;
+- **A5 必跑**:OPD 恒为 1 意味着**从没检验过 OPD 在弱模型上是否还有正贡献**——完全可能
+  是 RL+SFT 在起作用而 OPD 在拖后腿,四臂设计对此完全盲;
+- **A0 必须配对重跑**,不能拿 1.7B v2 的历史数据当对照:那之间隔着代码变更、数据顺序、
+  researcher 换代(27B→35B),把这些差异算进"目标函数效应"是最容易犯的错。
+
+**执行顺序的更正**:此前写"A3 失败则 A1/A2 大概率也失败,故先跑 A3"——**该推断不成立**。
+A3 完全可能因 RL 与 SFT 梯度冲突而失败,同时 A1 或 A2 单独成功。**不得以 A3 的成败决定
+是否执行拆解臂。**
+
+**三重混杂必须在报告里显式处理**(开 SFT 臂同时改变了三件事):①环境交互数与生成算力
+(每任务多 4 条 rollout);②训练 batch 的序列数与动态 packing;③每个裸 token 在微批中的
+权重。因此固定 step 的比较**既不是固定样本量也不是固定算力**。论文至少要同时报:
+固定 task-step / 固定裸 rollout 数 / 固定总环境 episode / GPU-hour。
+
+**统计单位是任务,不是轨迹**:每任务 8 条 rollout 共享同一份文档,轨迹之间不独立;
+显著性按任务(必要时按 seed)聚类计算,≥3 seeds。
+
+**专家数据是 best-of-4 后再按成功条件化的样本**,不是任务分布上的无偏专家数据。
+容易被文档救活的任务会稳定贡献 SFT,难任务持续贡献零 ⇒ 只看总体成功率可能把"容易任务
+被强化"读成"弱模型整体被救活"。须按任务族报告 expert 接受率、至少一条被接受专家样本的
+任务覆盖率、以及有/无专家样本的任务后续裸成功率。
 
 ## 7. 风险与边界
 
