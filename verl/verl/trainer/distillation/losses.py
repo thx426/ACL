@@ -224,22 +224,35 @@ def distillation_ppo_loss(
     rl_loss_coef = float(getattr(distillation_loss_config, "rl_loss_coef", 0.0) or 0.0)
 
     if rl_loss_coef > 0.0:
-        # ``ppo_loss`` fills config.global_batch_info as a side effect, and the
-        # config object outlives the micro-batch loop. With the RL arm on, the
-        # distillation term below would therefore normalise per micro-batch on
-        # the first micro-batch and globally on every one after it — a scale
-        # jump of roughly num_micro_batches x dp_size, and only in the arms that
-        # enable RL. The ablation is meaningless if the arms optimise
-        # differently scaled OPD terms, so pin it to the pure-OPD behaviour
-        # (empty info => per-micro-batch token mean, which is what the 4B
-        # mainline trains under today). With the arm off this block is skipped
-        # entirely: no snapshot, no restore, no behaviour change.
+        # Both trace-opd terms are evaluated under the SAME normalisation, and it
+        # has to be the per-micro-batch token mean — the pure-OPD path's
+        # behaviour, which is what the 4B mainline trains under today.
+        #
+        # Two things force this. First, ``ppo_loss`` fills
+        # config.global_batch_info as a side effect and the config object
+        # outlives the micro-batch loop, so the distillation term would
+        # normalise per micro-batch on the first micro-batch and globally on
+        # every one after it — a silent scale jump, and only in the arms that
+        # enable RL. Second, and worse: the two normalisations differ by the
+        # MICRO-BATCH COUNT. A per-micro-batch mean accumulates to N x mean over
+        # the N micro-batches of a gradient-accumulation step; a global mean
+        # accumulates to 1 x mean. At this run's shapes N is around 60, so a
+        # nominal mix_rl_weight of 1.0 would in truth weight OPD against RL
+        # about 60:1 — and the ablation would report "RL does not help" as an
+        # artefact of arithmetic, not as a finding.
+        #
+        # So the RL term does not go through ``ppo_loss``: that function refills
+        # the global counts from `data` regardless of what we clear here, and it
+        # also folds the entropy and reference-KL regularisers into the same
+        # scalar, neither of which should be scaled by an RL weight.
         saved_batch_info = dict(config.global_batch_info)
         config.global_batch_info.clear()
         try:
             distill_loss, distill_metrics = distillation_loss(
                 config, distillation_config, model_output, data
             )
+            policy_loss, policy_metrics = task_reward_pg(config, model_output, data)
+            policy_loss = policy_loss * rl_loss_coef
         finally:
             config.global_batch_info.clear()
             config.global_batch_info.update(saved_batch_info)
@@ -247,19 +260,14 @@ def distillation_ppo_loss(
         distill_loss, distill_metrics = distillation_loss(
             config, distillation_config, model_output, data
         )
-
-    if (
-        not distillation_loss_config.use_task_rewards
-        and not distillation_loss_config.use_policy_gradient
-        and rl_loss_coef <= 0.0
-    ):
-        # no need to compute policy loss
-        policy_loss = 0.0
-        policy_metrics = {}
-    else:
-        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-        if not distillation_loss_config.use_task_rewards:
-            policy_loss = policy_loss * rl_loss_coef if rl_loss_coef > 0.0 else 0.0
+        if distillation_loss_config.use_task_rewards or distillation_loss_config.use_policy_gradient:
+            policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+            if not distillation_loss_config.use_task_rewards:
+                policy_loss = 0.0
+        else:
+            # no need to compute policy loss
+            policy_loss = 0.0
+            policy_metrics = {}
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
@@ -281,6 +289,54 @@ def distillation_ppo_loss(
         policy_metrics.update(sft_metrics)
 
     return policy_loss, policy_metrics
+
+
+def task_reward_pg(
+    config: ActorConfig, model_output: dict, data: TensorDict
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Task-reward policy gradient for the mixed objective's RL arm.
+
+    The same clipped objective ``ppo_loss`` computes, over the same GRPO
+    advantages, but aggregated the way the distillation term is — under whatever
+    ``config.global_batch_info`` the caller has set up, rather than refilling it
+    from the batch. That is the whole reason this exists rather than calling
+    ``ppo_loss``: see the comment at the call site for why a mismatch there costs
+    a factor of the micro-batch count. It also leaves the entropy and
+    reference-KL regularisers out, since neither belongs under an RL weight.
+
+    Expert rows contribute nothing: their response_mask is all zero, so they
+    leave both the numerator and the denominator.
+    """
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    fields = ["response_mask", "old_log_probs", "advantages"]
+    if "rollout_is_weights" in data:
+        fields.append("rollout_is_weights")
+    padded = data.select(*fields).to_padded_tensor()
+    response_mask = padded["response_mask"].to(bool)
+
+    policy_loss_fn = get_policy_loss_fn(config.policy_loss.get("loss_mode", "vanilla"))
+    pg_loss, pg_metrics = policy_loss_fn(
+        old_log_prob=padded["old_log_probs"],
+        log_prob=log_prob,
+        advantages=padded["advantages"],
+        response_mask=response_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        config=config,
+        rollout_is_weights=padded.get("rollout_is_weights", None),
+    )
+    metrics: dict[str, Any] = {f"rl/{k[len('actor/'):]}": v for k, v in pg_metrics.items()}
+    metrics["rl/pg_loss"] = Metric(value=pg_loss, aggregation=AggregationType.SUM)
+    # How much of the batch actually carries an RL gradient. With a binary
+    # reward and G rollouts per task, a group whose members all succeed or all
+    # fail has zero advantage throughout, and at a few percent success rate that
+    # is most groups — so the arm's effective strength grows on its own as the
+    # policy improves. Worth watching rather than inferring.
+    nonzero = ((padded["advantages"] != 0) & response_mask).sum()
+    total = response_mask.sum()
+    metrics["rl/nonzero_advantage_frac"] = (
+        (nonzero.float() / total).item() if total > 0 else 0.0
+    )
+    return pg_loss, metrics
 
 
 def sft_ce_loss(model_output: dict, data: TensorDict) -> tuple[torch.Tensor, dict[str, Any]]:

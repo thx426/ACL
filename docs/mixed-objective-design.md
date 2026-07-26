@@ -90,10 +90,55 @@ L_total = w_opd · L_OPD + w_rl · L_RL + w_sft · L_SFT
   多了 `sample_role`/`sft_accepted` 两个字段、launcher 命令多两个零系数、manifest 与 viz
   schema 也变了;参数更新的数值等价性**尚未做同 checkpoint 同 batch 的一步差分验证**。
 - **L_RL**:GRPO——won∈{0,1} 轨迹级 reward,`{uid}_{session_id}` 组内标准化 advantage
-  (G=8 bare rollouts,verl `adv_estimator=grpo` **现已在算**,见 §4),PPO-clip
-  vanilla policy loss(verl 上游 `distillation_ppo_loss` 组合路径现成)。
+  (G=8 bare rollouts,verl `adv_estimator=grpo` **现已在算**),PPO-clip vanilla policy loss。
   follow SDAR/SEED:不加 ref-KL 正则第一期(我们无 ref 模型常驻,显存紧;SEED 的 βKL
   是防漂移的二道锚,我们的 OPD 项本身即强正则,一期观察 entropy 曲线再定)。
+  **不走上游 `ppo_loss`,理由见 §2.6。**
+
+### 2.6 RL 项为什么不直接用上游的 `ppo_loss`(归一化口径,踩过一次)
+
+上游 `distillation_ppo_loss` 确实提供了 OPD+PG 的组合(`use_task_rewards=True` ⇒
+`ppo_loss + distillation_loss_coef × OPD`),我最初就是复用它。两个理由让我最终绕开它:
+
+**① 上游的参数化不支持我们要的消融。** 它是 `RL(权重锁死 1) + c × OPD`;我们要的是
+`OPD(权重恒 1,保 A0 行为不变) + w_rl × RL`。两者数学上差一个整体缩放 c,而**整体缩放
+会改变有效学习率** ⇒ 要保 OPD 权重恒 1 就必须 `c=1`,那 RL 权重就锁死为 1,无法消融。
+所以必须有独立的 `rl_loss_coef`。
+
+**② 更要紧:两项的归一化口径会不一致,差一个微批数。** `ppo_loss` 从 `data` 重填
+`config.global_batch_info` ⇒ 它的 PG 项按**全局 token 数**归一;而 OPD 项被我钉在
+**每微批 token 平均**(A0 的历史口径,4B 主线就跑在它上面)。
+**"每微批平均"在 N 个微批上累加 = N × mean;"全局平均"累加 = 1 × mean** ⇒
+本 run 的形状下 N ≈ 60(已数值验算)⇒ **名义 `mix_rl_weight=1.0` 实际是 OPD:RL ≈ 60:1**,
+消融会报出"RL 没用"这个**算术假象**。
+
+**注意这不是上游的缺陷**:`use_task_rewards` 下两项都用全局口径,上游是自洽的
+(只有第一个微批因 config 还没被填而用 local,是个小瑕疵)。**不自洽是我造成的**——
+为了保 A0 的 local 口径而清空快照,却没管 `ppo_loss` 会重填。
+
+**修法**:`task_reward_pg` 用同一个 `policy_loss_fn`、同一批 GRPO advantage 算同一个
+clipped objective,但在**调用方设定的口径下**求值 ⇒ `mix_rl_weight` 才是真实的 1:1 权重。
+顺带修掉一个脆弱依赖:`ppo_loss` 把 entropy 与 ref-KL 正则折进同一个标量,而那两项
+**不该被 RL 权重缩放**(今天 `entropy_coeff=0`/`use_kl_loss=False` 所以无害,但谁一开就中招)。
+
+**⚠ 与此相关的待裁定项**:更彻底的做法是三项都用**全局分目标分母**(外部审阅建议),
+那样口径不再依赖微批切分。但它会把 OPD 的尺度改小 N 倍 ⇒ 等效 lr 小 N 倍 ⇒
+**必须连带调 lr 并重跑配对 A0**。当前方案(三项都用 local)不动 A0、且各项同口径,
+是不改基线前提下的正解。
+
+**RL 项的两个固有性质(不是 bug,但必须知道)**:
+1. **advantage 的稀疏性随成功率变化**。二元 reward + G=8,组内全成功或全失败则
+   advantage 恒 0(verl 用 `(r-mean)/(std+1e-6)`,std=0 时分子也是 0,**不会 NaN**)。
+   成功率 5% 时只有 `1-0.95⁸-0.05⁸ ≈ 33.7%` 的组带梯度;成功率 50% 时 ≈ 99.2%。
+   **所以 RL 项的有效强度会随训练自动长大约 3 倍**——一个隐式 curriculum(冷启动 SFT 主导、
+   成功率上来后 RL 接管),但它是非声明的,故新增 `rl/nonzero_advantage_frac` 直接测它。
+2. **罕见成功被放大**。k=1/G=8 时成功样本 advantage = `(1-1/8)/std ≈ 2.47`、失败 ≈ `-0.35`。
+   低成功率下"偶然走对一次"会拿到大正 advantage ⇒ 有强化运气的风险,靠多任务平均缓解。
+3. **PPO clip 实际不激活**:`ppo_mini_batch_size × rollout_n = train_batch_size × rollout_n`
+   ⇒ 每步一次 optimizer step ⇒ π_θ 与 π_old 同权重,ratio ≡ 1(仅两次前向的数值噪声)。
+   所以 `pg_clipfrac` 恒 ≈ 0、`clip_ratio` 配置无效,PG 退化为 vanilla REINFORCE。
+   **这其实是好事**(无 off-policy 偏差),但 `pg_clipfrac` 这个监控项没有信息量。
+
 - **L_SFT**:guided 成功轨迹上的 token 级 CE(response 生成段,mask 语义同现构流)。
   **前缀由 `mix_sft_prefix` 决定,默认 `doc`** ——这不是同一想法的两种写法,而是**两个不同
   的优化对象**,详见 §2.5。

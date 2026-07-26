@@ -96,7 +96,7 @@ A3 完全可能因 RL 与 SFT 梯度冲突而失败,而 A1 或 A2 单独成功�
 | 5 | `sft/loss` | 有限 | NaN/inf 立即停并回报。**`doc` 前缀下开局就低、几乎不降是预期**——expert 轨迹本就采自 `policy(·│doc)`,只对成功轨迹做 CE 是 filtered BC,teacher 自走成功率越高(实测 87.5%)可转移的概率质量越少。**若确认弱到接近 no-op,那是"该走二期(从 student 错误前缀出发、带 doc、成功恢复的轨迹)"的信号**,不是 bug |
 | 5b | guided 成功率 vs bare 成功率的差 | 不应被 SFT 拉大 | teacher 与 student 是同一组权重,SFT(doc) 存在"有 doc 就照做、没 doc 就摆烂"的失败模式:**guided 涨而 bare 不涨**即是它 |
 | 6 | `critic/score/mean` | **不因开臂而跳变** | 跳变说明 expert 行漏进了行为指标(隔离-3 失效),此时曲线不可信 |
-| 7 | `actor/pg_loss`、advantage 分布、clip 率 | 有值 | **低成功率早期组内全败 ⇒ advantage=0 ⇒ RL 信号稀疏,这是预期不是 bug** |
+| 7 | `rl/pg_loss`、`rl/nonzero_advantage_frac` | 有值;后者 ≈ 0.34 @ 5% 成功率 | **组内全败或全成功 ⇒ advantage 恒 0 ⇒ 该组无 RL 梯度,这是预期不是 bug**。`nonzero_advantage_frac` 就是直接量:成功率 5% 时约 34% 的组带梯度,50% 时约 99% ⇒ **RL 的有效强度会随训练自动长大约 3 倍**(隐式 curriculum)。注:metric 前缀是 `rl/` 而非 `actor/`——RL 项不走上游 `ppo_loss`(设计文档 §2.6);`pg_clipfrac` 恒 ≈ 0 是预期(每步一次 optimizer step ⇒ ratio ≡ 1),该指标无信息量 |
 | 8 | 显微镜 `mask_mismatch` | 仍为 **0** | 非 0 说明隔离-4 失效,分析链路会读到脏数据 |
 
 ## 4. 会变化的运行形态(别当成故障)

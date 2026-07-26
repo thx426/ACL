@@ -128,6 +128,24 @@ def test_padding_template_shrinks_the_sft_mask_with_the_sequence():
     assert "does not match the response layout" in _read("trainer/distillation/losses.py")
 
 
+def test_rl_arm_shares_the_opd_normalisation():
+    # 6de6693: ppo_loss refills global_batch_info from the batch, so its PG term
+    # normalises over the global token count while the OPD term is pinned to the
+    # per-micro-batch mean. Those differ by the micro-batch count (~60 here), so
+    # mix_rl_weight=1.0 would really have been OPD:RL of 60:1. The RL term must
+    # therefore go through task_reward_pg, not ppo_loss.
+    src = _read("trainer/distillation/losses.py")
+    assert "def task_reward_pg" in src
+    assert "policy_loss, policy_metrics = task_reward_pg(config, model_output, data)" in src
+    # ...and inside the cleared-snapshot block, i.e. the same convention as OPD.
+    block = src[src.index("if rl_loss_coef > 0.0:"):src.index("def task_reward_pg")]
+    assert "config.global_batch_info.clear()" in block
+    assert "task_reward_pg(" in block
+    # The share of the batch actually carrying an RL gradient is measured, not
+    # assumed: with a binary reward most groups are all-success or all-failure.
+    assert "rl/nonzero_advantage_frac" in src
+
+
 def test_microscope_skips_rows_with_no_distillation():
     # 93a0109: an all-zero mask row (expert sample, or a prompt the hang guard
     # cancelled) would make the offline span-vs-mask integrity check misfire.
