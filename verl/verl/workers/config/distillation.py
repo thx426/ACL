@@ -61,6 +61,12 @@ class DistillationLossConfig(BaseConfig):
         Upper bound for PPO clipping ratio.
     loss_settings (DistillationLossSettings, optional):
         Runtime-populated settings based on loss_mode. Not set by user.
+    opd_loss_coef (float):
+        trace-opd mixed objective: weight of the distillation term. 1.0 (default)
+        is the historical behaviour. Note that with the other arms off this is a
+        plain multiplier on the loss, i.e. on the effective learning rate — the
+        pure-OPD baseline was established at 1.0. 0 drops the term entirely,
+        which is the arm that asks whether OPD still contributes at all.
     rl_loss_coef (float):
         trace-opd mixed objective: weight of the task-reward policy-gradient term.
         0 disables it (default) and keeps the pure-distillation behaviour.
@@ -94,19 +100,24 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
-    # trace-opd mixed objective (docs/mixed-objective-design.md). The total loss
-    # becomes
-    #     distillation_loss_coef * OPD  +  rl_loss_coef * RL  +  sft_loss_coef * SFT
-    # where RL is the task-reward policy gradient (GRPO advantages, same
-    # ``ppo_loss`` upstream uses for ``use_task_rewards``) and SFT is a token-level
-    # cross-entropy over expert tokens selected by the ``sft_mask`` field (rows
-    # produced by rolling out WITH the privileged document and replayed under the
-    # bare prompt). All three terms share the ``token-mean`` aggregation and the
-    # same global ``batch_num_tokens`` denominator, so the coefficients are
-    # directly comparable per token.
+    # trace-opd mixed objective (docs/mixed-objective-design.md):
+    #     opd_loss_coef * OPD  +  rl_loss_coef * RL  +  sft_loss_coef * SFT
+    # RL is the task-reward policy gradient over the same GRPO advantages
+    # upstream's use_task_rewards path uses; SFT is a token-level cross-entropy
+    # over the expert tokens marked by ``sft_mask`` (rollouts produced WITH the
+    # privileged document).
     #
-    # Both default to 0.0, which is byte-identical to the pure-distillation path:
-    # nothing below activates and no extra field is required from the rollout.
+    # All three are aggregated the same way — a per-MICRO-BATCH token mean, which
+    # is what the pure-OPD path has always done (only ppo_loss ever fills
+    # global_batch_info, and pure distillation never calls it). That convention
+    # accumulates to N x mean over the N micro-batches of a gradient-accumulation
+    # step where a global mean accumulates to 1 x mean, so mixing the two
+    # conventions across terms costs a factor of N (~60 at this run's shapes).
+    # Hence the RL term does not go through ppo_loss; see task_reward_pg.
+    #
+    # RL and SFT default to 0.0 and OPD to 1.0, which is the pure-distillation
+    # path unchanged: nothing extra activates, and the rollout ships no extra field.
+    opd_loss_coef: float = 1.0
     rl_loss_coef: float = 0.0
     sft_loss_coef: float = 0.0
 
@@ -148,10 +159,16 @@ class DistillationLossConfig(BaseConfig):
 
         # trace-opd mixed objective: a negative or non-finite coefficient flips or
         # blows up the corresponding term silently, so reject it at config time.
-        for name in ("rl_loss_coef", "sft_loss_coef"):
+        for name in ("opd_loss_coef", "rl_loss_coef", "sft_loss_coef"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0 (0 disables the term), got {value}")
+
+        if not (self.opd_loss_coef or self.rl_loss_coef or self.sft_loss_coef):
+            raise ValueError(
+                "opd_loss_coef, rl_loss_coef and sft_loss_coef are all zero — there is no "
+                "objective left to optimise"
+            )
 
         if self.rl_loss_coef > 0.0 and self.use_task_rewards:
             raise ValueError(

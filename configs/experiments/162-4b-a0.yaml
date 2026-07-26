@@ -272,6 +272,14 @@ train:
   #   --set train.mix_rl_weight=1.0 --set train.mix_sft_weight=0.5
   # 覆盖走与本文件相同的校验,并记入 launch manifest 的 config_overrides;
   # 启动脚本不会 sed 改写这三个键(它只派生机器相关的部署项)。
+  mix_opd_weight: 1.0       # OPD 项系数。**两臂全关时它就是 loss 的整体缩放,也就是
+                            # 有效学习率的乘数**——纯 OPD 基线(4B step-9 起飞)是在 1.0
+                            # 上建立的,改它等于改基线。0 = 去掉 OPD 项 = A5 臂
+                            # (回答"OPD 在弱模型上还有没有净贡献")。
+                            # ⚠ 三项聚合口径都是「每微批 token 平均」——见设计文档 §2.6:
+                            # 它在 N 个微批上累加成 N×mean(全局平均则是 1×mean),所以
+                            # 现行 lr=1e-6 的**有效值约为 1e-6×N ≈ 6e-5**,且 N 随序列
+                            # 长度变化 ⇒ 有效 lr 会随训练漂移。改口径需连带调 lr 并重跑基线。
   mix_rl_weight: 0.0        # GRPO(轨迹 won 为 reward,组内标准化)权重
   mix_sft_weight: 0.0       # 专家轨迹 CE 权重;>0 时需 research.enabled
   mix_sft_rollouts: 4       # 每任务额外带文档 rollout 数(verl rollout.n 自动

@@ -328,6 +328,7 @@ train:
   train_file: /t.parquet
   val_files: [/v1.parquet]
   n_gpus: 2
+  mix_opd_weight: 1.0
   mix_rl_weight: 0.0
   mix_sft_weight: 0.0
   mix_sft_rollouts: 4
@@ -426,3 +427,38 @@ def test_shipped_experiment_configs_load_and_stay_in_step():
     for experiment in sorted((configs / "experiments").glob("*.yaml")):
         load_config(experiment)
         assert template_drift(experiment, template)["extra"] == [], experiment
+
+
+def test_opd_weight_is_explicit_and_zero_is_an_arm(tmp_path):
+    """Every term carries its own weight, so the arms read symmetrically. OPD at 0
+    is the arm that asks whether OPD contributes at all on a weak model — with it
+    pinned at 1 in every arm, nothing tested that."""
+    from trace_opd.common.config import load_config, objective_fingerprint
+
+    cfg = load_config(_write(tmp_path, "t.yaml", _TEMPLATE_YAML))
+    assert cfg.train.mix_opd_weight == 1.0
+
+    a5 = load_config(
+        _write(tmp_path / "a5", "t.yaml", _TEMPLATE_YAML),
+        overrides=["train.mix_opd_weight=0", "train.mix_rl_weight=1.0",
+                   "train.mix_sft_weight=0.5"],
+    )
+    assert a5.train.mix_opd_weight == 0.0
+    # It changes what is optimised, so it separates the arms for resume purposes.
+    assert objective_fingerprint(a5) != objective_fingerprint(cfg)
+
+
+def test_config_rejects_an_empty_objective(tmp_path):
+    """All three at zero is not an ablation, it is a run that optimises nothing."""
+    from trace_opd.common.config import load_config
+
+    with pytest.raises(ValueError, match="no objective left"):
+        load_config(_write(tmp_path, "t.yaml", _TEMPLATE_YAML), overrides=["train.mix_opd_weight=0"])
+
+
+def test_launcher_forwards_all_three_weights(tmp_path):
+    cfg, module = _load(tmp_path, ", mix_opd_weight: 0.01, mix_rl_weight: 1.0")
+    cmd = module.build_command(cfg, tmp_path / "run")
+    assert "+distillation.distillation_loss.opd_loss_coef=0.01" in cmd
+    assert "+distillation.distillation_loss.rl_loss_coef=1.0" in cmd
+    assert "+distillation.distillation_loss.sft_loss_coef=0.0" in cmd

@@ -81,8 +81,17 @@ LUFFY = off-policy expert trace 与 on-policy rollout 同组 Mixed-Policy GRPO(�
 ## 2. 目标函数(规范形)
 
 ```
-L_total = w_opd · L_OPD + w_rl · L_RL + w_sft · L_SFT
+L_total = mix_opd_weight · L_OPD + mix_rl_weight · L_RL + mix_sft_weight · L_SFT
+                  (默认 1.0)              (默认 0)               (默认 0)
 ```
+
+三项各有显式系数,消融读法对称;**三项也必须在同一归一化口径下求值**,否则系数不是权重
+(§2.6 记了一次代价为微批数的教训)。校验拦住"三项全 0"(那不是消融,是不优化任何东西)。
+
+**`mix_opd_weight` 的两个含义**:①两臂全关时它就是 loss 的整体缩放,**也就是有效学习率的
+乘数**——纯 OPD 基线(4B step-9 起飞)是在 1.0 上建立的,改它等于改基线;②`0` 是一个真实的
+消融臂(A5:RL+SFT 无 OPD),回答"OPD 在弱模型上还有没有净贡献"——在它被钉死为 1 的时候,
+**没有任何一个臂在检验这件事**。
 
 - **L_OPD**(现状,不动):forward_kl_topk(top-64)+ 硬 clamp(10)+ SUM 聚合。
   `w_opd=1, w_rl=0, w_sft=0` 时**不产生任何额外目标计算,训练数学语义与改动前相同**

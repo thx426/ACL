@@ -248,6 +248,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "distillation.distillation_loss.loss_max_clamp=10.0",
         "distillation.distillation_loss.log_prob_min_clamp=-10.0",
         # Mixed objective (docs/mixed-objective-design.md). 0/0 = pure OPD.
+        f"+distillation.distillation_loss.opd_loss_coef={t.mix_opd_weight}",
         f"+distillation.distillation_loss.rl_loss_coef={t.mix_rl_weight}",
         f"+distillation.distillation_loss.sft_loss_coef={t.mix_sft_weight}",
     ]

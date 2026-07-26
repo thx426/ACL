@@ -271,9 +271,14 @@ def distillation_ppo_loss(
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
+    # Upstream's distillation_loss_coef is forced to 1 unless use_task_rewards is
+    # on, because under pure distillation an overall scale is meaningless. In the
+    # mixed objective it is not meaningless, so trace-opd carries its own
+    # explicit weight on top — 1.0 by default, which leaves both behaviours
+    # unchanged. All three arms then read the same way: a weight per term.
     distillation_loss_coef = (
         distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
-    )
+    ) * float(getattr(distillation_loss_config, "opd_loss_coef", 1.0))
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
 

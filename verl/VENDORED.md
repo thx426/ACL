@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(6c4e090)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(e8ecd43)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -42,6 +42,8 @@
 | f27eb65 | trace-opd:混合目标的两处归一化定正——①`config.global_batch_info` 只由 `ppo_loss` 写入,而纯 OPD 路径从不调它 ⇒ 现行 OPD 一直是「每微批 token 平均」;开 RL 臂后该 config 跨微批存活,使 OPD 从第二个微批起静默换成全局分母(尺度跳 ~微批数×dp_size)且**只发生在开 RL 的臂** ⇒ 消融失效。现 OPD 项在 `rl_loss_coef>0` 时对清空后的快照求值,各臂钉死纯 OPD 口径。②SFT 项改为自算「每微批 expert token 平均」(clamp 分母)——同族口径使 `sft_loss_coef` 跨臂含义一致,且规避 `agg_loss` token-mean 在「该微批无 expert token」时的 0/0 → NaN |
 | c7c2194 | trace-opd:混合目标的三处收口——①`construct_minimal_padding_template` 会 clone 源行**全部**字段再覆盖一份固定清单,`sft_mask` 不在其中 ⇒ 合成的 padding 行带着**别的行的全长 mask**(很可能是真专家行的),而其 responses 已截到 1 token ⇒ SFT loss 形状崩溃,或(宽度恰好相同时)**静默虚增 `sft/expert_tokens`**——正是判定该臂是否生效的指标。现按需收缩(字段存在才改,SFT 关时不凭空造字段);`sft_ce_loss` 另加形状断言,任何未来"合成整行"的路径都会 fail loud 而非错数。②TQ 侧 mask 切分原为无条件执行,SFT 关时仍每行分配零 `sft_mask` 并入 TQ(每 step 数十 MB 纯浪费)⇒ 改由 `sample_role` 标记 gate(trace agent loop 仅在该臂开启时给所有行盖章)⇒ **关臂即零开销**。③`global_batch_info` 快照仅在 RL 臂开启时执行 |
 | 6c4e090 | trace-opd:**全 expert 微批的 OPD 除零**(外部审阅发现)——expert 行 `response_mask` 全零,而均衡分区器按 workload 分微批、不看 role ⇒ 「整个微批都是 expert 行」可达;此时 `agg_loss` 的 token-mean 分母 = `loss_mask.sum()` = 0(纯 OPD 路径下 `global_batch_info` 恒为空,只有 `ppo_loss` 会填它)⇒ NaN 进 backward 毒化更新。改为传入 clamp 后的计数:mask 非空时分母**完全不变**(各臂 loss 尺度不动),全空时该微批贡献恰为 0。SFT 项此前已自行处理空批,蒸馏项没有 |
+| 6de6693 | trace-opd:**RL 项与 OPD 项同归一化口径**——`ppo_loss` 会从 data 重填 `global_batch_info` ⇒ 其 PG 项按**全局** token 归一,而 OPD 项被钉在**每微批** token 平均(A0 历史口径)。两者的差是**微批数**:每微批平均在 N 个微批上累加成 N×mean,全局平均累加成 1×mean,本 run 形状下 N≈60(已数值验算)⇒ 名义 `mix_rl_weight=1.0` 实为 OPD:RL≈60:1,消融会报出"RL 没用"这个**算术假象**。注:**上游不是缺陷**(`use_task_rewards` 下两项都全局、自洽),不自洽是我们钉 OPD 口径造成的。故 RL 项改走新 `task_reward_pg`(同一 `policy_loss_fn`、同一批 GRPO advantage,但在调用方口径下求值),并顺带不再把 entropy/ref-KL 正则折进被 RL 系数缩放的标量。新增 `rl/nonzero_advantage_frac`(二元 reward 下组内全成功/全失败则 advantage 恒 0,低成功率时多数组如此 ⇒ RL 有效强度随成功率自动长大,直接测而非推断) |
+| e8ecd43 | trace-opd:蒸馏项获得显式系数 `opd_loss_coef`(默认 1.0)。上游 `distillation_loss_coef` 仅在 `use_task_rewards` 时生效(纯蒸馏下整体缩放无意义故被强制 1),混合目标里它有意义了 ⇒ 三臂读法对称,且 **0 成为一个真实的消融臂**(A5:RL+SFT 无 OPD,回答"OPD 在弱模型上还有没有净贡献"——此前它被钉死为 1,没有任何臂在检验这件事)。config 校验拦住"三项全 0"。同时更正了那段声称"三项共用全局 `batch_num_tokens`"的注释——实际共用的是每微批 token 平均 |
 
 ## 修改/更新流程(保持单一真源)
 

@@ -185,6 +185,11 @@ class TrainCfg:
     # student 错误前缀下失去文档语义抓地力,KL 信号起不来,故给 RL 锚(真实
     # reward 的 GRPO)与 SFT 锚(特权文档 rollout 的成功轨迹)。三项同 token 口径,
     # 权重可直接互比;也是正式的消融开关(A0/A1/A2/A3 臂,见设计文档 §6)。
+    mix_opd_weight: float = 1.0        # OPD 项自己的系数。**两臂全关时它就是 loss 的
+                                      # 整体缩放,也就是有效学习率的乘数**——纯 OPD 基线
+                                      # 是在 1.0 上建立的(4B step-9 起飞),改它等于改基线。
+                                      # 0 = 完全去掉 OPD 项,即"OPD 在弱模型上还有没有净
+                                      # 贡献"那个消融臂(A5)。
     mix_rl_weight: float = 0.0
     mix_sft_weight: float = 0.0
     mix_sft_rollouts: int = 4         # 每任务额外的带文档 rollout 数(仅
@@ -329,6 +334,7 @@ def _validate(cfg: "Config") -> None:
     import math as _math
 
     for _name, _value in (
+        ("mix_opd_weight", cfg.train.mix_opd_weight),
         ("mix_rl_weight", cfg.train.mix_rl_weight),
         ("mix_sft_weight", cfg.train.mix_sft_weight),
     ):
@@ -337,6 +343,11 @@ def _validate(cfg: "Config") -> None:
     if cfg.train.mix_sft_rollouts < 0:
         problems.append(
             f"train.mix_sft_rollouts={cfg.train.mix_sft_rollouts} must be >= 0"
+        )
+    if not (cfg.train.mix_opd_weight or cfg.train.mix_rl_weight or cfg.train.mix_sft_weight):
+        problems.append(
+            "train.mix_opd_weight / mix_rl_weight / mix_sft_weight are all 0 — "
+            "there is no objective left to optimise"
         )
     if cfg.train.mix_sft_prefix not in ("doc", "bare"):
         problems.append(
@@ -560,7 +571,8 @@ def objective_fingerprint(cfg: "Config") -> str:
     t = cfg.train
     material = "|".join(
         str(x) for x in (
-            t.model_path, t.mix_rl_weight, t.mix_sft_weight, t.mix_sft_rollouts,
+            t.model_path, t.mix_opd_weight, t.mix_rl_weight, t.mix_sft_weight,
+            t.mix_sft_rollouts,
             t.mix_sft_prefix,
             t.rollout_n, t.train_batch_size, t.distill_topk, t.lr,
             t.teacher_scoring_backend, cfg.research.enabled,
