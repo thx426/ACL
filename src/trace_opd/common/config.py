@@ -481,43 +481,58 @@ def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any
     return data
 
 
-def merge_profile(base: dict[str, Any], overlay: dict[str, Any], source: str = "profile") -> dict[str, Any]:
-    """Deep-merge an experiment profile onto the default template.
+def template_drift(config_path: str | Path, template_path: str | Path) -> dict[str, list[str]]:
+    """Compare an experiment's config against the mechanism's template.
 
-    ``configs/trace.yaml`` is the mechanism's default template: every key, with
-    its recommended value and the reasoning behind it, evolving as the mechanism
-    does. A concrete experiment derives from it with a profile that states ONLY
-    what differs — the machine's GPU topology, an ablation arm, a smoke run's
-    step count. The template keeps improving underneath every profile, and a
-    profile stays short enough to read as a description of the experiment.
+    Each experiment owns a COMPLETE copy of the template — not a diff against it.
+    A run's config is then self-contained: readable on its own months later,
+    diffable against any other experiment, and immune to a template edit
+    silently changing what a finished experiment meant.
 
-    A key the template does not define is an error rather than a new setting:
-    that is what turns a typo, or a key the mechanism has since renamed, into a
-    startup failure instead of a value nothing reads. (The ``roles`` section is
-    the exception — a profile may introduce a role the template does not list.)
+    The cost of copies is drift, so the template earns its keep by being the one
+    place a mechanism change is made and the reference every copy is checked
+    against. This reports both directions:
+
+      missing — the template has keys this experiment does not. The mechanism
+                grew a setting after the copy was taken; the run falls back to
+                the code's default, which may not be the template's recommended
+                value. Surfaced at launch, never silent.
+      extra   — this experiment has keys the template does not. Usually a
+                setting the mechanism removed and the copy still carries.
+                (An outright typo is already rejected by the dataclass loader.)
     """
-    merged = dict(base)
-    for key, value in overlay.items():
-        if key not in base:
-            raise ValueError(
-                f"{source}: key {key!r} is not defined in the config template — "
-                "a profile states differences from the template, it cannot invent settings"
-            )
-        if isinstance(value, dict) and isinstance(base[key], dict):
-            nested = f"{source}.{key}"
-            if key == "roles":
-                # A profile may add a role; within a role the template rules.
-                merged[key] = dict(base[key])
-                for role, role_cfg in value.items():
-                    if role in base[key] and isinstance(role_cfg, dict) and isinstance(base[key][role], dict):
-                        merged[key][role] = merge_profile(base[key][role], role_cfg, f"{nested}.{role}")
-                    else:
-                        merged[key][role] = role_cfg
+    def flat(data: Any, prefix: str = "") -> set[str]:
+        keys: set[str] = set()
+        if not isinstance(data, dict):
+            return keys
+        for key, value in data.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                keys |= flat(value, path)
             else:
-                merged[key] = merge_profile(base[key], value, nested)
-        else:
-            merged[key] = value
-    return merged
+                keys.add(path)
+        return keys
+
+    experiment = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    template = yaml.safe_load(Path(template_path).read_text(encoding="utf-8")) or {}
+    exp_keys, tpl_keys = flat(experiment), flat(template)
+    # Role names are the experiment's business (a run may serve roles the
+    # template does not list); compare the SHAPE of a role, not which roles exist.
+    def role_shape(keys: set[str]) -> set[str]:
+        out = set()
+        for key in keys:
+            parts = key.split(".")
+            if parts[0] == "roles" and len(parts) >= 3:
+                out.add("roles.*." + ".".join(parts[2:]))
+            else:
+                out.add(key)
+        return out
+
+    exp_keys, tpl_keys = role_shape(exp_keys), role_shape(tpl_keys)
+    return {
+        "missing": sorted(tpl_keys - exp_keys),
+        "extra": sorted(exp_keys - tpl_keys),
+    }
 
 
 def objective_fingerprint(cfg: "Config") -> str:
@@ -540,16 +555,9 @@ def objective_fingerprint(cfg: "Config") -> str:
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
 
-def load_config(
-    path: str | Path,
-    overrides: list[str] | None = None,
-    profiles: list[str | Path] | None = None,
-) -> Config:
+def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     data = _expand(raw)
-    for profile in profiles or []:
-        overlay = _expand(yaml.safe_load(Path(profile).read_text(encoding="utf-8")) or {})
-        data = merge_profile(data, overlay, source=str(profile))
     if overrides:
         data = apply_overrides(data, overrides)
     unknown = set(data) - _KNOWN_SECTIONS

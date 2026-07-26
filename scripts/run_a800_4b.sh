@@ -72,17 +72,20 @@ for p in 18888 18889; do
   [[ "$code" == "200" ]] && say "researcher 端点 $p OK" || { echo "FATAL 端点 $p 不通($code)"; exit 1; }
 done
 
-# ---- 配置:模板 + 机器 profile(不再 sed 派生)----
-# 机器差异全部写在 configs/profiles/machine-a800.yaml(卡数/并行/显存/端点/拓扑),
-# 硬约束一与二的完整说明也在那里。启动脚本不再改写配置——sed 派生曾无条件覆盖
-# yaml 里的值,谁在配置文件里设了什么都会被悄悄改回默认(MIX_RL、TOKLEN 两次同型事故)。
-# 消融臂用臂 profile 或 --set,并务必配不同的 --run-name(臂进 objective fingerprint,
-# 同名 resume 会被 launcher 拦下):
-#   bash scripts/run_a800_4b.sh --profile $T/configs/profiles/arm-a3-mixed.yaml \
-#        --run-name trace_opd_4b_a3
-CONFIG=$T/configs/trace.yaml
-PROFILE=$T/configs/profiles/machine-a800.yaml
-say "配置: 模板 $CONFIG + profile $PROFILE(解析后写入 <run_dir>/effective_config.yaml)"
+# ---- 配置:本实验自己的一份完整配置(不再 sed 派生)----
+# 每个实验在 configs/experiments/ 下有一份【完整副本】(由 config_tool new 从
+# configs/trace.yaml 模板复制),它就是这个实验的全部定义:自足、可单独阅读、
+# 可与其他实验直接 diff,模板日后怎么改都不会追溯性地改变它。
+# 启动脚本不再改写配置——sed 派生曾无条件覆盖 yaml 里的值,谁在配置文件里设了什么
+# 都会被悄悄改回默认(MIX_RL、TOKLEN 两次同型事故)。
+#   新建:  python -m trace_opd.tools.config_tool new a800-4b-a3
+#   看漂移:python -m trace_opd.tools.config_tool diff a800-4b-a3
+# 换实验就换 CONFIG_NAME;不同臂务必配不同的 run.name(臂进 objective fingerprint,
+# 同名 resume 会被 launcher 拦下)。
+CONFIG_NAME=${CONFIG_NAME:-a800-4b-a0}
+CONFIG=$T/configs/experiments/${CONFIG_NAME}.yaml
+[[ -f "$CONFIG" ]] || { echo "FATAL 实验配置不存在: $CONFIG(先 config_tool new $CONFIG_NAME)"; exit 1; }
+say "配置: $CONFIG(解析后写入 <run_dir>/effective_config.yaml,所有进程读它)"
 
 # ---- 单卡显存:optimizer 状态 offload 到 CPU(468G RAM) ----
 # 单卡不再有 FSDP 4 路分片:模型状态从 12GB/卡 涨到 48GB,不 offload 必 OOM
@@ -111,6 +114,6 @@ mkdir -p $W/logs
 say "启动 → $LOG"
 cd $T
 # "$@" 透传给 launcher:--set section.key=value(配置覆盖,可重复)与 verl override 都走这里
-nohup $PY $T/scripts/launch_train.py --config "$CONFIG" --profile "$PROFILE" \
+nohup $PY $T/scripts/launch_train.py --config "$CONFIG" \
       --run-name "$RUN_NAME" $EXTRA_OVERRIDES "$@" > "$LOG" 2>&1 &
 echo "PID=$! LOG=$LOG"

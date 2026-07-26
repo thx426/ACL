@@ -274,11 +274,11 @@ def test_override_refuses_to_descend_into_a_non_mapping(tmp_path):
         apply_overrides({"train": {"lr": 1e-6}}, ["train.lr.nested=1"])
 
 
-# --------------------------------------------- config template + profiles
+# ------------------------------------- config template + experiment copies
 
 
-# A template must declare every key a profile may set — that is what makes an
-# undeclared key a typo rather than a new setting.
+# A template must declare every key an experiment config may carry — that is
+# what makes an undeclared key a typo rather than a new setting.
 _TEMPLATE_YAML = """
 run: {name: t, runs_root: runs, tape: false}
 research: {enabled: true}
@@ -299,91 +299,93 @@ eval: {}
 """
 
 
-def _write_template(tmp_path, name="template.yaml"):
+def _write(tmp_path, name, body):
     from pathlib import Path
 
     root = Path(tmp_path)
     root.mkdir(parents=True, exist_ok=True)
-    template = root / name
-    template.write_text(_TEMPLATE_YAML)
-    return template
+    path = root / name
+    path.write_text(body)
+    return path
 
 
-def _template_and_profile(tmp_path, profile_body):
-    from pathlib import Path
+def test_experiment_config_is_a_complete_copy_not_a_diff(tmp_path):
+    """An experiment owns the whole file. It reads on its own months later, and a
+    later template edit cannot retroactively change what it meant."""
+    from trace_opd.common.config import load_config, template_drift
 
-    from trace_opd.common.config import load_config
-
-    template = _write_template(tmp_path)
-    profile = Path(tmp_path) / "profile.yaml"
-    profile.write_text(profile_body)
-    return load_config(template, profiles=[profile])
-
-
-def test_profile_states_only_the_difference(tmp_path):
-    """The template carries the mechanism's defaults; a profile says what this
-    experiment changes. Everything it does not mention keeps following the
-    template, which is how a default improved in the mechanism reaches every
-    existing experiment without editing them."""
-    cfg = _template_and_profile(tmp_path, "train:\n  mix_sft_weight: 0.5\n")
-    assert cfg.train.mix_sft_weight == 0.5
-    assert cfg.train.mix_rl_weight == 0.0          # untouched
-    assert cfg.train.teacher_scoring_backend == "fsdp"  # still the template's
-
-
-def test_profile_cannot_invent_a_setting(tmp_path):
-    """A key the template does not define is a typo or a setting the mechanism
-    has since renamed — either way it must fail at startup, not become a value
-    nothing reads."""
-    with pytest.raises(ValueError, match="not defined in the config template"):
-        _template_and_profile(tmp_path, "train:\n  mix_sft_wieght: 0.5\n")
-
-
-def test_profiles_apply_in_order_and_set_wins(tmp_path):
-    from pathlib import Path
-
-    from trace_opd.common.config import load_config
-
-    template = _write_template(tmp_path, "t.yaml")
-    root = Path(tmp_path)
-    first = root / "a.yaml"
-    first.write_text("train:\n  mix_rl_weight: 1.0\n  mix_sft_weight: 0.25\n")
-    second = root / "b.yaml"
-    second.write_text("train:\n  mix_sft_weight: 0.5\n")
-    cfg = load_config(
-        template, profiles=[first, second], overrides=["train.mix_rl_weight=2.0"]
+    template = _write(tmp_path, "template.yaml", _TEMPLATE_YAML)
+    experiment = _write(
+        tmp_path, "exp.yaml", _TEMPLATE_YAML.replace("mix_sft_weight: 0.0", "mix_sft_weight: 0.5")
     )
-    assert cfg.train.mix_sft_weight == 0.5   # later profile wins
-    assert cfg.train.mix_rl_weight == 2.0    # --set beats every profile
+    cfg = load_config(experiment)
+    assert cfg.train.mix_sft_weight == 0.5
+    assert cfg.train.mix_rl_weight == 0.0
+    assert template_drift(experiment, template) == {"missing": [], "extra": []}
+
+    # Editing the template afterwards does not reach the experiment...
+    template.write_text(_TEMPLATE_YAML.replace("mix_rl_weight: 0.0", "mix_rl_weight: 1.0"))
+    assert load_config(experiment).train.mix_rl_weight == 0.0
+    # ...and the values themselves are not what drift tracks — only the key set.
+    assert template_drift(experiment, template) == {"missing": [], "extra": []}
+
+
+def test_drift_reports_what_the_template_grew_and_what_the_copy_kept(tmp_path):
+    """The cost of copies is drift, so it has to be visible at launch rather than
+    discovered as a run quietly using a code default."""
+    from trace_opd.common.config import template_drift
+
+    template = _write(tmp_path, "template.yaml", _TEMPLATE_YAML)
+    behind = _write(
+        tmp_path, "behind.yaml", _TEMPLATE_YAML.replace("  teacher_scoring_backend: fsdp\n", "")
+    )
+    assert template_drift(behind, template)["missing"] == ["train.teacher_scoring_backend"]
+
+    stale = _write(tmp_path, "stale.yaml", _TEMPLATE_YAML.replace(
+        "  mix_sft_rollouts: 4", "  mix_sft_rollouts: 4\n  distill_block_turns: 4"))
+    assert template_drift(stale, template)["extra"] == ["train.distill_block_turns"]
+
+
+def test_drift_compares_the_shape_of_a_role_not_which_roles_exist(tmp_path):
+    """Which roles a run serves is its own business; whether a role carries the
+    settings the mechanism expects is not."""
+    from trace_opd.common.config import template_drift
+
+    template = _write(tmp_path, "template.yaml", _TEMPLATE_YAML)
+    extra_role = _write(tmp_path, "exp.yaml", _TEMPLATE_YAML.replace(
+        '  researcher: {endpoint: "http://x:1/v1", model: m}',
+        '  researcher: {endpoint: "http://x:1/v1", model: m}\n'
+        '  narrator_external: {endpoint: "http://y:2/v1", model: n}'))
+    assert template_drift(extra_role, template) == {"missing": [], "extra": []}
 
 
 def test_objective_fingerprint_separates_the_arms(tmp_path):
     """Arms share a default run name, so resuming the wrong one is a forgotten
     flag away. The fingerprint is what the launcher refuses on."""
-    from trace_opd.common.config import objective_fingerprint
+    from trace_opd.common.config import load_config, objective_fingerprint
 
-    a0 = _template_and_profile(tmp_path / "a0", "train:\n  mix_rl_weight: 0.0\n")
-    a3 = _template_and_profile(tmp_path / "a3", "train:\n  mix_rl_weight: 1.0\n")
-    same = _template_and_profile(tmp_path / "same", "train:\n  mix_rl_weight: 0.0\n")
-    assert objective_fingerprint(a0) != objective_fingerprint(a3)
-    assert objective_fingerprint(a0) == objective_fingerprint(same)
+    def arm(name, body):
+        return objective_fingerprint(load_config(_write(tmp_path / name, "c.yaml", body)))
+
+    a0 = arm("a0", _TEMPLATE_YAML)
+    a3 = arm("a3", _TEMPLATE_YAML.replace("mix_rl_weight: 0.0", "mix_rl_weight: 1.0"))
+    same = arm("same", _TEMPLATE_YAML)
+    assert a0 != a3
+    assert a0 == same
     # A machine-only difference must NOT change it: resuming on other hardware
     # is legitimate, resuming under another objective is not.
-    other_machine = _template_and_profile(tmp_path / "m", "train:\n  n_gpus: 8\n")
-    assert objective_fingerprint(other_machine) == objective_fingerprint(
-        _template_and_profile(tmp_path / "m2", "train:\n  n_gpus: 2\n")
-    )
+    assert arm("m8", _TEMPLATE_YAML.replace("n_gpus: 2", "n_gpus: 8")) == a0
 
 
-def test_repo_profiles_all_derive_cleanly():
-    """The shipped profiles must actually apply to the shipped template —
-    otherwise the first person to use one finds out at launch time."""
+def test_shipped_experiment_configs_load_and_stay_in_step():
+    """The configs in the repo must actually load against the current schema and
+    not have fallen behind the template."""
     from pathlib import Path
 
-    from trace_opd.common.config import load_config
+    from trace_opd.common.config import load_config, template_drift
 
-    root = Path(__file__).resolve().parents[1] / "configs"
-    template = root / "trace.yaml"
-    for profile in sorted((root / "profiles").glob("*.yaml")):
-        cfg = load_config(template, profiles=[profile])
-        assert cfg.train.model_path is not None, profile
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    template = configs / "trace.yaml"
+    for experiment in sorted((configs / "experiments").glob("*.yaml")):
+        load_config(experiment)
+        assert template_drift(experiment, template)["extra"] == [], experiment

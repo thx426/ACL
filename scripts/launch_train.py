@@ -46,6 +46,7 @@ from trace_opd.common.config import (  # noqa: E402
     Config,
     load_config,
     objective_fingerprint,
+    template_drift,
 )
 
 
@@ -260,11 +261,6 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument(
-        "--profile", dest="profiles", action="append", default=[], metavar="FILE",
-        help="derive this run from the config template with a profile stating only "
-             "what differs (repeatable, applied in order). See configs/profiles/.",
-    )
-    parser.add_argument(
         "--set", dest="overrides", action="append", default=[], metavar="section.key=value",
         help="override a config setting for this run, e.g. "
              "--set train.mix_rl_weight=1.0 (repeatable, applied after profiles). "
@@ -275,10 +271,19 @@ def main() -> int:
     if not args.config:
         raise SystemExit("--config (or TRACE_CONFIG) is required")
     config_path = Path(args.config).resolve()
-    profiles = [Path(p).resolve() for p in args.profiles]
-    cfg = load_config(config_path, overrides=args.overrides, profiles=profiles)
-    for profile in profiles:
-        print(f"[launch] profile: {profile}")
+    cfg = load_config(config_path, overrides=args.overrides)
+    # Each experiment owns a complete copy of the template, so a copy can fall
+    # behind a mechanism change. Say so at launch: a key the template grew after
+    # this copy was taken silently falls back to the code default, which is not
+    # necessarily the value the template recommends.
+    template_path = REPO / "trace_opd" / "configs" / "trace.yaml"
+    if config_path != template_path and template_path.exists():
+        drift = template_drift(config_path, template_path)
+        for key in drift["missing"]:
+            print(f"[launch] NOTE config is behind the template: {key} is missing "
+                  "(falling back to the code default)")
+        for key in drift["extra"]:
+            print(f"[launch] NOTE config has {key}, which the template does not")
     if args.overrides:
         print(f"[launch] config overrides: {' '.join(args.overrides)}")
     if args.run_name:
@@ -306,8 +311,7 @@ def main() -> int:
     header = (
         "# RESOLVED CONFIG — written by launch_train.py, read by every worker.\n"
         "# Do not edit: it is regenerated at each launch from\n"
-        f"#   template : {config_path}\n"
-        + "".join(f"#   profile  : {p}\n" for p in profiles)
+        f"#   config   : {config_path}\n"
         + "".join(f"#   --set    : {o}\n" for o in args.overrides)
         + f"# objective fingerprint: {fingerprint}\n"
     )
@@ -411,8 +415,7 @@ def main() -> int:
 
     manifest = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "config_template": str(config_path),
-        "config_profiles": [str(p) for p in profiles],
+        "config_path": str(config_path),
         "config_overrides": list(args.overrides),
         # The file every process actually read, and a hash of the settings that
         # define what this run optimises (resume checks it, see above).

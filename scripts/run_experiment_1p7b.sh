@@ -142,14 +142,13 @@ else
     export TRACE_RESEARCHER_ENDPOINT=http://127.0.0.1:$PORT_27B/v1
     export TRACE_RESEARCHER_MODEL=$SERVED_27B
 fi
-# 配置:模板 configs/trace.yaml + 机器 profile + (可选)臂 profile。
-# 机器差异用 --profile configs/profiles/machine-162.yaml;消融臂用臂 profile 或 --set,
-# 并务必配不同的 --run-name(臂进 objective fingerprint,同名 resume 会被 launcher 拦下):
-#   RUN_NAME=trace_opd_1p7b_a3 bash scripts/run_experiment_1p7b.sh \
-#       --profile $TRACE_REPO/trace_opd/configs/profiles/machine-162.yaml \
-#       --profile $TRACE_REPO/trace_opd/configs/profiles/arm-a3-mixed.yaml
-# 上面 REMOTE_RESEARCHER 那段 sed 派生可由 machine-162.yaml 取代(它已含 external_pool
-# 端点与 mode);保留是为了不打断 CD-006 正在用的启动方式,下轮统一。
+# 配置:每个实验在 configs/experiments/ 下有一份【完整副本】(config_tool new 从
+# configs/trace.yaml 模板复制),它就是该实验的全部定义。用 CONFIG 指向它:
+#   CONFIG=$TRACE_REPO/trace_opd/configs/experiments/162-1p7b-a3.yaml \
+#   RUN_NAME=trace_opd_1p7b_a3 bash scripts/run_experiment_1p7b.sh
+# 不同臂务必配不同 run 名(臂进 objective fingerprint,同名 resume 会被 launcher 拦下)。
+# 上面 REMOTE_RESEARCHER 那段 sed 派生可由实验配置里的 roles.researcher.mode 取代;
+# 保留是为了不打断 CD-006 正在用的启动方式,下轮统一。
 
 [[ -z "${SWANLAB_API_KEY:-}" ]] && say "提示:SWANLAB_API_KEY 未设,曲线走 offline 模式"
 
