@@ -10,7 +10,7 @@
 cd trace_opd
 git log --oneline -1                      # 期望 main 含 "mixed objective OPD x RL x SFT"
 grep -n "^  mix_" configs/trace.yaml      # 期望 mix_rl_weight/mix_sft_weight 均为 0.0
-python3 -m pytest tests/ -q | tail -2     # 期望 154 passed
+python3 -m pytest tests/ -q | tail -2     # 期望 158 passed
 ```
 
 **默认全关 = A0 = 纯 OPD,与你们现在跑的 4B 主线逐字节一致。**
