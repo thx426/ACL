@@ -201,6 +201,7 @@ async function viewStep(run, step, params) {
       <div class="kpi"><div class="v">${pct(st.success_rate)}</div><div class="k">success (${st.n_success}/${st.n})</div></div>
       <div class="kpi"><div class="v">${num(st.env_steps_success_median)}</div><div class="k">median steps · success</div></div>
       <div class="kpi"><div class="v">${num(st.env_steps_failed_median)}</div><div class="k">median steps · failed</div></div>
+      ${st.n_expert ? `<div class="kpi"><div class="v">${st.n_expert}</div><div class="k">expert rows (excluded)</div></div>` : ""}
     </div>
     <div class="panel">
       <b>failure stages</b> <span class="muted">(click to filter)</span>
@@ -223,7 +224,8 @@ async function viewStep(run, step, params) {
           <th>fmt✗</th><th>repeat</th><th>tags</th></tr>
       ${data.rollouts.map((r) => `
         <tr class="click" data-href="${link.rollout(run, r.file)}">
-          <td class="mono">${esc(r.task_id)}</td>
+          <td class="mono">${esc(r.task_id)}${r.sample_role === "sft"
+                ? '<span class="tag warn">expert</span>' : ""}</td>
           <td>${r.sample_idx}</td>
           <td>${r.won ? '<span class="ok">✓</span>' : `<span class="bad">${esc(r.outcome)}</span>`}</td>
           <td>${esc(r.fail_label)}</td>

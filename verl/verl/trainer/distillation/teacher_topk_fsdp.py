@@ -131,7 +131,7 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     for i in range(n):
         ex = extras[i] or {}
         mode = ex.get("teacher_mode", None)
-        if mode not in ("privileged", "bare"):
+        if mode not in ("privileged", "bare", "sft"):
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} has teacher_mode={mode!r} "
                                "— provenance lost in transit (codex H1)")
         k = ex.get("teacher_topk", None)
@@ -146,13 +146,21 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
         if mode == "privileged" and prefix is None:
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} is 'privileged' but "
                                "teacher_prefix_ids is missing (codex H1)")
+        resp = responses[i]
+        if mode == "sft":
+            # trace-opd mixed objective: an expert row is supervised by the SFT
+            # cross-entropy alone. Its response_mask was cleared at TQ put time,
+            # so whatever sits in teacher_ids/teacher_logprobs is masked out of
+            # the distillation loss and its metrics — scoring it would burn a
+            # full forward per expert rollout for a value nothing reads.
+            plan.append((None, resp, int(prompts[i].numel()), int(resp.numel())))
+            continue
         if mode == "bare":
             # vLLM-path semantics: research failed => score under the BARE
             # student prompt (teacher == student => per-token KL ~ 0, neutral).
             prefix = prompts[i]
         else:
             prefix = torch.as_tensor(list(prefix), dtype=torch.long)
-        resp = responses[i]
         P, R, T = int(prompts[i].numel()), int(resp.numel()), int(prefix.numel())
         if R <= 0:
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} has empty response (codex L1)")
@@ -184,6 +192,10 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
         try:
             device = next(module.parameters()).device
             for i, (prefix, resp, P, R) in enumerate(plan):
+                if prefix is None:  # expert (SFT) row: no teacher, no forward
+                    out_ids.append(torch.zeros((P + R, topk), dtype=torch.int32))
+                    out_lps.append(torch.zeros((P + R, topk), dtype=torch.float32))
+                    continue
                 T = int(prefix.numel())
                 seq = torch.cat([prefix.cpu(), resp.cpu()]).to(device).unsqueeze(0)
                 logits = module(input_ids=seq, use_cache=False).logits[0]

@@ -14,6 +14,13 @@ from typing import Any
 from . import plugins, schema
 from .index import Index
 
+# Every aggregate reads on-policy student rollouts only. The mixed objective's
+# expert rollouts (docs/mixed-objective-design.md) run WITH the privileged
+# document and succeed far more often, so mixing them in would show a score the
+# policy never earned. ``IS NOT`` rather than ``!=`` so rows predating the
+# column (NULL) count as on-policy. The step drill-down keeps them, labelled.
+_ON_POLICY = "sample_role IS NOT 'sft'"
+
 # Whitelisted per-step curve definitions over the rollout table.
 # expr must be a pure SQL aggregate over rollout columns.
 CURVES: dict[str, dict[str, str]] = {
@@ -94,7 +101,7 @@ class Queries:
                 agg = db.execute(
                     "SELECT COUNT(*) AS n, MAX(step) AS last_step, MAX(ts) AS last_ts,"
                     " AVG(CASE WHEN validate=0 THEN won END) AS train_score"
-                    " FROM rollout WHERE run=?",
+                    " FROM rollout WHERE run=? AND " + _ON_POLICY,
                     (run,),
                 ).fetchone()
                 scan = db.execute(
@@ -118,7 +125,8 @@ class Queries:
                 dict(r)
                 for r in db.execute(
                     "SELECT step, validate, COUNT(*) AS n, SUM(won) AS n_success"
-                    " FROM rollout WHERE run=? GROUP BY step, validate ORDER BY step",
+                    " FROM rollout WHERE run=? AND " + _ON_POLICY +
+                    " GROUP BY step, validate ORDER BY step",
                     (run,),
                 )
             ]
@@ -160,7 +168,7 @@ class Queries:
                 if mode == "train":
                     rows = db.execute(
                         f"SELECT step, {expr} AS v, COUNT(*) AS n FROM rollout"
-                        " WHERE run=? AND validate=0 GROUP BY step ORDER BY step",
+                        f" WHERE run=? AND validate=0 AND {_ON_POLICY} GROUP BY step ORDER BY step",
                         (run,),
                     ).fetchall()
                     series[key] = {
@@ -174,7 +182,7 @@ class Queries:
                 else:  # val: one series per split
                     rows = db.execute(
                         f"SELECT step, split, {expr} AS v, COUNT(*) AS n FROM rollout"
-                        " WHERE run=? AND validate=1 GROUP BY step, split ORDER BY step",
+                        f" WHERE run=? AND validate=1 AND {_ON_POLICY} GROUP BY step, split ORDER BY step",
                         (run,),
                     ).fetchall()
                     by_split: dict[str, list] = {}
@@ -210,13 +218,18 @@ class Queries:
                     "SELECT file, task_id, family, split, outcome, won, env_steps,"
                     " assistant_turns, invalid_format, truncated, n_invalid, n_noact,"
                     " max_repeat, sample_idx, fail_label, plugin_ver, tags,"
-                    " research_final_success, research_archive"
+                    " research_final_success, research_archive, sample_role"
                     f" FROM rollout WHERE {' AND '.join(where)}"
                     " ORDER BY task_id, sample_idx",
                     args,
                 )
             ]
-        stats = _stratified(rows)
+        # The listing shows every row (an expert trajectory is worth reading —
+        # it is the SFT arm's supervision), but the success/failure split above
+        # it must describe the policy, so it counts on-policy rows only.
+        on_policy = [r for r in rows if r.get("sample_role") != "sft"]
+        stats = _stratified(on_policy)
+        stats["n_expert"] = len(rows) - len(on_policy)
         crit = sorted({r["plugin_ver"] for r in rows}) if rows else []
         scope = f"runs/{run}/rollouts/step_{step:05d}{'_val' if validate else ''}/"
         return {
@@ -371,7 +384,7 @@ class Queries:
                 for r in db.execute(
                     "SELECT file, step, validate, won, outcome, env_steps, fail_label,"
                     " family, max_repeat, sample_idx FROM rollout WHERE run=? AND task_id=?"
-                    " ORDER BY validate, step, sample_idx",
+                    f" AND {_ON_POLICY} ORDER BY validate, step, sample_idx",
                     (run, task_id),
                 )
             ]

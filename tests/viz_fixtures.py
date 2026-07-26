@@ -31,6 +31,7 @@ def write_dump(
     run_dir: Path, *, step: int, validate: bool, task_id: str, traj: dict,
     split: str = "train", uid: str = "aaaa0000", archive: str = "",
     invalid_format: int = 0, truncated: bool = False, final_success: float = 0.0,
+    sample_role: str = "bare",
 ) -> Path:
     step_dir = run_dir / "rollouts" / (f"step_{step:05d}" + ("_val" if validate else ""))
     step_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +47,7 @@ def write_dump(
             "doc_missing": 0, "research_archive": archive,
         },
         "trajectory": traj, "ts": 1000.0 + step,
+        "sample_role": sample_role,
     }
     path = step_dir / f"{task_id.replace('/', '__')}_{uid}.json"
     path.write_text(json.dumps(payload), encoding="utf-8")

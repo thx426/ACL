@@ -1535,15 +1535,48 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _mixed_objective_enabled(self) -> bool:
+        """trace-opd: whether the RL or SFT arm of the mixed objective is on."""
+        if not is_distillation_enabled(self.config.get("distillation")):
+            return False
+        loss_cfg = self.distillation_config.distillation_loss
+        return (
+            float(getattr(loss_cfg, "rl_loss_coef", 0.0) or 0.0) > 0.0
+            or float(getattr(loss_cfg, "sft_loss_coef", 0.0) or 0.0) > 0.0
+        )
+
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        # trace-opd mixed objective: sample_role decides the GRPO group (below).
+        mixed_objective = self._mixed_objective_enabled()
+        if mixed_objective:
+            fields.append("extra_fields")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        sample_roles = data.pop("extra_fields", None) if mixed_objective else None
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+
+        if sample_roles is not None:
+            # Expert (SFT) samples reach ~96% success while the bare rollouts of
+            # the same task sit far lower, so leaving them in the task's GRPO
+            # group would drag the group mean up and hand the successful BARE
+            # rollouts a negative advantage. Give them their own group instead;
+            # their advantages are then masked out of the loss anyway (all-zero
+            # response_mask), the isolation is purely to keep the on-policy
+            # group statistics honest.
+            roles = sample_roles.tolist() if hasattr(sample_roles, "tolist") else list(sample_roles)
+            uids = data.non_tensor_batch["uid"]
+            data.non_tensor_batch["uid"] = np.array(
+                [
+                    f"{uid}:sft" if isinstance(extra, dict) and extra.get("sample_role") == "sft" else uid
+                    for uid, extra in zip(uids, roles)
+                ],
+                dtype=object,
+            )
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1638,6 +1671,11 @@ class PPOTrainer(ABC):
                 distillation_use_topk
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
+                # trace-opd mixed objective: the RL and SFT terms both need the
+                # full policy-loss path (advantages / log-probs), so the
+                # memory-saving distillation-only shortcut must stay off.
+                and float(getattr(distillation_loss_cfg, "rl_loss_coef", 0.0) or 0.0) <= 0.0
+                and float(getattr(distillation_loss_cfg, "sft_loss_coef", 0.0) or 0.0) <= 0.0
             )
         extra_info = {
             "calculate_entropy": calculate_entropy,
@@ -1722,13 +1760,32 @@ class PPOTrainer(ABC):
             select_fields=["extra_fields"],
         )
         rollout_extra_fields = extra_data.pop("extra_fields", None)
+        # trace-opd mixed objective: expert (SFT) rows are document-guided, not
+        # on-policy — at ~96% success they would visibly lift critic/score/mean,
+        # which is the run's primary health and stopping signal. Every behaviour
+        # metric below reads on-policy rows only; the sft_* counters keep the
+        # full population because they ARE the expert-arm bookkeeping.
+        on_policy_mask = non_padding_mask
         if rollout_extra_fields is not None:
+            is_expert = np.array(
+                [
+                    isinstance(extra_field, dict) and extra_field.get("sample_role") == "sft"
+                    for extra_field in rollout_extra_fields.tolist()
+                ],
+                dtype=bool,
+            )
+            if is_expert.any():
+                on_policy_mask = non_padding_mask & ~is_expert
+
             reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-            for keep, extra_field in zip(non_padding_mask.tolist(), rollout_extra_fields.tolist()):
-                if not keep or not isinstance(extra_field, dict):
+            for keep_any, keep_on_policy, extra_field in zip(
+                non_padding_mask.tolist(), on_policy_mask.tolist(), rollout_extra_fields.tolist()
+            ):
+                if not keep_any or not isinstance(extra_field, dict):
                     continue
                 for key, value in extra_field.get("reward_extra_info", {}).items():
-                    reward_extra_infos_dict[key].append(value)
+                    if key.startswith("sft_") or keep_on_policy:
+                        reward_extra_infos_dict[key].append(value)
             if reward_extra_infos_dict:
                 metrics.update(compute_rollout_extra_metrics(reward_extra_infos_dict))
 
@@ -1739,7 +1796,7 @@ class PPOTrainer(ABC):
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
-        metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
+        metrics_batch = batch.select_idxs(on_policy_mask) if on_policy_mask.any() else batch
 
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
@@ -1759,8 +1816,8 @@ class PPOTrainer(ABC):
         metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
-        if non_padding_mask.any():
-            num_turns = num_turns[non_padding_mask]
+        if on_policy_mask.any():
+            num_turns = num_turns[on_policy_mask]
         metrics.update(
             {
                 "training/num_turns/mean": num_turns.mean(),

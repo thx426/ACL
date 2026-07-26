@@ -90,6 +90,37 @@ def test_distillation_diagnostics_survive_empty_batch():
     assert src.count(".numel() == 0") >= 2
 
 
+def test_mixed_objective_terms_are_wired_and_default_off():
+    # a61c654: the RL and SFT arms exist, default to 0 (byte-identical to pure
+    # OPD), and the expert rows are excluded from the on-policy machinery at
+    # every point they could leak into it.
+    cfg = _read("workers/config/distillation.py")
+    assert "rl_loss_coef: float = 0.0" in cfg
+    assert "sft_loss_coef: float = 0.0" in cfg
+
+    losses = _read("trainer/distillation/losses.py")
+    assert "def sft_ce_loss" in losses
+    assert "sft_mask" in losses
+
+    # response_mask cleared at TQ put time — this is what keeps the OPD scale
+    # unchanged when the SFT arm is switched on, so the ablation arms compare.
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert 'field["sft_mask"]' in tq
+    assert 'field["response_mask"] = torch.zeros_like(response_mask)' in tq
+
+    trainer = _read("trainer/ppo/v1/trainer_base.py")
+    assert ":sft" in trainer  # own GRPO group
+    assert "on_policy_mask" in trainer  # 93a0109: metrics exclude expert rows
+    assert "metrics_batch = batch.select_idxs(on_policy_mask)" in trainer
+
+
+def test_microscope_skips_rows_with_no_distillation():
+    # 93a0109: an all-zero mask row (expert sample, or a prompt the hang guard
+    # cancelled) would make the offline span-vs-mask integrity check misfire.
+    src = _read("trainer/distillation/losses.py")
+    assert "if not bool(mask[i, :length].any()):" in src
+
+
 def test_signal_enhancement_triplet_removed():
     # User decision 2026-07-26 (requirements 3-D): K1/K2/K3 are REMOVED, not
     # disabled — no implementation, no config fields, anywhere in the export.

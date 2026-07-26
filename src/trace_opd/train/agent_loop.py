@@ -60,6 +60,7 @@ from ..common.hashing import response_token_hash
 from ..common.llm import make_client
 from ..common.tape import TapeWriter
 from ..core.episode import EpisodeResult, run_episode
+from ..core.expert import build_expert_sample
 from ..core.template_delta import TemplateDelta, render_ids
 from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
 from ..docstore.archive import ResearchArchive
@@ -152,6 +153,11 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 # research session (keyed by (step, task_id); see
                 # common.aio.shared_task for the invariants).
                 "research_tasks": {},
+                # Mixed objective: hands out the replica index within a
+                # (step, task) so the trailing copies can be expert rollouts.
+                # Same invariant as research_tasks — all copies of a task land
+                # in one worker process and one event loop.
+                "replica_counters": {},
             }
         )
         return _STATE
@@ -170,6 +176,19 @@ class TraceAgentLoop(AgentLoopBase):
         self.narrator_client = state["narrator_client"]
         self.executor_model_name: str = state["executor_model_name"]
         self.research_tasks: dict = state["research_tasks"]
+        self.replica_counters: dict = state["replica_counters"]
+
+    def _next_replica_index(self, global_step: int | None, task_id: str) -> int:
+        """Index of this copy within the (step, task) rollout group.
+
+        No lock and no await between read and write: all copies of a task run as
+        coroutines on one event loop (the same invariant ``shared_task`` relies
+        on), so the increment is atomic with respect to them.
+        """
+        key = (global_step, task_id)
+        index = self.replica_counters.get(key, 0)
+        self.replica_counters[key] = index + 1
+        return index
 
     # ------------------------------------------------------------- research
 
@@ -404,9 +423,7 @@ class TraceAgentLoop(AgentLoopBase):
         # (policy weights are frozen within a step; shared_task still de-dupes one
         # session per (step, task)) while letting both phases run concurrently.
         research_fut = None
-        t_research0 = 0.0
         if self.cfg.research.enabled and not validate:
-            t_research0 = time.time()
             # Shared across the rollout_n copies of this task in this step:
             # exactly one research session runs (and archives) per (step,
             # task); every copy distills against the same document.
@@ -418,25 +435,64 @@ class TraceAgentLoop(AgentLoopBase):
                 )
             )
 
-        t0 = time.time()
-        result = await self._student_rollout(adapter, sampling_params, response_length, route)
-        metrics.generate_sequences += time.time() - t0
+        # Mixed objective (docs/mixed-objective-design.md): the trailing copies
+        # of a task roll out WITH the document and feed the SFT arm instead of
+        # the OPD/RL arms. They need the document before they can start, so they
+        # await research first; every other copy keeps the overlap below.
+        is_expert = (
+            not validate
+            and self.cfg.train.mix_sft_weight > 0
+            and self.cfg.train.mix_sft_rollouts > 0
+            and research_fut is not None
+            and self._next_replica_index(global_step, adapter.task_id) >= self.cfg.train.rollout_n
+        )
+        expert_fields: dict[str, Any] = {}
+        research_awaited = False
 
-        if research_fut is not None:
+        async def await_research() -> None:
             # Only the *blocking* remainder is charged here; the part that ran
             # under the rollout is free. (Pre-overlap this metric was the full
             # research wall time — expect it to drop sharply.)
+            nonlocal doc, research_fields, research_awaited
             t_block0 = time.time()
             doc, research_fields = await research_fut
             metrics.tool_calls += time.time() - t_block0
-            del t_research0
+            research_awaited = True
+
+        if is_expert:
+            await await_research()
+            if not doc:
+                # Research failed — an expert copy has nothing to imitate, so it
+                # contributes as an ordinary on-policy sample instead.
+                is_expert = False
+
+        t0 = time.time()
+        if is_expert:
+            result = await self._expert_rollout(
+                adapter, doc, sampling_params, response_length, route
+            )
+        else:
+            result = await self._student_rollout(adapter, sampling_params, response_length, route)
+        metrics.generate_sequences += time.time() - t0
+
+        if research_fut is not None and not research_awaited:
+            await await_research()
 
         traj = result.trajectory
         env_steps = sum(1 for s in traj.steps if s.acted)
+        tokens = result.tokens
+        if is_expert:
+            tokens, expert_fields = build_expert_sample(
+                adapter=adapter,
+                tokenizer=self.tokenizer,
+                result=result,
+                max_model_len=self.cfg.train.rollout_max_model_len,
+            )
+
         output = AgentLoopOutput(
-            prompt_ids=result.tokens.prompt_ids,
-            response_ids=result.tokens.response_ids,
-            response_mask=result.tokens.response_mask,
+            prompt_ids=tokens.prompt_ids,
+            response_ids=tokens.response_ids,
+            response_mask=tokens.response_mask,
             reward_score=1.0 if traj.won else 0.0,
             num_turns=2 * result.assistant_turns + 1,
             metrics=metrics,
@@ -449,15 +505,16 @@ class TraceAgentLoop(AgentLoopBase):
                 "truncated": result.truncated,
                 **result.gen_extra,
                 **research_fields,
+                **expert_fields,
             },
         )
 
-        if not validate:
+        if not validate and not is_expert:
             # Teacher scoring joins the task's sticky replica too (verl pops
             # this key and uses it as the routing id for the scoring request —
             # the 8 copies then share one prefill of the doc prefix).
             output.extra_fields["teacher_routing_key"] = route
-        if doc and not validate:
+        if doc and not validate and not is_expert:
             teacher_prompt_ids = self._teacher_prompt_ids(
                 adapter, doc, result.tokens.prompt_ids, traj.initial_obs
             )
@@ -472,6 +529,7 @@ class TraceAgentLoop(AgentLoopBase):
         output.extra_fields["reward_extra_info"] = build_curve_metrics(
             validate=validate,
             research_enabled=self.cfg.research.enabled,
+            mixed_sft=self.cfg.train.mix_sft_weight > 0 and self.cfg.train.mix_sft_rollouts > 0,
             fields=output.extra_fields,
         )
 
@@ -491,6 +549,13 @@ class TraceAgentLoop(AgentLoopBase):
                     "assistant_turns": result.assistant_turns,
                     "invalid_format": result.invalid_format,
                     "truncated": result.truncated,
+                    # Mixed objective: "bare" (OPD/RL arms) or "sft" (an expert
+                    # rollout run WITH the document). Analysis and the viz layer
+                    # must be able to separate the two populations — an expert
+                    # trajectory's ~96% success would otherwise inflate every
+                    # behaviour curve read off the dumps.
+                    "sample_role": output.extra_fields.get("sample_role", "bare"),
+                    "sft_accepted": output.extra_fields.get("sft_accepted", 0),
                     "doc_words": research_fields.get("doc_words", 0),
                     "research": {
                         k: v for k, v in research_fields.items() if k != "doc_words"
@@ -510,6 +575,32 @@ class TraceAgentLoop(AgentLoopBase):
         except Exception:  # noqa: BLE001 — dumps must never fail a sample
             logger.exception("rollout dump failed for %s", adapter.task_id)
         return output
+
+    async def _expert_rollout(
+        self,
+        adapter,
+        doc: str,
+        sampling_params: dict[str, Any],
+        response_length: int,
+        route: str,
+    ) -> EpisodeResult:
+        """One rollout WITH the document in context — the SFT arm's data source.
+
+        Same episode runner, same protocol, same sampling as the bare student;
+        the only difference is the guidance slot. Success rate on these is also
+        the PG-7 document-quality signal (doc-injected rollout success).
+        """
+        epi_route = f"{route}:e{uuid4().hex[:6]}"
+        return await run_episode(
+            adapter=adapter,
+            generate=EngineGenerate(self.server_manager, self.tokenizer, request_id=epi_route),
+            tokenizer=self.tokenizer,
+            delta=self.delta,
+            guidance=doc,
+            episode_id="expert",
+            response_budget=response_length,
+            sampling_params=sampling_params,
+        )
 
     async def _student_rollout(
         self, adapter, sampling_params: dict[str, Any], response_length: int, route: str

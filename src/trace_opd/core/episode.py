@@ -320,6 +320,47 @@ async def run_episode(
             pass
 
 
+def replay_bare_tokens(*, adapter: TaskAdapter, tokenizer, result: EpisodeResult) -> EpisodeTokens:
+    """Re-address a document-guided episode to the BARE prompt.
+
+    The SFT arm of the mixed objective (docs/mixed-objective-design.md) trains on
+    trajectories the policy produced WITH the privileged document in context. It
+    must not train them under that document — otherwise it learns "act well when
+    a document is present", which is the opposite of internalization (PACT,
+    arXiv:2606.16215, reports stripping the privileged context is essential).
+
+    The rewrite is exact and needs no re-tokenization: guidance lives only in the
+    system message, i.e. only in ``prompt_ids``. The response stream — generated
+    tokens, turn glue, observations — is built append-only after the first turn
+    and is byte-identical under either prompt. So the replay is the guided
+    response stream re-attached to the bare first-turn prompt.
+    """
+    system_prompt = inject_guidance(adapter.executor_scaffold(), "")
+    prompt_ids = render_ids(
+        tokenizer,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": protocol.truncate_obs(result.trajectory.initial_obs)},
+        ],
+        True,
+    )
+    # Both prompts must land in the same generation context, or the first
+    # response token would continue a different template state (the same
+    # invariant the privileged teacher prefix asserts).
+    guided_prompt_ids = result.tokens.prompt_ids
+    tail = min(8, len(prompt_ids), len(guided_prompt_ids))
+    if tail and prompt_ids[-tail:] != guided_prompt_ids[-tail:]:
+        raise RuntimeError(
+            "replay_bare_tokens: bare and guided prompts diverge near the generation prefix"
+        )
+    return EpisodeTokens(
+        prompt_ids=prompt_ids,
+        response_ids=list(result.tokens.response_ids),
+        response_mask=list(result.tokens.response_mask),
+        turn_spans=[list(span) for span in result.tokens.turn_spans],
+    )
+
+
 def _close_orphan_env(boot: "asyncio.Future") -> None:
     """Done-callback for a cancelled boot: close the handle off-loop."""
     if boot.cancelled() or boot.exception() is not None:

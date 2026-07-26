@@ -57,3 +57,35 @@ def test_research_rows(tmp_path):
     assert len(rows) == 4
     assert all(r["doc_present"] == 1 and r["final_success"] == 1.0 for r in rows)
     assert {r["policy_version"] for r in rows} == {1, 2}
+
+
+def test_expert_rollouts_are_kept_out_of_every_aggregate(tmp_path):
+    """Mixed objective: expert rollouts run WITH the document and win far more
+    often. They must never reach a curve, a score, or the completeness audit —
+    otherwise the observatory reports progress the policy never made."""
+    idx = _index(tmp_path)
+    run_dir = tmp_path / "runs" / "alf_run"
+    q = Queries(idx)
+    idx.scan()
+    before_curve = q.curves("alf_run", ["score"], "train")["series"]["score"]["points"]
+    before_overview = q.overview("alf_run")
+    before_runs = q.runs()[0]
+
+    for i in range(4):  # four winning expert rows on an existing train step
+        write_dump(run_dir, step=1, validate=False, task_id=ALF_TASK,
+                   traj=_traj(ALF_TASK, WIN_STEPS, True), uid=f"expert00{i}",
+                   sample_role="sft")
+    assert idx.scan()["alf_run"]["added"] == 4
+
+    assert q.curves("alf_run", ["score"], "train")["series"]["score"]["points"] == before_curve
+    assert q.overview("alf_run")["steps"] == before_overview["steps"]
+    assert q.runs()[0]["train_score"] == before_runs["train_score"]
+    history = q.task_history("alf_run", ALF_TASK)["history"]
+    assert not any(r["file"].count("expert") for g in history for r in g["rollouts"])
+
+    # ...but they stay browsable in the step drill-down, labelled and excluded
+    # from the success split shown above the listing.
+    step = q.step_rollouts("alf_run", 1, False, {})
+    assert step["stats"]["n_expert"] == 4
+    assert step["stats"]["n"] == before_overview["steps"][0]["n"]
+    assert sum(1 for r in step["rollouts"] if r["sample_role"] == "sft") == 4

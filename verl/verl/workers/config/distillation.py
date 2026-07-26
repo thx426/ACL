@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -60,6 +61,12 @@ class DistillationLossConfig(BaseConfig):
         Upper bound for PPO clipping ratio.
     loss_settings (DistillationLossSettings, optional):
         Runtime-populated settings based on loss_mode. Not set by user.
+    rl_loss_coef (float):
+        trace-opd mixed objective: weight of the task-reward policy-gradient term.
+        0 disables it (default) and keeps the pure-distillation behaviour.
+    sft_loss_coef (float):
+        trace-opd mixed objective: weight of the cross-entropy term over expert
+        tokens marked by the ``sft_mask`` field. 0 disables it (default).
     """
 
     loss_mode: str = "k3"
@@ -86,6 +93,22 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
+
+    # trace-opd mixed objective (docs/mixed-objective-design.md). The total loss
+    # becomes
+    #     distillation_loss_coef * OPD  +  rl_loss_coef * RL  +  sft_loss_coef * SFT
+    # where RL is the task-reward policy gradient (GRPO advantages, same
+    # ``ppo_loss`` upstream uses for ``use_task_rewards``) and SFT is a token-level
+    # cross-entropy over expert tokens selected by the ``sft_mask`` field (rows
+    # produced by rolling out WITH the privileged document and replayed under the
+    # bare prompt). All three terms share the ``token-mean`` aggregation and the
+    # same global ``batch_num_tokens`` denominator, so the coefficients are
+    # directly comparable per token.
+    #
+    # Both default to 0.0, which is byte-identical to the pure-distillation path:
+    # nothing below activates and no extra field is required from the rollout.
+    rl_loss_coef: float = 0.0
+    sft_loss_coef: float = 0.0
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -121,6 +144,20 @@ class DistillationLossConfig(BaseConfig):
             raise ValueError(
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
+            )
+
+        # trace-opd mixed objective: a negative or non-finite coefficient flips or
+        # blows up the corresponding term silently, so reject it at config time.
+        for name in ("rl_loss_coef", "sft_loss_coef"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0 (0 disables the term), got {value}")
+
+        if self.rl_loss_coef > 0.0 and self.use_task_rewards:
+            raise ValueError(
+                "rl_loss_coef and use_task_rewards both scale the same task-reward policy-gradient "
+                "term. Use rl_loss_coef (explicit weight, trace-opd mixed objective) or "
+                "use_task_rewards (upstream, implicit weight 1), not both."
             )
 
 

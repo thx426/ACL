@@ -165,6 +165,18 @@ class TrainCfg:
                                       # root cause at 4096; halved for coexistence)
     rollout_temperature: float = 1.0
     distill_topk: int = 64
+    # --- 混合目标(OPD × RL × SFT;docs/mixed-objective-design.md)---
+    # 总损失 = OPD + mix_rl_weight × RL + mix_sft_weight × SFT。两个权重默认 0
+    # ⇒ 与纯 OPD 逐字节一致(4B 主线无感知)。弱模型(1.7B)上 self-teacher 在
+    # student 错误前缀下失去文档语义抓地力,KL 信号起不来,故给 RL 锚(真实
+    # reward 的 GRPO)与 SFT 锚(特权文档 rollout 的成功轨迹)。三项同 token 口径,
+    # 权重可直接互比;也是正式的消融开关(A0/A1/A2/A3 臂,见设计文档 §6)。
+    mix_rl_weight: float = 0.0
+    mix_sft_weight: float = 0.0
+    mix_sft_rollouts: int = 4         # 每任务额外的带文档 rollout 数(仅
+                                      # mix_sft_weight>0 时生效);verl 侧
+                                      # rollout.n = rollout_n + 本值,尾部这几
+                                      # 个副本走 expert 分支,不参与 OPD/RL
     distill_microscope: bool = True   # sample per-token distillation quantities
                                       # to <run>/microscope/ for the analysis
                                       # suite (docs/analysis-design.md; ~MBs/step)
@@ -267,6 +279,29 @@ def _validate(cfg: "Config") -> None:
         problems.append(
             f"train.distill_sample_every={cfg.train.distill_sample_every} must be >= 1"
         )
+    # 混合目标:负权重会翻转梯度方向而不报错,必须显式拦住
+    import math as _math
+
+    for _name, _value in (
+        ("mix_rl_weight", cfg.train.mix_rl_weight),
+        ("mix_sft_weight", cfg.train.mix_sft_weight),
+    ):
+        if not (_math.isfinite(_value) and _value >= 0):
+            problems.append(f"train.{_name}={_value} must be finite and >= 0 (0 disables the arm)")
+    if cfg.train.mix_sft_rollouts < 0:
+        problems.append(
+            f"train.mix_sft_rollouts={cfg.train.mix_sft_rollouts} must be >= 0"
+        )
+    if cfg.train.mix_sft_weight > 0:
+        if cfg.train.mix_sft_rollouts < 1:
+            problems.append(
+                "train.mix_sft_weight>0 requires mix_sft_rollouts>=1 (no expert rollouts, "
+                "no expert samples — the SFT term would silently stay zero)"
+            )
+        if not cfg.research.enabled:
+            problems.append(
+                "train.mix_sft_weight>0 requires research.enabled (expert rollouts need a document)"
+            )
     for name, role in cfg.roles.items():
         if role.dp_size < 0:
             problems.append(f"roles.{name}.dp_size must be >= 0 (0 disables routing)")

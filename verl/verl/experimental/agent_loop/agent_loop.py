@@ -1056,7 +1056,13 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_routing_key", None)
             # codex H1: explicit provenance so a prefix lost in transit fails
             # loud on the trainer side instead of silently degrading to bare.
-            output.extra_fields["teacher_mode"] = "privileged" if _tp is not None else "bare"
+            # trace-opd mixed objective: an expert (SFT) row has no teacher at
+            # all — it is supervised by cross-entropy on its own tokens, and its
+            # response_mask is cleared, so the trainer skips the scoring forward.
+            if output.extra_fields.get("sample_role") == "sft":
+                output.extra_fields["teacher_mode"] = "sft"
+            else:
+                output.extra_fields["teacher_mode"] = "privileged" if _tp is not None else "bare"
             # codex M2: K rides with the sample; trainer asserts consistency.
             output.extra_fields["teacher_topk"] = int(self.self_teacher_num_logprobs)
             if _tp is not None:

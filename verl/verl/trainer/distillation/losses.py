@@ -219,14 +219,22 @@ def distillation_ppo_loss(
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    if not distillation_loss_config.use_task_rewards and not distillation_loss_config.use_policy_gradient:
+    # trace-opd mixed objective: an explicitly weighted task-reward policy gradient
+    # alongside the distillation term (config rejects combining it with
+    # use_task_rewards, which is the same term at an implicit weight of 1).
+    rl_loss_coef = float(getattr(distillation_loss_config, "rl_loss_coef", 0.0) or 0.0)
+    if (
+        not distillation_loss_config.use_task_rewards
+        and not distillation_loss_config.use_policy_gradient
+        and rl_loss_coef <= 0.0
+    ):
         # no need to compute policy loss
         policy_loss = 0.0
         policy_metrics = {}
     else:
         policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
         if not distillation_loss_config.use_task_rewards:
-            policy_loss = 0.0
+            policy_loss = policy_loss * rl_loss_coef if rl_loss_coef > 0.0 else 0.0
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
@@ -236,7 +244,68 @@ def distillation_ppo_loss(
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
 
+    # trace-opd mixed objective: cross-entropy over the expert tokens of the
+    # privileged-guided rollouts. Those rows carry an all-zero response_mask
+    # (cleared at TQ put time), so they contribute nothing above and nothing to
+    # batch_num_tokens — the OPD/RL terms keep the exact scale they have with the
+    # SFT arm off, and this term is a pure addition.
+    sft_loss_coef = float(getattr(distillation_loss_config, "sft_loss_coef", 0.0) or 0.0)
+    if sft_loss_coef > 0.0:
+        sft_loss, sft_metrics = sft_ce_loss(config, model_output, data)
+        policy_loss = policy_loss + sft_loss * sft_loss_coef
+        policy_metrics.update(sft_metrics)
+
     return policy_loss, policy_metrics
+
+
+def sft_ce_loss(
+    config: ActorConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Token-level cross-entropy over expert tokens (trace-opd mixed objective).
+
+    ``sft_mask`` marks the assistant-generated tokens of a privileged-guided
+    trajectory that has been replayed under the BARE prompt, i.e. the supervision
+    the policy should be able to produce without the document. Every other row —
+    and every observation token inside an expert row — is masked out.
+
+    Aggregation deliberately reuses ``loss_agg_mode`` and the same global
+    ``batch_num_tokens`` denominator as the OPD and RL terms, so ``sft_loss_coef``
+    is a per-token weight directly comparable with the other two. A step with no
+    surviving expert trajectory contributes exactly 0 (masked_sum of nothing),
+    never a NaN.
+    """
+    sft_mask = data.get("sft_mask", None)
+    if sft_mask is None:
+        # Fail loud: a silently dropped SFT arm looks exactly like "SFT does not
+        # help", which is the one conclusion this experiment must not fake.
+        raise RuntimeError(
+            "sft_loss_coef > 0 but the batch carries no 'sft_mask' field — the rollout "
+            "side did not mark expert samples (expected extra_fields['sample_role'] == 'sft')"
+        )
+    if sft_mask.is_nested:
+        sft_mask = sft_mask.to_padded_tensor(0)
+    sft_mask = sft_mask.to(torch.bool)
+
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    ce = -log_prob
+    sft_loss = agg_loss(
+        loss_mat=ce,
+        loss_mask=sft_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        **config.global_batch_info,
+    )
+    n_expert_tokens = sft_mask.sum()
+    metrics = {
+        "sft/loss": Metric(value=sft_loss, aggregation=AggregationType.SUM),
+        "sft/expert_tokens": Metric(value=n_expert_tokens, aggregation=AggregationType.SUM),
+    }
+    if n_expert_tokens > 0:
+        # Mean CE per expert token — unlike sft/loss this is comparable across
+        # steps regardless of how many expert trajectories survived filtering.
+        metrics["sft/ce_per_token"] = (ce.detach()[sft_mask]).mean().item()
+    return sft_loss, metrics
 
 
 def distillation_loss(
@@ -358,6 +427,13 @@ def _dump_microscope_rows(data: TensorDict, kl, mask, extras: dict) -> None:
             if resp_hash % every:
                 continue
             length = len(ids)
+            if not bool(mask[i, :length].any()):
+                # No distillation happened on this row — an expert (SFT) sample
+                # of the mixed objective, or a prompt the hang guard cancelled.
+                # Dumping it would put an all-zero mask in front of the offline
+                # join, whose integrity check compares the mask against the
+                # trajectory's turn spans and would report a false mismatch.
+                continue
 
             def row_of(t):
                 return [round(float(v), 5) for v in t[i, :length].tolist()]

@@ -15,6 +15,11 @@ from typing import Any
 
 from . import plugins, schema
 
+# Bump whenever the derived schema below changes shape. The DB is a pure cache
+# over runs/, so a mismatch just drops it and rescans — much safer than leaving
+# a stale layout to fail on a column count at insert time.
+_SCHEMA_VERSION = 2
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rollout(
   run TEXT, file TEXT, step INTEGER, validate INTEGER, split TEXT,
@@ -24,6 +29,7 @@ CREATE TABLE IF NOT EXISTS rollout(
   doc_missing INTEGER, research_archive TEXT,
   n_steps INTEGER, n_invalid INTEGER, n_noact INTEGER, max_repeat INTEGER,
   sample_idx INTEGER, fail_label TEXT, plugin_ver TEXT, tags TEXT, ts REAL,
+  sample_role TEXT,
   PRIMARY KEY(run, file));
 CREATE INDEX IF NOT EXISTS idx_rollout_step ON rollout(run, validate, step);
 CREATE INDEX IF NOT EXISTS idx_rollout_task ON rollout(run, task_id);
@@ -56,6 +62,11 @@ class Index:
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version != _SCHEMA_VERSION:
+                for table in ("rollout", "research", "dir_state", "scan_state"):
+                    db.execute(f"DROP TABLE IF EXISTS {table}")
+                db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             db.executescript(_SCHEMA)
 
     def connect(self) -> sqlite3.Connection:
@@ -164,6 +175,12 @@ class Index:
             int(traj.get("sample_idx") or 0),
             plugins.classify(task_id, traj, won), plugins.classifier_version(task_id),
             tags, float(d.get("ts") or 0.0),
+            # "bare" = an on-policy student rollout; "sft" = an expert rollout of
+            # the mixed objective, produced WITH the privileged document. Every
+            # aggregate in queries.py reads on-policy rows only — expert
+            # trajectories succeed ~96% of the time and would otherwise show up
+            # as a jump in the score curve that the policy never earned.
+            str(d.get("sample_role") or "bare"),
         )
 
     def _scan_research(self, db: sqlite3.Connection, run: str) -> tuple[int, int]:

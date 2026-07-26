@@ -246,6 +246,14 @@ train:
                             # 调大须同步调小 27B 侧 GPU_MEM(serve_researcher.sh)
   rollout_temperature: 1.0
   distill_topk: 64          # forward_kl_topk 的 k | h3 定版(verl 官方推荐区间)
+  # --- 混合目标 OPD × RL × SFT(docs/mixed-objective-design.md;默认全关=纯 OPD)---
+  # 4B 仅靠 OPD 即可内化(step-9 起飞实证);1.7B 上 self-teacher 在 student 错误
+  # 前缀下丢失文档语义抓地力,KL 信号起不来 —— 给它 RL 锚与 SFT 锚。也是正式消融
+  # 开关:A0 纯 OPD(0/0)/A1 +RL(1/0)/A2 +SFT(0/0.5)/A3 全混(1/0.5)。
+  mix_rl_weight: 0.0        # GRPO(轨迹 won 为 reward,组内标准化)权重
+  mix_sft_weight: 0.0       # 专家轨迹 CE 权重;>0 时需 research.enabled
+  mix_sft_rollouts: 4       # 每任务额外带文档 rollout 数(verl rollout.n 自动
+                            # = rollout_n + 本值;仅 mix_sft_weight>0 时生效)
   distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
                             # <run>/microscope/(verl 6f3d089;~几 MB/step,离线经
                             # analysis.collect 与 rollout dump join 出深度剖面/

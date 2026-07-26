@@ -190,7 +190,10 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # n student rollouts per task, all scored under the SAME research doc;
         # verl repeats the batch (interleave) and scales ppo_mini_batch_size
         # by n internally, so mini_batch keeps its "tasks" unit.
-        f"actor_rollout_ref.rollout.n={t.rollout_n}",
+        # Mixed objective: the SFT arm adds expert copies on top — the agent
+        # loop hands the trailing mix_sft_rollouts indices of each task to the
+        # document-guided branch, so the bare group stays exactly rollout_n.
+        f"actor_rollout_ref.rollout.n={t.rollout_n + (t.mix_sft_rollouts if t.mix_sft_weight > 0 else 0)}",
         f"actor_rollout_ref.rollout.max_model_len={t.rollout_max_model_len}",
         # Chunked-prefill budget. Also sizes the transient full-vocab logits
         # tensor vLLM materializes per chunk during self-teacher prompt_logprobs
@@ -234,6 +237,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "distillation.distillation_loss.use_task_rewards=False",
         "distillation.distillation_loss.loss_max_clamp=10.0",
         "distillation.distillation_loss.log_prob_min_clamp=-10.0",
+        # Mixed objective (docs/mixed-objective-design.md). 0/0 = pure OPD.
+        f"+distillation.distillation_loss.rl_loss_coef={t.mix_rl_weight}",
+        f"+distillation.distillation_loss.sft_loss_coef={t.mix_sft_weight}",
     ]
 
 

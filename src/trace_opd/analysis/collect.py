@@ -40,6 +40,12 @@ def index_dumps(run_dir: Path) -> dict[int, dict[str, Any]]:
             d = read_json(file)
             if not d or "response_token_hash" not in d:
                 continue
+            if d.get("sample_role") == "sft":
+                # Expert rollouts of the mixed objective carry no distillation,
+                # so no microscope row can legitimately join them — indexing
+                # them only widens the surface for a hash collision to steal a
+                # real row's provenance.
+                continue
             h = int(d["response_token_hash"])
             if h in index:
                 collisions += 1

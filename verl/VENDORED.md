@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(1c6d457)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(93a0109)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -35,6 +35,9 @@
 | f88db6c | trace-opd(CD-006 上收 617817c):fsdp engine `prepare_model_outputs` 跳过 temperature 恒等除法(`logits / 1.0` 额外分配一份 seqlen×vocab fp32 = 13.5GiB@22k 序列,step-16 OOM 直接触发点;逐位等价;宜提上游 PR)+ fsdp 打分探针 print 到 stdout(Ray worker 不可靠转发 logger 层级) |
 | 28a82d5 | trace-opd(CD-006 上收 01f0fae+5f9a29d):蒸馏诊断 metrics 空批防御——hang guard 取消 prompt 后其副本空 response、mask 全 False,`min()/max()` 在空张量上抛错把"损失一个 prompt"放大成杀 run(step-17 两处两杀);两处调用点均判空后按缺席上报,loss 数学不动 |
 | 1c6d457 | trace-opd:**清除 K3 残留引用**(rollout 侧 `teacher_doc_ids`/`teacher_block_starts` 透传 + fsdp 打分的 K3 死警告)。信号增强三件套 K1/K2/K3 按用户 2026-07-26 裁定**从机制中移除**:其实现只存在于 vendored 树(CD-006 1.7B v2 时代直改,从未进本真源仓库),本次重导出即自然消失——K2 实证 no-op、K3 在 fsdp 打分后端不被支持且为步时 2.7× 开销主因、K1 留作独立立项 |
+
+| a61c654 | trace-opd:**混合目标 OPD × RL × SFT**(`docs/mixed-objective-design.md`)——`DistillationLossConfig` 新增 `rl_loss_coef`/`sft_loss_coef`(均默认 0 ⇒ 与纯蒸馏逐字节一致);RL 项复用上游 `ppo_loss`(GRPO 任务 reward)但带显式权重(与 `use_task_rewards` 互斥,config 拦);SFT 项 = 新 `sft_ce_loss` 对 `sft_mask` 选中的专家 token 做 CE;三项共用 `loss_agg_mode` 与全局 `batch_num_tokens` 分母 ⇒ 系数按 token 可直接互比。expert 行在 **TQ put 时清空 `response_mask`**(`agent_loop_tq`),故不进 OPD/PG 分子、也不进 `batch_num_tokens` ⇒ 开 SFT 臂不改变 OPD 尺度(消融臂可比);零专家轨迹的 step 贡献恰为 0 而非 NaN。另:expert 行独立 GRPO 组(uid 后缀,防 96% 成功率抬高 bare 组均值使成功的 bare 行拿到负 advantage)、fsdp 打分对其跳过前向(`teacher_mode="sft"`)、`distillation_only` 在任一臂开启时关闭 |
+| 93a0109 | trace-opd:**expert 行的观测隔离**——`_compute_metrics` 由 `sample_role` 导出 on-policy mask,`compute_data_metrics`/方差代理/`num_turns`/除 `sft_*` 外的 reward_extra 键一律只读 on-policy 行(否则 `critic/score/mean` 被 96% 成功率的专家行抬高,而它正是判停曲线);吞吐/计时仍计全部行(专家行确实耗算力)。显微镜落盘跳过全零 mask 行(专家行 + hang guard 取消的 prompt),否则离线 join 的 span-vs-mask 完整性自检会误报 mismatch |
 
 ## 修改/更新流程(保持单一真源)
 

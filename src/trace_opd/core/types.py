@@ -59,6 +59,23 @@ def guidance_hash(guidance: str) -> str:
     return hashlib.sha1(guidance.encode("utf-8")).hexdigest()[:12]
 
 
+_GUIDANCE_MENTIONS = ("task guidance", "the guidance", "guidance says", "guidance document")
+
+
+def mentions_guidance(text: str) -> bool:
+    """Whether a trajectory's own text refers to the guidance document.
+
+    Used to drop expert trajectories from the SFT arm: a bare policy has no
+    document, so reasoning like "following the task guidance, ..." is a
+    hallucinated reference once the privileged context is stripped, and training
+    on it teaches exactly that hallucination (PACT, arXiv:2606.16215, finds the
+    filter essential). Deliberately over-broad — losing one of four expert
+    rollouts costs a sample, keeping a poisoned one costs the behaviour.
+    """
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _GUIDANCE_MENTIONS)
+
+
 # ----------------------------------------------------------------- episode
 
 

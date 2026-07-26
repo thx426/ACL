@@ -189,6 +189,19 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field.update(kwargs)
             # do not store raw image/video
             field.pop("multi_modal_data", None)
+            # trace-opd mixed objective (docs/mixed-objective-design.md): an
+            # expert sample — a rollout produced WITH the privileged document and
+            # replayed under the bare prompt — supervises through `sft_mask` and
+            # nothing else. Clearing its response_mask keeps it out of the
+            # on-policy terms (top-k OPD, policy gradient) AND out of every
+            # denominator derived from them (batch_num_tokens is a sum over
+            # loss_mask), so switching the SFT arm on cannot rescale the OPD loss.
+            # Every row carries both fields so the batch layout stays uniform.
+            response_mask = field["response_mask"]
+            is_expert_sample = (field.get("extra_fields") or {}).get("sample_role") == "sft"
+            field["sft_mask"] = response_mask.clone() if is_expert_sample else torch.zeros_like(response_mask)
+            if is_expert_sample:
+                field["response_mask"] = torch.zeros_like(response_mask)
             # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

@@ -30,19 +30,34 @@ _RESEARCH = (
     "research_experiments",
     "research_episodes",
 )
+# Mixed objective, SFT arm (docs/mixed-objective-design.md).
+_MIXED_SFT = ("sft_role", "sft_won", "sft_accepted", "sft_dropped_ref")
 
 
 def build_curve_metrics(
-    *, validate: bool, research_enabled: bool, fields: dict[str, Any]
+    *,
+    validate: bool,
+    research_enabled: bool,
+    fields: dict[str, Any],
+    mixed_sft: bool = False,
 ) -> dict[str, float]:
     """Assemble the per-sample curve scalars from the sample's extra_fields.
 
     Call AFTER the teacher-prefix step so ``doc_missing`` reflects the final
     state (a doc overflowing the teacher context degrades to bare and flips
     doc_missing to 1 in extra_fields after research reported 0).
+
+    ``mixed_sft`` is a batch-wide constant (the config's SFT weight), so adding
+    its keys keeps the homogeneity contract. They are per-BATCH means over all
+    replicas, expert and bare alike — read them as ratios: ``sft_won/sft_role``
+    is the document-guided success rate (the PG-7 document-quality signal) and
+    ``sft_accepted/sft_role`` is what actually reaches the SFT loss.
     """
     metrics = {key: float(fields[key]) for key in _ALWAYS}
     if not validate and research_enabled:
         for key in _RESEARCH:
+            metrics[key] = float(fields.get(key, 0) or 0)
+    if not validate and mixed_sft:
+        for key in _MIXED_SFT:
             metrics[key] = float(fields.get(key, 0) or 0)
     return metrics
