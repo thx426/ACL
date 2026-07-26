@@ -41,6 +41,12 @@ def build_expert_sample(
         bare policy never sees (see ``mentions_guidance``);
       * the replay does not fit the sequence budget.
     """
+    if not result.tokens.response_ids:
+        # Caller contract: an empty response must never reach the trainer — verl
+        # writes rm_scores[-1] unconditionally and would die on the index. The
+        # agent loop falls back to a bare rollout instead.
+        raise ValueError("build_expert_sample: episode produced no response tokens")
+
     trajectory = result.trajectory
     fields: dict[str, Any] = {
         "sample_role": "sft",

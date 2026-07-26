@@ -467,11 +467,25 @@ class TraceAgentLoop(AgentLoopBase):
                 is_expert = False
 
         t0 = time.time()
+        result = None
         if is_expert:
             result = await self._expert_rollout(
                 adapter, doc, sampling_params, response_length, route
             )
-        else:
+            if not result.tokens.response_ids:
+                # An environment fault before the first generation leaves nothing
+                # to imitate — and an empty response is a shape the trainer
+                # cannot take (as_dict writes rm_scores[-1]). Fall back to the
+                # student path, which retries the fault and fails loud twice
+                # over rather than emitting a degenerate row.
+                logger.warning(
+                    "expert episode for %s produced no tokens (%s); falling back to a bare rollout",
+                    adapter.task_id,
+                    result.trajectory.error,
+                )
+                is_expert = False
+                result = None
+        if result is None:
             result = await self._student_rollout(adapter, sampling_params, response_length, route)
         metrics.generate_sequences += time.time() - t0
 

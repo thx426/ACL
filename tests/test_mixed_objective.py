@@ -193,3 +193,23 @@ def test_launcher_adds_expert_rollouts_only_when_the_sft_arm_is_on(tmp_path):
     assert "actor_rollout_ref.rollout.n=12" in on
     assert "+distillation.distillation_loss.sft_loss_coef=0.5" in on
     assert "+distillation.distillation_loss.rl_loss_coef=1.0" in on
+
+
+@pytest.mark.asyncio
+async def test_expert_sample_refuses_an_episode_with_no_response():
+    """An empty response is the one shape the trainer cannot take (verl writes
+    rm_scores[-1] unconditionally), so the contract fails loud here and the
+    agent loop falls back to a bare rollout."""
+    from trace_opd.core.episode import EpisodeResult, EpisodeTokens
+    from trace_opd.core.types import OUTCOME_ENV_ERROR, Trajectory
+
+    traj = Trajectory(episode_id="e", task_id="fake/task_1", guidance_hash="h",
+                      sample_idx=0, initial_obs="")
+    traj.outcome = OUTCOME_ENV_ERROR
+    empty = EpisodeResult(
+        trajectory=traj,
+        tokens=EpisodeTokens(prompt_ids=[], response_ids=[], response_mask=[]),
+        assistant_turns=0, invalid_format=0, truncated=False, gen_extra={},
+    )
+    with pytest.raises(ValueError, match="no response tokens"):
+        _sample(empty)
