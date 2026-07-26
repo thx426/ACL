@@ -35,6 +35,16 @@
 - **无脉冲/无闸门/无冻结/无输入过滤**:标准 OPD 连续训练;只保留 verl 标准
   的曲线 logging 与定期 checkpoint。
 
+> **循环形态演变(2026-07-24/25,用户裁定,机制语义不变)**:
+> ① researcher 由本地 27B sidecar 迁**外部 qwen3.6-35b-a3b 双端点池**(经隧道,
+> `PooledClient` 会话粘性+least-active 均衡+故障切换;27B 下线,本地卡归 policy
+> 独占;详见 `docs/collab/cd005-cd006/req-external-researcher-pool.md`)。
+> ② 研究会话与学生裸 rollout **并行**(学生不依赖 doc,doc 只在 teacher 打分处
+> await;并发上限 21→112,3401ba5)。
+> ③ self-teacher 打分双后端:`TRACE_TEACHER_SCORING_BACKEND` = `vllm`(原路径,
+> rollout 引擎 prompt_logprobs)/ **`fsdp`(主线)**——打分迁训练引擎 no-grad
+> 前向,行语义严格复刻,根治 vLLM logprobs 预算外分配(见 §6 R11)。
+
 ## 3. 角色 × 后端矩阵
 
 LLM 角色统一经 `backend` 声明解析(`common/config.py` + `train/backends.py`):
@@ -121,6 +131,38 @@ task_id/gamefile/initial_obs/split/**gt_text(预提取)**,GT 是否给 researche
   (用户第二次裁定保持 20:间隔 320 任务,时间分辨率比 h3 细一倍,
   代价 val 墙钟 ≈6.6h)。与 h3(batch 64)对比结论时注意口径差。
   评审全部裁决见 `docs/review-findings.md`。
+
+### 6.2 R11:self-teacher 打分迁训练引擎(fsdp 后端,2026-07-26 定版主线)
+
+vLLM `prompt_logprobs` 的 logprobs 分配在 `gpu_memory_utilization` 预算之外
+(vllm issue #5907)——rollout 尾部 76-81GB 显存尖峰与 vLLM 进程 torch 驻留爬升
+(5→15GB)的共同根因。R11(CD-006 实施、经 codex 深评、生产冒烟通过后收编)把
+self-teacher 打分移到训练引擎:rollout 侧跳过 vLLM 调用,特权前缀随
+`extra_fields`(`teacher_mode`/`teacher_topk`/`teacher_prefix_ids`,provenance
+fail-loud)到 trainer,`update_actor` 入口对每样本 no-grad 前向取 top-K
+(`verl/trainer/distillation/teacher_topk_fsdp.py`,行语义严格复刻 vLLM 路径:
+prefix+response 打分行、per-sample 零填充/有效/dummy 布局、fp32 logsumexp)。
+权重相等性:update_actor 在本 step optimizer 更新之前执行 = vLLM 本会用的权重。
+等价性实测:overlap_ratio 0.850(vLLM 基线带 0.828-0.848)、teacher_mass
+0.99880、行级 KL 均值 7.7e-04(小于训练信号 3 个数量级);rollout 尾部尖峰
+81.2→47.2GB 根除,并顺带消除跨引擎数值 mismatch(旧 P3)。配套:
+`logits/temperature` 恒等除法跳过(seqlen×vocab fp32 副本 13.5GiB@22k,
+step-16 OOM 触发点,逐位等价);`rollout_max_num_batched_tokens` 与后端联锁
+(fsdp→4096 恢复 h3 铁稳值,vllm 回退→2048)。开关默认 fsdp(脚本层),
+`vllm` 保留为回退路径。
+
+### 6.3 信号增强三件套 K1/K2/K3:已移除(2026-07-26 用户裁定)
+
+CD-006 在 1.7B v2 时代实验过的 loss/打分侧三改动(K1 clamp 软化、K2 KL^α
+自适应加权、K3 分块保鲜打分)按用户裁定**从机制中整体移除(非关闭)**:
+K2 实测 no-op;K3 在 fsdp 打分后端不被支持(只会静默降级)且是步时 2.7×
+开销主因(33.0→12.4 分钟);K1 是唯一可能有价值的(早期黄金信号撞
+`loss_max_clamp=10` 截顶,observations (73)),留作主线稳定后的**独立立项
+A/B**,不作常驻开关。蒸馏 loss 回归纯 `forward_kl_topk` + 硬 clamp(= v1 与
+h3 口径,跨版本 loss 曲线可比性恢复)。移除由 `test_vendored_verl.py::
+test_signal_enhancement_triplet_removed` 锁死。三件套的实验判决数据仍有效
+(K3 曾证深度保持率 3.6%→16.7%——深处信号可救,为后续机制设计保留证据;
+见 `docs/experiments/cd006-signal-enhancement-final.md` 与 feedback 底账)。
 
 ### 6.1 序列容量伸缩路径(长程任务预案,用户原则:配置不得限制任务)
 
@@ -234,6 +276,19 @@ engine 后端的 LLM 调用不做请求级磁带:研究 episodes 与 student rol
 结构化全轨迹,narration 产物随归档——语义层记录完整,请求层冗余。
 
 ## 9. 部署拓扑:162 单机分时复用(用户裁定 2026-07-23)
+
+> **拓扑演变(2026-07-25/26 定版,本节以下为 162 时代历史记录)**:4B 主线迁
+> **A800 8 卡**(10.10.252.11;该机两条硬约束:①卡间通信不可靠——默认
+> MODE=noshard 全 gloo 零 NCCL,MODE=shard2 最小化 NCCL;②驱动 525 **不可用
+> `ulysses_sp>1`/flash-attn**——实证六卡同时 Xid 31 MMU Fault,回退须卸载
+> flash-attn)+ **切勿设 `expandable_segments:True`**(与 vLLM CuMemAllocator
+> 互斥,实证事故)。researcher = 外部 35B 双端点(§2 演变);162 保留对照线。
+> 稳定性定版:R1 打包预算不抬 + R2 resume weights 前清缓存 + R3 每 prompt
+> 2700s 超时 + `VLLM_RPC_TIMEOUT=300000` + 空批诊断防御;ckpt 策略
+> `save_contents` 去 `hf_model`(需 HF 用 `python -m verl.model_merger` 离线转,
+> **probe 工具链取 HF 权重按此路径**)+ `max_actor_ckpt_to_keep=3`(峰值 ckpt
+> 由 CD-006 手工 pin,requirements 归档区 R4)。启动入口
+> `scripts/run_a800_4b.sh`(联锁与硬约束注释在脚本内)。
 
 A800-SXM 经用户实测确认不可靠(TP4 负载 40min 楔死事故 + 复测仍不可用),
 **正式与测试实验一律在 zkgy(10.77.110.162,4×80G:A800=GPU0,1 / A100=GPU2,3,
