@@ -463,31 +463,6 @@ class TraceAgentLoop(AgentLoopBase):
             )
             if teacher_prompt_ids is not None:
                 output.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
-                # K3 block-refresh scoring (2026-07-24, user-approved, W=4):
-                # doc-as-prefix influence decays ~50x by turn 7 (measured), so
-                # ship block boundaries (response offsets after every W-th
-                # assistant turn) + the tokenized full doc; the verl scorer
-                # inserts ONE fresh copy per block. Block 0 stays byte-
-                # identical to the historical teacher (doc adjacent anyway).
-                W = self.cfg.train.distill_block_turns
-                spans = result.tokens.turn_spans
-                if W > 0 and len(spans) > W:
-                    doc_block_ids = self.tokenizer.encode(
-                        "\n\n## Task guidance\n" + doc + "\n", add_special_tokens=False
-                    )
-                    fits = (
-                        len(teacher_prompt_ids)
-                        + len(result.tokens.response_ids)
-                        + len(doc_block_ids)
-                        + 8
-                        <= self.cfg.train.rollout_max_model_len
-                    )
-                    if fits:
-                        output.extra_fields["teacher_block_starts"] = [
-                            spans[m][1] for m in range(W - 1, len(spans) - 1, W)
-                        ]
-                        output.extra_fields["teacher_doc_ids"] = doc_block_ids
-                    # 不合长时静默退回单次打分(等价旧机制,非错误)
             else:
                 output.extra_fields["doc_missing"] = 1  # overflow degraded to bare
 

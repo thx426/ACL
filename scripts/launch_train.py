@@ -234,10 +234,6 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "distillation.distillation_loss.use_task_rewards=False",
         "distillation.distillation_loss.loss_max_clamp=10.0",
         "distillation.distillation_loss.log_prob_min_clamp=-10.0",
-        # 信号增强三件套 K1/K2(K3 经 extra_fields 走 agent loop,无 CLI 项)
-        f"+distillation.distillation_loss.loss_soft_cap={t.distill_loss_soft_cap}",
-        f"+distillation.distillation_loss.kl_weight_alpha={t.distill_kl_weight_alpha}",
-        f"+distillation.distillation_loss.kl_weight_cap={t.distill_kl_weight_cap}",
     ]
 
 

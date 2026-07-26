@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A800-SXM 多卡 4B(FSDP1 NO_SHARD + 全 gloo,零 NVLink 流量) —— 对齐 trace_opd_v1(三件套全关),硬约束:零卡间通信
+# A800-SXM 多卡 4B(FSDP1 NO_SHARD + 全 gloo,零 NVLink 流量) —— 对齐 trace_opd_v1,硬约束:零卡间通信
 # memory: a800-no-inter-gpu-comm
 set -euo pipefail
 W=/fs/fast/u2021000902/wushang/workspace/TRACE-OPD
@@ -44,14 +44,17 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-300000}
 # CD-006 R11a(2026-07-25):self-teacher 打分后端。fsdp = 在训练引擎上打分,
 # 彻底绕开 vLLM prompt_logprobs 的预算外分配缺陷(官方 issue #5907,rollout 尾部
-# 76-81GB 尖峰与基线爬升的共同根因);vllm = 原路径。等价性已验证后默认 fsdp。
-export TRACE_TEACHER_SCORING_BACKEND=${TRACE_TEACHER_SCORING_BACKEND:-vllm}
+# 76-81GB 尖峰与基线爬升的共同根因);vllm = 原路径(回退用)。
+# CD-005 2026-07-26 收编时切默认 fsdp:生产冒烟已过(overlap 0.850 在 vLLM 基线带内、
+# teacher_mass 0.99880、rollout 尾部尖峰 81.2→47.2GB 根除),requirements §1 定版主线。
+export TRACE_TEACHER_SCORING_BACKEND=${TRACE_TEACHER_SCORING_BACKEND:-fsdp}
 # torch allocator 超 85% 主动回收 unused blocks(纵深防御,主要护 vLLM 进程侧驻留;
 # 不可用 expandable_segments——与 vLLM CuMemAllocator 冲突为实证事故)
 # ⚠ 不要在这里设 expandable_segments:True —— 2026-07-26 实测它与 vLLM 的 memory pool 互斥,
 # 引擎直接起不来:`AssertionError: Expandable segments are not compatible with memory pool`
 # (pytorch#147851)。本 run 依赖 vLLM sleep/wake 的 CuMemAllocator,两者不可共存。
-# 抗 OOM 改由 ulysses_sp=2(切分序列,logits 减半)+ 跳过 temperature 恒等复制承担,
+# 抗 OOM 由「跳过 temperature 恒等复制」(617817c,省 13.5GiB@22k 序列)承担;
+# ulysses_sp 在该机不可用(硬约束一,见派生配置段注释)。
 # 分配器保持 PyTorch 默认。garbage_collection_threshold 亦不再设(推迟回收,未验证有益)。
 MINFREE=$(nvidia-smi -i $CARDS --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
 [[ $MINFREE -lt 70000 ]] && { echo "FATAL 某卡剩余仅 ${MINFREE}MiB,疑有残留进程"; exit 1; }
@@ -104,26 +107,31 @@ done
 # 根因,必须降半到 2048;R11 把打分移到训练引擎后该成因消失,恢复 h3 铁稳值 4096(长序列
 # prefill 的 chunk 数减半,缓解 (72) 实测的 rollout 吞吐下降)。联锁写在这里而不是靠人记住:
 # 回退 backend 时预算自动跟随,漏改就会当场 OOM。
-if [[ "${TRACE_TEACHER_SCORING_BACKEND:-vllm}" == "fsdp" ]]; then
+if [[ "${TRACE_TEACHER_SCORING_BACKEND:-fsdp}" == "fsdp" ]]; then
   NBT=4096; NBT_WHY="R11 fsdp 打分:vLLM 不再物化打分 logits,恢复 h3 铁稳值"
 else
   NBT=2048; NBT_WHY="vLLM 侧打分:必须降半压制 logits 缓冲(feedback P0 OOM 根因)"
 fi
 say "chunked-prefill 预算 rollout_max_num_batched_tokens=$NBT  ($NBT_WHY)"
 
-# ---- 派生配置:单卡 + 三件套全关(= v1 基线) ----
+# ---- 派生配置(= v1 基线) ----
 CONFIG=$T/configs/trace.yaml
 GEN=$T/configs/trace_a800_4b.gen.yaml
+# ⚠⚠ 硬约束一(2026-07-26 07:06 实证,requirements §3-C):A800(驱动 525)上
+# **不可用 ulysses_sp>1 / flash-attn**。启用 SP=2(联动 rmpad+FA2)后 vLLM 报
+# `CUDA error: an illegal memory access` → 六卡同时 NVRM Xid 31 MMU Fault →
+# nvidia-smi 连续 5 分钟无响应;六卡同发 = 系统性 kernel 越界,与该机卡间通信
+# 不可靠的历史顽疾同源(SP 走 all-to-all)。回退须【卸载 flash-attn】,只设
+# SP=1 不够——vLLM 会自动选用已装的 flash-attn 且 0.19.1 无后端开关。
+# SP=2 显存收益本就很小(峰值 66481 vs 单靠 temperature 恒等修复推算 67369),
+# 长序列 OOM 由 617817c(跳过 temperature 恒等复制)独立承担。默认定版 SP=1。
 sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo 后端(零 NCCL)|" \
-    -e "s|^  ulysses_sp: .*|  ulysses_sp: ${ULYSSES_SP:-2}             # CD-006 2026-07-26 开启序列并行。step-16 因 22k token 序列的全词表 logits(seqlen x 151936 x 4B = 13.5GiB)在训练前向 OOM;SP 把序列切到 2 卡,单卡 logits 减半,并由 launch_train.py 联动 use_remove_padding=True + FA2(消除 padding 浪费)。flash-attn 2.8.3 已装并过 varlen 冒烟。ULYSSES_SP=1 可一键回退|" \
+    -e "s|^  ulysses_sp: .*|  ulysses_sp: ${ULYSSES_SP:-1}             # A800 硬约束一:SP>1/flash-attn 触发六卡 MMU Fault(见上方注释),定版 1|" \
     -e 's|^  rollout_tp: .*|  rollout_tp: 1             # 单卡 ⇒ TP1|' \
     -e 's|^  rollout_gpu_mem: .*|  rollout_gpu_mem: 0.40     # CD-006 2026-07-25 二次上调(0.30→0.40):step-5 崩因是训练后 torch 未归还足够物理显存,vLLM wake_up 拿不到 KV 池(cumem_allocator OOM)。降 4GB 需求换余量|' \
     -e "s|^  rollout_max_num_batched_tokens: .*|  rollout_max_num_batched_tokens: $NBT   # $NBT_WHY|" \
     -e "s|^  ppo_max_token_len_per_gpu: .*|  ppo_max_token_len_per_gpu: $TOKLEN      # 执行层,不改训练数学|" \
     -e "s|^  log_prob_max_token_len_per_gpu: .*|  log_prob_max_token_len_per_gpu: $TOKLEN  # 同上|" \
-    -e 's|^  distill_block_turns: .*|  distill_block_turns: 0    # K3 关(对齐 v1)|' \
-    -e 's|^  distill_loss_soft_cap: .*|  distill_loss_soft_cap: false  # K1 关(对齐 v1,回退 hard clamp)|' \
-    -e 's|^  distill_kl_weight_alpha: .*|  distill_kl_weight_alpha: 0.0  # K2 关(对齐 v1;已实证 no-op)|' \
     -e 's|^  test_freq: .*|  test_freq: 10             # CD-006 2026-07-25 用户裁定开评测:每 10 步一次 val(seen+unseen 两 split, greedy)|' \
     -e 's|^  save_freq: .*|  save_freq: 5|' \
     -e '/^  researcher:/,/max_concurrency:/{
@@ -132,7 +140,7 @@ sed -e "s|^  n_gpus: .*|  n_gpus: $NGPU                 # A800 ${NGPU}卡 + gloo
         s|^    model: "${TRACE_RESEARCHER_MODEL}".*|&\n    api_key_env: TRACE_RESEARCHER_API_KEY|
     }' "$CONFIG" > "$GEN"
 say "派生配置: $GEN"
-grep -E "^  n_gpus:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  log_prob_max_token|^  distill_block_turns:|^  distill_loss_soft_cap:|^  distill_kl_weight_alpha:|^  lr:|^  test_freq:|sidecar_sleep:|dp_size:|api_key_env:" "$GEN" | sed 's/^/    /'
+grep -E "^  n_gpus:|^  ulysses_sp:|^  rollout_tp:|^  rollout_gpu_mem:|^  ppo_max_token_len|^  log_prob_max_token|^  lr:|^  test_freq:|sidecar_sleep:|dp_size:|api_key_env:" "$GEN" | sed 's/^/    /'
 
 # ---- 单卡显存:optimizer 状态 offload 到 CPU(468G RAM) ----
 # 单卡不再有 FSDP 4 路分片:模型状态从 12GB/卡 涨到 48GB,不 offload 必 OOM
