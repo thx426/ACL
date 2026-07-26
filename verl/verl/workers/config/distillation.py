@@ -69,18 +69,6 @@ class DistillationLossConfig(BaseConfig):
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
-    # trace-opd K1 (2026-07-24, user-approved): soften the hard loss cap —
-    # above loss_max_clamp compress as c + log1p(x - c) instead of flattening.
-    # Preserves ordering of the strongest teacher-disagreement spikes (the
-    # decision-fork signals measured at KL>=10) instead of erasing them.
-    loss_soft_cap: bool = False
-    # trace-opd K2: signal-adaptive per-token weighting w ∝ |KL|^alpha
-    # (detached, batch-mean-normalized, capped). alpha=0 disables. In the
-    # self-teacher setting per-token KL is exactly the "document differential",
-    # so decision tokens self-select without any vocabulary/env dependence.
-    kl_weight_alpha: float = 0.0
-    kl_weight_cap: float = 10.0
-
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
     # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
     # Default ``False`` to preserve short-context performance (chunked path

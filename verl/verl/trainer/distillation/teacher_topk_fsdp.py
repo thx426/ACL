@@ -128,7 +128,6 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     # ---- codex M4: full structural validation BEFORE any forward ----------
     topk = None
     plan = []  # (prefix_tensor, response_tensor, P, R)
-    k3_warned = False
     for i in range(n):
         ex = extras[i] or {}
         mode = ex.get("teacher_mode", None)
@@ -153,10 +152,6 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
             prefix = prompts[i]
         else:
             prefix = torch.as_tensor(list(prefix), dtype=torch.long)
-        if ex.get("teacher_block_starts") and not k3_warned:
-            logger.warning("teacher_topk_fsdp: K3 block starts present — K3 is not "
-                           "implemented on the fsdp backend, single-prefix scoring")
-            k3_warned = True
         resp = responses[i]
         P, R, T = int(prompts[i].numel()), int(resp.numel()), int(prefix.numel())
         if R <= 0:
