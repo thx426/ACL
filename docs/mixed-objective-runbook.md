@@ -155,3 +155,59 @@ OPD 项内部的散度可换,与三系数正交。**默认 `forward_kl_topk` = �
 - estimator 两模式(`reverse_kl_k3`/`reverse_kl_gated`)下,`distillation/student_mass`、`teacher_mass`、`overlap_ratio`、`teacher_topk_entropy` 曲线**自动缺席**(数据上不存在,不是故障);gated 新增 `distillation/gate_mean`、`gate_active_ratio`、`teacher_gap_mean`。显微镜照常落盘(per-token loss;gated 多一列 gate)。
 - **reverse 系重点盯 response 长度**:CD-003 记录过 reverse-KL 的 length inflation 伴生症(7186→9193 逼近上限)。
 - 打分开销:estimator 模式**低于** forward(无 topk kernel、teacher 传输从 64 列降为 1 列);top-k 两模式开销与现状相同。
+
+## 8. 方向消融三定点:怎么跑(v2.3 实验指导,2026-07-27)
+
+### 8.0 前置:代码同步与在跑 run 的安全性
+
+- 拉 `mixed-objective` 最新 `dd3de2f`(vendored verl 已重导出到 `48c8743`)。同步到服务器后两个必做:
+  ①`python3 -m pytest tests/test_vendored_verl.py -q`(vendored 完整性,秒级;有 torch 的机器可加 `tests/test_kl_modes_numeric.py` 跑数值真值);
+  ②工作树 status 核对你们的生产热修与活配置没被覆盖(你们四个未提交文件——三份实验配置 + `run_a800_4b.sh`——我这边全程未碰)。
+- **在跑的 A0/A1/A2-doc 零动作**:新代码对 `forward_kl_topk` 路径行为等价(唯一差异是打分对齐哨兵从"看首行"放宽为"看前 8 行",只会更少误报),fingerprint 逐字节不变 ⇒ **任何时候重启/resume 都安全,不需要等臂跑完才换代码**。
+
+### 8.1 三定点与优先级(卡位由你们/用户定,建议接各臂出结论后的空位,不抢占)
+
+| 优先 | 定点 | 唯一变量 | 回答什么 |
+|---|---|---|---|
+| P1 | `A1×gated`:OPD 1.0(gated)+ RL 1.0 | opd_kl_mode(对照 A1×forward) | 同 RL 锚同权重下,OPD 项形式(dense forward vs 采样点 gated)的贡献差——SDAR/SEED 配方核心元件在我们机制下的真对照,也直指 1.7B 原始动机 |
+| P2 | `A0×reverse_kl_topk`:纯 OPD,只换方向 | KL 方向本身 | CD-003"方向是二阶因素"在 1.7B + 动态 doc 语境下的复验;这是唯一严格单变量的方向臂 |
+| P3 | `A0×reverse_kl_k3` | 形式(方向+单点+估计器) | 主流估计器形式参照。⚠ CD-003 的 `h3_2507_full_rkl3_from10` 是 **4B** 从 step-10 起,与 1.7B 只做**定性**对照,不做数值对照 |
+| 备选 | `A1×gated` 文献复刻版:`mix_opd_weight=0.1` | (相对 P1)λ | SDAR 原配方(RL 主干 + 小系数 gated;其代码默认 0.1、论文 0.01)。P1 显示形式有差后再上 |
+
+### 8.2 建副本(以 P1 为例;沿用你们"cp 最近邻副本"的实践)
+
+```bash
+cd trace_opd
+cp configs/experiments/a800-1p7b-a1-rl.yaml configs/experiments/a800-1p7b-a1-gated.yaml
+# 编辑新文件,三处:
+#   1) run.name → trace_opd_a800_1p7b_a1_gated(必须换:换模式=换目标,旧目录
+#      resume 会被 fingerprint 拒,这是保护不是故障)
+#   2) 头部注释写明:派生自 a800-1p7b-a1-rl,唯一变量 opd_kl_mode
+#   3) train: 段加两键(你们的副本尚无它们;推荐从 configs/trace.yaml 把
+#      「OPD 项的散度形式」整个注释块 paste 过来,最少则两行):
+#        opd_kl_mode: reverse_kl_gated
+#        opd_gate_beta: 5.0
+PYTHONPATH=src python3 -m trace_opd.tools.config_tool diff a800-1p7b-a1-gated  # 顺手核漂移
+```
+
+P2 同法:`cp a800-1p7b-a0-pure.yaml → a800-1p7b-a0-rtopk.yaml`,`opd_kl_mode: reverse_kl_topk`(此模式**不需要** `opd_gate_beta`,留默认即可);P3:`opd_kl_mode: reverse_kl_k3`。启动用各机现行方式(162 `run_experiment_1p7b.sh` / A800 你们的现行 env 覆盖),把 config 指向新副本即可。
+
+### 8.3 首验清单(第一个 step 内,7 条)
+
+1. `<run_dir>/effective_config.yaml` + 启动命令行:`loss_mode=reverse_kl_gated`(gated/k3 模式**不应出现** `topk=`/`use_chunked_topk` 行——出现了说明映射没生效;rtopk 应出现 `topk=64`)。
+2. trainer stdout 出现 **`teacher_topk_fsdp ACTIVE: backend=fsdp topk=0`**(gated/k3;rtopk 为 `topk=64`)——这行是单点打分真正生效的唯一凭证(判据纪律:看产物不看配置)。
+3. 曲线面:gated 应出现 `distillation/gate_mean`、`gate_active_ratio`、`teacher_gap_mean`;estimator 两模式下 `student/teacher_mass`、`overlap_ratio`、`teacher_topk_entropy` **缺席是预期**,不是故障。
+4. **gate 健康判读**:`gate_mean` 预期 0.5~0.8 区间(glue token gap≈0 → gate≈0.5;doc 增益 token → 1)。**恒≈1.0 或恒≈0.0 = teacher 前缀/对齐出了结构性问题,立即停并回报**。`teacher_gap_mean` 应 >0——这条就是 v2.2 补充监控要的「teacher−student gap」的 token 级直接度量,gated 模式免费自带。
+5. `distillation/loss` 语义:k3 非负(bare 降级行 ≈0);**gated 可为负(合法)**;各模式与 forward 历史曲线不同量纲,只比任务指标不比 loss 数值。
+6. 显微镜:`runs/<run>/microscope/rank*.jsonl` 照常落盘,estimator 模式记录含 `kl` 列(gated 另有 `gate` 列);`collect` join 口径不变。
+7. 哨兵:若见 `first response rows look like dummy rows` / `looks like the dummy row` 报错 = 打分对齐真出错,带完整 traceback 回报,**不要绕过**。
+
+### 8.4 运行观察与判停
+
+- 三主线照旧:成功率(`critic/score/mean`,只算 on-policy 行)、entropy、**response 长度**——reverse 系的重点(CD-003 记录 length inflation 7186→9193 逼近上限);若 5 步内 p50 涨 >30% 且成功率不涨,按崩塌前兆处理。thought 逐字重复率判别照用(测模型状态,与 KL 模式无关)。
+- gated 特有读数:`gate_active_ratio` 的趋势 = 信号自耗尽的直接读数——student 逼近 teacher 时它向 0.5 回落(类比 forward 模式 KL 收敛=文档增益被吃完)。
+- 判停沿用现行口径;跨模式误 resume 由 fingerprint 自动拦,无需人肉防。
+
+### 8.5 回退
+
+任何异常:停新臂;原臂配置照旧重启即回已知良好状态(默认模式行为等价、指纹不变)。新臂的 run 目录保留供事后分析,不复用。
