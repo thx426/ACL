@@ -39,6 +39,12 @@ v2 incorporates the codex adversarial review (task-ms0edrml-9d9z87):
 
 Weights: update_actor runs BEFORE this step's optimizer update, so scoring
 weights equal what vLLM would have used. Same model, same prefix, same tokens.
+
+Single-point mode (trace-opd reverse-KL family): ``teacher_topk == 0`` mirrors
+the vLLM convention (``prompt_logprobs=0`` -> one column holding the REALIZED
+token's logprob; extract_prompt_logprobs pads dummies at ``max(k, 1)`` width).
+The estimator losses (k3 / reverse_kl_gated) consume exactly that column, so
+scoring skips torch.topk entirely and ships (rows, 1) tensors.
 """
 import logging
 import os
@@ -103,6 +109,24 @@ def _score_rows_topk(rows: torch.Tensor, topk: int, chunk: int):
     return ids, lps
 
 
+def _score_rows_realized(rows: torch.Tensor, resp: torch.Tensor, chunk: int):
+    """Single-point mode (topk == 0): logprob of the REALIZED response token per
+    row, (R, 1) tensors matching the vLLM ``prompt_logprobs=0`` layout. Row i
+    predicts response token i, so the gather index is simply resp[i]."""
+    R = rows.shape[0]
+    ids = resp.to(torch.int32).unsqueeze(-1).cpu()
+    lps = torch.empty((R, 1), dtype=torch.float32)
+    gather_ix = resp.to(rows.device, torch.long).unsqueeze(-1)
+    for s in range(0, R, chunk):
+        e = min(s + chunk, R)
+        ch = rows[s:e].float()                        # [c, V] fp32 (only copy)
+        v_logit = torch.gather(ch, dim=-1, index=gather_ix[s:e])
+        lz = torch.logsumexp(ch, dim=-1, keepdim=True)
+        lps[s:e] = (v_logit - lz).cpu()
+        del ch, v_logit, lz
+    return ids, lps
+
+
 @torch.no_grad()
 def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     """Fill data["teacher_ids"/"teacher_logprobs"] by scoring on the FSDP engine.
@@ -124,6 +148,8 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     if not (len(extras) == len(prompts) == n):
         raise RuntimeError(f"teacher_topk_fsdp: misaligned batch extras={len(extras)} "
                            f"prompts={len(prompts)} responses={n}")
+    if n == 0:
+        raise RuntimeError("teacher_topk_fsdp: empty batch — nothing to score")
 
     # ---- codex M4: full structural validation BEFORE any forward ----------
     topk = None
@@ -185,6 +211,9 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
         _LOGGED_BACKEND = True
 
     was_training = module.training
+    # vLLM parity: prompt_logprobs=0 still ships ONE column (the realized
+    # token), and extract_prompt_logprobs pads dummies at max(k, 1) width.
+    width = max(topk, 1)
     out_ids, out_lps = [], []
     # codex H2: run under the engine's eval contract (offload load/unload, mode).
     with engine.eval_mode(zero_grad_on_exit=False):
@@ -193,8 +222,8 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
             device = next(module.parameters()).device
             for i, (prefix, resp, P, R) in enumerate(plan):
                 if prefix is None:  # expert (SFT) row: no teacher, no forward
-                    out_ids.append(torch.zeros((P + R, topk), dtype=torch.int32))
-                    out_lps.append(torch.zeros((P + R, topk), dtype=torch.float32))
+                    out_ids.append(torch.zeros((P + R, width), dtype=torch.int32))
+                    out_lps.append(torch.zeros((P + R, width), dtype=torch.float32))
                     continue
                 T = int(prefix.numel())
                 seq = torch.cat([prefix.cpu(), resp.cpu()]).to(device).unsqueeze(0)
@@ -203,15 +232,23 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
                 if rows.shape[0] != R:
                     raise RuntimeError(f"teacher_topk_fsdp: sample {i} rows "
                                        f"{rows.shape[0]} != R {R}")
-                ids_i, lps_i = _score_rows_topk(rows, topk, chunk)
+                if topk > 0:
+                    ids_i, lps_i = _score_rows_topk(rows, topk, chunk)
+                else:
+                    ids_i, lps_i = _score_rows_realized(rows, resp, chunk)
                 del logits, rows
-                if not (lps_i[0] < 0).any():
-                    raise RuntimeError("teacher_topk_fsdp: first response row looks "
-                                       "like a dummy row — alignment is off")
-                zid = torch.zeros((P - 1, topk), dtype=torch.int32)
-                zlp = torch.zeros((P - 1, topk), dtype=torch.float32)
-                did = torch.zeros((1, topk), dtype=torch.int32)
-                dlp = torch.zeros((1, topk), dtype=torch.float32)
+                # Alignment sentinel across the first few rows, not just row 0:
+                # with a single column (topk == 0) one saturated glue token can
+                # legitimately round its logprob to exactly 0.0 in fp32, but a
+                # run of them cannot — while a misaligned window still reads the
+                # all-zero dummy row and fails here on every row.
+                if not (lps_i[: min(8, R)] < 0).any():
+                    raise RuntimeError("teacher_topk_fsdp: first response rows look "
+                                       "like dummy rows — alignment is off")
+                zid = torch.zeros((P - 1, width), dtype=torch.int32)
+                zlp = torch.zeros((P - 1, width), dtype=torch.float32)
+                did = torch.zeros((1, width), dtype=torch.int32)
+                dlp = torch.zeros((1, width), dtype=torch.float32)
                 out_ids.append(torch.cat([zid, ids_i, did], dim=0))
                 out_lps.append(torch.cat([zlp, lps_i, dlp], dim=0))
         finally:

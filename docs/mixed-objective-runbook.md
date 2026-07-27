@@ -134,3 +134,24 @@ A3 完全可能因 RL 与 SFT 梯度冲突而失败,而 A1 或 A2 单独成功�
 - **dump 新增两个字段**:`sample_role`("bare"/"sft")与 `sft_accepted`,
   你们做自定义分析时可据此分层。
 - **probe 工具链**不受影响(它读 checkpoint,与 batch 组成无关)。
+
+## 7. KL 模式(`opd_kl_mode`,2026-07-27 新增;设计文档 §2.7)
+
+OPD 项内部的散度可换,与三系数正交。**默认 `forward_kl_topk` = 现状,不改配置就没有任何变化**(存量 run 的 fingerprint 也不变,resume 不受影响)。
+
+```bash
+# 纯方向单变量(接 CD-003 结论):dense 反向 KL,同一份 top-64 数据
+--set train.opd_kl_mode=reverse_kl_topk
+# CD-003 消融同款(历史曲线可比):采样点 k3,teacher 打分自动降为单点
+--set train.opd_kl_mode=reverse_kl_k3
+# SDAR/SEED 文献配方(通常配 RL 臂;λ 用 mix_opd_weight 表达,SDAR 代码默认 0.1)
+--set train.opd_kl_mode=reverse_kl_gated --set train.mix_rl_weight=1.0 \
+  --set train.mix_opd_weight=0.1   # 可选:--set train.opd_gate_beta=5.0(默认即 5.0)
+```
+
+**须知**:
+- **换模式 = 换目标**,fingerprint 会拒绝在旧 run 目录上 resume——新模式请换 `run.name` 或新实验配置副本(`config_tool new`)。
+- **loss 数值尺度跨模式不可比**(k3/gated 与 forward 完全不同量纲;gated 可为负),判停与对比只看成功率/entropy/response 长度。`sft/loss`、`rl/*` 不受影响。
+- estimator 两模式(`reverse_kl_k3`/`reverse_kl_gated`)下,`distillation/student_mass`、`teacher_mass`、`overlap_ratio`、`teacher_topk_entropy` 曲线**自动缺席**(数据上不存在,不是故障);gated 新增 `distillation/gate_mean`、`gate_active_ratio`、`teacher_gap_mean`。显微镜照常落盘(per-token loss;gated 多一列 gate)。
+- **reverse 系重点盯 response 长度**:CD-003 记录过 reverse-KL 的 length inflation 伴生症(7186→9193 逼近上限)。
+- 打分开销:estimator 模式**低于** forward(无 topk kernel、teacher 传输从 64 列降为 1 列);top-k 两模式开销与现状相同。

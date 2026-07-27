@@ -462,3 +462,88 @@ def test_launcher_forwards_all_three_weights(tmp_path):
     assert "+distillation.distillation_loss.opd_loss_coef=0.01" in cmd
     assert "+distillation.distillation_loss.rl_loss_coef=1.0" in cmd
     assert "+distillation.distillation_loss.sft_loss_coef=0.0" in cmd
+
+
+# --------------------------------------------------------- the KL-mode family
+
+
+def test_config_rejects_an_unknown_kl_mode(tmp_path):
+    with pytest.raises(ValueError, match="opd_kl_mode"):
+        _load(tmp_path, ", opd_kl_mode: reverse_kl")  # no such member; must not guess
+
+
+def test_config_rejects_a_degenerate_gate_beta(tmp_path):
+    # beta -> 0 flattens the gate to 0.5, negative beta inverts it onto
+    # teacher-rejected tokens; both would run and mean nothing.
+    with pytest.raises(ValueError, match="opd_gate_beta"):
+        _load(tmp_path, ", opd_gate_beta: 0")
+
+
+def test_fingerprint_is_byte_stable_for_the_default_mode(tmp_path):
+    """Three production arms were live on forward_kl_topk when the field landed.
+    The default mode must hash to EXACTLY the legacy 12-field material, or our
+    own resume guard refuses every one of their next restarts."""
+    import hashlib
+
+    from trace_opd.common.config import objective_fingerprint
+
+    cfg, _ = _load(tmp_path)
+    t = cfg.train
+    legacy_material = "|".join(
+        str(x) for x in (
+            t.model_path, t.mix_opd_weight, t.mix_rl_weight, t.mix_sft_weight,
+            t.mix_sft_rollouts, t.mix_sft_prefix,
+            t.rollout_n, t.train_batch_size, t.distill_topk, t.lr,
+            t.teacher_scoring_backend, cfg.research.enabled,
+        )
+    )
+    assert objective_fingerprint(cfg) == hashlib.sha1(
+        legacy_material.encode("utf-8")).hexdigest()[:12]
+
+
+def test_fingerprint_separates_kl_modes_and_beta_only_gates_the_gated_mode(tmp_path):
+    from trace_opd.common.config import objective_fingerprint
+
+    def fp(name, extra=""):
+        cfg, _ = _load(tmp_path / name, extra)
+        return objective_fingerprint(cfg)
+
+    default = fp("default")
+    modes = {
+        "k3": fp("k3", ", opd_kl_mode: reverse_kl_k3"),
+        "topk": fp("topk", ", opd_kl_mode: reverse_kl_topk"),
+        "gated": fp("gated", ", opd_kl_mode: reverse_kl_gated"),
+    }
+    assert len({default, *modes.values()}) == 4  # every mode is its own objective
+    # beta is inert outside the gated mode and must not split resumes there...
+    assert fp("beta-inert", ", opd_gate_beta: 7.0") == default
+    # ...but under the gated mode it changes what is optimised.
+    assert fp("gated-b7", ", opd_kl_mode: reverse_kl_gated, opd_gate_beta: 7.0") != modes["gated"]
+
+
+def test_launcher_maps_kl_modes_and_ships_no_inert_flags(tmp_path):
+    def args_for(name, extra=""):
+        cfg, module = _load(tmp_path / name, extra)
+        return module.build_command(cfg, tmp_path / name / "run")
+
+    default = args_for("default")
+    assert "distillation.distillation_loss.loss_mode=forward_kl_topk" in default
+    assert "distillation.distillation_loss.topk=64" in default
+    assert "+distillation.distillation_loss.use_chunked_topk=True" in default
+    assert not any(a.startswith("+distillation.distillation_loss.gate_beta") for a in default)
+
+    k3 = args_for("k3", ", opd_kl_mode: reverse_kl_k3")
+    assert "distillation.distillation_loss.loss_mode=k3" in k3
+    # estimator modes score a single point: the top-k plumbing must not ride
+    # along as inert noise in the effective config.
+    assert not any(a.startswith("distillation.distillation_loss.topk=") for a in k3)
+    assert not any("use_chunked_topk" in a for a in k3)
+
+    rtopk = args_for("rtopk", ", opd_kl_mode: reverse_kl_topk")
+    assert "distillation.distillation_loss.loss_mode=reverse_kl_topk" in rtopk
+    assert "distillation.distillation_loss.topk=64" in rtopk
+
+    gated = args_for("gated", ", opd_kl_mode: reverse_kl_gated, opd_gate_beta: 7.5")
+    assert "distillation.distillation_loss.loss_mode=reverse_kl_gated" in gated
+    assert "+distillation.distillation_loss.gate_beta=7.5" in gated
+    assert not any(a.startswith("distillation.distillation_loss.topk=") for a in gated)

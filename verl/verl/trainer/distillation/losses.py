@@ -143,6 +143,7 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         # fsdp2 shares the FSDP data layout as well (H3 pilot fix: the upstream
@@ -151,10 +152,15 @@ def compute_topk_loss(
         case "fsdp" | "fsdp2" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if loss_mode == "reverse_kl_topk":
+                distillation_loss_fn = fsdp_losses.compute_reverse_kl_topk
+            else:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
+            if loss_mode == "reverse_kl_topk":
+                raise NotImplementedError("reverse_kl_topk is implemented for the FSDP family only")
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -555,14 +561,23 @@ def _dump_microscope_rows(data: TensorDict, kl, mask, extras: dict) -> None:
         logger.warning("distillation microscope dump failed", exc_info=True)
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl_topk"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
     model_output: dict,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Compute forward KL distillation loss and related metrics using top-k log probabilities.
+    """Compute top-k distillation loss and related metrics using top-k log probabilities.
+
+    Registered for BOTH top-k modes: the direction-specific math runs in the
+    logits processor (``compute_topk_loss`` dispatches on ``loss_mode`` to
+    ``fsdp.losses.compute_forward_kl_topk`` / ``compute_reverse_kl_topk``);
+    this outer function only post-processes what that stage computed, and every
+    step of it — mass/overlap/entropy diagnostics, clamps, microscope dump —
+    is direction-agnostic.
 
     Returns:
     - distillation_losses: (bsz, resp_len)
@@ -675,8 +690,92 @@ def compute_distillation_loss_reverse_kl_estimator(
     distillation_losses = kl_penalty(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
-    # Since k1 can be negative, log the mean absolute loss.
-    metrics = {
-        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
-    }
+    # Since k1 can be negative, log the mean absolute loss. Guarded like every
+    # other diagnostic: an all-cancelled/all-expert micro-batch selects nothing.
+    valid_losses = distillation_losses[response_mask_bool]
+    metrics = {}
+    if valid_losses.numel() > 0:
+        metrics["distillation/abs_loss"] = Metric(AggregationType.MEAN, valid_losses.abs().mean())
+    # Estimator modes carry no top-k tensors, so the microscope row is just the
+    # per-token estimate itself; the offline join (resp_hash, mask integrity)
+    # works the same as under forward_kl_topk.
+    _dump_microscope_rows(data, distillation_losses, response_mask_bool, {})
+    return distillation_losses, metrics
+
+
+def _gated_logp_shift(
+    student_log_probs: torch.Tensor, teacher_log_probs: torch.Tensor, gate_beta: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The SDAR/SEED math, dependency-free so tests can execute it in isolation.
+
+    Returns (per-token losses, gate, teacher_gap); gradient flows only through
+    the student log-probs — gap and gate are detached, teacher is data.
+    """
+    teacher_gap = (teacher_log_probs - student_log_probs).detach()
+    gate = torch.sigmoid(float(gate_beta) * teacher_gap)
+    losses = gate * (teacher_log_probs.detach() - student_log_probs)
+    return losses, gate, teacher_gap
+
+
+@register_distillation_loss(DistillationLossSettings(names=["reverse_kl_gated"], use_estimator=True))  # type: ignore[arg-type]
+def compute_distillation_loss_gated_logp_shift(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Confidence-gated logp-shift on sampled tokens — the SDAR/SEED objective.
+
+    The two 2026 agentic self-distillation lines use the mathematically
+    identical term (SDAR ``sdar_utils.compute_sdar_loss``, SEED
+    ``core_algos.compute_opd_loss``, both gate_beta=5.0 by default):
+
+        delta_t = log pi_T(y_t) - log pi_S(y_t)          (sampled token, detached)
+        gate_t  = sigmoid(beta * delta_t)                 (detached)
+        loss_t  = gate_t * (log pi_T(y_t) - log pi_S(y_t))
+
+    Gradient flows only through -log pi_S: every sampled token is pulled UP
+    with strength gate_t — full pull where the teacher endorses it beyond the
+    student's own confidence, exponentially attenuated where the teacher
+    rejects it. It is not a KL estimator (the papers call it a reverse-KL
+    surrogate); unlike k1, the teacher does shape the gradient — through the
+    detached gate.
+
+    Differences to the source repos, on purpose: their sample/step-level
+    ``opd_step_mask`` (SEED hindsight skills cover only some steps) has no
+    counterpart here because the privileged document conditions the whole
+    trajectory — response_mask IS the step mask; and their loss coefficient
+    (SDAR ``sdar_loss_coef``, code default 0.1, paper 0.01; SEED
+    ``opd_loss_coef``) maps onto the caller's opd_loss_coef, not a second knob.
+
+    Returns:
+    - distillation_losses: (bsz, resp_len)
+    - distillation_metrics: Dictionary of metrics.
+    """
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    if data["response_mask"].is_nested:
+        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask_bool = data["response_mask"].bool()
+    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+
+    loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    gate_beta = float(getattr(loss_config, "gate_beta", 5.0))
+    distillation_losses, gate, teacher_gap = _gated_logp_shift(
+        student_log_probs, teacher_log_probs, gate_beta
+    )
+
+    metrics = {}
+    valid_gate = gate[response_mask_bool]
+    if valid_gate.numel() > 0:
+        metrics = {
+            "distillation/gate_mean": valid_gate.mean().item(),
+            "distillation/gate_active_ratio": (valid_gate > 0.5).float().mean().item(),
+            "distillation/teacher_gap_mean": teacher_gap[response_mask_bool].mean().item(),
+            "distillation/abs_loss": Metric(
+                AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()
+            ),
+        }
+    _dump_microscope_rows(data, distillation_losses, response_mask_bool, {"gate": gate})
     return distillation_losses, metrics

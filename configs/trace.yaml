@@ -270,7 +270,33 @@ train:
                             # 训练阶段两引擎皆 sleep,FSDP 可用 ~76GB/卡。
                             # 调大须同步调小 27B 侧 GPU_MEM(serve_researcher.sh)
   rollout_temperature: 1.0
-  distill_topk: 64          # forward_kl_topk 的 k | h3 定版(verl 官方推荐区间)
+  distill_topk: 64          # top-k 两模式的 k | h3 定版(verl 官方推荐区间)
+  # --- OPD 项的散度形式(docs/mixed-objective-design.md §2.7;默认=现状)---------
+  # 与 mix_opd_weight 正交:系数管强度,这里管 OPD 项内部用哪种散度。
+  #   forward_kl_topk —— 默认。teacher top-K 截断前向 KL(dense 分布蒸馏);
+  #                      4B 主线全部结论建立于此。
+  #   reverse_kl_k3   —— 采样 token 单点反向 KL 的 k3 估计器(Schulman kl-approx
+  #                      编号,与已移除的三件套 K1/K2/K3 无关)。CD-003 消融同款,
+  #                      与 h3_2507_full_rkl3_from10 历史曲线严格可比;teacher 打分
+  #                      降为单点(无 topk kernel、传输 1 列,开销低于 forward)。
+  #   reverse_kl_topk —— forward 的稠密方向镜像(同一份 top-K 数据 + 尾桶,真 KL
+  #                      非负)。消融时**唯一变量是 KL 方向**;estimator 形式一次
+  #                      改三个变量(方向/单点 vs 分布/估计器形式)。
+  #   reverse_kl_gated—— SDAR/SEED 置信门控 logp-shift(两家数学同构,已逐位对拍
+  #                      SEED 官方测试向量):gate=sigmoid(β·Δ) detach、梯度=
+  #                      −gate·∇logπ_S,只上拉采样 token、teacher 否决则指数衰减。
+  #                      他们的 λ 对应 mix_opd_weight(SDAR 代码默认 0.1、论文 0.01),
+  #                      β 对应 opd_gate_beta。
+  # ⚠ ①各模式 loss 数值尺度互不可比:跨模式只比成功率等任务指标,mix_opd_weight
+  #   的"等效学习率"含义随模式变;②CD-003 定论:单换 KL 方向不救崩塌(二阶因素,
+  #   只调崩塌速度/深度)——此开关的价值是消融完备性 + "方向 × RL/SFT 臂交互"
+  #   开放问题(SDAR/SEED 稳定配方 = RL 锚 + 采样点 reverse surrogate,CD-003 只测过
+  #   纯 OPD × reverse);③estimator 两模式下 top-k 系观察(student/teacher_mass、
+  #   overlap_ratio、teacher_topk_entropy)数据上不存在,自动缺席;显微镜仍落
+  #   per-token loss(gated 另有 gate 列);④换模式=换目标,fingerprint 会拒绝
+  #   跨模式 resume(默认模式不进指纹,存量 run 的指纹不变)。
+  opd_kl_mode: forward_kl_topk
+  opd_gate_beta: 5.0        # 仅 reverse_kl_gated 消费;SDAR/SEED 均默认 5.0
   # --- 混合目标 OPD × RL × SFT(docs/mixed-objective-design.md;默认全关=纯 OPD)---
   # 4B 仅靠 OPD 即可内化(step-9 起飞实证);1.7B 上 self-teacher 在 student 错误
   # 前缀下丢失文档语义抓地力,KL 信号起不来 —— 给它 RL 锚与 SFT 锚。也是正式消融

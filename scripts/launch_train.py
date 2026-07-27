@@ -138,6 +138,25 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         if t.ulysses_sp > 1
         else []
     )
+    # OPD 项的散度形式(config §opd_kl_mode → verl loss_mode;设计文档 §2.7)。
+    # top-k 两模式带 top-K 数据面参数;estimator 两模式打分自动降为单点
+    # (rollout 侧由注册表 use_topk=False 推出 prompt_logprobs=0/teacher_topk=0),
+    # chunked-topk 参数不再传——留着只会在 effective config 里当惰性噪声。
+    kl_mode_verl = {
+        "forward_kl_topk": "forward_kl_topk",
+        "reverse_kl_k3": "k3",
+        "reverse_kl_topk": "reverse_kl_topk",
+        "reverse_kl_gated": "reverse_kl_gated",
+    }[t.opd_kl_mode]
+    kl_args = [f"distillation.distillation_loss.loss_mode={kl_mode_verl}"]
+    if t.opd_kl_mode in ("forward_kl_topk", "reverse_kl_topk"):
+        kl_args += [
+            f"distillation.distillation_loss.topk={t.distill_topk}",
+            "+distillation.distillation_loss.use_chunked_topk=True",
+            "+distillation.distillation_loss.chunked_topk_chunk_size=2048",
+        ]
+    if t.opd_kl_mode == "reverse_kl_gated":
+        kl_args.append(f"+distillation.distillation_loss.gate_beta={t.opd_gate_beta}")
     return [
         sys.executable, "-m", "verl.trainer.main_ppo",
         "algorithm.adv_estimator=grpo",
@@ -239,10 +258,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "distillation.n_gpus_per_node=0",
         "distillation.nnodes=0",
         f"distillation.teacher_models.teacher_model.model_path={t.model_path}",
-        "distillation.distillation_loss.loss_mode=forward_kl_topk",
-        f"distillation.distillation_loss.topk={t.distill_topk}",
-        "+distillation.distillation_loss.use_chunked_topk=True",
-        "+distillation.distillation_loss.chunked_topk_chunk_size=2048",
+        *kl_args,
         "distillation.distillation_loss.use_policy_gradient=False",
         "distillation.distillation_loss.use_task_rewards=False",
         "distillation.distillation_loss.loss_max_clamp=10.0",

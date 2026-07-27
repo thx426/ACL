@@ -153,3 +153,100 @@ def compute_forward_kl_topk(
         "overlap_token_advantage": overlap_token_advantage,
         "teacher_topk_entropy": teacher_topk_entropy,
     }
+
+
+def compute_reverse_kl_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict:
+    """Reverse-KL mirror of ``compute_forward_kl_topk`` on the SAME top-k data.
+
+    Per token the loss is the KL between the two (K+1)-bucket categorical
+    distributions induced by the teacher's top-k support plus a tail bucket:
+
+        sum_{i in topK} p_S(i) * (log p_S(i) - log p_T(i))
+          + (1 - m_S) * (log(1 - m_S) - log(1 - m_T))
+
+    with m_S / m_T the two distributions' top-k masses. The member sum alone is
+    the truncated reverse KL; the tail bucket is what makes the whole thing a
+    true KL (non-negative, and it is the term that penalises student mass
+    parked OUTSIDE the teacher's top-k — exactly the mode-seeking pressure a
+    support-restricted sum cannot express). Deliberately a standalone mirror
+    rather than a refactor: ``compute_forward_kl_topk`` is the 4B mainline's
+    hot path and stays byte-identical.
+    """
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, total_nnz, topk)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)  # (1, total_nnz, topk)
+
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+    loss_config: DistillationLossConfig = config.distillation_loss
+    use_chunked_topk = getattr(loss_config, "use_chunked_topk", False)
+    if use_chunked_topk:
+        student_topk_ids = torch.topk(student_logits, k=teacher_topk_ids.shape[-1], dim=-1).indices
+        student_topk_log_probs = _chunked_topk_log_probs(
+            student_logits,
+            teacher_topk_ids,
+            chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
+        )
+    else:
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        student_topk_ids = torch.topk(student_log_probs, k=teacher_topk_ids.shape[-1], dim=-1).indices
+        student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+
+    # Masses come off the RAW log-probs (same order as the forward path: mass
+    # first, clamp after) and stay in the graph — the tail term is where the
+    # out-of-support gradient comes from.
+    student_mass = student_topk_log_probs.exp().sum(dim=-1)
+    teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
+    if loss_config.log_prob_min_clamp is not None:
+        clamped_student_lp = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        clamped_teacher_lp = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+    else:
+        clamped_student_lp = student_topk_log_probs
+        clamped_teacher_lp = teacher_topk_log_probs
+    # Member sum: q||p with the roles of kl_divergence's arguments swapped.
+    member_kl = kl_divergence(log_q=clamped_teacher_lp, log_p=clamped_student_lp)
+
+    # Tail bucket. exp/sum can carry the mass a hair past 1.0 in fp32 and
+    # clamping members ABOVE the floor can only add mass, so cap strictly
+    # below 1 before log1p; the same -10 floor as the members bounds the term.
+    tail_floor = loss_config.log_prob_min_clamp if loss_config.log_prob_min_clamp is not None else -80.0
+    student_tail = (1.0 - student_mass.clamp(min=0.0, max=1.0 - 1e-6)).clamp(min=1e-6)
+    teacher_tail = (1.0 - teacher_mass.clamp(min=0.0, max=1.0 - 1e-6)).clamp(min=1e-6)
+    log_student_tail = student_tail.log().clamp_min(tail_floor)
+    log_teacher_tail = teacher_tail.log().clamp_min(tail_floor)
+    tail_kl = student_tail * (log_student_tail - log_teacher_tail)
+
+    distillation_losses = member_kl + tail_kl
+
+    # Same overlap diagnostics as the forward path (the definition is
+    # direction-agnostic: teacher-token forward-KL contribution on overlapped
+    # tokens), so the 2604.13016 curves stay comparable across arms.
+    overlap_mask = (teacher_topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
+    overlap_count = overlap_mask.sum(dim=-1)
+    token_kl = clamped_teacher_lp.exp() * (clamped_teacher_lp - clamped_student_lp)
+    overlap_token_advantage_sum = (-token_kl * overlap_mask).sum(dim=-1)
+    overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
+    overlap_token_advantage = torch.where(
+        overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
+    )
+
+    teacher_topk_probs = clamped_teacher_lp.exp()
+    teacher_topk_entropy = -(teacher_topk_probs * clamped_teacher_lp).sum(dim=-1)
+
+    return {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+        "overlap_count": overlap_count,
+        "overlap_token_advantage": overlap_token_advantage,
+        "teacher_topk_entropy": teacher_topk_entropy,
+    }

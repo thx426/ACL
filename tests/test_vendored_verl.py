@@ -153,6 +153,45 @@ def test_microscope_skips_rows_with_no_distillation():
     assert "if not bool(mask[i, :length].any()):" in src
 
 
+def test_kl_mode_family_wired_on_the_executed_paths():
+    # 0a6edfb + 6fb4145 + 48c8743: the four opd_kl_mode values all resolve to
+    # code that exists in the export, on the paths training actually runs.
+    losses = _read("trainer/distillation/losses.py")
+    # top-k direction dispatch in the logits-processor entry, both names on the
+    # (direction-agnostic) outer post-processor, and the gated objective.
+    assert 'loss_mode == "reverse_kl_topk"' in losses
+    assert '"forward_kl_topk", "reverse_kl_topk"' in losses
+    assert "def compute_distillation_loss_gated_logp_shift" in losses
+    assert "def _gated_logp_shift" in losses
+    assert 'names=["reverse_kl_gated"]' in losses
+
+    fsdp = _read("trainer/distillation/fsdp/losses.py")
+    assert "def compute_reverse_kl_topk" in fsdp
+    assert "tail_kl" in fsdp  # the (K+1)-bucket tail term, not a bare truncation
+
+    cfg = _read("workers/config/distillation.py")
+    assert "gate_beta: float = 5.0" in cfg
+    assert "gate_beta must be finite and > 0" in cfg
+
+
+def test_single_point_scoring_mode_on_the_fsdp_backend():
+    # 0a6edfb: teacher_topk == 0 (the estimator family) must not hit torch.topk,
+    # and the dummy width must follow the vLLM max(k, 1) convention.
+    fsdp = _read("trainer/distillation/teacher_topk_fsdp.py")
+    assert "def _score_rows_realized" in fsdp
+    assert "width = max(topk, 1)" in fsdp
+    # hardened alignment sentinel: first rows, not row 0 alone (a single
+    # saturated glue token can round to logprob 0.0 in fp32).
+    assert "lps_i[: min(8, R)]" in fsdp
+
+
+def test_estimator_family_reaches_the_microscope():
+    # 48c8743: under k3/gated the offline analysis must not silently go dark —
+    # forward, the estimator family, and the gated mode all dump rows.
+    losses = _read("trainer/distillation/losses.py")
+    assert losses.count("_dump_microscope_rows(") >= 3
+
+
 def test_signal_enhancement_triplet_removed():
     # User decision 2026-07-26 (requirements 3-D): K1/K2/K3 are REMOVED, not
     # disabled — no implementation, no config fields, anywhere in the export.

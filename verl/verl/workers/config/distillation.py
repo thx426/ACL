@@ -61,6 +61,11 @@ class DistillationLossConfig(BaseConfig):
         Upper bound for PPO clipping ratio.
     loss_settings (DistillationLossSettings, optional):
         Runtime-populated settings based on loss_mode. Not set by user.
+    gate_beta (float):
+        Sigmoid sharpness of the confidence gate, consumed ONLY by
+        ``loss_mode='reverse_kl_gated'`` (the SDAR/SEED gated logp-shift).
+        5.0 is both papers' default (SDAR ``sdar_gate_beta``, SEED
+        ``opd_gate_beta``); inert under every other loss_mode.
     opd_loss_coef (float):
         trace-opd mixed objective: weight of the distillation term. 1.0 (default)
         is the historical behaviour. Note that with the other arms off this is a
@@ -99,6 +104,10 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
+
+    # Confidence-gate sharpness for loss_mode='reverse_kl_gated' (SDAR/SEED
+    # form); inert everywhere else. Both source repos default to 5.0.
+    gate_beta: float = 5.0
 
     # trace-opd mixed objective (docs/mixed-objective-design.md):
     #     opd_loss_coef * OPD  +  rl_loss_coef * RL  +  sft_loss_coef * SFT
@@ -143,9 +152,9 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+        if self.use_policy_gradient and self.loss_settings.use_topk:
             print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."
@@ -163,6 +172,13 @@ class DistillationLossConfig(BaseConfig):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0 (0 disables the term), got {value}")
+
+        gate_beta = float(self.gate_beta)
+        if not math.isfinite(gate_beta) or gate_beta <= 0.0:
+            # beta -> 0 degenerates the gate to a flat 0.5 (a plain half-strength
+            # logp shift) and a negative beta INVERTS it — strengthening exactly
+            # the teacher-rejected tokens. Neither is ever what an experiment means.
+            raise ValueError(f"gate_beta must be finite and > 0, got {gate_beta}")
 
         if not (self.opd_loss_coef or self.rl_loss_coef or self.sft_loss_coef):
             raise ValueError(

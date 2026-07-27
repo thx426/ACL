@@ -179,6 +179,33 @@ class TrainCfg:
                                       # root cause at 4096; halved for coexistence)
     rollout_temperature: float = 1.0
     distill_topk: int = 64
+    # --- OPD 项的散度形式(docs/mixed-objective-design.md §2.7)-----------------
+    # 与 mix_opd_weight 正交:系数管强度,这里管 OPD 项内部用哪种散度。四个值:
+    #   forward_kl_topk —— 现状默认。teacher top-K 上的截断前向 KL(分布蒸馏,
+    #                      dense,K=distill_topk)。4B 主线全部结论建立于此。
+    #   reverse_kl_k3   —— 采样 token 单点反向 KL 的 k3 估计器(Schulman
+    #                      kl-approx 编号,与已移除的信号增强三件套 K1/K2/K3 无关),
+    #                      CD-003 反向 KL 消融同款 ⇒ 与 h3_2507_full_rkl3_from10
+    #                      历史曲线严格可比。teacher 打分降为单点(topk=0),
+    #                      传输/打分开销反而低于 forward。
+    #   reverse_kl_topk —— 与 forward 完全镜像的稠密反向 KL(同一份 top-K 数据
+    #                      + 尾桶),消融时**唯一变量是 KL 方向本身**;estimator
+    #                      形式一次改三个变量(方向/单点 vs 分布/估计器),回答
+    #                      不了"方向贡献几何"。
+    #   reverse_kl_gated—— SDAR/SEED 的置信门控 logp-shift(两家数学同构;
+    #                      gate=sigmoid(β·Δ) detach,梯度=−gate·∇logπ_S,
+    #                      只上拉采样 token、teacher 否决则指数衰减)。他们的
+    #                      λ 对应我们的 mix_opd_weight(SDAR 代码默认 0.1、
+    #                      论文 0.01),β 对应 opd_gate_beta。
+    # 注意:①各模式 loss 数值尺度互不可比,跨模式只比成功率等任务指标,
+    # mix_opd_weight 的"等效学习率"含义也随模式变;②CD-003 定论:单换 KL 方向
+    # 不救崩塌(方向是二阶因素,只调崩塌速度/深度)——此开关的价值是消融完备性
+    # 与"方向 × RL/SFT 臂交互"这一开放问题(SDAR/SEED 的稳定配方 = RL 锚 +
+    # 采样点 reverse surrogate,CD-003 只测过纯 OPD × reverse);③estimator 两模式
+    # 下 top-k 系观察(student/teacher_mass、overlap_ratio、teacher_topk_entropy)
+    # 数据上不存在,自动缺席;显微镜仍落 per-token loss(gated 另有 gate 列)。
+    opd_kl_mode: str = "forward_kl_topk"
+    opd_gate_beta: float = 5.0        # 仅 reverse_kl_gated 消费;SDAR/SEED 均默认 5.0
     # --- 混合目标(OPD × RL × SFT;docs/mixed-objective-design.md)---
     # 总损失 = OPD + mix_rl_weight × RL + mix_sft_weight × SFT。两个权重默认 0
     # ⇒ 与纯 OPD 逐字节一致(4B 主线无感知)。弱模型(1.7B)上 self-teacher 在
@@ -363,6 +390,19 @@ def _validate(cfg: "Config") -> None:
             problems.append(
                 "train.mix_sft_weight>0 requires research.enabled (expert rollouts need a document)"
             )
+    if cfg.train.opd_kl_mode not in (
+        "forward_kl_topk", "reverse_kl_k3", "reverse_kl_topk", "reverse_kl_gated"
+    ):
+        problems.append(
+            f"train.opd_kl_mode={cfg.train.opd_kl_mode!r} must be one of "
+            "forward_kl_topk / reverse_kl_k3 / reverse_kl_topk / reverse_kl_gated"
+        )
+    if not (_math.isfinite(cfg.train.opd_gate_beta) and cfg.train.opd_gate_beta > 0):
+        # β→0 把 gate 退化成平坦 0.5(半强度 logp-shift),负 β 反转到
+        # teacher 否决的 token 上——都不是任何实验想表达的意思
+        problems.append(
+            f"train.opd_gate_beta={cfg.train.opd_gate_beta} must be finite and > 0"
+        )
     if cfg.train.teacher_scoring_backend not in ("fsdp", "vllm"):
         problems.append(
             f"train.teacher_scoring_backend={cfg.train.teacher_scoring_backend!r} "
@@ -578,6 +618,15 @@ def objective_fingerprint(cfg: "Config") -> str:
             t.teacher_scoring_backend, cfg.research.enabled,
         )
     )
+    # KL 模式条件式追加,而非无条件进列表:加字段那一刻有三个消融臂在生产上跑
+    # (A0/A1/A2-doc,均为 forward_kl_topk),无条件追加会改变它们已写入 manifest
+    # 的指纹,让下一次 resume 被我们自己的守卫拒掉。默认值不进 hash ⇒ 旧指纹
+    # 逐字节不变;非默认模式照常拒绝跨模式 resume;β 只在 gated 模式下有语义,
+    # 也只在那时参与。
+    if t.opd_kl_mode != "forward_kl_topk":
+        material += f"|opd_kl_mode={t.opd_kl_mode}"
+        if t.opd_kl_mode == "reverse_kl_gated":
+            material += f"|opd_gate_beta={t.opd_gate_beta}"
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
 

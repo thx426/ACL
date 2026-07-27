@@ -163,6 +163,58 @@ clipped objective,但在**调用方设定的口径下**求值 ⇒ `mix_rl_weight
    发生** ⇒ 消融将比较两个不同尺度的 OPD 目标。实现里 OPD 项在 `rl_loss_coef>0` 时对
    **清空后的快照**求值,把各臂钉死在纯 OPD 口径上(A0/A2 与上游 `use_task_rewards` 语义均不受影响)。
 
+### 2.7 OPD 项的散度形式:`opd_kl_mode` 四值族(2026-07-27 用户裁定新增)
+
+与三系数正交:系数管强度,这里管 **L_OPD 内部用哪种散度**。`train.opd_kl_mode` 四值,
+launcher 映射到 verl `distillation.distillation_loss.loss_mode`;换模式 = 换目标,
+fingerprint 拒绝跨模式 resume(默认模式不进指纹 ⇒ 存量 run 指纹逐字节不变——落地时
+A0/A1/A2-doc 三个臂正在生产上跑,无条件进指纹会让我们自己的守卫拒掉它们的下一次重启)。
+
+| 值 | 数学(每 token) | 数据面 | 出处/可比性 |
+|---|---|---|---|
+| `forward_kl_topk`(默认) | `Σ_{i∈topK} p_T(log p_T−log p_S)`(截断,双侧 clamp −10,外层 clamp≥0) | teacher top-64 | 现状;4B 主线全部结论建立于此 |
+| `reverse_kl_k3` | `k3 = exp(Δ)−1−Δ`,`Δ=logπ_T(y_t)−logπ_S(y_t)`,仅采样 token | **单点**(topk=0) | Schulman kl-approx;**CD-003 消融同款**(`h3_2507_full_rkl3_from10`,verl 官方 supervised 反向 KL 推荐;k1 直接反传被 verl 禁止——其梯度与 teacher 无关) |
+| `reverse_kl_topk` | `Σ_{i∈topK} p_S(log p_S−log p_T) + (1−m_S)(log(1−m_S)−log(1−m_T))` | teacher top-64(同 forward) | 自建镜像:teacher top-K 支撑 + 尾桶的 (K+1) 类分布**真 KL**(非负;尾桶是"student 质量停在 teacher top-K 外"的 mode-seeking 压力唯一表达点,两侧质量本就为诊断在算) |
+| `reverse_kl_gated` | `gate·Δ`,`gate=sigmoid(β·Δ).detach()`,梯度=−gate·∇logπ_S | **单点**(topk=0) | **SDAR/SEED 数学同构引入**(逐位对拍 SEED 官方测试向量:loss/gate/梯度);β=`opd_gate_beta`(两家默认 5.0),λ 对应 `mix_opd_weight`(SDAR 代码默认 0.1、论文 0.01) |
+
+**为什么四个而不是一个 reverse**:`reverse_kl_k3`/`reverse_kl_gated` 相对 forward 一次改了
+三个变量(方向、单点 vs 分布、估计器形式),回答"主流 reverse 配方在我们机制下如何";
+`reverse_kl_topk` 只改一个变量(方向),回答"KL 方向本身贡献几何"。审稿人两个都会问。
+
+**gated 的引入考证**(源码级,克隆于 `~/workspace/vibe_coding_projects/work/refs/{SDAR,SEED}`):
+SDAR `verl/trainer/ppo/sdar_utils.py::compute_sdar_loss` 与 SEED
+`verl/trainer/ppo/core_algos.py::compute_opd_loss` 逐行同构(gate detach、teacher detach、
+`agg_loss` token-mean——**与我们的每微批口径同族**,λ 语义直接对上);集成同为
+`policy_loss += coef · loss`。两处刻意不移植:①SEED 的 `opd_step_mask`
+(`critical_step_mask`)——他们的 hindsight skill 只覆盖部分步,而我们的特权文档条件化
+整条轨迹,response_mask 即 step mask,这是机制差异不是遗漏;②他们的 λ 不另设旋钮,
+映射到 `mix_opd_weight`(复刻 SDAR 全配方 = `opd_kl_mode=reverse_kl_gated,
+mix_opd_weight=0.1, mix_rl_weight=1.0`)。gated 项**不是 KL 估计器**(论文称
+reverse-KL surrogate):它只上拉采样 token(teacher 背书全力、否决指数衰减),从不下压
+——与 k1 不同,teacher 通过 detached gate 塑形梯度,所以直接反传是对的(k1 的
+teacher 无关梯度问题不存在)。
+
+**数据面**:estimator 两模式打分自动降为单点——rollout 侧由注册表 `use_topk=False`
+推出 `prompt_logprobs=0`(vLLM 路径,CD-003 已走通)/`teacher_topk=0`(fsdp 路径,
+本次新增 `_score_rows_realized`:gather 已实现 token logit − fp32 logsumexp,
+无 topk kernel、传输 1 列,**开销低于 forward**)。top-k 两模式共享全部现有数据面。
+
+**观察面代价**(选 estimator 模式时须知):`student/teacher_mass`、`overlap_ratio`、
+`teacher_topk_entropy` 数据上不存在 ⇒ 曲线自动缺席;显微镜仍落 per-token loss
+(gated 另有 gate 列),`resp_hash` join 与 mask 完整性自检不变;新增 gated 专属曲线
+`distillation/gate_mean`、`gate_active_ratio`、`teacher_gap_mean`(SEED 同名诊断)。
+**各模式 loss 数值尺度互不可比**:跨模式只比成功率等任务指标;`mix_opd_weight` 的
+"有效学习率"含义随模式变(CD-003 note 当年就为此只对照 entropy/成功率/长度)。
+
+**科学定位(诚实)**:CD-003 定论不变——**单换 KL 方向不救崩塌**(方向是二阶因素,
+只调崩塌速度/深度:step-17 成功率 rev 25% vs fwd 6%,伴 length inflation 7186→9193)。
+此开关的价值:①消融完备性;②**开放问题:方向 × RL/SFT 臂交互**——SDAR/SEED 的稳定
+配方正是"RL 锚 + 采样点 reverse surrogate",CD-003 只测过纯 OPD × reverse,
+`A1 × reverse_kl_gated` 是文献配方在我们机制下的第一次真对照;③待检验假设:mode-seeking
+在弱模型上信号更省(不强拉 1.7B 覆盖 teacher 整个 top-64,只压自己已有质量的方向,
+与"OPD 只能调已有行为"的能力边界一致)。reverse 模式的重点观察曲线:**response 长度**
+(CD-003 记录的伴生症)。
+
 ### 2.5 SFT 的前缀:在优化谁(2026-07-26 用户裁定,CD-006 §3-G 实证)
 
 | 前缀 | 优化对象 | 后果 |
@@ -320,6 +372,16 @@ verl(真源 `../verl` trace-opd,commit `a61c654` + `93a0109`):
 | V4 | `trainer/ppo/v1/trainer_base.py` | `_mixed_objective_enabled` + `_compute_advantage` 的 uid `:sft`(隔离-2);`_compute_metrics` 的 `on_policy_mask`(隔离-3);`distillation_only` 在任一臂开启时关闭 |
 | V5 | `trainer/distillation/teacher_topk_fsdp.py` + `experimental/agent_loop/agent_loop.py` | `teacher_mode="sft"`:零填充不前向 |
 
+KL 模式族追加(§2.7;commit `0a6edfb` + `6fb4145` + `48c8743`):
+
+| # | 位置 | 改动 |
+|---|---|---|
+| V6 | `trainer/distillation/teacher_topk_fsdp.py` | 单点打分模式(`teacher_topk=0` → `_score_rows_realized`,宽度 `max(k,1)` 同 vLLM 约定);对齐哨兵改看前 8 行(单列下饱和 token 的 logprob 可合法取整 0.0);空批显式拒绝 |
+| V7 | `trainer/distillation/fsdp/losses.py` | `compute_reverse_kl_topk`(独立镜像不重构——forward 是在跑热路径,保持逐字节不动) |
+| V8 | `trainer/distillation/losses.py` | `compute_topk_loss` 按 loss_mode 分发(megatron 对 reverse 明确 raise);top-k 外层后处理注册双名;`_gated_logp_shift` + `compute_distillation_loss_gated_logp_shift`(SDAR/SEED);estimator 家族补显微镜落盘与 abs_loss 空批防御 |
+| V9 | `workers/config/distillation.py` | `gate_beta`(默认 5.0,有限且>0);`use_policy_gradient` 警告覆盖全部 use_topk 模式 |
+| V10 | `experimental/agent_loop/agent_loop.py` | vLLM 路径对齐哨兵同 V6 加固(既有 `use_topk→prompt_logprobs=0` 推导零改动) |
+
 **已存在、无需动的**:GRPO advantage 全链路(`adv_estimator=grpo` 已配置且每步在算)、
 reward 通道(`reward_score = won` → rm_scores → token_level_rewards)、old_log_prob
 阶段(V1 主循环无条件跑)、`ppo_loss`(上游 vanilla + clip)。
@@ -329,7 +391,7 @@ trace_opd 侧:
 
 | # | 位置 | 改动 |
 |---|---|---|
-| T1 | `common/config.py` | `mix_rl_weight` / `mix_sft_weight` / `mix_sft_rollouts`(默认 0/0/4)+ 校验(负值、`mix_sft_weight>0` 却无 expert rollout 或无 research 均拦) |
+| T1 | `common/config.py` | `mix_rl_weight` / `mix_sft_weight` / `mix_sft_rollouts`(默认 0/0/4)+ 校验(负值、`mix_sft_weight>0` 却无 expert rollout 或无 research 均拦);**KL 族追加**:`opd_kl_mode`(四值)/`opd_gate_beta` + 校验 + fingerprint **条件式**参与(默认模式不进指纹——落地时三个臂在生产上跑,无条件进会拒掉它们的 resume;β 仅 gated 模式参与) |
 | T2 | `core/episode.py` | `replay_bare_tokens()`(§3.2) |
 | T3 | `core/expert.py`(新) | `build_expert_sample()` 三道过滤 + 拒收置零(**verl-free,故可单测**) |
 | T4 | `core/types.py` | `mentions_guidance()` |
@@ -388,6 +450,12 @@ trace_opd 侧:
 | A3 全混 | 1 | 1 | 0.5 | 完整机制 | 必跑 |
 | **A4 纯 RL** | 0 | 1 | 0 | GRPO 裸基线 | **必跑**(见下,原列为"可选"是错的) |
 | **A5 RL+SFT(无 OPD)** | 0 | 1 | 0.5 | **OPD 在弱模型上是否还有净贡献** | 必跑 |
+
+**KL 方向维(§2.7,与上表正交;记法 `臂×模式`,如 `A1×gated`)**:默认全表跑在
+`forward_kl_topk`;方向消融不展开全积,只加三个定点——`A0×reverse_kl_topk`(纯方向
+单变量,接 CD-003 结论)、`A1×reverse_kl_gated`(SDAR/SEED 文献配方在我们机制下的
+真对照)、`A0×reverse_kl_k3`(与 `h3_2507_full_rkl3_from10` 历史曲线可比的锚点)。
+跨模式只比任务指标,loss 数值尺度互不可比。
 
 A0-A3 构成"OPD 恒为 1、RL×SFT 做 2×2 因子实验",可估计 RL 增量(A1−A0)、SFT 增量
 (A2−A0)与交互(A3−A2−A1+A0)。**但只有这四臂答不了三个问题**(外部审阅 2026-07-26):

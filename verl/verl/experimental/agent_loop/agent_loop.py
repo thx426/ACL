@@ -1134,9 +1134,14 @@ class AgentLoopWorker:
                 )
                 # Sentinel against off-by-one regressions: a real top-k
                 # distribution has strictly negative logprobs; the dummy row
-                # is all zeros.
-                assert (response_teacher_logprobs[0] < 0).any(), (
-                    "first teacher response row looks like the dummy row — "
+                # is all zeros. Checked across the first few rows rather than
+                # row 0 alone — in single-point mode (prompt_logprobs=0, the
+                # reverse-KL estimator family) a row holds ONE value, and a
+                # saturated glue token can round its logprob to exactly 0.0 in
+                # fp32; a run of them cannot, while a misaligned window reads
+                # the zero padding on every row and still fails here.
+                assert (response_teacher_logprobs[: min(8, len(response_ids))] < 0).any(), (
+                    "first teacher response rows look like dummy rows — "
                     "prompt-logprob alignment is off"
                 )
                 prompt_pad_ids = torch.zeros((len(prompt_ids) - 1, teacher_ids.shape[1]), dtype=teacher_ids.dtype)

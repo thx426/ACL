@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(e8ecd43)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(48c8743)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -44,6 +44,9 @@
 | 6c4e090 | trace-opd:**全 expert 微批的 OPD 除零**(外部审阅发现)——expert 行 `response_mask` 全零,而均衡分区器按 workload 分微批、不看 role ⇒ 「整个微批都是 expert 行」可达;此时 `agg_loss` 的 token-mean 分母 = `loss_mask.sum()` = 0(纯 OPD 路径下 `global_batch_info` 恒为空,只有 `ppo_loss` 会填它)⇒ NaN 进 backward 毒化更新。改为传入 clamp 后的计数:mask 非空时分母**完全不变**(各臂 loss 尺度不动),全空时该微批贡献恰为 0。SFT 项此前已自行处理空批,蒸馏项没有 |
 | 6de6693 | trace-opd:**RL 项与 OPD 项同归一化口径**——`ppo_loss` 会从 data 重填 `global_batch_info` ⇒ 其 PG 项按**全局** token 归一,而 OPD 项被钉在**每微批** token 平均(A0 历史口径)。两者的差是**微批数**:每微批平均在 N 个微批上累加成 N×mean,全局平均累加成 1×mean,本 run 形状下 N≈60(已数值验算)⇒ 名义 `mix_rl_weight=1.0` 实为 OPD:RL≈60:1,消融会报出"RL 没用"这个**算术假象**。注:**上游不是缺陷**(`use_task_rewards` 下两项都全局、自洽),不自洽是我们钉 OPD 口径造成的。故 RL 项改走新 `task_reward_pg`(同一 `policy_loss_fn`、同一批 GRPO advantage,但在调用方口径下求值),并顺带不再把 entropy/ref-KL 正则折进被 RL 系数缩放的标量。新增 `rl/nonzero_advantage_frac`(二元 reward 下组内全成功/全失败则 advantage 恒 0,低成功率时多数组如此 ⇒ RL 有效强度随成功率自动长大,直接测而非推断) |
 | e8ecd43 | trace-opd:蒸馏项获得显式系数 `opd_loss_coef`(默认 1.0)。上游 `distillation_loss_coef` 仅在 `use_task_rewards` 时生效(纯蒸馏下整体缩放无意义故被强制 1),混合目标里它有意义了 ⇒ 三臂读法对称,且 **0 成为一个真实的消融臂**(A5:RL+SFT 无 OPD,回答"OPD 在弱模型上还有没有净贡献"——此前它被钉死为 1,没有任何臂在检验这件事)。config 校验拦住"三项全 0"。同时更正了那段声称"三项共用全局 `batch_num_tokens`"的注释——实际共用的是每微批 token 平均 |
+| 0a6edfb | trace-opd:**fsdp 打分后端单点模式(`teacher_topk=0`)**——estimator 家族(k3 / reverse_kl_gated)每位置只需已实现 token 的 teacher logprob;vLLM 路径自 CD-003 reverse-KL 消融起就支持(`prompt_logprobs=0`),R11a fsdp 后端(现默认)此前无条件 `torch.topk`。新 `_score_rows_realized`:gather 已实现 token logit − fp32 logsumexp,产 `(rows, 1)` 张量(dummy 宽度 `max(k,1)` 与 vLLM 提取器一致);比 top-k 更省(无 topk kernel、传输 1 列)。两处对齐哨兵(fsdp/vLLM)从"只看首行"改为"看前 8 行"——单列下一个饱和 glue token 的 logprob 在 fp32 中可合法取整到 0.0(假警报),错位窗口读到的全零 dummy 行仍必然触发;空批显式拒绝 |
+| 6fb4145 | trace-opd:**`reverse_kl_topk`——forward_kl_topk 的稠密方向镜像**。逐 token 为 teacher top-k 支撑 + 尾桶的 (K+1) 类分布真 KL:`Σ p_S(log p_S−log p_T) + (1−m_S)(log(1−m_S)−log(1−m_T))`;尾桶使其非负、且是"student 质量停在 teacher top-k 之外"的 mode-seeking 压力唯一表达点(两侧质量本就为诊断而算)。同数据面、同 clamp、同 chunked 路径、同 overlap/熵诊断 ⇒ 拨此开关的消融**只改一个变量(KL 方向)**;estimator 模式一次改三个(方向/单点 vs 分布/估计器形式)。刻意独立镜像不重构——`compute_forward_kl_topk` 是 4B 主线在跑热路径,保持逐字节不动。已验:手算对拍/恒等零/20 随机抽样非负/尾桶梯度方向(支撑外 logit 压下、支撑内抬起)/chunked 一致 |
+| 48c8743 | trace-opd:**`reverse_kl_gated`(SDAR/SEED 置信门控 logp-shift)+ KL 模式分发**。两家 2026 agentic 自蒸馏线的辅助项数学同构(SDAR `sdar_utils.compute_sdar_loss`、SEED `core_algos.compute_opd_loss`,β 均默认 5.0):`Δ_t=logπ_T(y_t)−logπ_S(y_t)`(detach)、`gate=sigmoid(βΔ)`(detach)、`loss=gate·Δ`,梯度只走 `−logπ_S`——每个采样 token 都被以 gate 强度上拉(teacher 背书则全力、否决则指数衰减);非 KL 估计器(论文称 reverse-KL surrogate),但与 k1 不同,teacher 经 detached gate 塑形梯度。纯数学抽为 `_gated_logp_shift` 供测试独立执行,**逐位复现 SEED 官方测试向量**(loss/gate/梯度)。他们的 step 级 `opd_step_mask` 刻意无对应物(SEED hindsight skill 只覆盖部分步;我们的特权文档条件化整条轨迹——response_mask 即 step mask);λ(SDAR 代码默认 0.1、论文 0.01;SEED `opd_loss_coef`)映射到我们的 `opd_loss_coef` 不另设旋钮。另:`compute_topk_loss` 按 loss_mode 分发(megatron 对 reverse 明确 raise)、top-k 外层后处理注册双名(其每一步都方向无关)、`gate_beta` 进 config(有限且 >0:β→0 退化为平坦 0.5、负 β 反转到 teacher 否决 token 上)、`use_policy_gradient` 警告覆盖全部 use_topk 模式、estimator 家族补显微镜落盘(gated 加 gate 列)与 abs_loss 空批防御 |
 
 ## 修改/更新流程(保持单一真源)
 
