@@ -220,6 +220,13 @@ P2 同法:`cp a800-1p7b-a0-pure.yaml → a800-1p7b-a0-rtopk.yaml`,`opd_kl_mode: 
 > 只有调试/探针意义——1.7B/4B 裸模型的 research 能力≈0,全组 p=0 ⇒ 通道安全
 > 空转(无梯度)但纯烧算力(N×会话 + N×K×评测)。正式开启以 M0 探针达标为门。
 
+### 9.0 同步与在跑 run 安全
+
+- **同步物**:`mixed-objective` 分支 HEAD **`52524bb`**(机制 `f9abbda` → codex 修复 `604ddbc` → 自查加固 `52524bb`;vendored verl **`92f8ac9`**)。同一仓库直接 `git log` 核对即可,无需跨机拷贝。
+- **在跑臂零动作**:`research_rl.weight` 默认 0 ⇒ 不产副本、不加字段、不加 loss 项、fingerprint 逐字节不变(有钉死测试)。A0/A1/A2-doc/rtopk 各臂随时重启/resume 安全,不需要等臂跑完。
+  唯一的既有行为变化(与 research 无关、且只在 **vLLM 打分后端**):expert(SFT)行不再被 vLLM 白白打分,改发对齐 dummy——loss 从不读这两列,数值逐位不变,纯省时间;A2-doc 臂重启后 rollout 段会略变快,不是异常。
+- **同步后两必做**:`python3 -m pytest tests/ -q`(应 210 全绿)+ `git status` 核对你们的四个活文件与 rtopk 配置未被覆盖。
+
 ### 9.1 开法
 
 ```yaml
@@ -277,4 +284,72 @@ rollout.n 自动扩为 `rollout_n + (sft_rollouts) + n_docs`,launcher 校验角�
   warmup 是否还没过;separate 模式下看 grad_norm 是否压在 clip_grad 上
   (§7.1 饱和语义);
 - 回退 = `research_rl.weight: 0`:副本、字段、loss 项、fingerprint 全部消失,
-  逐字节回到现行机制(206 测试钉死)。
+  逐字节回到现行机制(测试钉死)。
+
+### 9.4 机制冒烟方案(M0 冷启动之前唯一该跑的形态)
+
+目的是**验证管线而非效果**:会话在 engine 上真跑、reward 真算、双模式更新真发生、
+曲线齐、显存不爆。未冷启动的 policy 大概率产出低质文档(p 低甚至全 0)——
+**全 0 是预期读数不是故障**(零信号=零梯度,机制安全空转)。同时它会给出两个
+真实数字:裸 policy 在 text 协议下的 finalize 率、doc 增益基线——这两个数就是
+M0 冷启动探针的达标线原料。
+
+**冒烟配置(快速档,≈现行 2× 算力)**——从最近臂配置 cp 副本、换 `run.name`、
+paste 以下段(全部键显式写,勿依赖默认):
+
+```yaml
+research:
+  backend: engine
+  tool_protocol: text
+  n_exp: 4                  # 会话实验预算压缩(冒烟不需要 12)
+  max_turns: 12
+roles:
+  researcher:
+    sidecar_sleep: false
+research_rl:
+  weight: 0.02
+  update_mode: joint        # 先 joint;separate 冒烟第二轮
+  n_docs: 4
+  eval_k: 2
+  warmup_steps: 2           # 冒烟把 warmup 压短,第 3 步就能看到 loss 通道
+  max_sample_tokens: 10240  # + prompt 1024 < log_prob 打包预算 12288,避开
+                            # 10GiB 级 fp32 logits 峰值(§9.2b 警告的来源)
+train:
+  agent_task_timeout_s: 0   # 或 >= session_timeout_s+1800(config 校验强制)
+```
+
+**跑多少**:5-8 个 step 足够回答全部管线问题。卡位不抢生产臂(A800 空闲组
+或 162 空窗自行安排)。
+
+**逐步判读**:
+- step 1-2(warmup 内):stdout 每任务 4 行 `research replica ...` + 每 step 一行
+  `self-research warmup: step N <= 2`;曲线 `research_rl_role/mean ≈ 4/12`;
+  `research/pg_loss` 不存在或为 0;**显存峰值记录一次**(rollout / old-log-prob /
+  update 三段,对照该臂 research 关断时的基线);
+- step 3+:warmup 行消失;若组内 p 有差异则 `research/pg_loss` 非零、
+  `research/tokens`>0;若全 0/全同,`research_rl_group_all_fail` ≈1 且 loss=0——
+  预期,记录 finalize 率(`research_rl_finalized/research_rl_role` 比值)与
+  doc_words 供 M0 参考;
+- 任一 step:`research_rl_best_p`>0 时核 rollouts dump 里该任务 teacher 是否
+  真用了胜出文档(`doc_missing=0`);
+- 结束后:`ls research/` 归档目录应有 policy(engine) 会话(meta 里
+  `researcher_model: policy(engine)`、`tool_protocol: text`)。
+
+**separate 冒烟(第二轮,同配置只改一键)**:`update_mode: separate`。加验三条:
+`research_update/` 指标组出现;插桩确认 optimizer step=2 / scheduler step=1
+(改 constant→cosine 临时跑 2 步比 lr 曲线即可);故意做一个全同 p 组
+(eval_k=1 且任务全败)看 `research_update/skipped_zero_signal=1`。
+
+**服务器侧三必做(codex 验证清单精选,上正式实验前完成一次)**:
+1. **world-size 梯度等价**:同一固定 batch 在 n_gpus=2 与 4 下各跑 1 step,
+   对比 `research/pg_loss` 与 grad_norm——修复后应一致(P0-3 的回归;修复前
+   会差 2×);
+2. **打包不变性**:同一 batch 改 `ppo_max_token_len_per_gpu`(8192 vs 16384)
+   各跑 1 step,`research/pg_loss` 累计值应一致(全局分母的直接验证);
+3. **separate 插桩计数**(上段)。
+
+### 9.5 给 M0 冷启动的衔接
+
+冒烟产出的三个数(finalize 率 / doc 增益 / p 分布)直接构成 M0 的 Go/No-Go
+基线:冷启动后同口径重测,finalize 率应显著上移、doc 增益应转正。冷启动数据
+与训练方案由 CD-005 后续同步,实验侧无需先动。
