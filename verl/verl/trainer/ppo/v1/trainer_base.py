@@ -1830,6 +1830,21 @@ class PPOTrainer(ABC):
                 else:
                     research_split = _subset(is_research)
                     batch_for_update = _subset(keep)
+                    # P1-5 hardening: a partial role group (failure prompt)
+                    # can leave a row count TransferQueue cannot spread evenly
+                    # across dp ranks. Training an uneven research split risks
+                    # a short rank inside a collective; skip it loudly instead
+                    # — the executor update still runs, and one step without a
+                    # research gradient is the cheap failure mode.
+                    dp_ranks = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+                    if dp_ranks > 0 and len(research_split.keys) % dp_ranks != 0:
+                        logger.error(
+                            "self-research split has %d rows, not divisible by %d dp ranks "
+                            "(partial role group?) — skipping the research update this step",
+                            len(research_split.keys), dp_ranks,
+                        )
+                        metrics["research_update/skipped_uneven_split"] = 1.0
+                        research_split = None
                 # A subset no longer matches the mini-batch size derived from
                 # rollout.n above — the dataloader would emit zero full
                 # mini-batches and the update would silently do nothing. The
@@ -1881,6 +1896,9 @@ class PPOTrainer(ABC):
 
             research_extra = dict(extra_info)
             research_extra["research_only"] = True
+            # Entropy is an executor-side curve; computing it over the research
+            # rows' long sequences buys nothing and costs a full-vocab pass.
+            research_extra["calculate_entropy"] = False
             # codex review P1-7: the scheduler already advanced on the executor
             # update of this global step.
             research_extra["advance_lr_scheduler"] = False

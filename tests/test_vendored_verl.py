@@ -274,3 +274,13 @@ def test_codex_review_fixes_present_on_the_executed_paths():
     assert "* dp_size" in losses.split("def research_pg_loss")[1].split("def ")[0]
     assert "clamp(min=-20.0, max=20.0)" in losses
 
+def test_self_review_hardening_present():
+    # 92f8ac9: vLLM scoring skip for sft/research rows, entropy off and the
+    # divisibility guard on the separate research split.
+    agent = _read("experimental/agent_loop/agent_loop.py")
+    assert 'get("sample_role") in ("sft", "research")' in agent  # dummy columns, no forward
+
+    trainer = _read("trainer/ppo/v1/trainer_base.py")
+    assert '"calculate_entropy"] = False' in trainer
+    assert "skipped_uneven_split" in trainer
+

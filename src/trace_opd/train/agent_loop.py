@@ -724,7 +724,7 @@ class TraceAgentLoop(AgentLoopBase):
         utility p_i, ties to the shorter document; p*=0 admits no teacher
         (PG-5(3) input filtering, realised endogenously — a document that never
         helped downstream never reaches the distillation prefix)."""
-        rcfg, rrl = self.cfg.research, self.cfg.research_rl
+        rcfg = self.cfg.research
         group = self._research_group((global_step, task_id))
         # Sessions run concurrently, so the group wall-clock is one session
         # plus its eval rollouts — the shared-session timeout plus slack.
@@ -750,7 +750,6 @@ class TraceAgentLoop(AgentLoopBase):
         best = select_best_doc(results)
         doc = best["doc"] if best else None
         ps = [float(r.get("p", 0.0)) for r in results]
-        n_final = sum(1 for r in results if r.get("finalized"))
         # The historical research_* keys keep their curves alive under the
         # group regime, re-based on the WINNING document (the one training
         # actually distills from); research_final_success upgrades from "last
@@ -769,9 +768,8 @@ class TraceAgentLoop(AgentLoopBase):
             "research_rl_best_p": max(ps) if ps else 0.0,
             "research_archive": "",
         }
-        fields["research_rl_finalize_rate"] = (
-            n_final / len(results) if results else 0.0
-        )
+        # (group finalize rate is readable as research_rl_finalized /
+        # research_rl_role from the curves; no extra field is shipped here)
         group["resolution"] = (doc, dict(fields))
         return doc, dict(fields)
 

@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(13741a2)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(92f8ac9)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -51,6 +51,7 @@
 | e3bd3bf | trace-opd:research 行退出 on-policy 行为指标(SFT 行同款纪律——expert 行会抬高指标,research 行会拉低:research 会话没有任务结局,其 reward 是文档成功率);`research_rl_` 前缀曲线照 `sft_` 先例全量收集 |
 | af6a8d3 | trace-opd:角色拆分后的子批带 `num_mini_batch=1`——拆分批行数不再匹配按 rollout.n 推导的 mini_batch_size,dataloader 会产出零个完整 mini-batch、更新静默变 no-op(生产配置 ppo_mini_batch_size==train_batch_size 下 num_mini_batch=1 精确保持原语义) |
 | 13741a2 | trace-opd:**codex 审阅修复(gpt-5.6-sol max effort,3 P0 + 3 P1 + 2 P2)**。P0-1 打分端 M4 结构校验枚举纳入 `research`(原先在跳过分支之前就 raise,任何 research 批必死);P0-2 `distillation_only` 显存捷径在 `research_loss_coef>0` 时保持关闭(research PG 每次 update 都读 log_probs,warmup 的 exec 子批也调它——纯 OPD 模板 + research 开启原先第一步就崩);P0-3 research 分母乘回 `dp_size`(FSDP 对梯度做 mean-reduce,`local/T_global` 落在真值的 1/dp——上游 agg_loss 的同款补偿);P1-5 全 research 拆分(failure prompt 残组)回退不拆批;P1-7 `train_mini_batch` 新增 `advance_lr_scheduler` 门(原 flag 在末 mini-batch 无条件置位 ⇒ separate 每 step 推 scheduler 两次);P1-8 全零 advantage 的 research 拆分整体跳过 optimizer step(Adam 动量+weight decay 在零梯度下仍动参数);P2-11 组内可训候选 <2 整组零梯度;P2-12 log-ratio 先 clamp ±20 再 exp(防 inf*0 毒化) |
+| 92f8ac9 | trace-opd:**自查加固(codex 轮之后)**。①vLLM 打分路径(1.7B 臂默认后端)此前对**每一行**做 prompt_logprobs 打分——16k 的 research 行会在 gpu_memory_utilization 预算之外分配 logprobs(R11a OOM 同型;expert 行的同款浪费也一直存在,loss 从不读它们的 teacher 列)⇒ sft/research 行改发对齐零 dummy(与 fsdp 后端跳过同形),行为等价、forward 不再烧;②separate 第二次 update 关 calculate_entropy(executor 侧曲线,对 research 长行是纯浪费的全词表 pass);③research 拆分行数不能被 dp 均分(failure prompt 残组)时响亮跳过该次 research update(短 rank 卡 collective 的廉价失败模式) |
 
 ## 修改/更新流程(保持单一真源)
 

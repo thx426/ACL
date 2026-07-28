@@ -468,6 +468,22 @@ def _validate(cfg: "Config") -> None:
                 f"{cfg.research.session_timeout_s}+1800): the hang guard would kill the "
                 "prompt group before the session's own timeout/degradation can run"
             )
+        if (
+            rrl.max_sample_tokens + cfg.train.max_prompt_length
+            > cfg.train.log_prob_max_token_len_per_gpu
+        ):
+            # Soft warning, not a rejection: the packing budget clamps up to the
+            # longest sequence (c48568e), so the run survives — but the
+            # old-log-prob forward then peaks at max_sample_tokens x vocab x 4B
+            # of fp32 logits (~10 GiB at 16k x 152k), which is exactly the
+            # profile that killed earlier runs on the A800.
+            print(
+                f"[config] WARNING research_rl.max_sample_tokens={rrl.max_sample_tokens} "
+                f"exceeds log_prob_max_token_len_per_gpu="
+                f"{cfg.train.log_prob_max_token_len_per_gpu}: the log-prob packing "
+                "budget will be clamped up by the longest research row — watch the "
+                "old-log-prob peak memory on the first step"
+            )
         if rrl.max_sample_tokens + cfg.train.max_prompt_length > cfg.train.rollout_max_model_len:
             problems.append(
                 f"research_rl.max_sample_tokens={rrl.max_sample_tokens} + "

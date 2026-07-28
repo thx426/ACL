@@ -1085,6 +1085,26 @@ class AgentLoopWorker:
         # Always popped — it must never leak into the training batch.
         teacher_routing_key = output.extra_fields.pop("teacher_routing_key", None)
         if self.distillation_enabled and not validate:
+            # trace-opd (self-review after the codex round): expert rows are
+            # supervised by cross-entropy and research rows by their own PG —
+            # neither ever reads its teacher columns (their response_mask is
+            # cleared at TQ put time). The fsdp backend already skips them at
+            # plan time; THIS path did not, and a vLLM prompt_logprobs call on
+            # a (possibly 16k-token) research row allocates OUTSIDE the
+            # gpu_memory_utilization budget — the exact R11a OOM pattern. Ship
+            # aligned dummy columns instead (same shape the fsdp skip emits);
+            # the loss masks them out, so behaviour is identical and the
+            # forward is simply not burned.
+            if output.extra_fields.get("sample_role") in ("sft", "research"):
+                dummy_width = max(int(getattr(self, "self_teacher_num_logprobs", 1) or 1), 1)
+                total_len = len(prompt_ids) + len(response_ids)
+                output.extra_fields["teacher_ids"] = torch.zeros(
+                    (total_len, dummy_width), dtype=torch.int32
+                )
+                output.extra_fields["teacher_logprobs"] = torch.zeros(
+                    (total_len, dummy_width), dtype=torch.float32
+                )
+                return
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
