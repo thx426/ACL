@@ -280,3 +280,5 @@ L_res   = −(1/T_res_global) Σ_{research 行 token} A_i · logπ_θ(y_t)
 6. **separate 模式首跑必验项**:TQ 对拆分子批的行→dp 分配均匀性(launcher 已校验行数整除 n_gpus,分配序未验);`research_update/` 指标组出现。
 
 **机制不变式(实现层已测试钉死)**:`research_rl.weight=0` ⇒ 不产副本、不加字段、不进 fingerprint、loss 逐字节现状;research 行 response_mask 清零 ⇒ 执行侧三项及其分母永不见 research token;teacher 打分对 research 行零 forward;p*=0 不设 teacher;未 finalize p=0;组注册走 finally(无死锁);token 样本=引擎采样 ids 原样(重分词禁绝)。
+
+**Codex 审阅与修复(2026-07-28,gpt-5.6-sol max effort,新线程)**:审出 3 P0 / 7 P1 / 6 P2,经逐条代码核实全部关键指控属实——P0-1 打分端结构校验拒斥 research 行(跳过分支不可达)、P0-2 `distillation_only` 捷径在纯 OPD+research 配置下第一步即崩、P0-3 分母缺 dp_size 补偿(梯度随卡数缩小)、P1-7 scheduler flag 与实现相反(separate 双步进)。已修复:verl `13741a2`(P0×3 + P1-5 防御/P1-7/P1-8 + P2-11/12),trace_opd 侧 P1-9 决议冻结、P1-6 泄漏清理、P1-4 超时层级校验、P2-15 fingerprint 补 max_sample_tokens;209 测试全绿(新增 dp_size 缩放/极端 ratio/修复接线断言)。**仍挂账(P2)**:P1-5 完整修法(failure prompt 的 drop+refill 或角色 padding——现为安全降级+日志)、P2-13(research 行的 entropy/topk processor 无用计算,首跑显存画像验证)、P2-14 reducer 侧按角色分母(现为 runbook 读法约定)、P2-16(weight=0 的两个空 dict 惰性分配)。Codex 的 15 项"上训练前验证清单"移入 runbook §9 前置条件参考,其中 world-size 梯度等价(No.4)、微批打包不变性(No.5)、separate 插桩计数(No.6)为服务器侧首验必做。

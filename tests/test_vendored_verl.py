@@ -244,3 +244,33 @@ def test_self_research_channel_wired_on_the_executed_paths():
     assert "research_loss_coef: float = 0.0" in cfg
     assert 'research_update_mode: str = "joint"' in cfg
 
+def test_codex_review_fixes_present_on_the_executed_paths():
+    # 13741a2: the three P0s and the P1 fixes from the codex review, pinned.
+    fsdp = _read("trainer/distillation/teacher_topk_fsdp.py")
+    # P0-1: the M4 structural gate must admit research rows, or the skip
+    # branch behind it is unreachable and every research batch dies.
+    assert '("privileged", "bare", "sft", "research")' in fsdp
+
+    trainer = _read("trainer/ppo/v1/trainer_base.py")
+    # P0-2: the memory shortcut must stay off while the research term is on
+    # (it reads log_probs on every update, warmup exec sub-batches included).
+    dist_only = trainer.split("distillation_only = (")[1][:1200]
+    assert "research_loss_coef" in dist_only
+    # P1-7/P1-8: the second update neither advances the scheduler nor runs on
+    # a zero-signal split; P1-5: an all-research split falls back unsplit.
+    assert '"advance_lr_scheduler"] = False' in trainer
+    assert "skipped_zero_signal" in trainer
+    assert "falling back to the" in trainer
+    # P2-11: groups below two trainable candidates carry no gradient.
+    assert "trainable = mask_padded.sum(dim=-1) > 0" in trainer
+
+    workers = _read("workers/engine_workers.py")
+    # P1-7: the last-mini-batch scheduler stamp is now gated.
+    assert "advance_lr_scheduler" in workers
+    assert "update_lr_scheduler=advance_lr_scheduler" in workers
+
+    losses = _read("trainer/distillation/losses.py")
+    # P0-3 + P2-12: dp compensation and the clamped log-ratio.
+    assert "* dp_size" in losses.split("def research_pg_loss")[1].split("def ")[0]
+    assert "clamp(min=-20.0, max=20.0)" in losses
+

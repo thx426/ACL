@@ -453,6 +453,21 @@ def _validate(cfg: "Config") -> None:
             problems.append(
                 f"research_rl.max_sample_tokens={rrl.max_sample_tokens} must be >= 1024"
             )
+        # codex review P1-4: the R3 hang guard (agent_task_timeout_s) wraps the
+        # WHOLE prompt group — with the research arm on that group serially
+        # contains a full researcher session plus its eval rollouts, so the
+        # default 2700s guard fires BEFORE the 3600s session timeout and every
+        # in-session degradation path becomes unreachable. Require headroom.
+        if cfg.train.agent_task_timeout_s != 0 and (
+            cfg.train.agent_task_timeout_s
+            < cfg.research.session_timeout_s + 1800
+        ):
+            problems.append(
+                f"research_rl.weight>0 requires train.agent_task_timeout_s=0 or >= "
+                f"research.session_timeout_s+1800 (got {cfg.train.agent_task_timeout_s} vs "
+                f"{cfg.research.session_timeout_s}+1800): the hang guard would kill the "
+                "prompt group before the session's own timeout/degradation can run"
+            )
         if rrl.max_sample_tokens + cfg.train.max_prompt_length > cfg.train.rollout_max_model_len:
             problems.append(
                 f"research_rl.max_sample_tokens={rrl.max_sample_tokens} + "
@@ -703,7 +718,7 @@ def objective_fingerprint(cfg: "Config") -> str:
     if rrl.weight > 0.0:
         material += (
             f"|research_rl={rrl.weight},{rrl.update_mode},{rrl.n_docs},"
-            f"{rrl.eval_k},{rrl.adv_clip},{rrl.warmup_steps}"
+            f"{rrl.eval_k},{rrl.adv_clip},{rrl.warmup_steps},{rrl.max_sample_tokens}"
         )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 

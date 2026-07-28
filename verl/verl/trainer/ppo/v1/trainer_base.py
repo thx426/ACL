@@ -1657,12 +1657,22 @@ class PPOTrainer(ABC):
                 for i in research_rows:
                     group_rows.setdefault(str(data.non_tensor_batch["uid"][i]), []).append(i)
                 row_adv = torch.zeros_like(scores)
+                mask_padded = data.batch["research_mask"]
+                # codex review P2-11 / design 7.2: a "trainable candidate" is a
+                # row whose research_mask carries tokens (degraded rows — empty
+                # or over-length sessions — keep their real reward in the group
+                # mean but cannot carry gradient). A group with fewer than two
+                # trainable candidates is skipped whole: one row against a mean
+                # of untrainable rewards is a baseline comparison, not a
+                # group-relative one.
+                trainable = mask_padded.sum(dim=-1) > 0
                 for rows in group_rows.values():
                     idx = torch.tensor(rows, dtype=torch.long, device=scores.device)
+                    if int(trainable[idx].sum().item()) < 2:
+                        continue
                     rewards = scores[idx]
                     centred = rewards - rewards.mean()
                     row_adv[idx] = centred.clamp(min=-adv_clip, max=adv_clip)
-                mask_padded = data.batch["research_mask"]
                 research_advantage_padded = row_adv.unsqueeze(-1).expand(mask_padded.shape).contiguous()
 
         # 4. write nested advantages and returns back to TransferQueue
@@ -1734,6 +1744,12 @@ class PPOTrainer(ABC):
                 # memory-saving distillation-only shortcut must stay off.
                 and float(getattr(distillation_loss_cfg, "rl_loss_coef", 0.0) or 0.0) <= 0.0
                 and float(getattr(distillation_loss_cfg, "sft_loss_coef", 0.0) or 0.0) <= 0.0
+                # trace-opd self-research (codex review P0-2): the research PG
+                # term reads model_output["log_probs"] on EVERY update while its
+                # coefficient is positive (warmup exec sub-batches included —
+                # the aggregator calls research_pg_loss whenever the coef is
+                # on), so the memory-saving shortcut must stay off with it.
+                and float(getattr(distillation_loss_cfg, "research_loss_coef", 0.0) or 0.0) <= 0.0
             )
         extra_info = {
             "calculate_entropy": calculate_entropy,
@@ -1786,7 +1802,22 @@ class PPOTrainer(ABC):
                     sub.extra_info.update(batch.extra_info)
                     return sub
 
-                if in_warmup:
+                # codex review P1-5 (first-line defence): a failure prompt can
+                # ship a PARTIAL role group into the batch (replay treats
+                # failure as a samplable terminal state), which breaks the
+                # launcher's nominal divisibility maths. Splitting an empty
+                # executor side would train nothing at all — fall back to the
+                # unsplit batch (joint-style mixing: safe, never silent).
+                if not keep.any():
+                    logger.error(
+                        "self-research split found NO executor rows (%d research rows, "
+                        "likely a failure-prompt partial group) — falling back to the "
+                        "unsplit batch for this update",
+                        int(is_research.sum()),
+                    )
+                    batch_for_update = batch
+                    research_split = None
+                elif in_warmup:
                     # Research rows sit this update out; one greppable line so a
                     # silent warmup is never mistaken for a broken channel.
                     logger.info(
@@ -1828,8 +1859,31 @@ class PPOTrainer(ABC):
             # divisibility assert for the smaller split; the lr scheduler is
             # NOT advanced here (train_mini_batch only steps it when the
             # update_lr_scheduler flag is set, which we do not set).
+            # codex review P1-8: an all-zero-advantage research split would still
+            # run a full optimizer step — and Adam momentum plus weight decay
+            # move parameters even on a zero gradient, which is NOT the "natural
+            # zero gradient" the design promises. Skip the update entirely.
+            adv_data = tq.kv_batch_get(
+                keys=research_split.keys,
+                partition_id=research_split.partition_id,
+                select_fields=["research_advantage"],
+            )
+            research_adv = adv_data["research_advantage"]
+            if hasattr(research_adv, "to_padded_tensor"):
+                research_adv = research_adv.to_padded_tensor(0.0)
+            if not bool((research_adv.abs() > 1e-8).any()):
+                logger.info(
+                    "self-research separate update skipped: zero advantage signal "
+                    "(%d rows)", len(research_split.keys)
+                )
+                metrics["research_update/skipped_zero_signal"] = 1.0
+                return batch
+
             research_extra = dict(extra_info)
             research_extra["research_only"] = True
+            # codex review P1-7: the scheduler already advanced on the executor
+            # update of this global step.
+            research_extra["advance_lr_scheduler"] = False
             # The research rows carry only dummy teacher columns (their scoring
             # was skipped) — running the top-k logits processor over these very
             # long sequences would burn memory for a value the loss never

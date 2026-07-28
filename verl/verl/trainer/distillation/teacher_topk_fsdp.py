@@ -157,7 +157,7 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     for i in range(n):
         ex = extras[i] or {}
         mode = ex.get("teacher_mode", None)
-        if mode not in ("privileged", "bare", "sft"):
+        if mode not in ("privileged", "bare", "sft", "research"):
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} has teacher_mode={mode!r} "
                                "— provenance lost in transit (codex H1)")
         k = ex.get("teacher_topk", None)

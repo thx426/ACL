@@ -29,6 +29,8 @@ def _cfg(**research_rl):
             # the template pins the EXTERNAL researcher's sidecar; the engine
             # form has no external server to drive
             "roles.researcher.sidecar_sleep=false",
+            # codex review P1-4: the hang guard must clear the session timeout
+            "train.agent_task_timeout_s=0",
         ]
     return load_config(_ROOT / "configs" / "trace.yaml", overrides)
 
@@ -367,3 +369,33 @@ def test_research_pg_fails_loud_without_its_fields(research_pg):
                 old_log_probs=lp,
             ),
         )
+
+def test_research_pg_multiplies_back_dp_size(research_pg):
+    """codex review P0-3: FSDP mean-reduces gradients across dp ranks, so the
+    loss must multiply dp_size back (upstream agg_loss convention) or the
+    effective research weight shrinks with the GPU count."""
+    fn, torch = research_pg
+    lp = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+    mask = torch.tensor([[1, 1]])
+    adv = torch.tensor([[0.5, 0.5]])
+    base = _mk_data(torch, mask, adv, lp.detach().clone(), t_global=2.0)
+    loss_1, _ = fn(_LossCfg(), {"log_probs": lp}, base)
+    with_dp = _mk_data(torch, mask, adv, lp.detach().clone(), t_global=2.0)
+    with_dp["dp_size"] = 4
+    loss_4, _ = fn(_LossCfg(), {"log_probs": lp}, with_dp)
+    assert torch.allclose(loss_4, loss_1 * 4.0)
+
+
+def test_research_pg_survives_an_extreme_stale_ratio(research_pg):
+    """codex review P2-12: the log-ratio is clamped before exp — an overflow
+    would poison the sum through inf*0 even on masked tokens."""
+    fn, torch = research_pg
+    lp = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    old = torch.tensor([[-100.0, 100.0]])  # ratios e^100 / e^-100 without clamp
+    mask = torch.tensor([[1, 0]])          # the exploding one is even masked
+    adv = torch.tensor([[1.0, 1.0]])
+    loss, _ = fn(_LossCfg(), {"log_probs": lp}, _mk_data(torch, mask, adv, old, 1.0))
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(lp.grad).all()
+

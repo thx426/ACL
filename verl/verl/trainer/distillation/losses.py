@@ -490,14 +490,27 @@ def research_pg_loss(
             "research rows present but 'research_num_tokens' missing — the engine did not "
             "compute the batch-global research-token count (forward_backward_batch)"
         ) from err
+    # codex review P0-3: FSDP averages gradients across dp ranks, so a loss of
+    # local_numerator / T_global lands at 1/dp_size of the true value — the
+    # exact compensation upstream agg_loss applies (masked_sum / batch_num_tokens
+    # * dp_size). Without it the effective research weight shrinks with the GPU
+    # count and the packing/parallelism invariance claim is false.
+    try:
+        dp_size = float(data["dp_size"])
+    except KeyError:
+        dp_size = 1.0
 
     clip_low = float(getattr(distillation_loss_config, "clip_ratio_low", 0.2) or 0.2)
     clip_high = float(getattr(distillation_loss_config, "clip_ratio_high", 0.2) or 0.2)
-    ratio = torch.exp(log_prob - old_log_prob)
+    # codex review P2-12: clamp the log-ratio before exp (PPO main path does the
+    # same) — an extreme stale ratio would overflow, and inf*0 on a masked or
+    # zero-advantage token still poisons the sum with NaN.
+    log_ratio = (log_prob - old_log_prob).clamp(min=-20.0, max=20.0)
+    ratio = torch.exp(log_ratio)
     clipped_ratio = ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high)
     per_token = -torch.minimum(ratio * research_adv, clipped_ratio * research_adv)
     denominator = max(t_res_global, 1.0)
-    research_loss = (per_token * research_mask).sum() / denominator
+    research_loss = (per_token * research_mask).sum() / denominator * dp_size
 
     n_tokens = research_mask.sum()
     with torch.no_grad():

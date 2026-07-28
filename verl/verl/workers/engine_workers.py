@@ -252,6 +252,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         batch_size_per_dp = data.shape[0]
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
+        # trace-opd self-research (codex review P1-7): the second update of a
+        # global step must NOT advance the lr scheduler again — this flag used
+        # to be stamped unconditionally on the last mini-batch.
+        advance_lr_scheduler = bool(tu.pop(data, key="advance_lr_scheduler", default=True))
         num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
@@ -304,7 +308,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                    update_lr_scheduler=advance_lr_scheduler
+                    and batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
                 actor_output = self.train_batch(mini_batch_td)

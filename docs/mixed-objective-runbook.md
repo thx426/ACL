@@ -258,6 +258,15 @@ rollout.n 自动扩为 `rollout_n + (sft_rollouts) + n_docs`,launcher 校验角�
 6. separate 模式加验:`research_update/` 指标组出现;首跑核对各 dp rank 的
    research 行数均匀(launcher 只校验总数整除)。
 
+### 9.2b 曲线读法与超时要求(codex 审阅补充)
+
+- **曲线是全副本均值,读比值不读裸 mean**:`research_rl_reward` 只在 research 行
+  非零 ⇒ 真实 researcher 均值 = `research_rl_reward / research_rl_role`;组统计
+  (all_fail/all_pass/best_p)只在 bare/expert 行非零,同理按占比换算。
+- **超时层级(config 校验强制)**:`research_rl.weight>0` 要求
+  `train.agent_task_timeout_s = 0` 或 `>= research.session_timeout_s + 1800`——
+  否则 R3 hang guard 会先于会话自身的超时降级杀掉整个 prompt 组。
+
 ### 9.3 判停与回退
 
 - `research_rl_group_all_fail` 长期≈1:飞轮没点着(冷启动不足/任务过难)——

@@ -679,9 +679,27 @@ class TraceAgentLoop(AgentLoopBase):
 
     # ------------------------------------------------- self-research channel
 
+    def _purge_stale_step_state(self, global_step) -> None:
+        """codex review P1-6: research_groups and replica_counters grow one
+        entry per (step, task) forever — groups even hold N document texts.
+        Steps run as barriers (a new step's replicas only spawn after the
+        previous batch was consumed), so entries older than the previous step
+        are dead. Keep one step of slack for the V1 pipeline's tail."""
+        if global_step is None:
+            return
+        cutoff = int(global_step) - 1
+        for registry in (self.research_groups, self.replica_counters):
+            stale = [
+                k for k in registry
+                if isinstance(k, tuple) and isinstance(k[0], int) and k[0] < cutoff
+            ]
+            for k in stale:
+                del registry[k]
+
     def _research_group(self, key) -> dict[str, Any]:
         group = self.research_groups.get(key)
         if group is None:
+            self._purge_stale_step_state(key[0])
             group = {
                 "results": [],
                 "event": asyncio.Event(),
@@ -719,6 +737,15 @@ class TraceAgentLoop(AgentLoopBase):
                 "selecting over what arrived",
                 global_step, task_id, timeout, len(group["results"]), group["n"],
             )
+        # codex review P1-9: freeze the teacher decision on FIRST resolution.
+        # Multiple bare/expert awaiters resolve concurrently; without a cache a
+        # late-arriving registration between two timeouts could hand the same
+        # task's replicas DIFFERENT documents. Same-event-loop invariant makes
+        # the check-then-set below atomic (no await between them).
+        cached = group.get("resolution")
+        if cached is not None:
+            doc, fields = cached
+            return doc, dict(fields)
         results = list(group["results"])
         best = select_best_doc(results)
         doc = best["doc"] if best else None
@@ -745,7 +772,8 @@ class TraceAgentLoop(AgentLoopBase):
         fields["research_rl_finalize_rate"] = (
             n_final / len(results) if results else 0.0
         )
-        return doc, fields
+        group["resolution"] = (doc, dict(fields))
+        return doc, dict(fields)
 
     async def _research_replica(
         self, adapter, global_step, route, sampling_params, response_length
