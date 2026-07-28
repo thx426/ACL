@@ -1,0 +1,72 @@
+:root {
+  --bg: #14161a; --panel: #1c1f26; --line: #2b2f3a; --fg: #d8dce6;
+  --dim: #7d8494; --accent: #6ea8fe; --teacher: #4f9cf7; --student: #f7a24f;
+  --win: #3fbf7f; --lose: #e06c75; --gold: #e5c07b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 13px/1.5 "SF Mono", Menlo, Consolas, monospace; }
+header { display: flex; align-items: center; gap: 18px; padding: 8px 14px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5; }
+.brand { font-weight: 700; color: var(--accent); }
+nav a { color: var(--dim); text-decoration: none; padding: 4px 10px; border-radius: 6px; }
+nav a.active { color: var(--fg); background: #262b36; }
+.meta, .dim { color: var(--dim); }
+main { padding: 12px 14px; }
+.view { display: none; }
+.view.active { display: block; }
+.bar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 6px 0 10px; }
+select, input, button { background: #232733; color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px;
+  font: inherit; }
+button { cursor: pointer; } button:hover { border-color: var(--accent); }
+.num { width: 70px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 4px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); cursor: pointer; user-select: none; position: sticky; top: 41px;
+  background: var(--bg); }
+tbody tr { cursor: pointer; } tbody tr:hover { background: #20242e; }
+.won-1 { color: var(--win); } .won-0 { color: var(--lose); }
+
+#t-minimap { width: 100%; display: block; border: 1px solid var(--line);
+  border-radius: 6px; margin-bottom: 8px; cursor: crosshair; }
+.split { display: flex; gap: 12px; align-items: flex-start; }
+.tokens { flex: 1 1 62%; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 12px; white-space: pre-wrap; word-break: break-all;
+  max-height: calc(100vh - 260px); overflow-y: auto; outline: none; }
+.tokens .tk { border-radius: 2px; cursor: pointer; }
+.tokens .tk.obs { color: var(--dim); font-style: italic; }
+.tokens .tk.uncov { opacity: .35; }
+.tokens .tk.sel { outline: 2px solid var(--accent); }
+.tokens .turn-sep { display: block; border-top: 1px dashed var(--line);
+  color: var(--dim); margin: 6px 0 2px; font-size: 11px; }
+.inspector { flex: 1 1 38%; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; max-height: calc(100vh - 260px); overflow-y: auto; }
+.pad { padding: 12px; }
+.inspector h4 { margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line);
+  color: var(--accent); font-size: 12px; }
+.kv { display: grid; grid-template-columns: auto auto; gap: 2px 14px;
+  padding: 8px 12px; font-size: 12px; }
+.kv b { color: var(--dim); font-weight: 400; }
+.label-chip { display: inline-block; padding: 1px 8px; border-radius: 10px;
+  background: #2a2f3d; color: var(--gold); font-size: 11px; }
+.dist { padding: 6px 12px 12px; }
+.dist .drow { display: grid; grid-template-columns: 120px 1fr; gap: 8px;
+  align-items: center; margin: 1px 0; font-size: 12px; }
+.dist .dtok { overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+.dist .dtok.hit { color: var(--gold); font-weight: 700; }
+.bars { position: relative; height: 14px; }
+.bars .b { position: absolute; top: 0; height: 6px; border-radius: 2px; }
+.bars .bt { background: var(--teacher); top: 0; }
+.bars .bs { background: var(--student); top: 8px; }
+.outflow { margin: 6px 12px; padding: 6px 10px; background: #2a2230;
+  border-left: 3px solid var(--student); border-radius: 4px; font-size: 12px; }
+.ctx { padding: 8px 12px; color: var(--dim); font-size: 12px; white-space: pre-wrap;
+  word-break: break-all; border-top: 1px solid var(--line); }
+.ctx .cur { color: var(--gold); font-weight: 700; }
+#v-grid { width: 100%; border: 1px solid var(--line); border-radius: 8px;
+  cursor: crosshair; }
+.legend { display: inline-flex; gap: 10px; align-items: center; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }

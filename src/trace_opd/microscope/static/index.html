@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>TRACE-OPD 蒸馏显微镜</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <span class="brand">OPD 显微镜</span>
+  <nav id="tabs">
+    <a data-view="samples" href="#/samples">样本</a>
+    <a data-view="traj" href="#/traj">轨迹</a>
+    <a data-view="explore" href="#/explore">检索</a>
+    <a data-view="evolution" href="#/evolution">演化</a>
+  </nav>
+  <span id="meta" class="meta"></span>
+</header>
+
+<main>
+  <section id="view-samples" class="view">
+    <div class="bar">
+      <label>step <select id="s-step"></select></label>
+      <label>role <select id="s-role"><option value="">全部</option><option>bare</option><option>sft</option><option>research</option></select></label>
+      <label>won <select id="s-won"><option value="">全部</option><option value="1">胜</option><option value="0">负</option></select></label>
+      <span id="s-count" class="dim"></span>
+    </div>
+    <table id="s-table"><thead></thead><tbody></tbody></table>
+  </section>
+
+  <section id="view-traj" class="view">
+    <div class="bar">
+      <span id="t-title"></span>
+      <label>着色 <select id="t-track"></select></label>
+      <span id="t-audit" class="dim"></span>
+      <span class="dim">← → 逐 token · n/p 高分歧跳转 · 点击看分布</span>
+    </div>
+    <canvas id="t-minimap" height="72"></canvas>
+    <div class="split">
+      <div id="t-tokens" class="tokens" tabindex="0"></div>
+      <aside id="t-inspector" class="inspector"><div class="dim pad">点击一个 token</div></aside>
+    </div>
+  </section>
+
+  <section id="view-explore" class="view">
+    <div class="bar">
+      <label>模式 <select id="e-mode">
+        <option value="metric">指标 Top</option>
+        <option value="verdict_conflict">判决冲突</option>
+        <option value="repeat">重复 n-gram 起点</option>
+        <option value="teacher_abstains">teacher 弃权</option>
+      </select></label>
+      <label>指标 <select id="e-metric"></select></label>
+      <label>step <input id="e-lo" type="number" class="num"> – <input id="e-hi" type="number" class="num"></label>
+      <button id="e-run">检索</button>
+      <span id="e-status" class="dim"></span>
+    </div>
+    <table id="e-table"><thead><tr><th>step</th><th>task</th><th>won</th><th>pos</th><th>值</th><th>片段</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section id="view-evolution" class="view">
+    <div class="bar">
+      <label>task <select id="v-task"></select></label>
+      <label>指标 <select id="v-metric"></select></label>
+      <span class="dim">y=turn · x=step · 点击格子跳到该 step 轨迹</span>
+    </div>
+    <canvas id="v-grid" height="480"></canvas>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

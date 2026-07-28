@@ -284,3 +284,18 @@ def test_self_review_hardening_present():
     assert '"calculate_entropy"] = False' in trainer
     assert "skipped_uneven_split" in trainer
 
+
+def test_observation_packs_wired_on_the_executed_paths():
+    # 5389497: the distribution-quartet collection points.
+    obs = _read("trainer/distillation/observation.py")
+    assert "TRACE_OBS_DIR" in obs
+    assert "def collect_micro_batch" in obs
+    assert "loss_mode" in obs                       # self-contained audit metadata
+
+    fsdp = _read("trainer/distillation/fsdp/losses.py")
+    assert fsdp.count("_observation_payload(") >= 3  # def + both topk functions
+    assert '"obs": obs' in fsdp
+
+    losses = _read("trainer/distillation/losses.py")
+    assert "_collect_observation_rows(" in losses
+    assert "log_prob_min_clamp=distillation_config" in losses

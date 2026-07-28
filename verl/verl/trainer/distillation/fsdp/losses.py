@@ -72,6 +72,41 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     return kld.sum(dim=-1)
 
 
+def _observation_payload(
+    student_logits, student_log_probs, student_topk_ids, student_topk_log_probs,
+    teacher_topk_log_probs, teacher_topk_ids, loss_config, use_chunked_topk,
+):
+    """trace-opd observation packs (docs/microscope-design.md): the raw
+    distribution quartet of this rank's sequence segment, collected ONLY when
+    TRACE_OBS_DIR is set. student_topk_log_probs here is the student ON the
+    teacher support (pre-clamp); the student's OWN top-k log-probs are the one
+    piece the loss never needed, computed here on demand (a second chunked
+    pass when chunking — memory-safe, obs-gated)."""
+    try:
+        from ..observation import observation_enabled
+    except Exception:  # noqa: BLE001 — best-effort contract: no module, no packs
+        return None
+
+    if not observation_enabled():
+        return None
+    with torch.no_grad():
+        if use_chunked_topk or student_log_probs is None:
+            student_own_lps = _chunked_topk_log_probs(
+                student_logits,
+                student_topk_ids,
+                chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
+            )
+        else:
+            student_own_lps = torch.gather(student_log_probs, dim=-1, index=student_topk_ids)
+        return {
+            "teacher_ids": teacher_topk_ids.detach(),
+            "teacher_lps": teacher_topk_log_probs.detach(),
+            "student_ids": student_topk_ids.detach(),
+            "student_lps": student_own_lps.detach(),
+            "student_support_lps": student_topk_log_probs.detach(),
+        }
+
+
 def compute_forward_kl_topk(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
@@ -124,6 +159,11 @@ def compute_forward_kl_topk(
         student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
+    obs = _observation_payload(
+        student_logits, None if use_chunked_topk else student_log_probs,
+        student_topk_ids, student_topk_log_probs,
+        teacher_topk_log_probs, teacher_topk_ids, loss_config, use_chunked_topk,
+    )
     if loss_config.log_prob_min_clamp is not None:
         student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
@@ -152,6 +192,7 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
         "teacher_topk_entropy": teacher_topk_entropy,
+        "obs": obs,
     }
 
 
@@ -206,6 +247,11 @@ def compute_reverse_kl_topk(
     # out-of-support gradient comes from.
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
+    obs = _observation_payload(
+        student_logits, None if use_chunked_topk else student_log_probs,
+        student_topk_ids, student_topk_log_probs,
+        teacher_topk_log_probs, teacher_topk_ids, loss_config, use_chunked_topk,
+    )
     if loss_config.log_prob_min_clamp is not None:
         clamped_student_lp = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
         clamped_teacher_lp = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
@@ -249,4 +295,5 @@ def compute_reverse_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
         "teacher_topk_entropy": teacher_topk_entropy,
+        "obs": obs,
     }

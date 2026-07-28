@@ -285,6 +285,16 @@ class TrainCfg:
     #           文档才知道东西在哪,重放到裸条件后这些断言没有依据,而 expert 轨迹里
     #           没有一条演示「猜错了怎么回退」⇒ 学到自信断言 + 无法恢复。保留作对照臂。
     mix_sft_prefix: str = "doc"       # doc | bare
+    # --- 分布观察包(docs/microscope-design.md;显微镜工作台的数据层)--------
+    # 存"最小完备源":每训练样本每 response 位置的 teacher top-K / student top-K /
+    # student-on-teacher-support / realized 双侧 + 训练 per-token loss 真值锚。
+    # 一切指标(KL/overlap/mass/熵/rank/外流)由读取层实时派生 ⇒ 分析视角可
+    # 不断进化而数据不过时。成本 ~300-465MB/step(K=64 对称,fp16+压缩),
+    # 默认关;观察/消融 run 显式开。仅 topk 系 KL 模式有数据(estimator 模式
+    # student logits 不过 processor,自动无包)。SP>1 时按段落盘、读层重组
+    # (162 SP=2 首用时验证)。
+    microscope_distributions: bool = False
+    microscope_dist_every: int = 1    # 每 N 个 global step 存一次(1=每步)
     distill_microscope: bool = True   # sample per-token distillation quantities
                                       # to <run>/microscope/ for the analysis
                                       # suite (docs/analysis-design.md; ~MBs/step)

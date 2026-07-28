@@ -18,6 +18,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 
@@ -172,6 +173,13 @@ def compute_topk_loss(
         config=distillation_config,
         data_format=data_format,
     )
+    obs = outputs.pop("obs", None)
+    if obs is not None:
+        _collect_observation_rows(
+            data, obs, outputs["distillation_losses"],
+            loss_mode=loss_mode,
+            log_prob_min_clamp=distillation_config.distillation_loss.log_prob_min_clamp,
+        )
 
     expected_shape = student_logits.shape[:2]
     for k, v in outputs.items():
@@ -646,6 +654,104 @@ def _response_id_rows(data: TensorDict):
     prompt_len = prompts.shape[1]
     lens = attention_mask[:, prompt_len:].sum(dim=1).tolist()
     return [responses[i, : int(n)].tolist() for i, n in enumerate(lens)]
+
+
+def _collect_observation_rows(
+    data: TensorDict, obs: dict, token_losses: torch.Tensor,
+    *, loss_mode: str, log_prob_min_clamp,
+) -> None:
+    """trace-opd observation packs: cut each row's RESPONSE window out of this
+    rank's packed-sequence segment and hand per-row numpy records to the
+    collector (docs/microscope-design.md).
+
+    Layout facts this function owns:
+      * the packed THD stream concatenates prompt+response per row; the row's
+        response PREDICTIONS live at [start + P - 1, start + P - 1 + R) — the
+        same window no_padding_2_padding reads;
+      * under sequence parallel the stream is padded to a multiple of sp_size
+        and split evenly; this rank holds [sp_rank*parts, (sp_rank+1)*parts).
+        Rows are cut to the intersection; token_loss here is the PRE-outer-
+        clamp per-token KL (the audit's ground-truth anchor, noted as such).
+    Best-effort by contract: any failure disables collection, never training.
+    """
+    try:
+        from verl.trainer.distillation.observation import collect_micro_batch, observation_enabled
+        from verl.utils.ulysses import (
+            get_ulysses_sequence_parallel_rank,
+            get_ulysses_sequence_parallel_world_size,
+        )
+
+        if not observation_enabled():
+            return
+        step_value = data.get("global_steps", None)
+        global_step = int(getattr(step_value, "data", step_value) or 0)
+
+        prompts = data["prompts"]
+        responses = data["responses"]
+        prompt_lens = prompts.offsets().diff().tolist()
+        resp_rows = [r.tolist() for r in responses.unbind()]
+        old_lp = data["old_log_probs"]
+        old_lp_rows = [r.float().cpu().numpy() for r in old_lp.unbind()]
+        mask_rows = [m.cpu().numpy() for m in data["response_mask"].unbind()]
+        rewards = data["rm_scores"].to_padded_tensor(0.0).sum(-1).cpu().tolist()
+        extras = data.get("extra_fields", None)
+        extras = list(extras) if extras is not None else [{}] * len(resp_rows)
+
+        sp_size = get_ulysses_sequence_parallel_world_size()
+        sp_rank = get_ulysses_sequence_parallel_rank() if sp_size > 1 else 0
+        full_len = int(sum(prompt_lens) + sum(len(r) for r in resp_rows))
+        padded = full_len
+        if sp_size > 1 and full_len % sp_size:
+            padded = full_len + (sp_size - full_len % sp_size)
+        parts = padded // sp_size
+        rank_lo, rank_hi = sp_rank * parts, (sp_rank + 1) * parts
+
+        def seg_np(t: torch.Tensor, lo: int, hi: int):
+            return t[0, lo:hi].detach().float().cpu().numpy() if t.dtype.is_floating_point else t[0, lo:hi].detach().cpu().numpy()
+
+        rows = []
+        start = 0
+        for i, resp in enumerate(resp_rows):
+            P, R = int(prompt_lens[i]), len(resp)
+            win_lo, win_hi = start + P - 1, start + P - 1 + R
+            start += P + R
+            lo, hi = max(win_lo, rank_lo), min(win_hi, rank_hi)
+            if lo >= hi:
+                continue
+            extra = extras[i] if isinstance(extras[i], dict) else {}
+            seg_slice = (lo - rank_lo, hi - rank_lo)
+            rows.append(
+                {
+                    "resp_hash": _resp_hash(resp),
+                    "task_id": extra.get("task_id", ""),
+                    "sample_role": extra.get("sample_role", "bare"),
+                    "won": extra.get("won", 0),
+                    "reward": rewards[i] if i < len(rewards) else 0.0,
+                    "turn_spans": extra.get("turn_spans") or [],
+                    "response_ids": np.asarray(resp, dtype=np.int32),
+                    "response_mask": mask_rows[i],
+                    "realized_student_lp": old_lp_rows[i],
+                    "seg_start": lo - win_lo,
+                    "seg_len": hi - lo,
+                    "teacher_ids": seg_np(obs["teacher_ids"], *seg_slice),
+                    "teacher_lps": seg_np(obs["teacher_lps"], *seg_slice),
+                    "student_ids": seg_np(obs["student_ids"], *seg_slice),
+                    "student_lps": seg_np(obs["student_lps"], *seg_slice),
+                    "student_support_lps": seg_np(obs["student_support_lps"], *seg_slice),
+                    "token_loss": seg_np(token_losses.detach(), *seg_slice),
+                }
+            )
+        if rows:
+            for row in rows:
+                row["loss_mode"] = loss_mode
+                row["log_prob_min_clamp"] = float(log_prob_min_clamp if log_prob_min_clamp is not None else -1e9)
+            collect_micro_batch(
+                global_step=global_step, rows=rows, sp_rank=sp_rank, sp_size=sp_size
+            )
+    except Exception as err:  # noqa: BLE001
+        from verl.trainer.distillation.observation import _disable
+
+        _disable(f"orchestration failed: {type(err).__name__}: {err}")
 
 
 def _dump_microscope_rows(data: TensorDict, kl, mask, extras: dict) -> None:

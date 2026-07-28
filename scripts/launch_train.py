@@ -423,6 +423,9 @@ def main() -> int:
     # backend silently reverted to vLLM on the 162 line (CD-006 requirement 3-F).
     env["TRACE_TEACHER_SCORING_BACKEND"] = cfg.train.teacher_scoring_backend
     env["TRACE_AGENT_TASK_TIMEOUT_S"] = str(cfg.train.agent_task_timeout_s)
+    if cfg.train.microscope_distributions:
+        env["TRACE_OBS_DIR"] = str(run_dir / "obs")
+        env["TRACE_OBS_EVERY"] = str(cfg.train.microscope_dist_every)
     env["VLLM_RPC_TIMEOUT"] = str(cfg.train.vllm_rpc_timeout_ms)
     if cfg.train.dist_backend:
         env["VERL_DIST_BACKEND"] = cfg.train.dist_backend

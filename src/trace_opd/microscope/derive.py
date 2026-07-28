@@ -1,0 +1,169 @@
+"""Derived quantities over observation packs — the analysis layer.
+
+Everything here is a pure function of the pack's raw quartet; NOTHING is read
+from stored scalars except ``token_loss``, which is the training-side truth
+anchor the ``audit`` function re-derives against. New analysis views belong
+here: add a function, rebuild the cache, and every historical pack gains the
+view — the packs themselves never change.
+
+Formula parity: ``forward_kl`` reproduces the vendored
+``compute_forward_kl_topk`` arithmetic (clamp both sides to
+``log_prob_min_clamp``, sum p_T·(lp_T − lp_S) over the teacher support) and
+``reverse_kl`` reproduces ``compute_reverse_kl_topk`` (member KL + tail
+bucket off the RAW masses). Both are pinned against the vendored functions by
+tests/test_microscope.py — if training arithmetic changes, the tests force
+this file to follow.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+LOG_PROB_MIN_CLAMP = -10.0
+
+
+def _clamp(lp: np.ndarray) -> np.ndarray:
+    return np.maximum(lp, LOG_PROB_MIN_CLAMP)
+
+
+def forward_kl(row: dict[str, Any]) -> np.ndarray:
+    t = _clamp(row["teacher_lps"])
+    s = _clamp(row["student_support_lps"])
+    return (np.exp(t) * (t - s)).sum(-1)
+
+
+def reverse_kl(row: dict[str, Any]) -> np.ndarray:
+    t_raw, s_raw = row["teacher_lps"], row["student_support_lps"]
+    s_mass = np.clip(np.exp(s_raw).sum(-1), 0.0, 1.0 - 1e-6)
+    t_mass = np.clip(np.exp(t_raw).sum(-1), 0.0, 1.0 - 1e-6)
+    t, s = _clamp(t_raw), _clamp(s_raw)
+    member = (np.exp(s) * (s - t)).sum(-1)
+    s_tail = np.maximum(1.0 - s_mass, 1e-6)
+    t_tail = np.maximum(1.0 - t_mass, 1e-6)
+    log_s_tail = np.maximum(np.log(s_tail), LOG_PROB_MIN_CLAMP)
+    tail = s_tail * (log_s_tail - np.log(t_tail))
+    return member + tail
+
+
+def realized_teacher_lp(row: dict[str, Any]) -> np.ndarray:
+    """Teacher log-prob of the sampled token — NaN where the token fell
+    outside the teacher's top-K (that absence is itself a signal)."""
+    hit = row["teacher_ids"] == row["response_ids"][:, None]
+    any_hit = hit.any(-1)
+    picked = np.where(hit, row["teacher_lps"], 0.0).sum(-1)
+    return np.where(any_hit, picked, np.nan)
+
+
+def realized_ranks(row: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Rank (0-based) of the sampled token in each side's top-K; -1 = outside."""
+    out = {}
+    for side, ids_key in (("student", "student_ids"), ("teacher", "teacher_ids")):
+        hit = row[ids_key] == row["response_ids"][:, None]
+        rank = np.where(hit.any(-1), hit.argmax(-1), -1)
+        out[f"{side}_rank"] = rank
+    return out
+
+
+def tracks(row: dict[str, Any]) -> dict[str, np.ndarray]:
+    """The per-token scalar tracks every view renders. All derived."""
+    t_lp, s_own, s_sup = row["teacher_lps"], row["student_lps"], row["student_support_lps"]
+    t_p = np.exp(_clamp(t_lp))
+    s_own_p = np.exp(_clamp(s_own))
+    overlap = (row["teacher_ids"][:, :, None] == row["student_ids"][:, None, :]).any(-1)
+    r_t = realized_teacher_lp(row)
+    out = {
+        "kl_forward": forward_kl(row),
+        "kl_reverse": reverse_kl(row),
+        "token_loss": row["token_loss"],
+        "teacher_mass": np.exp(t_lp).sum(-1),
+        "student_mass_on_support": np.exp(s_sup).sum(-1),
+        "student_mass_own": np.exp(s_own).sum(-1),
+        "teacher_entropy": -(t_p * _clamp(t_lp)).sum(-1),
+        "student_entropy": -(s_own_p * _clamp(s_own)).sum(-1),
+        "overlap_count": overlap.sum(-1),
+        "realized_student_lp": row["realized_student_lp"],
+        "realized_teacher_lp": r_t,
+        "gap": r_t - row["realized_student_lp"],
+        "mask": row["response_mask"].astype(np.float32),
+        "covered": row["covered"].astype(np.float32),
+    }
+    out.update({k: v.astype(np.float32) for k, v in realized_ranks(row).items()})
+    return out
+
+
+def divergence_label(row: dict[str, Any], pos: int) -> str:
+    """Coarse per-position diagnosis for the inspector."""
+    tr = tracks(row)
+    if not row["covered"][pos] or not row["response_mask"][pos]:
+        return "unmasked"
+    t_ent, s_ent = tr["teacher_entropy"][pos], tr["student_entropy"][pos]
+    outflow = 1.0 - tr["student_mass_own"][pos]
+    if tr["kl_forward"][pos] < 0.05:
+        return "agreement"
+    if t_ent > 3.0:
+        return "teacher-abstains"
+    if outflow > 0.3:
+        return "mass-outflow"
+    t_arg = row["teacher_ids"][pos, 0]
+    s_arg = row["student_ids"][pos, 0]
+    if t_arg != s_arg and s_ent < 1.0 and t_ent < 1.0:
+        return "verdict-conflict"
+    return "student-unconverged"
+
+
+def repeat_positions(row: dict[str, Any], n: int = 4, min_repeats: int = 2) -> np.ndarray:
+    """Start positions of n-grams that already occurred earlier in the
+    response — the token-level face of the thought-repetition signal."""
+    ids = row["response_ids"]
+    seen: dict[tuple, int] = {}
+    hits = np.zeros(len(ids), dtype=bool)
+    for i in range(len(ids) - n + 1):
+        key = tuple(ids[i : i + n])
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] >= min_repeats:
+            hits[i] = True
+    return hits
+
+
+def sample_summary(row: dict[str, Any]) -> dict[str, Any]:
+    tr = tracks(row)
+    m = row["response_mask"] & row["covered"]
+    def agg(track):
+        vals = tr[track][m]
+        vals = vals[np.isfinite(vals)]
+        return (float(vals.mean()), float(vals.max())) if len(vals) else (0.0, 0.0)
+    kl_mean, kl_max = agg("kl_forward")
+    gap_mean, _ = agg("gap")
+    return {
+        "resp_hash": row["resp_hash"],
+        "step": row["step"],
+        "task_id": row["task_id"],
+        "sample_role": row["sample_role"],
+        "won": row["won"],
+        "reward": row["reward"],
+        "resp_len": int(len(row["response_ids"])),
+        "masked_tokens": int(m.sum()),
+        "kl_mean": kl_mean,
+        "kl_max": kl_max,
+        "gap_mean": gap_mean,
+        "overlap_mean": float(tr["overlap_count"][m].mean()) if m.any() else 0.0,
+        "teacher_entropy_mean": float(tr["teacher_entropy"][m].mean()) if m.any() else 0.0,
+        "turns": len(row["turn_spans"]),
+    }
+
+
+def audit_row(
+    row: dict[str, Any], atol: float = 0.05, loss_mode: str = "forward_kl_topk"
+) -> dict[str, Any]:
+    """Re-derive the TRAINED objective (per the pack's recorded loss_mode)
+    from the quartet and compare against the training-side truth anchor
+    (fp16 both ways → tolerance ~5e-2)."""
+    m = row["response_mask"] & row["covered"] & np.isfinite(row["token_loss"])
+    if not m.any():
+        return {"checked": 0, "max_err": 0.0, "ok": True}
+    formula = reverse_kl if loss_mode == "reverse_kl_topk" else forward_kl
+    rederived = formula(row)[m]
+    truth = row["token_loss"][m]
+    err = np.abs(rederived - truth)
+    return {"checked": int(m.sum()), "max_err": float(err.max()), "ok": bool((err <= atol).all())}

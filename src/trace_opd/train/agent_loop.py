@@ -586,6 +586,9 @@ class TraceAgentLoop(AgentLoopBase):
             extra_fields={
                 "task_id": adapter.task_id,
                 "won": traj.won,
+                # Observation packs are self-contained (docs/microscope-design.md):
+                # turn structure rides the row instead of a cross-file join.
+                "turn_spans": [list(x) for x in result.tokens.turn_spans],
                 "outcome": traj.outcome,
                 "env_steps": env_steps,
                 "invalid_format": result.invalid_format,
@@ -942,6 +945,16 @@ class TraceAgentLoop(AgentLoopBase):
             dropped = "overlen"
 
         turns_used = result.turns_used if result is not None else 0
+        research_turn_spans: list[list[int]] = []
+        span_start = None
+        for pos, bit in enumerate(response_mask):
+            if bit and span_start is None:
+                span_start = pos
+            elif not bit and span_start is not None:
+                research_turn_spans.append([span_start, pos])
+                span_start = None
+        if span_start is not None:
+            research_turn_spans.append([span_start, len(response_mask)])
         fields: dict[str, Any] = {
             "task_id": adapter.task_id,
             "sample_role": "research",
@@ -965,6 +978,7 @@ class TraceAgentLoop(AgentLoopBase):
             "research_rl_reward": p,
             "research_rl_finalized": int(bool(doc)),
             "research_rl_traj_dropped": int(bool(dropped)),
+            "turn_spans": research_turn_spans,
         }
         logger.info(
             "research replica %s: doc=%s p=%.3f (%d/%d) tokens=%d%s%s",
