@@ -353,3 +353,59 @@ train:
 冒烟产出的三个数(finalize 率 / doc 增益 / p 分布)直接构成 M0 的 Go/No-Go
 基线:冷启动后同口径重测,finalize 率应显著上移、doc 增益应转正。冷启动数据
 与训练方案由 CD-005 后续同步,实验侧无需先动。
+
+## 10. Researcher-SFT 离线采样 pipeline(sftgen;docs/sftgen-design.md)
+
+> 2026-07-28,trace_opd `b7e9c84`。self-research 冷启动(M0)的数据生产环节——
+> **独立离线进程,与训练路径零交集**(新 config 节 sft_gen 轻校验默认恒合法,
+> 训练臂零动作)。设计三裁定:采样模型走标准 OpenAI fncall 面(任意兼容模型
+> 可换,导出时确定性转 text 协议,round-trip 有测试钉死);gt/tool_protocol 读
+> `research.*` 与训练共享的同一键;executor+narrator = 初始 policy
+> Qwen3-4B-Instruct-2507,采样模型 = 35B-A3B 复用现有端点。
+
+### 10.1 前置与服务拓扑
+
+- **一张卡起初始 policy 服务**(executor episodes 与 narrator 共用;绑 127.0.0.1):
+  `vllm serve <Qwen3-4B-Instruct-2507 路径> --port 8311 --host 127.0.0.1 ...`
+  (用 venv_infer;并发压力 ≈ task_parallel×(k_default+1) 路 completions);
+- **35B researcher 端点**:export 训练启动同款的
+  `TRACE_RESEARCHER_ENDPOINT`/`TRACE_RESEARCHER_MODEL` 环境变量即可(roles 配置
+  自动读);external_pool 多端点也照旧支持;
+- 不抢训练卡位:4B 服务一张空闲卡 + 35B 现有端点,与训练臂无资源交集。
+
+### 10.2 三步走
+
+```bash
+# 0) 预览分层任务清单(不需要任何服务;确认采样成分)
+PYTHONPATH=src python3 scripts/sample_researcher_sft.py \
+    --config configs/trace.yaml --out-dir /abs/runs/sftgen_v1 --dry-run --tasks 32
+
+# 1) 标定跑(32 任务;正式任务数用户后续制定,标定不依赖它)
+PYTHONPATH=src python3 scripts/sample_researcher_sft.py \
+    --config configs/trace.yaml --out-dir /abs/runs/sftgen_v1 \
+    --executor-endpoint http://127.0.0.1:8311/v1 \
+    --executor-model Qwen3-4B-Instruct-2507 --tasks 32
+# 长跑纪律照旧:setsid + nohup + </dev/null + 独立日志;进度看文件系统产物
+# (tasks/*/s0/DONE 计数),勿信日志尾。断点续跑=同命令重跑(DONE 幂等)。
+
+# 2) 导出暂缓(等全量采完 + 过滤条件裁定;归档全保,换过滤=重导出不重采)
+```
+
+### 10.3 标定跑判读(报回 experiment-feedback.md 的四个数)
+
+1. **finalize 率**(summary.json / 逐任务 stdout `doc=yes|NO`)——35B fncall 参照
+   H1 的 27B 实测 100%,显著低于此=协议或提示词问题;
+2. **35B 会话质量抽读**:tape/researcher.jsonl 抽 3-5 条看是否真实"实验-分析-
+   收敛"(H1 行为口径);malformed/工具拒绝率(tape 里 dispatch 拒绝记录);
+3. **mean_gain / p_bare**(summary.json)——这是 M0 探针的 35B 侧基线;p_bare
+   同时是初始 policy 的裸水平复核(应与已知基线一致);
+4. **单任务 wall 与吞吐**(日志时间戳)——全量任务数的成本外推依据。
+
+### 10.4 已知边界
+
+- SFT 数据是 executor-conditioned 的:换执行者尺寸(1.7B)理论上应各自采,
+  是否加采等用户裁定;
+- gt 默认 off(training 同键;gt=on 对照臂按需小批量);
+- export 的 --min-gain/--drop-multi-call 过滤条件等标定分布出来后议;
+- verl SFT 训练配置(fsdp_sft_trainer,multiturn messages 列)是 M0 下一环,
+  由 CD-005 后续同步。
