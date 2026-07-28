@@ -53,6 +53,8 @@ def main() -> int:
 
     cfg = load_config(args.config, args.overrides)
     if args.tasks is not None:
+        if int(args.tasks) < 1:
+            raise SystemExit("FATAL: --tasks must be >= 1")  # codex review P1-8
         cfg.sft_gen.tasks = int(args.tasks)
     if args.executor_endpoint:
         cfg.sft_gen.executor_endpoint = args.executor_endpoint
@@ -95,6 +97,16 @@ def main() -> int:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.train.model_path)
+    # codex review P1-7 (light): the tokenizer renders prompts the SERVED model
+    # must interpret — a mismatched pair corrupts every episode silently.
+    served = Path(cfg.sft_gen.executor_model).name
+    local = Path(cfg.train.model_path).name
+    if served and local and served not in (local, cfg.train.model_path):
+        print(
+            f"[sftgen] WARNING executor model {served!r} != tokenizer source "
+            f"{local!r} — token ids will be interpreted by the SERVED model; "
+            "make sure the vocabularies match"
+        )
     summary = asyncio.run(run_pipeline(cfg, Path(args.out_dir), tokenizer))
     return 0 if summary["errors"] == 0 else 2
 

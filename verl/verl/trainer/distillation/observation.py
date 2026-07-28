@@ -32,6 +32,7 @@ itself for the run with one warning — observation must never hurt training.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import threading
@@ -45,6 +46,7 @@ _LOCK = threading.Lock()
 _STEP_BUFFERS: dict[int, list[dict]] = {}
 _DISABLED = False
 _LAST_FLUSHED_STEP: int | None = None
+_PENDING: list[threading.Thread] = []
 
 
 def observation_dir() -> str | None:
@@ -58,7 +60,12 @@ def observation_enabled() -> bool:
 
 
 def _step_wanted(step: int) -> bool:
-    every = max(1, int(os.getenv("TRACE_OBS_EVERY", "1") or 1))
+    # codex review P2-9: a malformed TRACE_OBS_EVERY must degrade, not raise
+    # into the training loss path.
+    try:
+        every = max(1, int(os.getenv("TRACE_OBS_EVERY", "1") or 1))
+    except (TypeError, ValueError):
+        every = 1
     return step % every == 0
 
 
@@ -87,6 +94,11 @@ def collect_micro_batch(*, global_step: int, rows: list[dict], sp_rank: int, sp_
     if not observation_enabled() or not _step_wanted(int(global_step)):
         return
     try:
+        # codex review P2-4: the SP metadata must ride every row, not the
+        # collector call — flush reads it back from the rows.
+        for row in rows:
+            row.setdefault("sp_rank", int(sp_rank))
+            row.setdefault("sp_size", int(sp_size))
         with _LOCK:
             _STEP_BUFFERS.setdefault(int(global_step), []).extend(rows)
             _maybe_flush_older(int(global_step))
@@ -100,18 +112,28 @@ def _maybe_flush_older(current_step: int) -> None:
     stale = [s for s in _STEP_BUFFERS if s < current_step]
     for step in stale:
         records = _STEP_BUFFERS.pop(step)
-        threading.Thread(
-            target=_flush_step, args=(step, records), daemon=True
-        ).start()
+        thread = threading.Thread(target=_flush_step, args=(step, records), daemon=True)
+        thread.start()
+        _PENDING.append(thread)
         _LAST_FLUSHED_STEP = step
+    _PENDING[:] = [t for t in _PENDING if t.is_alive()]
 
 
 def flush_all() -> None:
-    """Flush everything buffered (checkpoint/exit hook)."""
+    """Flush everything buffered and join in-flight writers. Registered as an
+    atexit hook (codex review P1-9: nothing else ever called this, so the
+    LAST sampled step of every run was silently lost and single-step smokes
+    produced zero packs)."""
     with _LOCK:
         steps = list(_STEP_BUFFERS)
         for step in steps:
             _flush_step(step, _STEP_BUFFERS.pop(step))
+        pending = list(_PENDING)
+    for thread in pending:
+        thread.join(timeout=120.0)
+
+
+atexit.register(flush_all)
 
 
 def _flush_step(step: int, rows: list[dict]) -> None:

@@ -49,7 +49,7 @@ def export(
     out_path: Path,
     *,
     min_gain: float | None = None,
-    drop_multi_call: bool = False,
+    drop_multi_call: bool = True,
 ) -> dict[str, Any]:
     import pandas as pd
 
@@ -77,8 +77,9 @@ def export(
         if drop_multi_call and _multi_call_turns(messages):
             stats["dropped_multi_call"] += 1
             continue
+        tools = session.get("tools") or TOOL_SCHEMAS  # archived schema first (P1-5)
         text_messages = messages_to_text_protocol(
-            messages, TOOL_SCHEMAS, session.get("tool_protocol", "fncall")
+            messages, tools, session.get("tool_protocol", "fncall")
         )
         rows.append(
             {
@@ -93,6 +94,14 @@ def export(
         )
         stats["kept"] += 1
 
+    if not rows:
+        # codex review P1-8: a zero-row parquet has NO messages column and the
+        # verl dataset dies on it later, far from the cause — fail here.
+        raise SystemExit(
+            f"FATAL: export kept 0 of {stats['sessions']} sessions "
+            f"(filters: min_gain={min_gain}, drop_multi_call={drop_multi_call}) "
+            "— nothing trainable would be written"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(out_path, index=False)
     manifest = {
@@ -114,13 +123,16 @@ def main() -> int:
     parser.add_argument("--archive-dir", required=True)
     parser.add_argument("--out", required=True, help="output parquet path")
     parser.add_argument("--min-gain", type=float, default=None)
-    parser.add_argument("--drop-multi-call", action="store_true")
+    # codex review P1-4: the session executes only the FIRST call of a
+    # multi-call turn, so teaching the rest is teaching never-executed
+    # behaviour — dropped by default, keep only on explicit request.
+    parser.add_argument("--keep-multi-call", action="store_true")
     args = parser.parse_args()
     export(
         Path(args.archive_dir),
         Path(args.out),
         min_gain=args.min_gain,
-        drop_multi_call=args.drop_multi_call,
+        drop_multi_call=not args.keep_multi_call,
     )
     return 0
 

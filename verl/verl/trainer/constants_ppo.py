@@ -135,4 +135,11 @@ def get_ppo_ray_runtime_env(config=None):
     for key in ("TRACE_DISTILL_MICROSCOPE_DIR", "TRACE_DISTILL_SAMPLE_EVERY"):
         if os.environ.get(key):
             runtime_env["env_vars"][key] = os.environ[key]
+    # trace-opd observation packs (codex review P1-10): same explicit route —
+    # on an existing/remote Ray cluster the actor workers do NOT inherit the
+    # driver's environment, and a missing TRACE_OBS_DIR silently disables
+    # collection with zero packs and zero errors.
+    for key in ("TRACE_OBS_DIR", "TRACE_OBS_EVERY"):
+        if os.environ.get(key):
+            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

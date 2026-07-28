@@ -52,14 +52,26 @@ class StepPack:
                 resp_off = z["resp_offsets"]
                 spans_off = z["turn_spans_offsets"]
                 for i in range(n):
-                    h = int(z["row_hash"][i])
+                    # codex review P1-14: the rolling hash alone is not a
+                    # primary key — key on (hash, length) and REFUSE a merge
+                    # whose token stream disagrees (a silent cross-sample
+                    # merge is the one corruption a microscope must never do).
+                    resp = z["response_ids"][resp_off[i] : resp_off[i + 1]]
+                    h = (int(z["row_hash"][i]), int(len(resp)))
                     row = self._rows.get(h)
+                    if row is not None and not np.array_equal(
+                        row["response_ids"], resp.astype(np.int64)
+                    ):
+                        raise RuntimeError(
+                            f"observation pack row-key collision at step "
+                            f"{self.step}: hash {h[0]} len {h[1]} maps to two "
+                            "different token streams — needs a stronger UID"
+                        )
                     if row is None:
-                        resp = z["response_ids"][resp_off[i] : resp_off[i + 1]]
                         R = len(resp)
                         spans = z["turn_spans"][spans_off[i] : spans_off[i + 1]]
                         row = {
-                            "resp_hash": h,
+                            "resp_hash": h[0],
                             "step": self.step,
                             "task_id": str(z["row_task"][i]),
                             "sample_role": str(z["row_role"][i]),
@@ -89,13 +101,21 @@ class StepPack:
                     row["covered"][a:b] = True
 
     def hashes(self) -> list[int]:
-        return sorted(self._rows)
+        return sorted(h for h, _ in self._rows)
 
     def rows(self) -> list[dict[str, Any]]:
-        return [self._rows[h] for h in self.hashes()]
+        return [self._rows[k] for k in sorted(self._rows)]
 
     def row(self, resp_hash: int) -> dict[str, Any]:
-        return self._rows[int(resp_hash)]
+        matches = [k for k in self._rows if k[0] == int(resp_hash)]
+        if not matches:
+            raise KeyError(resp_hash)
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"hash {resp_hash} matches {len(matches)} rows of different "
+                "lengths — address rows via rows()"
+            )
+        return self._rows[matches[0]]
 
 
 @functools.lru_cache(maxsize=8)

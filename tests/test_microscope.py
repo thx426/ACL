@@ -204,3 +204,71 @@ def test_repeat_positions_flags_recurring_ngrams():
     ids = np.array([1, 2, 3, 4, 9, 1, 2, 3, 4, 8, 1, 2, 3, 4], dtype=np.int64)
     hits = derive.repeat_positions({"response_ids": ids}, n=4, min_repeats=2)
     assert hits[5] and hits[10] and not hits[0]
+
+def test_reverse_tail_floor_clamps_both_sides():
+    """codex review P1-15: a 0.99999-mass teacher against a 0.5-mass student
+    put the old derive ~0.756 off the training value (teacher tail log was
+    unclamped). Reproduce the construction and pin the parity."""
+    K = 4
+    t_lps = np.log(np.full((1, K), 0.99999 / K, dtype=np.float64))
+    s_lps = np.log(np.full((1, K), 0.5 / K, dtype=np.float64))
+    row = {"teacher_lps": t_lps, "student_support_lps": s_lps}
+    got = derive.reverse_kl(row, clamp=-10.0)[0]
+    # hand computation with BOTH tails floored at -10 (the vendored rule)
+    member = (0.5 * (np.log(0.5 / K) - np.log(0.99999 / K)) * K * (0.5 / K) * K)
+    member = (np.exp(s_lps) * (s_lps - t_lps)).sum()
+    s_tail, t_tail = 0.5, max(1 - 0.99999, 1e-6)
+    want = member + s_tail * (max(np.log(s_tail), -10.0) - max(np.log(t_tail), -10.0))
+    assert abs(got - want) < 1e-6
+
+
+def test_audit_reports_failure_on_empty_data():
+    """codex review P1-16: zero checked tokens must never read as OK."""
+    R = 4
+    row = {
+        "response_mask": np.zeros(R, dtype=bool),
+        "covered": np.zeros(R, dtype=bool),
+        "token_loss": np.full(R, np.nan),
+    }
+    assert derive.audit_row(row)["ok"] is False
+
+
+def test_reader_refuses_a_row_key_collision(fsdp_ns):
+    """codex review P1-14: same (hash, length) with different tokens must
+    raise, never silently merge."""
+    _, obs_ns, obs_dir = fsdp_ns
+    R, K = 4, 2
+    base = {
+        "resp_hash": 99, "task_id": "t", "sample_role": "bare", "won": 0,
+        "reward": 0.0, "turn_spans": [], "seg_start": 0, "seg_len": R,
+        "response_mask": np.ones(R, dtype=np.int8),
+        "realized_student_lp": np.zeros(R, dtype=np.float16),
+        "token_loss": np.zeros(R, dtype=np.float16),
+    }
+    for key in ("teacher_ids", "student_ids"):
+        base[key] = np.zeros((R, K), dtype=np.int32)
+    for key in ("teacher_lps", "student_lps", "student_support_lps"):
+        base[key] = np.zeros((R, K), dtype=np.float16)
+
+    class _D:
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def get_rank():
+            return 0
+
+    obs_ns["torch"].distributed = _D
+    obs_ns["_flush_step"](5, [dict(base, response_ids=np.array([1, 2, 3, 4], dtype=np.int32))])
+
+    class _D1(_D):
+        @staticmethod
+        def get_rank():
+            return 1
+
+    obs_ns["torch"].distributed = _D1
+    obs_ns["_flush_step"](5, [dict(base, response_ids=np.array([9, 8, 7, 6], dtype=np.int32))])
+    with pytest.raises(RuntimeError, match="collision"):
+        StepPack(obs_dir, 5)
+

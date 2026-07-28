@@ -66,3 +66,11 @@ tests/test_microscope.py 的端到端真理链:采集→npz→读取→派生 ==
 
 checkpoint 重放(全词表视角,限 checkpoint step);持久派生缓存(SQLite,
 大 run 首扫加速);token 类型透镜的环境插件化;与 viz 系统互相 deep-link。
+
+## Codex 审阅记录(2026-07-28,gpt-5.6-sol max effort,与 sftgen 合审)
+
+**已修**(verl `9172da4` + trace_opd 本 commit):P0-1(NonTensorStack 解包——未修则开启即自禁,首个微批就死)、P1-9(atexit flush——未修则末 step 必丢/单步冒烟零包)、P1-10(Ray env 白名单——remote 集群静默零包)、P1-11(采样门前置省 CPU 拷贝)、P1-14(reader 复合键+冲突 fail-loud)、P1-15(derive clamp 参数化 + reverse 尾桶两侧 floor——修前构造例偏差 0.756)、P1-16(audit 空数据=失败)、P1-18(演化格聚合 replica 均值+n;任务列表全 step 轻扫)、P1-19(XSS 两处)、P2-4/6/7/9(sp 元数据/请求竞态/pos 界/env 解析)。
+
+**挂账(P2,记录在案)**:P1-12(写盘线程有界队列/背压——首个观察 run 盯 flush backlog 与主机内存)、P1-13(step 完成 manifest 与跨 rank 完成协议——单机单代使用模式下风险低,重启复用同 obs 目录前手动清理)、P1-17(server 内存/payload 界:mmap/降采样/虚拟化——32k 轨迹首用时实测)、P1-18 局部(leaderboard per-row top-8 的近似语义已注释)、P2-5(minimap 像素 bin 聚合)、P2-8(真实 TQ 集成测试——服务器侧首验清单覆盖)。
+
+**服务器首验(codex 清单精选)**:两步真跑各 rank 齐 TRACE_OBS_*、日志无 disabled、包非空;单步冒烟验 atexit flush;SP=2 段重组逐 token 对拍;audit 全量非零退出语义;off/on 与 every=1/10 的显存墙钟 A/B。

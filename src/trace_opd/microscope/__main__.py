@@ -29,16 +29,27 @@ def main() -> int:
     from . import derive
     from .reader import list_steps, load_step
 
-    bad = 0
-    for step in list_steps(Path(args.obs_dir)):
+    bad = checked_rows = 0
+    steps = list_steps(Path(args.obs_dir))
+    for step in steps:
         pack = load_step(args.obs_dir, step)
         for row in pack.rows():
-            res = derive.audit_row(row, atol=args.atol, loss_mode=pack.loss_mode)
+            res = derive.audit_row(
+                row, atol=args.atol, loss_mode=pack.loss_mode,
+                clamp=pack.log_prob_min_clamp,
+            )
+            checked_rows += 1
             if not res["ok"]:
                 bad += 1
                 print(f"AUDIT FAIL step={step} hash={row['resp_hash']} "
                       f"max_err={res['max_err']:.4f} checked={res['checked']}")
-    print(f"audit done: {'OK' if bad == 0 else f'{bad} rows FAILED'}")
+    if not steps or not checked_rows:
+        # codex review P1-16: no packs / no rows is a data-integrity FAILURE,
+        # not a pass — the P0 failure mode looked exactly like this.
+        print(f"audit FAILED: steps={len(steps)} rows={checked_rows} — no data to audit")
+        return 2
+    print(f"audit done: {'OK' if bad == 0 else f'{bad} rows FAILED'} "
+          f"({checked_rows} rows over {len(steps)} steps)")
     return 0 if bad == 0 else 2
 
 

@@ -77,3 +77,9 @@ PYTHONPATH=src python3 -m trace_opd.sftgen.export \
   下一环,pipeline 产物 schema 已对齐(messages 列)。
 - 35B 在 fncall 下的会话质量参照 H1(27B 实测 finalize 100%);text 直采臂与
   gt=on 对照臂按需小批量跑。
+
+## Codex 审阅记录(2026-07-28,gpt-5.6-sol max effort,与 microscope 合审)
+
+**已修**:P1-1(error 会话写 FAILED 可重试,不再被 DONE 封存;无 error 的未 finalize 仍是真实数据点照常 DONE)、P1-2(manifest 身份校验——换 seed/数据/模型复用旧 out_dir 直接 FATAL)、P1-3(task_safe 加 sha1 后缀单射化)、P1-4(export 默认 drop 多 call 会话——runtime 只执行第一个 call,教未执行行为默认关)、P1-5(session.json 归档采样时 tools schema,export 优先用归档版)、P1-6(utility 测量加总墙)、P1-7(executor 模型与 tokenizer 来源不一致时启动警告)、P1-8(空任务/空导出 FATAL)、P2-1(三 client 全关)。
+
+**挂账(P2)**:P1-4 深修(会话历史内只保留已执行 call + 真实 fncall 服务端 prefix-replay 验证)、P1-7 硬校验(服务端 model 信息比对)、P2-2(MultiTurnSFTDataset 真实实例化测试——服务器侧标定跑时做)、P2-3(validate_for_sampling 汇总校验)。

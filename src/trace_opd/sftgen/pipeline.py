@@ -57,7 +57,14 @@ from .strata import STRATUM_FNS, stratified_sample
 
 
 def task_safe(task_id: str) -> str:
-    return task_id.replace("/", "__").replace(" ", "_")
+    # codex review P1-3: the readable slug is NOT injective ("a/b" vs "a__b");
+    # an 8-hex digest suffix makes the mapping collision-free in practice and
+    # keeps directories greppable.
+    import hashlib
+
+    slug = task_id.replace("/", "__").replace(" ", "_")
+    digest = hashlib.sha1(task_id.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}.{digest}"
 
 
 class SftGenDeps:
@@ -99,6 +106,12 @@ class SftGenDeps:
         )
 
     async def aclose(self) -> None:
+        import contextlib
+
+        # codex review P2-1: the two OpenAI clients hold their own pools.
+        for client in (self.researcher_client, self.narrator_client):
+            with contextlib.suppress(Exception):
+                await client.aclose()
         await self.http.aclose()
 
 
@@ -187,8 +200,13 @@ async def run_one_session(
     task_id = str(item["task_id"])
     task_dir = deps.out_dir / "tasks" / task_safe(task_id) / f"s{session_index}"
     done = task_dir / "DONE"
+    failed = task_dir / "FAILED"
     if done.exists():
         return json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+    if failed.exists():
+        # codex review P1-1: a transient failure must be RETRIED on rerun,
+        # never sealed forever; the retry supersedes the attempt in place.
+        failed.unlink()
 
     task_dir.mkdir(parents=True, exist_ok=True)
     adapter = deps.factory.adapter_from_item(item)
@@ -224,11 +242,26 @@ async def run_one_session(
     finally:
         TAPE_CONTEXT.reset(token)
 
-    utility = await _measure_doc(deps, item, result.doc)
+    try:
+        # codex review P1-6: the hard wall covered only the researcher session;
+        # a pathological utility measurement could stall the whole batch tail.
+        utility = await asyncio.wait_for(
+            _measure_doc(deps, item, result.doc),
+            timeout=deps.cfg.research.session_timeout_s,
+        )
+    except asyncio.TimeoutError:
+        utility = {"p_doc": 0.0, "p_bare": 0.0, "gain": 0.0,
+                   "doc_evals": [], "bare_evals": [], "timeout": True}
 
     (task_dir / "session.json").write_text(
         json.dumps(
-            {"messages": result.messages, "tool_protocol": rcfg.tool_protocol},
+            {
+                "messages": result.messages,
+                "tool_protocol": rcfg.tool_protocol,
+                # codex review P1-5: exports must fold the SAMPLING-TIME tool
+                # docs, not whatever the constant says at export time.
+                "tools": TOOL_SCHEMAS,
+            },
             ensure_ascii=False,
             indent=1,
         ),
@@ -261,7 +294,13 @@ async def run_one_session(
     (task_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
     )
-    done.write_text("ok", encoding="utf-8")
+    if result.error:
+        # Session ended on an exception/timeout: everything is archived but the
+        # slot stays retryable. A finalize-less session WITHOUT an error is a
+        # real behavioural data point and is sealed DONE as before.
+        failed.write_text(str(result.error), encoding="utf-8")
+    else:
+        done.write_text("ok", encoding="utf-8")
     print(
         f"[sftgen] {task_id} s{session_index}: doc={'yes' if result.doc else 'NO'} "
         f"p_doc={utility['p_doc']:.2f} p_bare={utility['p_bare']:.2f} "
@@ -299,9 +338,26 @@ async def run_pipeline(cfg: Config, out_dir: Path, tokenizer) -> dict[str, Any]:
         "researcher_endpoint": cfg.role("researcher").endpoint,
         "strata": sorted({stratum_fn(t) for t in picked}),
     }
-    (out_dir / "manifest.json").write_text(
+    # codex review P1-2: resuming into a directory sampled under a DIFFERENT
+    # experiment silently mixes generations behind old DONE markers — refuse
+    # on any identity mismatch.
+    identity_keys = ("benchmark", "train_file", "seed", "sessions_per_task",
+                     "researcher_model", "research", "sft_gen")
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        drift = [k for k in identity_keys if previous.get(k) != manifest.get(k)]
+        if drift:
+            raise SystemExit(
+                f"FATAL: {out_dir} was sampled under a different configuration "
+                f"(changed: {drift}) — use a fresh out_dir instead of mixing "
+                "generations"
+            )
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
     )
+    if not picked:
+        raise SystemExit("FATAL: the task sample is empty — nothing to sample")
 
     deps = SftGenDeps(cfg, out_dir, tokenizer)
     sem = asyncio.Semaphore(sg.task_parallel)

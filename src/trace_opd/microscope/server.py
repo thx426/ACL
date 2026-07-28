@@ -62,7 +62,7 @@ def _samples(step: int) -> list[dict]:
 def _sample_payload(step: int, resp_hash: int) -> dict:
     pack = load_step(_OBS_DIR, step)
     row = pack.row(resp_hash)
-    tr = derive.tracks(row)
+    tr = derive.tracks(row, pack.log_prob_min_clamp)
     repeats = derive.repeat_positions(row)
     tokens = [{"id": int(t), "text": _tok_text(t)} for t in row["response_ids"]]
     return {
@@ -72,14 +72,14 @@ def _sample_payload(step: int, resp_hash: int) -> dict:
         "tokens": tokens,
         "tracks": {k: _clean(v) for k, v in tr.items()},
         "repeat_mask": [int(x) for x in repeats.tolist()],
-        "audit": derive.audit_row(row, loss_mode=pack.loss_mode),
+        "audit": derive.audit_row(row, loss_mode=pack.loss_mode, clamp=pack.log_prob_min_clamp),
     }
 
 
 def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
     pack = load_step(_OBS_DIR, step)
     row = pack.row(resp_hash)
-    tr = derive.tracks(row)
+    tr = derive.tracks(row, pack.log_prob_min_clamp)
 
     def side(ids_key: str, lps_key: str) -> list[dict]:
         return [
@@ -88,6 +88,8 @@ def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
             for i, lp in zip(row[ids_key][pos], row[lps_key][pos])
         ]
 
+    if not (0 <= pos < len(row["response_ids"])):
+        raise KeyError(f"pos {pos} out of range 0..{len(row['response_ids']) - 1}")
     realized_id = int(row["response_ids"][pos])
     lo, hi = max(0, pos - 30), min(len(row["response_ids"]), pos + 31)
     return {
@@ -124,7 +126,7 @@ def _leaderboard(metric: str, step_lo: int, step_hi: int, mode: str, limit: int)
             continue
         pack = load_step(_OBS_DIR, step)
         for row in pack.rows():
-            tr = derive.tracks(row)
+            tr = derive.tracks(row, pack.log_prob_min_clamp)
             m = row["response_mask"] & row["covered"]
             if mode == "verdict_conflict":
                 cand = m & (row["teacher_ids"][:, 0] != row["student_ids"][:, 0]) \
@@ -163,22 +165,29 @@ def _evolution(task: str, metric: str) -> dict:
     key = ("evo", task, metric)
     if key in _MEMO:
         return _MEMO[key]
-    cells = []
+    acc: dict[tuple, list] = {}
+    reps: dict[tuple, list] = {}
     for step in list_steps(Path(_OBS_DIR)):
         pack = load_step(_OBS_DIR, step)
         for row in pack.rows():
             if row["task_id"] != task or row["sample_role"] != "bare":
                 continue
-            tr = derive.tracks(row)
+            tr = derive.tracks(row, pack.log_prob_min_clamp)
             for turn_index, (a, b) in enumerate(row["turn_spans"]):
                 m = row["response_mask"][a:b] & row["covered"][a:b]
                 vals = tr[metric][a:b][m]
                 vals = vals[np.isfinite(vals)]
                 if len(vals):
-                    cells.append(
-                        {"step": step, "turn": turn_index, "value": _clean(float(vals.mean())),
-                         "hash": row["resp_hash"]}
-                    )
+                    cell_key = (step, turn_index)
+                    acc.setdefault(cell_key, []).append(float(vals.mean()))
+                    reps.setdefault(cell_key, []).append(row["resp_hash"])
+    # codex review P1-18: rollout_n replicas per task are the NORM — the cell
+    # is the replica MEAN with n attached, never a last-writer-wins sample.
+    cells = [
+        {"step": step, "turn": turn, "value": _clean(float(np.mean(vals))),
+         "n": len(vals), "hash": reps[(step, turn)][0]}
+        for (step, turn), vals in sorted(acc.items())
+    ]
     out = {"task": task, "metric": metric, "cells": cells}
     _MEMO[key] = out
     return out
@@ -189,9 +198,10 @@ def _tasks() -> list[str]:
     if key in _MEMO:
         return _MEMO[key]
     tasks = set()
-    for step in list_steps(Path(_OBS_DIR))[:4]:
-        for row in load_step(_OBS_DIR, step).rows():
-            tasks.add(row["task_id"])
+    for step in list_steps(Path(_OBS_DIR)):
+        for path in (Path(_OBS_DIR) / f"step_{step:05d}").glob("rank*.npz"):
+            with np.load(path) as z:  # single-key read: cheap even at scale
+                tasks.update(str(t) for t in z["row_task"])
     out = sorted(tasks)
     _MEMO[key] = out
     return out

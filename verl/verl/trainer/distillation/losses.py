@@ -683,8 +683,27 @@ def _collect_observation_rows(
 
         if not observation_enabled():
             return
+        # codex review P0-1: global_steps is stamped per ROW at TQ put time, so
+        # the micro-batch carries a NonTensorStack (list semantics) — int() on
+        # it raises and the old code disabled collection forever on the very
+        # first batch. Unwrap every observed shape; rows of one micro-batch
+        # share the step, so the first element is the step.
         step_value = data.get("global_steps", None)
-        global_step = int(getattr(step_value, "data", step_value) or 0)
+        step_value = getattr(step_value, "data", step_value)
+        if hasattr(step_value, "tolist"):
+            step_value = step_value.tolist()
+        if isinstance(step_value, (list, tuple)):
+            step_value = step_value[0] if step_value else 0
+        step_value = getattr(step_value, "data", step_value)
+        global_step = int(step_value or 0)
+        # codex review P1-11: gate on the sampling schedule BEFORE any CPU
+        # copy/assembly. (The student-own top-k GPU pass in the payload cannot
+        # see the step and stays constant — ms-scale per micro-batch,
+        # documented as such.)
+        from verl.trainer.distillation.observation import _step_wanted
+
+        if not _step_wanted(global_step):
+            return
 
         prompts = data["prompts"]
         responses = data["responses"]

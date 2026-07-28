@@ -88,7 +88,7 @@ function renderSamples() {
       let v = r[k];
       if (typeof v === "number" && !Number.isInteger(v)) v = v.toFixed(3);
       if (k === "won") return `<td class="won-${r.won}">${r.won ? "✓" : "✗"}</td>`;
-      if (k === "task_id") v = String(v).slice(0, 46);
+      if (k === "task_id") v = esc(String(v).slice(0, 46));
       return `<td>${v}</td>`;
     }).join("") + "</tr>").join("");
   document.querySelectorAll("#s-table tbody tr").forEach((tr) => tr.onclick = () =>
@@ -117,7 +117,7 @@ async function viewTraj(q) {
   }
   const s = TRAJ.summary;
   $("#t-title").innerHTML =
-    `<b>${s.task_id.slice(0, 40)}</b> · step ${s.step} · ` +
+    `<b>${esc(s.task_id.slice(0, 40))}</b> · step ${s.step} · ` +
     `<span class="won-${s.won}">${s.won ? "WON" : "LOST"}</span> · ` +
     `${s.resp_len} tok · ${s.turns} turns · ${TRAJ.loss_mode}`;
   const a = TRAJ.audit;
@@ -195,8 +195,10 @@ function paintMinimap() {
     if (el) el.scrollIntoView({ block: "center" });
   };
 }
+let SEL_SEQ = 0;
 async function selectPos(i, push) {
   SEL = i;
+  const seq = ++SEL_SEQ;
   document.querySelectorAll("#t-tokens .tk.sel").forEach((e) => e.classList.remove("sel"));
   const el = document.querySelector(`#t-tokens .tk[data-i="${i}"]`);
   if (el) el.classList.add("sel");
@@ -206,6 +208,7 @@ async function selectPos(i, push) {
   if (push) history.replaceState(null, "",
     `#/traj?${new URLSearchParams({ step, hash, track: $("#t-track").value, pos: i })}`);
   const p = await api(`/api/position?step=${step}&hash=${hash}&pos=${i}`);
+  if (seq !== SEL_SEQ) return;  // a newer selection superseded this response
   renderInspector(p);
 }
 function renderInspector(p) {

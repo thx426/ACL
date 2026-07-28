@@ -20,29 +20,37 @@ from typing import Any
 
 import numpy as np
 
-LOG_PROB_MIN_CLAMP = -10.0
+LOG_PROB_MIN_CLAMP = -10.0  # default only; every formula takes the PACK value
 
 
-def _clamp(lp: np.ndarray) -> np.ndarray:
-    return np.maximum(lp, LOG_PROB_MIN_CLAMP)
+def _clamp(lp: np.ndarray, floor: float) -> np.ndarray:
+    return np.maximum(lp, floor)
 
 
-def forward_kl(row: dict[str, Any]) -> np.ndarray:
-    t = _clamp(row["teacher_lps"])
-    s = _clamp(row["student_support_lps"])
+def forward_kl(row: dict[str, Any], clamp: float = LOG_PROB_MIN_CLAMP) -> np.ndarray:
+    t = _clamp(row["teacher_lps"], clamp)
+    s = _clamp(row["student_support_lps"], clamp)
     return (np.exp(t) * (t - s)).sum(-1)
 
 
-def reverse_kl(row: dict[str, Any]) -> np.ndarray:
+def reverse_kl(row: dict[str, Any], clamp: float = LOG_PROB_MIN_CLAMP) -> np.ndarray:
+    """Vendored compute_reverse_kl_topk, exactly: masses off the RAW
+    log-probs, member KL on the clamped ones, and — codex review P1-15 —
+    the tail floor applied to BOTH tail logs (the old derive clamped only
+    the student side; a 0.99999-mass teacher against a 0.5-mass student put
+    it ~0.756 off the training value). tail_floor follows the vendored
+    None -> -80 convention."""
+    tail_floor = clamp if clamp is not None else -80.0
     t_raw, s_raw = row["teacher_lps"], row["student_support_lps"]
     s_mass = np.clip(np.exp(s_raw).sum(-1), 0.0, 1.0 - 1e-6)
     t_mass = np.clip(np.exp(t_raw).sum(-1), 0.0, 1.0 - 1e-6)
-    t, s = _clamp(t_raw), _clamp(s_raw)
+    t, s = _clamp(t_raw, clamp), _clamp(s_raw, clamp)
     member = (np.exp(s) * (s - t)).sum(-1)
     s_tail = np.maximum(1.0 - s_mass, 1e-6)
     t_tail = np.maximum(1.0 - t_mass, 1e-6)
-    log_s_tail = np.maximum(np.log(s_tail), LOG_PROB_MIN_CLAMP)
-    tail = s_tail * (log_s_tail - np.log(t_tail))
+    log_s_tail = np.maximum(np.log(s_tail), tail_floor)
+    log_t_tail = np.maximum(np.log(t_tail), tail_floor)
+    tail = s_tail * (log_s_tail - log_t_tail)
     return member + tail
 
 
@@ -65,22 +73,22 @@ def realized_ranks(row: dict[str, Any]) -> dict[str, np.ndarray]:
     return out
 
 
-def tracks(row: dict[str, Any]) -> dict[str, np.ndarray]:
+def tracks(row: dict[str, Any], clamp: float = LOG_PROB_MIN_CLAMP) -> dict[str, np.ndarray]:
     """The per-token scalar tracks every view renders. All derived."""
     t_lp, s_own, s_sup = row["teacher_lps"], row["student_lps"], row["student_support_lps"]
-    t_p = np.exp(_clamp(t_lp))
-    s_own_p = np.exp(_clamp(s_own))
+    t_p = np.exp(_clamp(t_lp, clamp))
+    s_own_p = np.exp(_clamp(s_own, clamp))
     overlap = (row["teacher_ids"][:, :, None] == row["student_ids"][:, None, :]).any(-1)
     r_t = realized_teacher_lp(row)
     out = {
-        "kl_forward": forward_kl(row),
-        "kl_reverse": reverse_kl(row),
+        "kl_forward": forward_kl(row, clamp),
+        "kl_reverse": reverse_kl(row, clamp),
         "token_loss": row["token_loss"],
         "teacher_mass": np.exp(t_lp).sum(-1),
         "student_mass_on_support": np.exp(s_sup).sum(-1),
         "student_mass_own": np.exp(s_own).sum(-1),
-        "teacher_entropy": -(t_p * _clamp(t_lp)).sum(-1),
-        "student_entropy": -(s_own_p * _clamp(s_own)).sum(-1),
+        "teacher_entropy": -(t_p * _clamp(t_lp, clamp)).sum(-1),
+        "student_entropy": -(s_own_p * _clamp(s_own, clamp)).sum(-1),
         "overlap_count": overlap.sum(-1),
         "realized_student_lp": row["realized_student_lp"],
         "realized_teacher_lp": r_t,
@@ -154,16 +162,21 @@ def sample_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def audit_row(
-    row: dict[str, Any], atol: float = 0.05, loss_mode: str = "forward_kl_topk"
+    row: dict[str, Any], atol: float = 0.05, loss_mode: str = "forward_kl_topk",
+    clamp: float = LOG_PROB_MIN_CLAMP,
 ) -> dict[str, Any]:
     """Re-derive the TRAINED objective (per the pack's recorded loss_mode)
     from the quartet and compare against the training-side truth anchor
     (fp16 both ways → tolerance ~5e-2)."""
     m = row["response_mask"] & row["covered"] & np.isfinite(row["token_loss"])
     if not m.any():
-        return {"checked": 0, "max_err": 0.0, "ok": True}
+        # codex review P1-16: absent data is a FAILURE, not a pass — a gate
+        # reporting OK on zero checked tokens hides every upstream loss.
+        return {"checked": 0, "max_err": 0.0, "ok": False}
+    if loss_mode not in ("forward_kl_topk", "reverse_kl_topk"):
+        return {"checked": 0, "max_err": float("inf"), "ok": False}
     formula = reverse_kl if loss_mode == "reverse_kl_topk" else forward_kl
-    rederived = formula(row)[m]
+    rederived = formula(row, clamp)[m]
     truth = row["token_loss"][m]
     err = np.abs(rederived - truth)
     return {"checked": int(m.sum()), "max_err": float(err.max()), "ok": bool((err <= atol).all())}

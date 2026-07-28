@@ -299,3 +299,17 @@ def test_observation_packs_wired_on_the_executed_paths():
     losses = _read("trainer/distillation/losses.py")
     assert "_collect_observation_rows(" in losses
     assert "log_prob_min_clamp=distillation_config" in losses
+
+def test_observation_review_fixes_present():
+    # 9172da4: the codex-review fixes on the observation packs.
+    losses = _read("trainer/distillation/losses.py")
+    assert "NonTensorStack" in losses or "tolist" in losses  # P0-1 unwrap
+    assert "_step_wanted(global_step)" in losses             # P1-11 early gate
+
+    obs = _read("trainer/distillation/observation.py")
+    assert "atexit.register(flush_all)" in obs               # P1-9
+    assert 'row.setdefault("sp_rank"' in obs                 # P2-4
+
+    consts = _read("trainer/constants_ppo.py")
+    assert '"TRACE_OBS_DIR", "TRACE_OBS_EVERY"' in consts    # P1-10
+
