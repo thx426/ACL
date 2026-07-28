@@ -157,6 +157,35 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         ]
     if t.opd_kl_mode == "reverse_kl_gated":
         kl_args.append(f"+distillation.distillation_loss.gate_beta={t.opd_gate_beta}")
+    # Self-research channel (docs/self-research-design.md): its coefficients
+    # ride the same distillation_loss config surface. Off (weight=0, default)
+    # ships nothing — no config keys, no extra replicas, byte-identical run.
+    rrl = cfg.research_rl
+    research_args = []
+    research_extra_n = 0
+    if rrl.weight > 0:
+        research_args = [
+            f"+distillation.distillation_loss.research_loss_coef={rrl.weight}",
+            f"+distillation.distillation_loss.research_update_mode={rrl.update_mode}",
+            f"+distillation.distillation_loss.research_adv_clip={rrl.adv_clip}",
+            f"+distillation.distillation_loss.research_warmup_steps={rrl.warmup_steps}",
+        ]
+        research_extra_n = rrl.n_docs
+        # The separate mode (and the warmup drop in either mode) splits the
+        # batch by role before update_actor; TransferQueue dispatches rows
+        # across the dp ranks, so each role's row count must divide n_gpus or
+        # a rank ends short. Fixed shapes make this a launch-time check.
+        n_research_rows = t.train_batch_size * rrl.n_docs
+        n_exec_rows = t.train_batch_size * (
+            t.rollout_n + (t.mix_sft_rollouts if t.mix_sft_weight > 0 else 0)
+        )
+        for label, rows in (("research", n_research_rows), ("executor", n_exec_rows)):
+            if rows % t.n_gpus != 0:
+                raise SystemExit(
+                    f"FATAL: {label} row count {rows} (batch {t.train_batch_size}) is not "
+                    f"divisible by n_gpus={t.n_gpus} — the role-split update would leave "
+                    "a dp rank short. Adjust research_rl.n_docs / rollout_n / batch size."
+                )
     return [
         sys.executable, "-m", "verl.trainer.main_ppo",
         "algorithm.adv_estimator=grpo",
@@ -222,7 +251,8 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # Mixed objective: the SFT arm adds expert copies on top — the agent
         # loop hands the trailing mix_sft_rollouts indices of each task to the
         # document-guided branch, so the bare group stays exactly rollout_n.
-        f"actor_rollout_ref.rollout.n={t.rollout_n + (t.mix_sft_rollouts if t.mix_sft_weight > 0 else 0)}",
+        f"actor_rollout_ref.rollout.n="
+        f"{t.rollout_n + (t.mix_sft_rollouts if t.mix_sft_weight > 0 else 0) + research_extra_n}",
         f"actor_rollout_ref.rollout.max_model_len={t.rollout_max_model_len}",
         # Chunked-prefill budget. Also sizes the transient full-vocab logits
         # tensor vLLM materializes per chunk during self-teacher prompt_logprobs
@@ -267,6 +297,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         f"+distillation.distillation_loss.opd_loss_coef={t.mix_opd_weight}",
         f"+distillation.distillation_loss.rl_loss_coef={t.mix_rl_weight}",
         f"+distillation.distillation_loss.sft_loss_coef={t.mix_sft_weight}",
+        *research_args,
     ]
 
 

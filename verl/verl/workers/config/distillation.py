@@ -130,6 +130,32 @@ class DistillationLossConfig(BaseConfig):
     rl_loss_coef: float = 0.0
     sft_loss_coef: float = 0.0
 
+    # trace-opd self-research module (docs/self-research-design.md): the research
+    # ROLE's own RL term, orthogonal to the executor-side mix above (those three
+    # optimise "execute better"; this one optimises "research better"; the only
+    # coupling is the data flow — the winning document takes the teacher seat).
+    # Rows with extra_fields.sample_role == "research" ship a ``research_mask``
+    # (their researcher-generated tokens; their response_mask is cleared at TQ
+    # put time, so they leave every executor-side term and denominator) and a
+    # ``research_advantage`` (group-relative doc-utility reward, filled in by
+    # the trainer's advantage stage). The loss is a clipped PG over those
+    # tokens normalised by the batch-GLOBAL research-token count, so its value
+    # does not depend on how rows are packed into micro-batches.
+    #     ... + research_loss_coef * RESEARCH   (0.0 = channel off, byte-identical)
+    research_loss_coef: float = 0.0
+    # joint: research rows share the executor backward — ONE optimizer step,
+    #        perfectly on-policy (every gradient at the sampling weights).
+    # separate: research rows are split out and trained in a SECOND update
+    #        within the same global step (UCOB/SEED form; one step off-policy,
+    #        held by the PPO clip). Kept as a switchable ablation/fallback.
+    research_update_mode: str = "joint"
+    # Hard clamp on the group-relative research advantage (UCOB ships +/-2.0).
+    research_adv_clip: float = 2.0
+    # Research rows contribute no gradient before this many global steps (UCOB
+    # warms its writer for ~30); document production and teacher selection run
+    # from step one regardless — warmup gates the gradient, not the mechanism.
+    research_warmup_steps: int = 0
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
@@ -192,6 +218,23 @@ class DistillationLossConfig(BaseConfig):
                 "term. Use rl_loss_coef (explicit weight, trace-opd mixed objective) or "
                 "use_task_rewards (upstream, implicit weight 1), not both."
             )
+
+        # trace-opd self-research module: reject silently-wrong shapes at config time.
+        research_coef = float(self.research_loss_coef)
+        if not math.isfinite(research_coef) or research_coef < 0.0:
+            raise ValueError(
+                f"research_loss_coef must be finite and >= 0 (0 disables the channel), got {research_coef}"
+            )
+        if self.research_update_mode not in ("joint", "separate"):
+            raise ValueError(
+                f"research_update_mode must be 'joint' or 'separate', got {self.research_update_mode!r}"
+            )
+        if research_coef > 0.0:
+            adv_clip = float(self.research_adv_clip)
+            if not math.isfinite(adv_clip) or adv_clip <= 0.0:
+                raise ValueError(f"research_adv_clip must be finite and > 0, got {adv_clip}")
+            if int(self.research_warmup_steps) < 0:
+                raise ValueError(f"research_warmup_steps must be >= 0, got {self.research_warmup_steps}")
 
 
 @dataclass

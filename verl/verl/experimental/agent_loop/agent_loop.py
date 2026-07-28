@@ -1061,6 +1061,12 @@ class AgentLoopWorker:
             # response_mask is cleared, so the trainer skips the scoring forward.
             if output.extra_fields.get("sample_role") == "sft":
                 output.extra_fields["teacher_mode"] = "sft"
+            elif output.extra_fields.get("sample_role") == "research":
+                # trace-opd self-research: a research row is the researcher
+                # session itself — it has no teacher, and scoring its (very
+                # long) trajectory would burn a full forward whose output the
+                # loss masks out. Same skip contract as the expert rows.
+                output.extra_fields["teacher_mode"] = "research"
             else:
                 output.extra_fields["teacher_mode"] = "privileged" if _tp is not None else "bare"
             # codex M2: K rides with the sample; trainer asserts consistency.

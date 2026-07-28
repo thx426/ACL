@@ -205,3 +205,42 @@ def test_signal_enhancement_triplet_removed():
         for marker in ("loss_soft_cap", "kl_weight_alpha", "kl_weight_cap",
                        "teacher_block_starts", "teacher_doc_ids"):
             assert marker not in src, f"{marker} still present in {rel}"
+
+def test_self_research_channel_wired_on_the_executed_paths():
+    # 6e524ed + e3bd3bf + af6a8d3: every touchpoint of the research channel
+    # must be present on the paths training actually runs.
+    losses = _read("trainer/distillation/losses.py")
+    assert "def research_pg_loss" in losses
+    assert "research_num_tokens" in losses            # batch-global denominator
+    assert 'data["research_only"]' in losses          # separate-mode short-circuit
+    assert "research_loss_coef" in losses
+
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert 'field["research_mask"] = response_mask' in tq
+    assert '"research_arm"' in tq                     # uniform allocation stamp
+
+    trainer = _read("trainer/ppo/v1/trainer_base.py")
+    assert "_grouped_uid" in trainer                  # own GRPO group per role
+    assert 'if role in ("sft", "research")' in trainer
+    assert "_research_channel_enabled" in trainer
+    assert "research_update_mode" in trainer          # joint/separate routing
+    assert "research_warmup_steps" in trainer
+    assert "num_mini_batch" in trainer                # af6a8d3 subset sizing fix
+    assert 'in ("sft", "research")' in trainer        # e3bd3bf metrics exclusion
+
+    engine = _read("workers/engine/fsdp/transformer_impl.py")
+    assert "research_num_tokens" in engine            # all-reduced pre-micro-batch
+
+    fsdp = _read("trainer/distillation/teacher_topk_fsdp.py")
+    assert 'in ("sft", "research")' in fsdp           # no scoring forward burned
+
+    agent = _read("experimental/agent_loop/agent_loop.py")
+    assert '"teacher_mode"] = "research"' in agent
+
+    padding = _read("trainer/ppo/padding_utils.py")
+    assert '"research_mask" in template_sample' in padding
+
+    cfg = _read("workers/config/distillation.py")
+    assert "research_loss_coef: float = 0.0" in cfg
+    assert 'research_update_mode: str = "joint"' in cfg
+

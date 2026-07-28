@@ -651,6 +651,17 @@ class FSDPEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        # trace-opd self-research: the research term normalises by the
+        # batch-GLOBAL research-token count (loss_mask excludes those rows —
+        # their response_mask was cleared at TQ put time), so its value cannot
+        # depend on how rows land in micro-batches. Computed here, next to
+        # batch_num_tokens, for exactly the same reason that one is.
+        if "research_mask" in data.keys():
+            research_num_tokens = data["research_mask"].sum().to(get_device_id())
+            torch.distributed.all_reduce(
+                research_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, research_num_tokens=research_num_tokens.item())
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True

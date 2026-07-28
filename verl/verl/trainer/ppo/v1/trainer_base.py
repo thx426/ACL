@@ -1536,14 +1536,23 @@ class PPOTrainer(ABC):
         return batch
 
     def _mixed_objective_enabled(self) -> bool:
-        """trace-opd: whether the RL or SFT arm of the mixed objective is on."""
+        """trace-opd: whether the RL or SFT arm of the mixed objective, or the
+        self-research channel, is on (all three key the sample_role machinery)."""
         if not is_distillation_enabled(self.config.get("distillation")):
             return False
         loss_cfg = self.distillation_config.distillation_loss
         return (
             float(getattr(loss_cfg, "rl_loss_coef", 0.0) or 0.0) > 0.0
             or float(getattr(loss_cfg, "sft_loss_coef", 0.0) or 0.0) > 0.0
+            or float(getattr(loss_cfg, "research_loss_coef", 0.0) or 0.0) > 0.0
         )
+
+    def _research_channel_enabled(self) -> bool:
+        """trace-opd self-research: whether research rows carry a gradient at all."""
+        if not is_distillation_enabled(self.config.get("distillation")):
+            return False
+        loss_cfg = self.distillation_config.distillation_loss
+        return float(getattr(loss_cfg, "research_loss_coef", 0.0) or 0.0) > 0.0
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
@@ -1552,10 +1561,16 @@ class PPOTrainer(ABC):
         mixed_objective = self._mixed_objective_enabled()
         if mixed_objective:
             fields.append("extra_fields")
+        research_enabled = self._research_channel_enabled()
+        if research_enabled:
+            fields.append("research_mask")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         sample_roles = data.pop("extra_fields", None) if mixed_objective else None
 
         response_mask = data["response_mask"]
+        # trace-opd self-research: nested layout template for writing the
+        # research advantages back (response_mask is all-zero on those rows).
+        research_mask_nested = data["research_mask"] if research_enabled else None
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
@@ -1570,11 +1585,19 @@ class PPOTrainer(ABC):
             # group statistics honest.
             roles = sample_roles.tolist() if hasattr(sample_roles, "tolist") else list(sample_roles)
             uids = data.non_tensor_batch["uid"]
+
+            def _grouped_uid(uid, extra):
+                role = extra.get("sample_role") if isinstance(extra, dict) else None
+                # trace-opd self-research: research rows form their own GRPO
+                # group per task. Their reward (the document's downstream
+                # success rate) lives on a different scale than the executor's
+                # binary outcome, and their advantage is recomputed below with
+                # the research formula anyway — the isolation keeps the
+                # executor groups' statistics untouched, same reason as :sft.
+                return f"{uid}:{role}" if role in ("sft", "research") else uid
+
             data.non_tensor_batch["uid"] = np.array(
-                [
-                    f"{uid}:sft" if isinstance(extra, dict) and extra.get("sample_role") == "sft" else uid
-                    for uid, extra in zip(uids, roles)
-                ],
+                [_grouped_uid(uid, extra) for uid, extra in zip(uids, roles)],
                 dtype=object,
             )
 
@@ -1611,6 +1634,37 @@ class PPOTrainer(ABC):
             config=self.config.algorithm,
         )
 
+        # 3b. trace-opd self-research: overwrite the research rows' advantage
+        # with the research formula — group-relative, mean-centred, NOT divided
+        # by the group std (K-rollout success rates make the std collapse on
+        # near-tied groups and dividing amplifies pure sampling noise;
+        # docs/self-research-design.md 7.2), hard-clamped to +/-adv_clip. The
+        # standard GRPO advantage these rows just received is never read (their
+        # response_mask is all zero), but the value shipped to the loss must be
+        # the research one, on its own field, nested by research_mask.
+        research_advantage_padded = None
+        if research_enabled and sample_roles is not None:
+            research_rows = [
+                i
+                for i, extra in enumerate(roles)
+                if isinstance(extra, dict) and extra.get("sample_role") == "research"
+            ]
+            if research_rows:
+                loss_cfg = self.distillation_config.distillation_loss
+                adv_clip = float(getattr(loss_cfg, "research_adv_clip", 2.0) or 2.0)
+                scores = data.batch["token_level_scores"].sum(-1)
+                group_rows: dict[str, list[int]] = {}
+                for i in research_rows:
+                    group_rows.setdefault(str(data.non_tensor_batch["uid"][i]), []).append(i)
+                row_adv = torch.zeros_like(scores)
+                for rows in group_rows.values():
+                    idx = torch.tensor(rows, dtype=torch.long, device=scores.device)
+                    rewards = scores[idx]
+                    centred = rewards - rewards.mean()
+                    row_adv[idx] = centred.clamp(min=-adv_clip, max=adv_clip)
+                mask_padded = data.batch["research_mask"]
+                research_advantage_padded = row_adv.unsqueeze(-1).expand(mask_padded.shape).contiguous()
+
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
         if self.config.algorithm.use_kl_in_reward:
@@ -1623,6 +1677,10 @@ class PPOTrainer(ABC):
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
+        if research_advantage_padded is not None:
+            output["research_advantage"] = response_to_nested(
+                research_advantage_padded, research_mask_nested
+            )
         output = TensorDict(output, batch_size=len(batch))
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
@@ -1688,13 +1746,102 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
-        batch.extra_info.update(extra_info)
+        # trace-opd self-research (docs/self-research-design.md 7.1): route the
+        # research rows according to research_update_mode.
+        #   warmup      research rows carry no gradient yet: they are dropped
+        #               from the update entirely (documents and teacher
+        #               selection already happened rollout-side).
+        #   joint       (default) research rows share the executor backward —
+        #               one optimizer step, every gradient at the sampling
+        #               weights. The loss keeps the terms apart via
+        #               research_mask and the batch-global research-token
+        #               denominator, so nothing here needs splitting.
+        #   separate    research rows are split out and trained in a SECOND
+        #               update within the same global step (UCOB/SEED form).
+        research_split = None
+        if self._research_channel_enabled():
+            loss_cfg = self.distillation_config.distillation_loss
+            role_data = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"]
+            )
+            role_fields = role_data.pop("extra_fields")
+            is_research = np.array(
+                [
+                    isinstance(extra, dict) and extra.get("sample_role") == "research"
+                    for extra in role_fields.tolist()
+                ],
+                dtype=bool,
+            )
+            in_warmup = self.global_steps <= int(getattr(loss_cfg, "research_warmup_steps", 0) or 0)
+            mode = str(getattr(loss_cfg, "research_update_mode", "joint") or "joint")
+            if is_research.any() and (in_warmup or mode == "separate"):
+                keep = ~is_research
 
-        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+                def _subset(mask: np.ndarray) -> KVBatchMeta:
+                    sub = KVBatchMeta(
+                        partition_id=batch.partition_id,
+                        keys=[k for k, m in zip(batch.keys, mask.tolist()) if m],
+                        tags=[t for t, m in zip(batch.tags, mask.tolist()) if m],
+                    )
+                    sub.extra_info.update(batch.extra_info)
+                    return sub
+
+                if in_warmup:
+                    # Research rows sit this update out; one greppable line so a
+                    # silent warmup is never mistaken for a broken channel.
+                    logger.info(
+                        "self-research warmup: step %s <= %s, %d research rows skipped",
+                        self.global_steps,
+                        getattr(loss_cfg, "research_warmup_steps", 0),
+                        int(is_research.sum()),
+                    )
+                    batch_for_update = _subset(keep)
+                else:
+                    research_split = _subset(is_research)
+                    batch_for_update = _subset(keep)
+                # A subset no longer matches the mini-batch size derived from
+                # rollout.n above — the dataloader would emit zero full
+                # mini-batches and the update would silently do nothing. The
+                # production configs run ppo_mini_batch_size == train_batch_size
+                # (one mini-batch per update), which num_mini_batch=1 preserves
+                # exactly for any subset row count.
+                extra_info = dict(extra_info)
+                extra_info["mini_batch_size"] = None
+                extra_info["num_mini_batch"] = 1
+            else:
+                batch_for_update = batch
+        else:
+            batch_for_update = batch
+
+        batch_for_update.extra_info.update(extra_info)
+
+        output: TensorDict = self.actor_rollout_wg.update_actor(batch_for_update)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
+
+        if research_split is not None:
+            # Second update of the same global step, research rows only. The
+            # loss side sees research_only and computes nothing but the
+            # research term; num_mini_batch=1 sidesteps the mini-batch-size
+            # divisibility assert for the smaller split; the lr scheduler is
+            # NOT advanced here (train_mini_batch only steps it when the
+            # update_lr_scheduler flag is set, which we do not set).
+            research_extra = dict(extra_info)
+            research_extra["research_only"] = True
+            # The research rows carry only dummy teacher columns (their scoring
+            # was skipped) — running the top-k logits processor over these very
+            # long sequences would burn memory for a value the loss never
+            # reads. The research term needs the plain log-probs path only.
+            research_extra["distillation_use_topk"] = False
+            research_extra["mini_batch_size"] = None
+            research_extra["num_mini_batch"] = 1
+            research_split.extra_info.update(research_extra)
+            research_output: TensorDict = self.actor_rollout_wg.update_actor(research_split)
+            research_output = rename_dict(research_output["metrics"], "research_update/")
+            research_output.pop("research_update/mfu", None)
+            metrics.update(reduce_metrics(research_output))
 
         return batch
 
@@ -1767,9 +1914,14 @@ class PPOTrainer(ABC):
         # full population because they ARE the expert-arm bookkeeping.
         on_policy_mask = non_padding_mask
         if rollout_extra_fields is not None:
+            # trace-opd: expert (SFT) rows and research rows are both excluded
+            # from the on-policy behaviour metrics — the former would inflate
+            # them (~96% success), the latter would deflate them (a research
+            # session has no task outcome; its reward is a doc success rate).
             is_expert = np.array(
                 [
-                    isinstance(extra_field, dict) and extra_field.get("sample_role") == "sft"
+                    isinstance(extra_field, dict)
+                    and extra_field.get("sample_role") in ("sft", "research")
                     for extra_field in rollout_extra_fields.tolist()
                 ],
                 dtype=bool,
@@ -1784,7 +1936,7 @@ class PPOTrainer(ABC):
                 if not keep_any or not isinstance(extra_field, dict):
                     continue
                 for key, value in extra_field.get("reward_extra_info", {}).items():
-                    if key.startswith("sft_") or keep_on_policy:
+                    if key.startswith(("sft_", "research_rl_")) or keep_on_policy:
                         reward_extra_infos_dict[key].append(value)
             if reward_extra_infos_dict:
                 metrics.update(compute_rollout_extra_metrics(reward_extra_infos_dict))

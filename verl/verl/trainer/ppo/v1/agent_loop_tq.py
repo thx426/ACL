@@ -210,6 +210,31 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     field["response_mask"] = torch.zeros_like(response_mask)
                 else:
                     field["sft_mask"] = torch.zeros_like(response_mask)
+            # trace-opd self-research (docs/self-research-design.md): a research
+            # row is the researcher session itself — its researcher-generated
+            # tokens live in response_mask exactly like an executor row's
+            # assistant tokens. Same discipline as the SFT arm: the row
+            # supervises through ``research_mask`` and nothing else. Clearing
+            # its response_mask keeps the (possibly very long) research
+            # trajectory out of the OPD/RL/SFT terms AND out of every
+            # denominator derived from response_mask, so switching the research
+            # channel on cannot rescale the executor-side losses. The
+            # ``research_arm`` stamp plays the role sample_role plays above:
+            # the agent loop stamps it on EVERY row exactly when the channel is
+            # on, so the batch layout stays uniform and the off path ships
+            # nothing.
+            if (field.get("extra_fields") or {}).get("research_arm") is not None:
+                response_mask = field["response_mask"]
+                if sample_role == "research":
+                    field["research_mask"] = response_mask
+                    field["response_mask"] = torch.zeros_like(response_mask)
+                else:
+                    field["research_mask"] = torch.zeros_like(response_mask)
+                # Placeholder; the trainer's advantage stage fills the real
+                # group-relative value (see trainer_base._compute_advantage).
+                field["research_advantage"] = torch.zeros_like(
+                    field["research_mask"], dtype=torch.float32
+                )
             # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

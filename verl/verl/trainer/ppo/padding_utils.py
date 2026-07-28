@@ -121,6 +121,15 @@ def construct_minimal_padding_template(
     # row must not invent one.
     if "sft_mask" in template_sample:
         template_sample["sft_mask"] = torch.zeros_like(response_mask)
+    # trace-opd self-research: same shape discipline as sft_mask — a padding
+    # row cloned off a research sample must not ship a full-length mask or a
+    # stale advantage into the loss.
+    if "research_mask" in template_sample:
+        template_sample["research_mask"] = torch.zeros_like(response_mask)
+    if "research_advantage" in template_sample:
+        template_sample["research_advantage"] = torch.zeros_like(
+            response_mask, dtype=torch.float32
+        )
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

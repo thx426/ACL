@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(48c8743)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(af6a8d3)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -47,6 +47,9 @@
 | 0a6edfb | trace-opd:**fsdp 打分后端单点模式(`teacher_topk=0`)**——estimator 家族(k3 / reverse_kl_gated)每位置只需已实现 token 的 teacher logprob;vLLM 路径自 CD-003 reverse-KL 消融起就支持(`prompt_logprobs=0`),R11a fsdp 后端(现默认)此前无条件 `torch.topk`。新 `_score_rows_realized`:gather 已实现 token logit − fp32 logsumexp,产 `(rows, 1)` 张量(dummy 宽度 `max(k,1)` 与 vLLM 提取器一致);比 top-k 更省(无 topk kernel、传输 1 列)。两处对齐哨兵(fsdp/vLLM)从"只看首行"改为"看前 8 行"——单列下一个饱和 glue token 的 logprob 在 fp32 中可合法取整到 0.0(假警报),错位窗口读到的全零 dummy 行仍必然触发;空批显式拒绝 |
 | 6fb4145 | trace-opd:**`reverse_kl_topk`——forward_kl_topk 的稠密方向镜像**。逐 token 为 teacher top-k 支撑 + 尾桶的 (K+1) 类分布真 KL:`Σ p_S(log p_S−log p_T) + (1−m_S)(log(1−m_S)−log(1−m_T))`;尾桶使其非负、且是"student 质量停在 teacher top-k 之外"的 mode-seeking 压力唯一表达点(两侧质量本就为诊断而算)。同数据面、同 clamp、同 chunked 路径、同 overlap/熵诊断 ⇒ 拨此开关的消融**只改一个变量(KL 方向)**;estimator 模式一次改三个(方向/单点 vs 分布/估计器形式)。刻意独立镜像不重构——`compute_forward_kl_topk` 是 4B 主线在跑热路径,保持逐字节不动。已验:手算对拍/恒等零/20 随机抽样非负/尾桶梯度方向(支撑外 logit 压下、支撑内抬起)/chunked 一致 |
 | 48c8743 | trace-opd:**`reverse_kl_gated`(SDAR/SEED 置信门控 logp-shift)+ KL 模式分发**。两家 2026 agentic 自蒸馏线的辅助项数学同构(SDAR `sdar_utils.compute_sdar_loss`、SEED `core_algos.compute_opd_loss`,β 均默认 5.0):`Δ_t=logπ_T(y_t)−logπ_S(y_t)`(detach)、`gate=sigmoid(βΔ)`(detach)、`loss=gate·Δ`,梯度只走 `−logπ_S`——每个采样 token 都被以 gate 强度上拉(teacher 背书则全力、否决则指数衰减);非 KL 估计器(论文称 reverse-KL surrogate),但与 k1 不同,teacher 经 detached gate 塑形梯度。纯数学抽为 `_gated_logp_shift` 供测试独立执行,**逐位复现 SEED 官方测试向量**(loss/gate/梯度)。他们的 step 级 `opd_step_mask` 刻意无对应物(SEED hindsight skill 只覆盖部分步;我们的特权文档条件化整条轨迹——response_mask 即 step mask);λ(SDAR 代码默认 0.1、论文 0.01;SEED `opd_loss_coef`)映射到我们的 `opd_loss_coef` 不另设旋钮。另:`compute_topk_loss` 按 loss_mode 分发(megatron 对 reverse 明确 raise)、top-k 外层后处理注册双名(其每一步都方向无关)、`gate_beta` 进 config(有限且 >0:β→0 退化为平坦 0.5、负 β 反转到 teacher 否决 token 上)、`use_policy_gradient` 警告覆盖全部 use_topk 模式、estimator 家族补显微镜落盘(gated 加 gate 列)与 abs_loss 空批防御 |
+| 6e524ed | trace-opd:**self-research 通道——policy-as-researcher 的 RL 项与 joint/separate 双更新形态**(docs/self-research-design.md)。research 行(researcher 会话轨迹)沿 SFT 臂纪律过 TQ:`response_mask` 清零 + 独立 `research_mask`(researcher 生成 token)+ `research_advantage` 占位 ⇒ 执行侧三项与其一切分母永远看不见它们;trainer 端 uid 加 `:research` 独立 GRPO 组,advantage = 组内去均值(**不除 std**——K 次成功率在近平组上 std 坍缩、除之放大纯采样噪声)+ 硬 clip ±`research_adv_clip`;按 `research_update_mode` 路由——**joint(默认)**:同一 backward 加带 ratio+clip 的 PG 项,分母 = 批全局 research token 数(`research_num_tokens`,切微批前 all-reduce ⇒ 数值与打包方式无关、完美 on-policy、系数在梯度裁剪下语义保持);**separate**:research 行拆出走同一全局 step 的第二次 update(独立 mini-batch、不推进 lr scheduler、关 topk logits processor、loss 端 `research_only` 短路)——UCOB/SEED 结构。`research_warmup_steps` 内 research 行整体退出 update(文档生产与 teacher 选择照常);teacher 打分对 research 行如 expert 行跳过(超长轨迹零浪费 forward);padding 模板同步缩零两个新字段;`research_loss_coef=0`(默认)零字段零开销逐字节现状 |
+| e3bd3bf | trace-opd:research 行退出 on-policy 行为指标(SFT 行同款纪律——expert 行会抬高指标,research 行会拉低:research 会话没有任务结局,其 reward 是文档成功率);`research_rl_` 前缀曲线照 `sft_` 先例全量收集 |
+| af6a8d3 | trace-opd:角色拆分后的子批带 `num_mini_batch=1`——拆分批行数不再匹配按 rollout.n 推导的 mini_batch_size,dataloader 会产出零个完整 mini-batch、更新静默变 no-op(生产配置 ppo_mini_batch_size==train_batch_size 下 num_mini_batch=1 精确保持原语义) |
 
 ## 修改/更新流程(保持单一真源)
 

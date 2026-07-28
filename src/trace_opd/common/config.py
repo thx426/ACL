@@ -9,6 +9,7 @@ roots, interpreter paths) live in env vars, not in the yaml.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -106,6 +107,36 @@ class ResearchCfg:
     episode_temperature: float = 1.0
     researcher_max_tokens: int = 4096
     session_timeout_s: float = 3600.0  # hard wall per research session (defensive)
+
+
+@dataclass
+class ResearchRLCfg:
+    """Self-research 通道(docs/self-research-design.md):policy-as-researcher 的
+    research 能力 RL。与执行侧混合目标(train.mix_*)是两个**正交模块**——那三个
+    系数优化「任务执行更好」,这里优化「researcher 更好」;二者唯一的耦合是数据流
+    (argmax 文档拿 teacher 位),不在 loss 语义上,故本节独立于 TrainCfg。
+
+    weight=0(默认)= 通道关断:不产 research 副本、不加 loss 项、不进 fingerprint,
+    与现状逐字节一致。开启硬前提:research.backend=engine + tool_protocol=text
+    (research 轨迹必须是 policy 自己的 on-policy 采样,外部 35B 的轨迹不能拿来
+    做 policy 的 PG)。"""
+
+    weight: float = 0.0               # research_loss_coef;第二通道的整体系数
+    update_mode: str = "joint"        # joint | separate(设计 §7.1:joint=同一
+                                      # backward,完美 on-policy,默认;separate=
+                                      # 同一全局 step 的第二次 update,UCOB/SEED
+                                      # 形态,备选与消融臂)
+    n_docs: int = 8                   # N:每任务并行 research 会话数(组间对比的
+                                      # 组大小;用户裁定默认 8,快速实验可调小,>=2)
+    eval_k: int = 8                   # K:每份文档的 doc-conditioned 评测 rollout 数
+                                      # (p_i = wins/K,即 PG-7 文档质量信号)
+    adv_clip: float = 2.0             # 组间 advantage 硬 clip(UCOB 同款 ±2.0)
+    warmup_steps: int = 30            # 前多少个 global step research 行不给梯度
+                                      # (UCOB writer warmup ~30);文档生产与
+                                      # teacher 选择从第 1 步照常
+    max_sample_tokens: int = 16384    # research 会话 token 样本总长预算;超限则
+                                      # 该轨迹降级不进训练面(doc 仍用、reward 仍
+                                      # 参与组统计),防超长序列打爆显存峰值
 
 
 @dataclass
@@ -288,6 +319,7 @@ class RunCfg:
 class Config:
     run: RunCfg
     research: ResearchCfg
+    research_rl: ResearchRLCfg
     narration: NarrationCfg
     roles: dict[str, RoleCfg]
     episode: EpisodeCfg
@@ -314,7 +346,7 @@ def _build(dc, d: dict[str, Any]):
     return dc(**d)
 
 
-_KNOWN_SECTIONS = {"run", "research", "narration", "roles", "episode", "alfworld", "train", "eval"}
+_KNOWN_SECTIONS = {"run", "research", "research_rl", "narration", "roles", "episode", "alfworld", "train", "eval"}
 
 
 def _validate(cfg: "Config") -> None:
@@ -390,6 +422,44 @@ def _validate(cfg: "Config") -> None:
             problems.append(
                 "train.mix_sft_weight>0 requires research.enabled (expert rollouts need a document)"
             )
+    # --- self-research 通道(docs/self-research-design.md §7)---------------
+    rrl = cfg.research_rl
+    if not math.isfinite(rrl.weight) or rrl.weight < 0.0:
+        problems.append(f"research_rl.weight={rrl.weight} must be finite and >= 0")
+    if rrl.update_mode not in ("joint", "separate"):
+        problems.append(f"research_rl.update_mode={rrl.update_mode!r} (joint|separate)")
+    if rrl.weight > 0.0:
+        if cfg.research.backend != "engine" or cfg.research.tool_protocol != "text":
+            problems.append(
+                "research_rl.weight>0 requires research.backend=engine and "
+                "research.tool_protocol=text — the research trajectories must be the "
+                "policy's own on-policy samples (an external researcher's tokens cannot "
+                "carry the policy's PG)"
+            )
+        if not cfg.research.enabled:
+            problems.append("research_rl.weight>0 requires research.enabled=true")
+        if rrl.n_docs < 2:
+            problems.append(
+                f"research_rl.n_docs={rrl.n_docs} must be >= 2 (the reward is a "
+                "group-relative comparison; one document has no group)"
+            )
+        if rrl.eval_k < 1:
+            problems.append(f"research_rl.eval_k={rrl.eval_k} must be >= 1")
+        if not math.isfinite(rrl.adv_clip) or rrl.adv_clip <= 0.0:
+            problems.append(f"research_rl.adv_clip={rrl.adv_clip} must be finite and > 0")
+        if rrl.warmup_steps < 0:
+            problems.append(f"research_rl.warmup_steps={rrl.warmup_steps} must be >= 0")
+        if rrl.max_sample_tokens < 1024:
+            problems.append(
+                f"research_rl.max_sample_tokens={rrl.max_sample_tokens} must be >= 1024"
+            )
+        if rrl.max_sample_tokens + cfg.train.max_prompt_length > cfg.train.rollout_max_model_len:
+            problems.append(
+                f"research_rl.max_sample_tokens={rrl.max_sample_tokens} + "
+                f"max_prompt_length={cfg.train.max_prompt_length} exceeds "
+                f"rollout_max_model_len={cfg.train.rollout_max_model_len}"
+            )
+
     if cfg.train.opd_kl_mode not in (
         "forward_kl_topk", "reverse_kl_k3", "reverse_kl_topk", "reverse_kl_gated"
     ):
@@ -627,6 +697,14 @@ def objective_fingerprint(cfg: "Config") -> str:
         material += f"|opd_kl_mode={t.opd_kl_mode}"
         if t.opd_kl_mode == "reverse_kl_gated":
             material += f"|opd_gate_beta={t.opd_gate_beta}"
+    # self-research 通道同一纪律:默认关断(weight=0)不进 hash ⇒ 存量 run 指纹
+    # 逐字节不变;开启后 N/K/模式/warmup 都定义"优化什么",跨值 resume 拒绝。
+    rrl = cfg.research_rl
+    if rrl.weight > 0.0:
+        material += (
+            f"|research_rl={rrl.weight},{rrl.update_mode},{rrl.n_docs},"
+            f"{rrl.eval_k},{rrl.adv_clip},{rrl.warmup_steps}"
+        )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
 
@@ -645,6 +723,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     cfg = Config(
         run=_build(RunCfg, data.get("run") or {}),
         research=_build(ResearchCfg, data.get("research") or {}),
+        research_rl=_build(ResearchRLCfg, data.get("research_rl") or {}),
         narration=_build(NarrationCfg, data.get("narration") or {}),
         roles=roles,
         episode=_build(EpisodeCfg, data.get("episode") or {}),

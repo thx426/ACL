@@ -224,6 +224,23 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
+
+    # trace-opd self-research, separate mode: the second update of a global
+    # step carries research rows ONLY. Every executor-side term would divide by
+    # an all-zero response_mask there (their masks were cleared at TQ put
+    # time), so the aggregator short-circuits to the research term alone. The
+    # flag rides batch.extra_info -> non-tensor key, set exclusively by the
+    # trainer's second update_actor call.
+    research_only = bool(data["research_only"]) if "research_only" in data.keys() else False
+    if research_only:
+        research_loss_coef = float(getattr(distillation_loss_config, "research_loss_coef", 0.0) or 0.0)
+        if research_loss_coef <= 0.0:
+            raise RuntimeError(
+                "research_only update dispatched but research_loss_coef is 0 — the trainer "
+                "split a research batch the loss is not configured to train"
+            )
+        research_loss, research_metrics = research_pg_loss(distillation_loss_config, model_output, data)
+        return research_loss * research_loss_coef, research_metrics
     # trace-opd mixed objective: an explicitly weighted task-reward policy gradient
     # alongside the distillation term (config rejects combining it with
     # use_task_rewards, which is the same term at an implicit weight of 1).
@@ -298,6 +315,19 @@ def distillation_ppo_loss(
         sft_loss, sft_metrics = sft_ce_loss(model_output, data)
         policy_loss = policy_loss + sft_loss * sft_loss_coef
         policy_metrics.update(sft_metrics)
+
+    # trace-opd self-research (docs/self-research-design.md 7.1, joint mode):
+    # the research role's own PG term, over research_mask tokens only, with its
+    # OWN batch-global denominator — a pure addition, exactly like the SFT arm.
+    # Research rows ship an all-zero response_mask, so nothing above ever sees
+    # them; and this term reads research_mask, so it never sees anything else.
+    # In warmup the trainer drops research rows from the update batch entirely,
+    # which leaves this term summing over an empty mask: 0, by construction.
+    research_loss_coef = float(getattr(distillation_loss_config, "research_loss_coef", 0.0) or 0.0)
+    if research_loss_coef > 0.0:
+        research_loss, research_metrics = research_pg_loss(distillation_loss_config, model_output, data)
+        policy_loss = policy_loss + research_loss * research_loss_coef
+        policy_metrics.update(research_metrics)
 
     return policy_loss, policy_metrics
 
@@ -399,6 +429,95 @@ def sft_ce_loss(model_output: dict, data: TensorDict) -> tuple[torch.Tensor, dic
         "sft/expert_tokens": Metric(value=n_expert_tokens, aggregation=AggregationType.SUM),
     }
     return sft_loss, metrics
+
+
+def research_pg_loss(
+    distillation_loss_config, model_output: dict, data: TensorDict
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Clipped policy gradient over researcher-session tokens (self-research).
+
+    ``research_mask`` marks the researcher-generated tokens of a research row
+    (tool returns and every non-research row are zero). ``research_advantage``
+    carries the group-relative document-utility advantage the trainer computed
+    (mean-centred over the task's N documents, NOT divided by the group std,
+    clamped to +/-research_adv_clip). The ratio term is the standard clipped
+    importance form: ~1 under joint mode (gradients at the sampling weights;
+    it still absorbs the rollout-vs-trainer logprob numerics), truly at work
+    under separate mode (one update of staleness).
+
+    Normalisation is the batch-GLOBAL research-token count, all-reduced before
+    micro-batching (``research_num_tokens``): each micro-batch contributes
+    numerator/T_global and the accumulation over micro-batches reconstructs the
+    exact global mean — the term's value cannot depend on sequence packing.
+    """
+    research_mask = data.get("research_mask", None)
+    if research_mask is None:
+        # Fail loud, same contract as the SFT arm: a silently dropped research
+        # channel reads as "research RL does not help", the one conclusion this
+        # experiment must not fake.
+        raise RuntimeError(
+            "research_loss_coef > 0 but the batch carries no 'research_mask' field — the "
+            "rollout side did not mark research samples (expected "
+            "extra_fields['research_arm'] stamps and sample_role == 'research')"
+        )
+    research_adv = data.get("research_advantage", None)
+    if research_adv is None:
+        raise RuntimeError(
+            "research rows arrived without 'research_advantage' — the trainer's advantage "
+            "stage did not run its research branch (trainer_base._compute_advantage)"
+        )
+    if research_mask.is_nested:
+        research_mask = research_mask.to_padded_tensor(0)
+    research_mask = research_mask.to(torch.bool)
+    if research_adv.is_nested:
+        research_adv = research_adv.to_padded_tensor(0.0)
+
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    old_log_prob = data["old_log_probs"]
+    if old_log_prob.is_nested:
+        old_log_prob = old_log_prob.to_padded_tensor(0.0)
+    if research_mask.shape != log_prob.shape or research_adv.shape != log_prob.shape:
+        raise RuntimeError(
+            f"research fields out of step with the response layout: mask "
+            f"{tuple(research_mask.shape)}, advantage {tuple(research_adv.shape)}, "
+            f"log_prob {tuple(log_prob.shape)}"
+        )
+
+    try:
+        t_res_global = float(data["research_num_tokens"])
+    except KeyError as err:
+        raise RuntimeError(
+            "research rows present but 'research_num_tokens' missing — the engine did not "
+            "compute the batch-global research-token count (forward_backward_batch)"
+        ) from err
+
+    clip_low = float(getattr(distillation_loss_config, "clip_ratio_low", 0.2) or 0.2)
+    clip_high = float(getattr(distillation_loss_config, "clip_ratio_high", 0.2) or 0.2)
+    ratio = torch.exp(log_prob - old_log_prob)
+    clipped_ratio = ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high)
+    per_token = -torch.minimum(ratio * research_adv, clipped_ratio * research_adv)
+    denominator = max(t_res_global, 1.0)
+    research_loss = (per_token * research_mask).sum() / denominator
+
+    n_tokens = research_mask.sum()
+    with torch.no_grad():
+        clipped_frac = (
+            (((ratio < 1.0 - clip_low) | (ratio > 1.0 + clip_high)) & research_mask).sum().float()
+            / n_tokens.clamp(min=1)
+        )
+        adv_rows = research_adv[research_mask]
+        adv_mean = adv_rows.mean() if adv_rows.numel() else torch.tensor(0.0)
+        adv_absmax = adv_rows.abs().max() if adv_rows.numel() else torch.tensor(0.0)
+    metrics = {
+        # SUM aggregation: micro-batches each hold numerator/T_global, so the
+        # sum over micro-batches is the true global value of the term.
+        "research/pg_loss": Metric(value=research_loss, aggregation=AggregationType.SUM),
+        "research/tokens": Metric(value=n_tokens, aggregation=AggregationType.SUM),
+        "research/ratio_clipped_frac": clipped_frac.item(),
+        "research/adv_mean": adv_mean.item(),
+        "research/adv_absmax": adv_absmax.item(),
+    }
+    return research_loss, metrics
 
 
 def distillation_loss(

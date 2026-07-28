@@ -30,6 +30,19 @@ _RESEARCH = (
     "research_experiments",
     "research_episodes",
 )
+# Self-research channel (docs/self-research-design.md). Research rows fill
+# their own values; bare/expert rows fill the group aggregates stamped by
+# _await_research_group (all_fail/all_pass/best_p) and 0 for the rest — the
+# homogeneity contract holds because research_rl is a batch-wide constant.
+_RESEARCH_RL = (
+    "research_rl_role",          # 1 on research rows: denominator for ratios
+    "research_rl_reward",        # p_i (doc's K-rollout success rate)
+    "research_rl_finalized",     # session produced a document
+    "research_rl_traj_dropped",  # sample degraded (empty/overlen), mask zeroed
+    "research_rl_group_all_fail",  # group stats, stamped on bare rows
+    "research_rl_group_all_pass",
+    "research_rl_best_p",
+)
 # Mixed objective, SFT arm (docs/mixed-objective-design.md).
 _MIXED_SFT = (
     "sft_role", "sft_won", "sft_accepted", "sft_dropped_ref",
@@ -47,6 +60,7 @@ def build_curve_metrics(
     research_enabled: bool,
     fields: dict[str, Any],
     mixed_sft: bool = False,
+    research_rl: bool = False,
 ) -> dict[str, float]:
     """Assemble the per-sample curve scalars from the sample's extra_fields.
 
@@ -66,5 +80,8 @@ def build_curve_metrics(
             metrics[key] = float(fields.get(key, 0) or 0)
     if not validate and mixed_sft:
         for key in _MIXED_SFT:
+            metrics[key] = float(fields.get(key, 0) or 0)
+    if not validate and research_rl:
+        for key in _RESEARCH_RL:
             metrics[key] = float(fields.get(key, 0) or 0)
     return metrics

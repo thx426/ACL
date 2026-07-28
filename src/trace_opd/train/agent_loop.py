@@ -70,8 +70,14 @@ from ..research.prompts import build_researcher_system
 from ..research.session import ResearchSession, SessionResult
 from ..research.toolproto import make_tool_protocol
 from ..research.tools import ToolRouter
-from .backends import EngineGenerate, engine_narrate_fn, engine_researcher_chat
+from .backends import (
+    EngineGenerate,
+    EngineResearcherTokenChat,
+    engine_narrate_fn,
+    engine_researcher_chat,
+)
 from .curve import build_curve_metrics
+from .research_group import select_best_doc
 
 logger = logging.getLogger(__file__)
 
@@ -154,6 +160,11 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 # research session (keyed by (step, task_id); see
                 # common.aio.shared_task for the invariants).
                 "research_tasks": {},
+                # Self-research channel: per-(step, task) group registry — the
+                # N research replicas register (doc, p) here and the bare
+                # replicas wait for the full group to pick the teacher.
+                # Same single-event-loop invariant as research_tasks.
+                "research_groups": {},
                 # Mixed objective: hands out the replica index within a
                 # (step, task) so the trailing copies can be expert rollouts.
                 # Same invariant as research_tasks — all copies of a task land
@@ -177,6 +188,7 @@ class TraceAgentLoop(AgentLoopBase):
         self.narrator_client = state["narrator_client"]
         self.executor_model_name: str = state["executor_model_name"]
         self.research_tasks: dict = state["research_tasks"]
+        self.research_groups: dict = state["research_groups"]
         self.replica_counters: dict = state["replica_counters"]
 
     def _next_replica_index(self, global_step: int | None, task_id: str) -> int:
@@ -424,7 +436,17 @@ class TraceAgentLoop(AgentLoopBase):
         # (policy weights are frozen within a step; shared_task still de-dupes one
         # session per (step, task)) while letting both phases run concurrently.
         research_fut = None
-        if self.cfg.research.enabled and not validate:
+        # Self-research channel (docs/self-research-design.md): with the arm on,
+        # documents come from the N-replica research GROUP (argmax by measured
+        # doc utility), not from one shared session — so the shared task is not
+        # started at all. Off: byte-identical single-session path below.
+        research_rl_arm = (
+            not validate
+            and self.cfg.research_rl.weight > 0
+            and self.cfg.research.enabled
+            and self.cfg.research.backend == "engine"
+        )
+        if self.cfg.research.enabled and not validate and not research_rl_arm:
             # Shared across the rollout_n copies of this task in this step:
             # exactly one research session runs (and archives) per (step,
             # task); every copy distills against the same document.
@@ -447,11 +469,34 @@ class TraceAgentLoop(AgentLoopBase):
             not validate
             and self.cfg.train.mix_sft_weight > 0
             and self.cfg.train.mix_sft_rollouts > 0
-            and research_fut is not None
+            # The expert rollout needs a document; either source will do — the
+            # shared session (research_fut) or the research group (argmax).
+            and (research_fut is not None or research_rl_arm)
         )
-        is_expert = sft_arm and (
-            self._next_replica_index(global_step, adapter.task_id) >= self.cfg.train.rollout_n
+        # Replica layout per task: [0, rollout_n) bare | [+mix_sft_rollouts)
+        # expert | [+research_rl.n_docs) research. With both arms off no index
+        # is drawn at all (byte-identical to the historical path).
+        n_bare = self.cfg.train.rollout_n
+        n_expert = self.cfg.train.mix_sft_rollouts if sft_arm else 0
+        replica_index = (
+            self._next_replica_index(global_step, adapter.task_id)
+            if (sft_arm or research_rl_arm)
+            else None
         )
+        is_expert = (
+            sft_arm
+            and replica_index is not None
+            and n_bare <= replica_index < n_bare + n_expert
+        )
+        is_research = (
+            research_rl_arm
+            and replica_index is not None
+            and replica_index >= n_bare + n_expert
+        )
+        if is_research:
+            return await self._research_replica(
+                adapter, global_step, route, sampling_params, response_length
+            )
         expert_fields: dict[str, Any] = {}
         research_awaited = False
 
@@ -461,7 +506,12 @@ class TraceAgentLoop(AgentLoopBase):
             # research wall time — expect it to drop sharply.)
             nonlocal doc, research_fields, research_awaited
             t_block0 = time.time()
-            doc, research_fields = await research_fut
+            if research_rl_arm:
+                doc, research_fields = await self._await_research_group(
+                    global_step, adapter.task_id
+                )
+            else:
+                doc, research_fields = await research_fut
             metrics.tool_calls += time.time() - t_block0
             research_awaited = True
 
@@ -501,7 +551,7 @@ class TraceAgentLoop(AgentLoopBase):
             result = await self._student_rollout(adapter, sampling_params, response_length, route)
         metrics.generate_sequences += time.time() - t0
 
-        if research_fut is not None and not research_awaited:
+        if (research_fut is not None or research_rl_arm) and not research_awaited:
             await await_research()
 
         traj = result.trajectory
@@ -552,6 +602,12 @@ class TraceAgentLoop(AgentLoopBase):
             # field's presence, so with the arm off it allocates and ships
             # nothing. Expert rows already carry "sft" from expert_fields.
             output.extra_fields.setdefault("sample_role", "bare")
+        if research_rl_arm:
+            # Same discipline for the research channel: the stamp on EVERY row
+            # is what makes the TQ side allocate research_mask uniformly; off,
+            # nothing ships. Research rows return earlier with their own stamp.
+            output.extra_fields.setdefault("sample_role", "bare")
+            output.extra_fields["research_arm"] = 1
 
         if not validate and not is_expert:
             # Teacher scoring joins the task's sticky replica too (verl pops
@@ -574,6 +630,7 @@ class TraceAgentLoop(AgentLoopBase):
             validate=validate,
             research_enabled=self.cfg.research.enabled,
             mixed_sft=self.cfg.train.mix_sft_weight > 0 and self.cfg.train.mix_sft_rollouts > 0,
+            research_rl=self.cfg.research_rl.weight > 0,
             fields=output.extra_fields,
         )
 
@@ -618,6 +675,325 @@ class TraceAgentLoop(AgentLoopBase):
             )
         except Exception:  # noqa: BLE001 — dumps must never fail a sample
             logger.exception("rollout dump failed for %s", adapter.task_id)
+        return output
+
+    # ------------------------------------------------- self-research channel
+
+    def _research_group(self, key) -> dict[str, Any]:
+        group = self.research_groups.get(key)
+        if group is None:
+            group = {
+                "results": [],
+                "event": asyncio.Event(),
+                "n": self.cfg.research_rl.n_docs,
+            }
+            self.research_groups[key] = group
+        return group
+
+    def _register_research_result(self, global_step, task_id, **entry) -> None:
+        """Called from a finally block: EVERY research replica registers, no
+        matter how it ended — an unregistered replica would leave the bare
+        replicas waiting on the group event forever."""
+        group = self._research_group((global_step, task_id))
+        group["results"].append(entry)
+        if len(group["results"]) >= group["n"]:
+            group["event"].set()
+
+    async def _await_research_group(
+        self, global_step, task_id
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Teacher selection over the research group: argmax measured doc
+        utility p_i, ties to the shorter document; p*=0 admits no teacher
+        (PG-5(3) input filtering, realised endogenously — a document that never
+        helped downstream never reaches the distillation prefix)."""
+        rcfg, rrl = self.cfg.research, self.cfg.research_rl
+        group = self._research_group((global_step, task_id))
+        # Sessions run concurrently, so the group wall-clock is one session
+        # plus its eval rollouts — the shared-session timeout plus slack.
+        timeout = rcfg.session_timeout_s + 900.0
+        try:
+            await asyncio.wait_for(group["event"].wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "research group %s/%s incomplete after %.0fs: %d/%d registered — "
+                "selecting over what arrived",
+                global_step, task_id, timeout, len(group["results"]), group["n"],
+            )
+        results = list(group["results"])
+        best = select_best_doc(results)
+        doc = best["doc"] if best else None
+        ps = [float(r.get("p", 0.0)) for r in results]
+        n_final = sum(1 for r in results if r.get("finalized"))
+        # The historical research_* keys keep their curves alive under the
+        # group regime, re-based on the WINNING document (the one training
+        # actually distills from); research_final_success upgrades from "last
+        # in-session experiment" to the measured K-rollout success of that
+        # document — strictly closer to the PG-7 signal it always proxied.
+        fields = {
+            "research_error": sum(1 for r in results if r.get("error")),
+            "research_experiments": float(best["experiments"]) if best else 0.0,
+            "research_episodes": float(sum(r.get("episodes", 0) for r in results)),
+            "research_turns": float(best["turns"]) if best else 0.0,
+            "research_final_success": float(best["p"]) if best else 0.0,
+            "doc_words": len(doc.split()) if doc else 0,
+            "doc_missing": int(not doc),
+            "research_rl_group_all_fail": int(bool(ps) and max(ps) <= 0.0),
+            "research_rl_group_all_pass": int(bool(ps) and min(ps) >= 1.0),
+            "research_rl_best_p": max(ps) if ps else 0.0,
+            "research_archive": "",
+        }
+        fields["research_rl_finalize_rate"] = (
+            n_final / len(results) if results else 0.0
+        )
+        return doc, fields
+
+    async def _research_replica(
+        self, adapter, global_step, route, sampling_params, response_length
+    ) -> AgentLoopOutput:
+        """One research-role replica (docs/self-research-design.md 4):
+        an independent researcher session ON THE ENGINE in token mode -> its
+        document -> eval_k doc-conditioned rollouts -> p_i -> the research
+        training sample. Registration into the group is unconditional
+        (finally), so a dead session costs its own reward, never the batch."""
+        metrics = AgentLoopMetrics()
+        rcfg, rrl = self.cfg.research, self.cfg.research_rl
+        rep_route = f"{route}:rr{uuid4().hex[:6]}"
+        role = self.cfg.roles.get("researcher")
+        chat = EngineResearcherTokenChat(
+            self.server_manager,
+            self.tokenizer,
+            self.delta,
+            temperature=role.temperature if role else 0.7,
+            max_tokens=rcfg.researcher_max_tokens,
+            max_sample_tokens=rrl.max_sample_tokens,
+            request_id=rep_route,
+        )
+        router: ToolRouter | None = None
+        session: ResearchSession | None = None
+        result: SessionResult | None = None
+        error: str | None = None
+        doc: str | None = None
+        wins = 0
+        p = 0.0
+        eval_summaries: list[dict[str, Any]] = []
+        try:
+            try:
+                router = ToolRouter(
+                    adapter=adapter,
+                    research=rcfg,
+                    narration=self.cfg.narration,
+                    # Per-EPISODE routing keys, same rationale as _research().
+                    generate_factory=lambda: EngineGenerate(
+                        self.server_manager, self.tokenizer,
+                        request_id=f"{rep_route}:r{uuid4().hex[:6]}",
+                    ),
+                    tokenizer=self.tokenizer,
+                    delta=self.delta,
+                    episode_response_budget=self.rollout_config.response_length,
+                    narrate_fn=self._narrate_fn(route),
+                )
+                session = ResearchSession(
+                    researcher_chat=chat,
+                    toolproto=make_tool_protocol(rcfg.tool_protocol),
+                    router=router,
+                    system_prompt=build_researcher_system(
+                        task_brief=adapter.task_brief(),
+                        executor_model=self.executor_model_name,
+                        n_exp=rcfg.n_exp,
+                        doc_max_words=rcfg.doc_max_words,
+                        gt_text=adapter.gt_text() if rcfg.gt == "on" else None,
+                    ),
+                    max_turns=rcfg.max_turns,
+                    wrapup_buffer=rcfg.wrapup_buffer,
+                )
+                t0 = time.time()
+                result = await asyncio.wait_for(
+                    session.run(), timeout=rcfg.session_timeout_s
+                )
+                metrics.tool_calls += time.time() - t0
+                error = result.error
+            except asyncio.TimeoutError:
+                error = f"research session exceeded {rcfg.session_timeout_s:.0f}s"
+                if session is not None:
+                    result = session.snapshot(error=error)
+            except Exception as err:  # noqa: BLE001 — degrade, never raise
+                error = f"{type(err).__name__}: {err}"
+            if error:
+                logger.warning(
+                    "research replica degraded for %s: %s", adapter.task_id, error
+                )
+            doc = result.doc if result is not None else None
+
+            # eval_k doc-conditioned rollouts: the document's measured utility.
+            # An unfinalized session evaluates nothing and scores p=0 —
+            # finalizing IS part of the researched skill (design 3.2-3).
+            if doc:
+                t0 = time.time()
+                eval_results = await asyncio.gather(
+                    *[
+                        self._expert_rollout(
+                            adapter, doc, sampling_params, response_length, rep_route
+                        )
+                        for _ in range(rrl.eval_k)
+                    ],
+                    return_exceptions=True,
+                )
+                metrics.generate_sequences += time.time() - t0
+                for er in eval_results:
+                    if isinstance(er, BaseException):
+                        eval_summaries.append({"won": False, "error": str(er)})
+                        continue
+                    won = bool(er.trajectory.won)
+                    wins += int(won)
+                    eval_summaries.append(
+                        {
+                            "won": won,
+                            "outcome": er.trajectory.outcome,
+                            "env_steps": sum(1 for st in er.trajectory.steps if st.acted),
+                        }
+                    )
+                p = wins / float(rrl.eval_k)
+        finally:
+            self._register_research_result(
+                global_step,
+                adapter.task_id,
+                doc=doc,
+                p=p,
+                finalized=bool(doc),
+                error=error,
+                experiments=result.experiments_used if result else 0,
+                episodes=result.episodes_consumed if result else 0,
+                turns=result.turns_used if result else 0,
+            )
+
+        # Archive the session like the shared path does (same directory
+        # contract; consumers key off researcher_model/tool_protocol).
+        archive_path = ""
+        records = list(router.state.episodes.values()) if router is not None else []
+        try:
+            path = await asyncio.to_thread(
+                self.archive.save,
+                task_id=adapter.task_id,
+                result=result,
+                records=records,
+                policy_version=global_step,
+                extra_meta={
+                    "gt": rcfg.gt,
+                    "gt_injected": bool(rcfg.gt == "on" and adapter.gt_text()),
+                    "narration_backend": self.cfg.narration.backend,
+                    "researcher_model": "policy(engine)",
+                    "tool_protocol": rcfg.tool_protocol,
+                    "error": error,
+                    "research_rl": {
+                        "p": p,
+                        "wins": wins,
+                        "eval_k": rrl.eval_k,
+                        "evals": eval_summaries,
+                    },
+                },
+            )
+            archive_path = str(path.relative_to(self.run_dir))
+        except Exception:  # noqa: BLE001
+            logger.exception("research replica archive failed for %s", adapter.task_id)
+
+        prompt_ids, response_ids, response_mask = chat.token_sample()
+        dropped = ""
+        if not response_ids:
+            # The session died before its first generation. The trainer cannot
+            # take an empty response (as_dict writes rm_scores[-1]), so the
+            # slot borrows a bare rollout's tokens and masks them out entirely:
+            # it still carries p into the group statistics, and nothing trains.
+            placeholder = await self._student_rollout(
+                adapter, sampling_params, response_length, rep_route
+            )
+            prompt_ids = placeholder.tokens.prompt_ids
+            response_ids = placeholder.tokens.response_ids
+            response_mask = [0] * len(response_ids)
+            dropped = "empty"
+        elif len(prompt_ids) + len(response_ids) > rrl.max_sample_tokens:
+            # Defensive: the chat budget should make this unreachable.
+            response_mask = [0] * len(response_ids)
+            dropped = "overlen"
+
+        turns_used = result.turns_used if result is not None else 0
+        fields: dict[str, Any] = {
+            "task_id": adapter.task_id,
+            "sample_role": "research",
+            "research_arm": 1,
+            # Behaviour fields exist for dump/curve homogeneity; the trainer
+            # excludes research rows from every on-policy behaviour metric.
+            "won": False,
+            "outcome": "research",
+            "env_steps": 0,
+            "invalid_format": 0,
+            "truncated": int(bool(dropped)),
+            "research_error": int(error is not None),
+            "doc_words": len(doc.split()) if doc else 0,
+            "doc_missing": int(not doc),
+            "research_experiments": result.experiments_used if result else 0,
+            "research_episodes": result.episodes_consumed if result else 0,
+            "research_turns": turns_used,
+            "research_final_success": p,
+            "research_archive": archive_path,
+            "research_rl_role": 1,
+            "research_rl_reward": p,
+            "research_rl_finalized": int(bool(doc)),
+            "research_rl_traj_dropped": int(bool(dropped)),
+        }
+        logger.info(
+            "research replica %s: doc=%s p=%.3f (%d/%d) tokens=%d%s%s",
+            adapter.task_id,
+            "yes" if doc else "no",
+            p,
+            wins,
+            rrl.eval_k,
+            len(prompt_ids) + len(response_ids),
+            f" dropped={dropped}" if dropped else "",
+            " ERROR" if error else "",
+        )
+        output = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            response_mask=response_mask,
+            reward_score=p,
+            num_turns=2 * turns_used + 1,
+            metrics=metrics,
+            extra_fields=fields,
+        )
+        output.extra_fields["reward_extra_info"] = build_curve_metrics(
+            validate=False,
+            research_enabled=True,
+            mixed_sft=self.cfg.train.mix_sft_weight > 0
+            and self.cfg.train.mix_sft_rollouts > 0,
+            research_rl=True,
+            fields=output.extra_fields,
+        )
+        try:
+            await asyncio.to_thread(
+                self._dump_rollout,
+                step=global_step,
+                validate=False,
+                payload={
+                    "task_id": adapter.task_id,
+                    "sample_role": "research",
+                    "global_step": global_step,
+                    "p": p,
+                    "wins": wins,
+                    "eval_k": rrl.eval_k,
+                    "evals": eval_summaries,
+                    "doc_words": fields["doc_words"],
+                    "doc_missing": fields["doc_missing"],
+                    "error": error,
+                    "dropped": dropped,
+                    "turns_used": turns_used,
+                    "response_token_len": len(response_ids),
+                    "response_token_hash": response_token_hash(response_ids),
+                    "research_archive": archive_path,
+                    "ts": time.time(),
+                },
+            )
+        except Exception:  # noqa: BLE001 — dumps must never fail a sample
+            logger.exception("research replica dump failed for %s", adapter.task_id)
         return output
 
     async def _expert_rollout(

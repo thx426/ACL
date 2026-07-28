@@ -106,3 +106,122 @@ def engine_researcher_chat(
         return ChatResult(content=text)
 
     return chat
+
+class ResearchBudgetExceeded(RuntimeError):
+    """The research session's token stream hit its hard budget. The session
+    loop catches any exception into a partial SessionResult, so raising here
+    ends the session cleanly: an already-finalized doc survives, an unfinished
+    one degrades to doc=None -> p=0 (docs/self-research-design.md 3.2)."""
+
+
+class EngineResearcherTokenChat:
+    """ResearcherChatFn on the rollout engine that ALSO builds the training
+    sample (trace-opd self-research, docs/self-research-design.md 4.1).
+
+    Same append-only discipline as core.episode: the researcher's generated
+    ids join the stream verbatim (mask=1) — training tokens ARE the engine's
+    sampled tokens, never a re-render (BPE roundtrips do not commute; UCOB's
+    re-tokenized replay is the cautionary tale) — and everything the session
+    injects between generations (tool results, wrap-up reminders, malformed
+    hints) is rendered as ONE merged user turn through the TemplateDelta glue
+    (mask=0). The archive keeps the messages un-merged; only the token stream
+    coalesces consecutive user turns, which is template-equivalent content.
+
+    The instance is single-session: the agent loop constructs one per research
+    replica and reads ``token_sample()`` after ``session.run()`` returns.
+    """
+
+    def __init__(
+        self, server_manager, tokenizer, delta, *, temperature: float,
+        max_tokens: int, max_sample_tokens: int, request_id: str,
+    ) -> None:
+        self._server = server_manager
+        self._tokenizer = tokenizer
+        self._delta = delta
+        self._temperature = temperature
+        self._max_tokens = max_tokens
+        self._max_sample_tokens = max_sample_tokens
+        self._request_id = request_id
+        self.prompt_ids: list[int] = []
+        self.stream: list[int] = []
+        self.mask: list[int] = []
+        self._n_seen = 0
+        self._last_gen_ids: list[int] = []
+        self._last_gen_text: str | None = None
+
+    async def __call__(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    ) -> ChatResult:
+        assert not tools, (
+            "engine researcher token backend requires research.tool_protocol=text "
+            "(function-calling tools cannot be served by the rollout engine)"
+        )
+        if not self.prompt_ids:
+            # First call: [system, kickoff] becomes the sample's prompt.
+            self.prompt_ids = render_ids(self._tokenizer, messages, True)
+        else:
+            new = messages[self._n_seen :]
+            if not new or new[0].get("role") != "assistant":
+                raise RuntimeError(
+                    "token researcher stream out of step: expected the previous "
+                    f"assistant turn at index {self._n_seen}, got "
+                    f"{[m.get('role') for m in new]}"
+                )
+            if (new[0].get("content") or "") != (self._last_gen_text or ""):
+                # canonicalize_assistant must be the identity under the text
+                # protocol; anything else forks the archive from the sample.
+                raise RuntimeError(
+                    "token researcher stream out of step: the archived assistant "
+                    "turn differs from the engine generation (canonicalize is "
+                    "expected to be the identity under the text protocol)"
+                )
+            user_texts = []
+            for message in new[1:]:
+                if message.get("role") != "user":
+                    raise RuntimeError(
+                        "token researcher stream out of step: non-user message "
+                        f"{message.get('role')!r} between generations"
+                    )
+                user_texts.append(str(message.get("content") or ""))
+            merged = "\n\n".join(user_texts)
+            glue = self._delta.after_generation(self._last_gen_ids)
+            user_ids = self._tokenizer.encode(merged, add_special_tokens=False)
+            structure = glue + user_ids + self._delta.post_obs
+            self.stream += structure
+            self.mask += [0] * len(structure)
+
+        budget = self._max_sample_tokens - len(self.prompt_ids) - len(self.stream)
+        if budget < 64:
+            raise ResearchBudgetExceeded(
+                f"research token stream at {len(self.prompt_ids) + len(self.stream)} "
+                f"tokens exceeds max_sample_tokens={self._max_sample_tokens}"
+            )
+        out = await self._server.generate(
+            request_id=self._request_id,  # multi-turn session: sticky replica
+            prompt_ids=self.prompt_ids + self.stream,
+            sampling_params={
+                "temperature": self._temperature,
+                "max_tokens": min(self._max_tokens, budget),
+            },
+        )
+        gen_ids = list(out.token_ids)
+        if getattr(out, "stop_reason", None) == "aborted" or not gen_ids:
+            raise ResearchBudgetExceeded(
+                "engine aborted or returned no tokens mid research session"
+            )
+        text = self._tokenizer.decode(gen_ids, skip_special_tokens=True)
+        self.stream += gen_ids
+        self.mask += [1] * len(gen_ids)
+        self._last_gen_ids = gen_ids
+        self._last_gen_text = text
+        self._n_seen = len(messages)
+        return ChatResult(
+            content=text,
+            prompt_tokens=len(self.prompt_ids) + len(self.stream) - len(gen_ids),
+            completion_tokens=len(gen_ids),
+        )
+
+    def token_sample(self) -> tuple[list[int], list[int], list[int]]:
+        """(prompt_ids, response_ids, response_mask) — the training sample."""
+        return list(self.prompt_ids), list(self.stream), list(self.mask)
+

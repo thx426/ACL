@@ -173,9 +173,10 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} is 'privileged' but "
                                "teacher_prefix_ids is missing (codex H1)")
         resp = responses[i]
-        if mode == "sft":
-            # trace-opd mixed objective: an expert row is supervised by the SFT
-            # cross-entropy alone. Its response_mask was cleared at TQ put time,
+        if mode in ("sft", "research"):
+            # trace-opd: an expert (SFT) row is supervised by the cross-entropy
+            # alone, a research row by its own PG term over research_mask; both
+            # have their response_mask cleared at TQ put time,
             # so whatever sits in teacher_ids/teacher_logprobs is masked out of
             # the distillation loss and its metrics — scoring it would burn a
             # full forward per expert rollout for a value nothing reads.
