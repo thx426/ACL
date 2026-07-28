@@ -15,7 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 import torch.nn.functional as F  # noqa: E402
 
-from trace_opd.microscope import derive  # noqa: E402
+from trace_opd.microscope import derive, segments  # noqa: E402
 from trace_opd.microscope.reader import StepPack, list_steps  # noqa: E402
 
 _VERL = Path(__file__).resolve().parents[1] / "verl" / "verl"
@@ -231,6 +231,76 @@ def test_audit_reports_failure_on_empty_data():
         "token_loss": np.full(R, np.nan),
     }
     assert derive.audit_row(row)["ok"] is False
+
+
+def test_segment_spans_maps_tags_across_piece_boundaries():
+    """The tag text survives arbitrary BPE cuts — the scan is character-level.
+    Layout: <reasoning>AB</reasoning><action>go</action> over 7 pieces with
+    both tags split mid-marker."""
+    pieces = ["<rea", "soning>", "AB", "</reasoning>", "<act", "ion>go", "</action>"]
+    seg = segments.segment_spans(pieces)
+    assert seg["reasoning"] == [[2, 3]]
+    # piece 5 ("ion>go") straddles the open marker and the content — the
+    # overlap rule admits it into the segment (±1-token contract)
+    assert seg["action"] == [[5, 6]]
+    assert seg["closings"]["reasoning"] == [3]
+    assert seg["closings"]["action"] == [6]
+    assert [0, 2] in seg["structure"] and [3, 4] in seg["structure"]
+
+
+def test_segment_spans_unclosed_tag_runs_to_end_without_closing():
+    pieces = ["<reasoning>", "still", " thinking", " forever"]
+    seg = segments.segment_spans(pieces)
+    assert seg["reasoning"] == [[1, 4]]
+    assert seg["closings"]["reasoning"] == []
+
+
+def test_aggregate_segments_budget_share_and_clamp_rate():
+    R = 6
+    row = {
+        "response_ids": np.arange(R),
+        "response_mask": np.ones(R, dtype=bool),
+        "covered": np.ones(R, dtype=bool),
+        # positions 0-1: both support entries at the clamp; others well above
+        "student_support_lps": np.array(
+            [[-10.0, -10.0], [-10.0, -10.0], [-1.0, -1.0],
+             [-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0]]
+        ),
+    }
+    tr = {
+        "kl_forward": np.array([1.0, 3.0, 2.0, 2.0, np.nan, 4.0]),
+        "student_entropy": np.full(R, 0.5),
+        "teacher_entropy": np.full(R, 0.25),
+        "teacher_mass": np.full(R, 0.9),
+        "token_loss": np.array([1.0, 3.0, 2.0, 2.0, np.nan, 4.0]),
+    }
+    seg = {"reasoning": [[0, 2]], "action": [[2, 6]]}
+    agg = segments.aggregate_segments(row, tr, seg, clamp=-10.0)
+    # total finite masked KL = 1+3+2+2+4 = 12
+    assert agg["reasoning"]["tokens"] == 2
+    assert abs(agg["reasoning"]["kl_mean"] - 2.0) < 1e-9
+    assert abs(agg["reasoning"]["kl_share"] - 4.0 / 12.0) < 1e-9
+    assert abs(agg["reasoning"]["clamp_hit_rate"] - 1.0) < 1e-9
+    assert agg["action"]["tokens"] == 4  # NaN position still counts as a token
+    assert abs(agg["action"]["kl_mean"] - 8.0 / 3.0) < 1e-9
+    assert abs(agg["action"]["kl_share"] - 8.0 / 12.0) < 1e-9
+    assert abs(agg["action"]["clamp_hit_rate"] - 0.0) < 1e-9
+
+
+def test_closing_token_stats_reads_both_sides_and_flags_topk_miss():
+    R = 5
+    row = {
+        "response_ids": np.arange(R),
+        "response_mask": np.ones(R, dtype=bool),
+        "covered": np.ones(R, dtype=bool),
+        "realized_student_lp": np.array([-9.0, -0.5, -9.0, -0.7, -9.0]),
+    }
+    tr = {"realized_teacher_lp": np.array([np.nan, -1.5, np.nan, np.nan, np.nan])}
+    seg = {"closings": {"reasoning": [1, 3]}}
+    stats = segments.closing_token_stats(row, tr, seg)
+    assert stats[0] == {"pos": 1, "teacher_lp": -1.5, "student_lp": -0.5}
+    # teacher pushed the closing token out of its top-K → None, the loud signal
+    assert stats[1]["teacher_lp"] is None and stats[1]["student_lp"] == -0.7
 
 
 def test_reader_refuses_a_row_key_collision(fsdp_ns):

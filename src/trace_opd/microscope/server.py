@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from . import derive
+from . import derive, segments
 from .reader import list_steps, load_step
 
 _STATIC = Path(__file__).parent / "static"
@@ -41,6 +41,13 @@ def _tok_text(token_id: int) -> str:
         return f"<{token_id}>"
     piece = _TOKENIZER.convert_ids_to_tokens([int(token_id)])[0]
     return piece.replace("Ġ", " ").replace("Ċ", "\\n").replace("▁", " ")
+
+
+def _tok_pieces(ids) -> list[str]:
+    """Batch piece stream with REAL whitespace — the segment scanner's input
+    (unlike _tok_text, which escapes newlines for display)."""
+    toks = _TOKENIZER.convert_ids_to_tokens([int(t) for t in ids])
+    return [t.replace("Ġ", " ").replace("Ċ", "\n").replace("▁", " ") for t in toks]
 
 
 def _clean(value):
@@ -65,6 +72,11 @@ def _sample_payload(step: int, resp_hash: int) -> dict:
     tr = derive.tracks(row, pack.log_prob_min_clamp)
     repeats = derive.repeat_positions(row)
     tokens = [{"id": int(t), "text": _tok_text(t)} for t in row["response_ids"]]
+    seg = (
+        segments.segment_spans(_tok_pieces(row["response_ids"]))
+        if _TOKENIZER is not None
+        else None
+    )
     return {
         "summary": derive.sample_summary(row),
         "loss_mode": pack.loss_mode,
@@ -72,6 +84,7 @@ def _sample_payload(step: int, resp_hash: int) -> dict:
         "tokens": tokens,
         "tracks": {k: _clean(v) for k, v in tr.items()},
         "repeat_mask": [int(x) for x in repeats.tolist()],
+        "segments": seg,
         "audit": derive.audit_row(row, loss_mode=pack.loss_mode, clamp=pack.log_prob_min_clamp),
     }
 
@@ -193,6 +206,84 @@ def _evolution(task: str, metric: str) -> dict:
     return out
 
 
+def _summarize_group(items: list[dict]) -> dict:
+    """Row-equal-weight means (never token-pooled: a single inflating row
+    must not dominate the step statistic through sheer length)."""
+    out: dict = {"n": len(items)}
+    if not items:
+        return out
+    out["resp_len_mean"] = float(np.mean([it["resp_len"] for it in items]))
+    out["repeat_rate_mean"] = float(np.mean([it["repeat_rate"] for it in items]))
+    for kind in segments.TAGS:
+        agg: dict = {}
+        toks = [it["agg"][kind]["tokens"] for it in items]
+        agg["tokens_mean"] = float(np.mean(toks))
+        for metric in ("kl_mean", "kl_share", "student_entropy", "teacher_entropy",
+                       "teacher_mass", "token_loss", "clamp_hit_rate"):
+            vals = [
+                it["agg"][kind][metric]
+                for it in items
+                if it["agg"][kind].get(metric) is not None
+            ]
+            agg[metric] = float(np.mean(vals)) if vals else None
+        out[kind] = agg
+    closings = [c for it in items for c in it["closing"]]
+    t_lps = [c["teacher_lp"] for c in closings if c["teacher_lp"] is not None]
+    s_lps = [c["student_lp"] for c in closings]
+    out["closing"] = {
+        "n": len(closings),
+        "teacher_outside_topk": len(closings) - len(t_lps),
+        "teacher_lp_mean": float(np.mean(t_lps)) if t_lps else None,
+        "student_lp_mean": float(np.mean(s_lps)) if s_lps else None,
+    }
+    return out
+
+
+def _segment_report(step_lo: int, step_hi: int, role: str) -> dict:
+    """Protocol items 1/3/4/6/7 in one sweep: per-step, won/lost-stratified,
+    per-segment KL budget, entropies, clamp/mass artefacts, closing-token
+    probabilities, lengths and repeat rates."""
+    key = ("segrep", step_lo, step_hi, role)
+    if key in _MEMO:
+        return _MEMO[key]
+    if _TOKENIZER is None:
+        raise KeyError("segment_report requires --tokenizer (tag scan is textual)")
+    records = []
+    for step in list_steps(Path(_OBS_DIR)):
+        if not (step_lo <= step <= step_hi):
+            continue
+        pack = load_step(_OBS_DIR, step)
+        groups: dict[str, list] = {"won": [], "lost": []}
+        for row in pack.rows():
+            if role and row["sample_role"] != role:
+                continue
+            seg = segments.segment_spans(_tok_pieces(row["response_ids"]))
+            tr = derive.tracks(row, pack.log_prob_min_clamp)
+            m = row["response_mask"].astype(bool) & row["covered"].astype(bool)
+            rep = derive.repeat_positions(row)
+            groups["won" if row["won"] else "lost"].append(
+                {
+                    "resp_len": int(len(row["response_ids"])),
+                    "repeat_rate": float(rep[m].mean()) if m.any() else 0.0,
+                    "agg": segments.aggregate_segments(
+                        row, tr, seg, clamp=pack.log_prob_min_clamp
+                    ),
+                    "closing": segments.closing_token_stats(row, tr, seg),
+                }
+            )
+        records.append(
+            {
+                "step": step,
+                "won": _summarize_group(groups["won"]),
+                "lost": _summarize_group(groups["lost"]),
+                "all": _summarize_group(groups["won"] + groups["lost"]),
+            }
+        )
+    out = {"role": role, "step_lo": step_lo, "step_hi": step_hi, "records": records}
+    _MEMO[key] = out
+    return out
+
+
 def _tasks() -> list[str]:
     key = ("tasks",)
     if key in _MEMO:
@@ -254,6 +345,15 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if url.path == "/api/evolution":
                 return self._json(_evolution(q["task"], q.get("metric", "kl_forward")))
+            if url.path == "/api/segment_report":
+                steps = list_steps(Path(_OBS_DIR)) or [0]
+                return self._json(
+                    _segment_report(
+                        int(q.get("step_lo", steps[0])),
+                        int(q.get("step_hi", steps[-1])),
+                        q.get("role", "bare"),
+                    )
+                )
             # static
             rel = "index.html" if url.path in ("/", "") else url.path.lstrip("/")
             rel = re.sub(r"[^A-Za-z0-9._/-]", "", rel)
