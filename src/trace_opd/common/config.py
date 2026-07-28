@@ -140,6 +140,28 @@ class ResearchRLCfg:
 
 
 @dataclass
+class SftGenCfg:
+    """Researcher-SFT 离线采样 pipeline(src/trace_opd/sftgen/;用户需求
+    2026-07-28)。与训练机制共享 research/narration/roles/alfworld 各节(同构性
+    由共享配置保证——特别是 research.gt 与 research.tool_protocol 两键,SFT 采样
+    与 self-evolve 训练读同一个值);本节只放 pipeline 特有键。不影响训练路径。"""
+
+    benchmark: str = "alfworld"       # 分层函数注册键(sftgen/strata.py;新
+                                      # benchmark = 新 adapter 包 + 一个分层函数)
+    tasks: int = 512                  # 采样任务数 T(用户后续制定;从训练 parquet
+                                      # 按 seed 分层采样,与训练任务身份严格同源)
+    sessions_per_task: int = 1        # 每任务会话数 M(覆盖优先,默认 1)
+    seed: int = 20260728
+    eval_k: int = 8                   # 每份 doc 的带文档评测 rollout 数(0=关);
+                                      # 口径=机制温度下的 PG-7 信号,直接对标训练时 p_i
+    bare_k: int = 8                   # 裸对照 rollout 数(增益 = p_doc − p_bare)
+    task_parallel: int = 16           # 并发会话数
+    executor_endpoint: str = ""       # 初始 policy 的 vLLM OpenAI 端点(${VAR};
+                                      # executor episodes 与 narrator 共用此服务)
+    executor_model: str = ""          # 该服务的模型名(Qwen3-4B-Instruct-2507)
+
+
+@dataclass
 class NarrationCfg:
     backend: str = "engine"          # engine (policy) | external | none
     max_words: int = 600
@@ -320,6 +342,7 @@ class Config:
     run: RunCfg
     research: ResearchCfg
     research_rl: ResearchRLCfg
+    sft_gen: SftGenCfg
     narration: NarrationCfg
     roles: dict[str, RoleCfg]
     episode: EpisodeCfg
@@ -346,7 +369,7 @@ def _build(dc, d: dict[str, Any]):
     return dc(**d)
 
 
-_KNOWN_SECTIONS = {"run", "research", "research_rl", "narration", "roles", "episode", "alfworld", "train", "eval"}
+_KNOWN_SECTIONS = {"run", "research", "research_rl", "sft_gen", "narration", "roles", "episode", "alfworld", "train", "eval"}
 
 
 def _validate(cfg: "Config") -> None:
@@ -422,6 +445,17 @@ def _validate(cfg: "Config") -> None:
             problems.append(
                 "train.mix_sft_weight>0 requires research.enabled (expert rollouts need a document)"
             )
+    # --- sftgen pipeline(轻校验:默认值恒合法,绝不阻训练路径)------------
+    sgc = cfg.sft_gen
+    if sgc.tasks < 1:
+        problems.append(f"sft_gen.tasks={sgc.tasks} must be >= 1")
+    if sgc.sessions_per_task < 1:
+        problems.append(f"sft_gen.sessions_per_task={sgc.sessions_per_task} must be >= 1")
+    if sgc.eval_k < 0 or sgc.bare_k < 0:
+        problems.append("sft_gen.eval_k/bare_k must be >= 0")
+    if sgc.task_parallel < 1:
+        problems.append(f"sft_gen.task_parallel={sgc.task_parallel} must be >= 1")
+
     # --- self-research 通道(docs/self-research-design.md §7)---------------
     rrl = cfg.research_rl
     if not math.isfinite(rrl.weight) or rrl.weight < 0.0:
@@ -755,6 +789,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         run=_build(RunCfg, data.get("run") or {}),
         research=_build(ResearchCfg, data.get("research") or {}),
         research_rl=_build(ResearchRLCfg, data.get("research_rl") or {}),
+        sft_gen=_build(SftGenCfg, data.get("sft_gen") or {}),
         narration=_build(NarrationCfg, data.get("narration") or {}),
         roles=roles,
         episode=_build(EpisodeCfg, data.get("episode") or {}),

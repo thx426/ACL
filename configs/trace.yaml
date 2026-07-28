@@ -69,6 +69,23 @@ research_rl:
   max_sample_tokens: 16384  # research 会话 token 样本总长预算;超限降级不进
                             # 训练面(doc 仍用,reward 仍参与组统计)
 
+# --- Researcher-SFT 离线采样 pipeline(scripts/sample_researcher_sft.py)---
+# 与训练机制共享 research/narration/roles/alfworld 各节:research.gt 与
+# research.tool_protocol 是 SFT 采样与 self-evolve 训练共读的两键(用户裁定:
+# 两侧设定必须一致,per-benchmark 由配置指定)。采样模型走 roles.researcher
+# 的标准 OpenAI 面(fncall 默认,任意兼容端点可换);导出时确定性转换到 policy
+# 训练用的 text 协议(sftgen/convert.py,round-trip 有测试钉死)。
+sft_gen:
+  benchmark: alfworld       # 分层函数注册键(新 benchmark = adapter 包 + 分层函数)
+  tasks: 512                # 采样任务数(用户后续制定;--tasks 可覆盖)
+  sessions_per_task: 1      # 每任务会话数(覆盖优先)
+  seed: 20260728
+  eval_k: 8                 # 每 doc 带文档评测数(机制温度,直接对标训练时 p_i)
+  bare_k: 8                 # 裸对照数(gain = p_doc − p_bare;顺产 M0 基线)
+  task_parallel: 16
+  executor_endpoint: ""     # 初始 policy vLLM 端点(命令行 --executor-endpoint)
+  executor_model: ""        # Qwen3-4B-Instruct-2507(--executor-model)
+
 # ---------------------------------------------------------------------------
 # 叙述阶段:实验 episode → 忠实自然语言叙述(researcher 的主要输入)
 # ---------------------------------------------------------------------------

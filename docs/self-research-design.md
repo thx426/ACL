@@ -98,6 +98,11 @@
 
 ## 5. SFT 冷启动
 
+> **2026-07-28 用户裁定更新:数据源改为专门离线采样 pipeline(不取训练归档)**——
+> 设计与用法见 `docs/sftgen-design.md`(sftgen 包,fncall→text 确定性转换、
+> gt/协议与训练共读同一配置键、评测内嵌产 M0 基线)。本节以下的"生产归档为
+> 数据源"方案作废,保留作历史记录。
+
 - **数据源(按优先序)**:①**当前生产 run 的 research/ 归档**——35B researcher 的真实会话每 step 都在落盘(`ResearchArchive`,meta 含 researcher_model / final_success / doc_words / error),同域同任务分布,量级 = 16 任务/step × 累计步数 × 3 臂;②H1 pilot 274 任务会话(27B,ALFWorld,`/data3/.../h1_pilot/runs/pilot/`)作补充。
 - **协议转换**:生产归档是 fncall 协议(35B client),policy-as-researcher 用文本协议 → 机械转换(tool_call JSON → 文本协议轮;`research/toolproto.py` 两种协议的对偶已在)。
 - **质量筛选**:final_success 高 + doc 非空 + 无 error 的会话;可再按"该 doc 的下游增益"筛(归档 meta + 当步 doc-cond 成功率可回查)。
