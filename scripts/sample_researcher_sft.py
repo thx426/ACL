@@ -59,6 +59,12 @@ def main() -> int:
     if args.executor_model:
         cfg.sft_gen.executor_model = args.executor_model
 
+    if not cfg.train.train_file:
+        raise SystemExit(
+            "FATAL: train.train_file is empty — the pipeline samples from the TRAIN "
+            "parquet (export the same env vars the training launcher uses, or --set "
+            "train.train_file=/abs/path/train.parquet)"
+        )
     if args.dry_run:
         from trace_opd.evalm.run_eval import load_tasks
 
