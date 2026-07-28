@@ -211,3 +211,61 @@ P2 同法:`cp a800-1p7b-a0-pure.yaml → a800-1p7b-a0-rtopk.yaml`,`opd_kl_mode: 
 ### 8.5 回退
 
 任何异常:停新臂;原臂配置照旧重启即回已知良好状态(默认模式行为等价、指纹不变)。新臂的 run 目录保留供事后分析,不复用。
+
+## 9. Self-research 通道(policy-as-researcher RL;docs/self-research-design.md)
+
+> 机制 v3(2026-07-28,trace_opd `f9abbda`,vendored verl `af6a8d3`)。与执行侧
+> mix_* 三系数**正交**:那边优化"执行更好",这边优化"researcher 更好"。
+> ⚠️ **冷启动前置声明**:policy 未做 research SFT 冷启动(M0)之前,开启本通道
+> 只有调试/探针意义——1.7B/4B 裸模型的 research 能力≈0,全组 p=0 ⇒ 通道安全
+> 空转(无梯度)但纯烧算力(N×会话 + N×K×评测)。正式开启以 M0 探针达标为门。
+
+### 9.1 开法
+
+```yaml
+research:
+  backend: engine           # 硬前提(config 校验拦):research 轨迹必须是
+  tool_protocol: text       # policy 自己的 on-policy 采样
+roles:
+  researcher:
+    sidecar_sleep: false    # engine 形态没有外部服务可驱动
+research_rl:
+  weight: 0.02              # >0 开通道。量级参照 §7.3:邻居 λ≈0.01,画像后定
+  update_mode: joint        # joint(默认)| separate(消融/退路,一键切)
+  n_docs: 8                 # N(用户裁定默认;快速实验 4)
+  eval_k: 8                 # K(同上)
+  warmup_steps: 30          # 文档生产从第 1 步照常,梯度从第 31 步进
+```
+
+算力账:全量 N8K8 每任务 ≈216 episodes ≈ 现行 7-8×;快速档 N4K4+n_exp=6 ≈ 3×。
+rollout.n 自动扩为 `rollout_n + (sft_rollouts) + n_docs`,launcher 校验角色行数
+整除 n_gpus(不满足直接 FATAL)。
+
+### 9.2 首验清单(第一个 step 内)
+
+1. trainer stdout 出现 `research replica <task>: doc=... p=...`(每任务 N 行)——
+   会话真跑在 engine 上的凭证;
+2. `self-research warmup: step N <= 30, ... skipped` 行(warmup 生效凭证;
+   第 31 步起消失且 `research/pg_loss` 曲线开始非零);
+3. 曲线:`rollout_extra/research_rl_role/mean ≈ n_docs/(rollout_n+n_docs)`
+   (副本布局正确);`research_rl_reward`、`research_rl_finalized`、
+   `research_rl_group_all_fail|all_pass`、`research_rl_best_p` 出现;
+4. `research_final_success` 曲线语义升级提示:组模式下它 = **胜出文档的
+   K-rollout 实测成功率**(不再是会话内末次实验成功率),与
+   `research_rl_best_p` 同值互证;
+5. resume 保护:开启通道后 fingerprint 变化,旧目录 resume 被拒是设计行为
+   (换 run.name);
+6. separate 模式加验:`research_update/` 指标组出现;首跑核对各 dp rank 的
+   research 行数均匀(launcher 只校验总数整除)。
+
+### 9.3 判停与回退
+
+- `research_rl_group_all_fail` 长期≈1:飞轮没点着(冷启动不足/任务过难)——
+  停通道查 M0,不要调 weight 硬拉;
+- `research_rl_finalized` 均值下滑:research 行为退化前兆,对照 doc_words 与
+  归档抽读;
+- 调 weight 无响应:joint 模式下 w 全程有效(clip 只缩总范数),真无响应先查
+  warmup 是否还没过;separate 模式下看 grad_norm 是否压在 clip_grad 上
+  (§7.1 饱和语义);
+- 回退 = `research_rl.weight: 0`:副本、字段、loss 项、fingerprint 全部消失,
+  逐字节回到现行机制(206 测试钉死)。
