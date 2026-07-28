@@ -409,3 +409,87 @@ PYTHONPATH=src python3 scripts/sample_researcher_sft.py \
 - export 的 --min-gain/--drop-multi-call 过滤条件等标定分布出来后议;
 - verl SFT 训练配置(fsdp_sft_trainer,multiturn messages 列)是 M0 下一环,
   由 CD-005 后续同步。
+
+### 10.5 增补(2026-07-28 codex 审阅修复后的操作语义变化)
+
+- **重试语义**:会话因异常/超时结束的 slot 现在写 `FAILED`(不写 `DONE`),
+  **重跑同命令自动重试**;只有正常结束(含"未 finalize 但无 error"——那是
+  模型行为的真实数据点)才封 `DONE`。看进度:`DONE` 计数 + `FAILED` 计数。
+- **out_dir 身份校验**:换 seed/train_file/模型/协议/预算后复用旧 out_dir 会
+  直接 FATAL(防混代)——换实验就换目录。
+- **export 默认变化**:多 tool-call 会话**默认丢弃**(runtime 只执行第一个
+  call,教未执行行为默认关;`--keep-multi-call` 显式保留);空导出直接 FATAL。
+- 任务目录名带 8 位哈希后缀(单射化);utility 测量有总墙(session_timeout_s)。
+
+## 11. 蒸馏显微镜(观察包 + 工作台;docs/microscope-design.md)
+
+> 2026-07-28,trace_opd `04f6879`,vendored verl `9172da4`。回答"OPD 在每条
+> 训练样本每个 token 上实际发生了什么"的人工分析系统:训练时存**最小完备源**
+> (teacher top-64 / student 自身 top-64 / student-on-teacher-support /
+> realized 双侧 + per-token 训练 loss 真值锚),一切指标由读取层实时派生——
+> 分析视角可不断进化,数据永不重采。
+
+### 11.1 开法与开销
+
+```yaml
+train:
+  microscope_distributions: true   # 默认关;观察/消融 run 显式开
+  microscope_dist_every: 1         # 每 N 个 global step 存一次
+```
+
+- 开销:~465MB/step 原始、压缩 ~300MB(K=64 对称,fp16);100 step ≈ 30GB。
+  **生产臂默认关**;磁盘按 run 预估后再开。
+- 落盘到 `<run_dir>/obs/step_XXXXX/rank{r}.npz`(launcher 自动设
+  TRACE_OBS_DIR/TRACE_OBS_EVERY,已进 Ray runtime-env 白名单)。
+- 边界(如实):仅 topk 系 KL 模式有包(forward/reverse_kl_topk;estimator
+  模式 k3/gated 的 student logits 不过 processor,自动无包);采集 best-effort
+  (任何失败自禁+一次警告,训练零感知);SP=2 按段落盘、读层重组(单段有
+  测试,**162 SP=2 首用时按 11.3 验证多段**)。
+
+### 11.2 工作台使用
+
+```bash
+# 服务器上(零依赖;packs 也可拷到任何有 numpy 的机器离线看)
+PYTHONPATH=src python3 -m trace_opd.microscope serve \
+    --obs-dir <run_dir>/obs --tokenizer <model_path> --port 8643
+# 本地:ssh -L 8643:127.0.0.1:8643 <server> → 浏览器 http://127.0.0.1:8643
+```
+
+四视图(全部 URL 可寻址,可直接把 deep-link 贴进 feedback/报告):
+- **样本**:step 内样本表,点列头排序(默认 KL μ 降序),role/won 过滤;
+- **轨迹**:token 流按 7 种轨道着色 + 五轨道 minimap(点击跳转);顶栏常显
+  该样本 **audit ✓/✗**(派生重算 vs 训练真值的逐位对拍——✗ 先怀疑数据链);
+  键盘:←→ 逐 token,**n/p 在高 KL 位置间跳**;
+- **检索**:四个预置查询(指标 Top / 判决冲突 / 重复 n-gram 起点 / teacher
+  弃权)× step 范围 → 点行直达轨迹对应位置;首次扫描慢(进程内缓存,重启
+  重算——这是设计:派生层可丢弃);
+- **演化**:任务级 turn×step 热图(格值 = rollout 副本均值,n 已附),点格跳
+  轨迹。
+- 分布对检查器(点击任意 token):双侧 top-64 合并条形、realized 金框、rank
+  位移、质量外流条、分歧标签、±30 上下文。
+
+### 11.3 审计与服务器首验(上正式观察 run 前一次性完成)
+
+```bash
+PYTHONPATH=src python3 -m trace_opd.microscope audit --obs-dir <run>/obs
+# 语义:零 step/零行 = 失败退出(数据完整性);逐行重算 vs 真值锚超容差 = 失败
+```
+
+五条首验(codex 清单精选):
+1. 两步真跑:各 rank 日志无 "observation collection disabled",每 step 的
+   rank npz 齐且非空;
+2. **单步冒烟**:跑 1 个 step 正常退出,确认 atexit flush 落了该 step(此前
+   的 bug 形态正是"末 step 必丢");
+3. SP=2(162):挑一条跨段样本,工作台 covered 全绿 + audit ✓(段重组判据);
+4. audit 全量跑一次非零/零退出语义符合预期;
+5. off/on 与 every=1/10 各跑两步:对比 step 墙钟、训练显存峰值、obs 目录
+   增长(预期:on 的额外开销主要在落盘带宽,GPU 侧毫秒级)。
+
+### 11.4 与机制实验的配合建议
+
+- 方向消融臂(rtopk/gated 等)是显微镜的第一目标客户:forward vs reverse 的
+  token 级分歧结构对比(gated 无包,用其对照臂的 topk 模式看);
+- 崩塌研究:演化视图盯 turn×step 剖面 + 检索台"重复 n-gram 起点"查询——
+  thought 重复率的 token 级证据链就从这里出;
+- 曲线异常(如 KL 突跳)→ 样本页按 kl_max 排序 → 轨迹页定位——三步内从
+  swanlab 曲线到 token 级证据。
