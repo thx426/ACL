@@ -194,6 +194,10 @@ async function viewTraj(q) {
     trackSel.onchange = () => { paintTokens(); paintMinimap(); };
   }
   if (q.track) trackSel.value = q.track;
+  if (!trackSel._heatWired) {
+    trackSel._heatWired = true;
+    trackSel.onchange = () => { paintTokens(); paintMinimap(); paintHeat(); };
+  }
   if (!q.step || !q.hash) { $("#t-title").textContent = "从样本页选择一条轨迹"; return; }
   const key = `${q.step}:${q.hash}`;
   if (TRAJ_KEY === key) {
@@ -269,9 +273,10 @@ async function viewTraj(q) {
         arr.forEach((v, j) => { TRAJ.tracks[k][part.lo + j] = v; }));
       part.repeat_mask.forEach((v, j) => { TRAJ.repeat_mask[part.lo + j] = v; });
       TRAJ.tracksDone = part.hi;
-      paintTokens(part.lo, part.hi); paintMinimap(); applyMaskClasses(part.lo, part.hi);
+      paintTokens(part.lo, part.hi); paintMinimap(); paintHeat();
+      applyMaskClasses(part.lo, part.hi);
     }
-    if (!stale()) { paintTokens(); applyMaskClasses(); }  // final full pass (scale settles)
+    if (!stale()) { paintTokens(); applyMaskClasses(); paintHeat(); }  // final pass
     if (!stale() && q.pos != null) selectPos(+q.pos, false);
   })().catch(() => { if (!stale()) { window._retryQ = q; $("#t-inspector").innerHTML =
       `<div class="dim pad">指标派生中断 —
@@ -431,6 +436,107 @@ function paintMinimap() {
   };
   cv.onmouseleave = () => { hoverEl.style.display = "none"; };
 }
+/* ---------- wrapped per-token detail heatmap ----------
+ * One CELL per token (always visible), one TURN per row (wrapping inside a
+ * turn when it overflows), row header = turn number. Canvas height adapts
+ * to the sequence; the wrapper scrolls. Cells grow for short sequences. */
+let HEAT = null;  // { cellW, cellH, gap, labelW, perRow, rows: [{start, count, turn, y}] }
+function buildHeatLayout() {
+  const cv = $("#t-heat"), dpr = devicePixelRatio;
+  const W = cv.clientWidth * dpr;
+  const labelW = 46 * dpr;
+  const spans = (TRAJ.skeleton && TRAJ.skeleton.turn_spans) || [[0, TRAJ.n]];
+  const avail = Math.max(50, W - labelW);
+  // adaptive cell: at least 6px so every token is individually visible,
+  // growing up to 22px when the whole sequence fits one row per turn
+  const base = 6 * dpr;
+  const longest = Math.max(...spans.map(([a, b]) => b - a), 1);
+  const cellW = Math.max(base, Math.min(22 * dpr, Math.floor(avail / longest)));
+  const perRow = Math.max(1, Math.floor(avail / cellW));
+  const cellH = Math.max(12 * dpr, Math.min(20 * dpr, cellW * 1.6));
+  const gap = 2 * dpr;
+  const rows = [];
+  let y = gap;
+  const bounds = spans.map(([a], k) =>
+    [a, k + 1 < spans.length ? spans[k + 1][0] : TRAJ.n, k + 1]);
+  bounds.forEach(([a, b, turn]) => {
+    for (let start = a; start < b; start += perRow) {
+      rows.push({ start, count: Math.min(perRow, b - start),
+                  turn: start === a ? turn : null, y });
+      y += cellH + gap;
+    }
+  });
+  HEAT = { cellW, cellH, gap, labelW, perRow, rows, height: y + gap };
+}
+function paintHeat() {
+  if (!TRAJ || !TRAJ.tracks) return;
+  const cv = $("#t-heat"), ctx = cv.getContext("2d"), dpr = devicePixelRatio;
+  buildHeatLayout();
+  cv.width = cv.clientWidth * dpr;
+  cv.height = HEAT.height;
+  cv.style.height = `${HEAT.height / dpr}px`;
+  const track = $("#t-track").value, vals = TRAJ.tracks[track] || [];
+  const hi = quantile(vals, 0.98) || 1, lo = Math.min(0, quantile(vals, 0.02));
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.font = `${10 * dpr}px monospace`;
+  HEAT.rows.forEach((row) => {
+    if (row.turn != null) {
+      ctx.fillStyle = "#8aa0b5";
+      ctx.fillText(`t${row.turn}`, 6 * dpr, row.y + HEAT.cellH - 3 * dpr);
+    }
+    for (let j = 0; j < row.count; j++) {
+      const i = row.start + j, v = vals[i];
+      ctx.fillStyle = v == null ? "#20242c" : cmap((v - lo) / (hi - lo || 1));
+      ctx.fillRect(HEAT.labelW + j * HEAT.cellW, row.y,
+                   HEAT.cellW - 1, HEAT.cellH);
+    }
+  });
+  if (SEL >= 0) {
+    const pos = heatCellRect(SEL);
+    if (pos) {
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 * dpr;
+      ctx.strokeRect(pos.x - dpr, pos.y - dpr,
+                     HEAT.cellW + dpr, HEAT.cellH + 2 * dpr);
+    }
+  }
+  cv.onclick = (ev) => {
+    const i = heatIndexAt(ev.offsetX * dpr, ev.offsetY * dpr);
+    if (i != null) {
+      selectPos(i, true);
+      if (TK_ELS[i]) TK_ELS[i].scrollIntoView({ block: "center" });
+    }
+  };
+  const hoverEl = $("#t-heathover");
+  cv.onmousemove = (ev) => {
+    const i = heatIndexAt(ev.offsetX * dpr, ev.offsetY * dpr);
+    if (i == null) { hoverEl.style.display = "none"; return; }
+    const v = vals[i];
+    hoverEl.textContent = `${track} @ pos ${i}: ${v == null ? "—" : (+v).toFixed(4)}`;
+    hoverEl.style.display = "block";
+  };
+  cv.onmouseleave = () => { hoverEl.style.display = "none"; };
+}
+function heatIndexAt(x, y) {
+  if (!HEAT) return null;
+  const row = HEAT.rows.find((r) => y >= r.y && y < r.y + HEAT.cellH);
+  if (!row || x < HEAT.labelW) return null;
+  const j = Math.floor((x - HEAT.labelW) / HEAT.cellW);
+  return j < row.count ? row.start + j : null;
+}
+function heatCellRect(i) {
+  if (!HEAT) return null;
+  const row = HEAT.rows.find((r) => i >= r.start && i < r.start + r.count);
+  if (!row) return null;
+  return { x: HEAT.labelW + (i - row.start) * HEAT.cellW, y: row.y };
+}
+function heatScrollTo(i) {
+  const rect = heatCellRect(i);
+  if (!rect) return;
+  const wrap = $("#t-heatwrap"), dpr = devicePixelRatio;
+  const yCss = rect.y / dpr;
+  if (yCss < wrap.scrollTop || yCss > wrap.scrollTop + wrap.clientHeight - 30)
+    wrap.scrollTop = Math.max(0, yCss - wrap.clientHeight / 2);
+}
 let SEL_SEQ = 0;
 async function selectPos(i, push) {
   SEL = i;
@@ -439,7 +545,7 @@ async function selectPos(i, push) {
   const el = TK_ELS[i];
   if (el) el.classList.add("sel");
   $("#t-tokens").focus({ preventScroll: true });
-  paintMinimap();
+  paintMinimap(); paintHeat(); heatScrollTo(i);
   const [step, hash] = TRAJ_KEY.split(":");
   if (push) history.replaceState(null, "",
     `#/traj?${new URLSearchParams({ step, hash, track: $("#t-track").value, pos: i })}`);

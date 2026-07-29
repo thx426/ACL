@@ -95,3 +95,11 @@ tbody tr { cursor: pointer; } tbody tr:hover { background: #20242e; }
   font: 12px/1.5 monospace; color: #dfe7ef; background: #10141bd9;
   border: 1px solid #2b3a4a; border-radius: 3px; pointer-events: none;
   display: none; }
+
+/* ---- per-token detail heatmap: one visible cell per token, one turn per
+   row, canvas height adapts to the sequence (user ruling 2026-07-29) ---- */
+#t-heatwrap { position: relative; max-height: 44vh; overflow-y: auto;
+  border-top: 1px solid #232a33; }
+#t-heat { display: block; cursor: crosshair; }
+#t-heathover { position: sticky; top: 4px; margin-left: auto;
+  width: max-content; margin-right: 8px; z-index: 2; }
