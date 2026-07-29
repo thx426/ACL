@@ -401,3 +401,69 @@ def test_sample_summary_light_path_matches_tracks(fsdp_ns):
     gap = tr["gap"][m]
     assert summary["gap_mean"] == pytest.approx(
         float(gap[np.isfinite(gap)].mean()), abs=1e-4)
+
+
+def test_server_split_endpoints_cover_the_detail_view(fsdp_ns, tmp_path):
+    """Usability contract 2026-07-29: the detail view is served by THREE
+    endpoints (skeleton / tokens / tracks) so the front-end renders
+    progressively; position clicks reuse the cached tracks. Exercise the
+    payload functions end-to-end on a real pack."""
+    ns, obs_ns, obs_dir = fsdp_ns
+    student_logits, nlp, nids = _mk_batch(seed=21)
+    out = ns["compute_forward_kl_topk"](student_logits, nlp, nids, _Cfg(), "thd")
+    obs = out["obs"]
+    R = student_logits.shape[1]
+    row = {
+        "resp_hash": 555, "task_id": "t/x", "sample_role": "bare",
+        "won": 0, "reward": 0.0, "turn_spans": [[0, R]],
+        "response_ids": np.arange(R, dtype=np.int32) % 48,
+        "response_mask": np.ones(R, dtype=np.int8),
+        "realized_student_lp": -np.random.RandomState(2).rand(R).astype(np.float32),
+        "seg_start": 0, "seg_len": R,
+        "loss_mode": "forward_kl_topk", "log_prob_min_clamp": -10.0,
+    }
+    for key in ("teacher_ids", "teacher_lps", "student_ids", "student_lps",
+                "student_support_lps"):
+        row[key] = obs[key][0].float().numpy()
+    row["token_loss"] = out["distillation_losses"][0].detach().numpy()
+    obs_ns["_flush_step"](3, [row])
+
+    import json
+
+    from trace_opd.microscope import server
+
+    server._OBS_DIR = str(obs_dir)
+    server._TOKENIZER = None
+    server._PACKS.clear(); server._TRACKS.clear(); server._MEMO.clear()
+    server._step_sizes_mb.cache_clear()
+
+    sk = server._sample_skeleton(3, 555)
+    assert sk["summary"]["resp_hash"] == 555
+    assert sk["audit"]["ok"] and "tracks" not in sk and "tokens" not in sk
+    tk = server._sample_tokens(3, 555)
+    assert len(tk["tokens"]) == R and tk["n"] == R
+    # windowed (streaming) access returns the slice with its bounds
+    tk2 = server._sample_tokens(3, 555, "2", "5")
+    assert tk2["lo"] == 2 and tk2["hi"] == 5 and len(tk2["tokens"]) == 3
+    tr = server._sample_tracks(3, 555)
+    assert len(tr["tracks"]["kl_forward"]) == R
+    assert (3, 555, R) in server._TRACKS  # cached for position clicks
+    tr2 = server._sample_tracks(3, 555, "1", "4")
+    assert len(tr2["tracks"]["kl_forward"]) == 3
+    # persistent derived caches landed next to the pack (rebuildable, signed)
+    cache_dir = obs_dir / "step_00003" / "_cache"
+    server._samples(3)
+    assert (cache_dir / "summary.json").exists()
+    assert list(cache_dir.glob("tracks_555_*.npz"))
+    # a fresh process (cleared memory) must serve the listing WITHOUT the pack
+    server._PACKS.clear(); server._MEMO.clear()
+    rows = server._samples(3)
+    assert rows and rows[0]["resp_hash"] == 555
+    assert 3 not in server._PACKS  # summary came from the persistent cache
+    pos = server._position_payload(3, 555, 0)
+    assert pos["label"] and "scalars" in pos
+    # every payload is JSON-serialisable (the wire contract)
+    for payload in (sk, tk, tr, pos):
+        json.dumps(payload)
+    # status endpoint state: the pack is resident, nothing loading
+    assert 3 in server._PACKS and not server._LOADING

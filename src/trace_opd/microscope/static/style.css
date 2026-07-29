@@ -70,3 +70,19 @@ tbody tr { cursor: pointer; } tbody tr:hover { background: #20242e; }
   cursor: crosshair; }
 .legend { display: inline-flex; gap: 10px; align-items: center; }
 .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+
+/* ---- global request status (usability contract 2026-07-29) ---- */
+.status { min-height: 0; font: 12px/1.6 monospace; padding: 0 12px; }
+.status.busy { background: #1c2733; color: #9fd0ff; padding: 4px 12px;
+  border-bottom: 1px solid #2b3a4a; }
+.status.err { background: #3a1c1c; color: #ffb3b3; padding: 4px 12px;
+  border-bottom: 1px solid #5a2b2b; }
+.status a { color: #ffd27f; margin-left: 8px; }
+.err-inline { color: #ffb3b3; }
+.err-inline a { color: #ffd27f; margin-left: 6px; }
+.spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px;
+  border: 2px solid #9fd0ff44; border-top-color: #9fd0ff; border-radius: 50%;
+  animation: spin 0.8s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.pad { padding: 12px; }
+.tk.pending { color: #444; }

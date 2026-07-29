@@ -1,16 +1,80 @@
 /* TRACE-OPD 蒸馏显微镜工作台(零依赖 vanilla JS)。
  * 路由:#/samples?step= | #/traj?step=&hash=&track=&pos= | #/explore | #/evolution?task=
- * 一切数值由后端从观察包实时派生;本文件只做渲染与交互。 */
+ * 一切数值由后端从观察包实时派生;本文件只做渲染与交互。
+ *
+ * 可用性契约(2026-07-29 用户裁定):任何网络请求都必须让用户看得见——
+ * 全局状态条显示"在加载什么、已等几秒、后端正在解压哪个 step";失败必须
+ * 显示错误与重试入口,绝不静默停在空白/"载入中"。轨迹详情三段渐进:
+ * 骨架(瞬时)→ token 文本 → per-token 指标(重),每段就绪即渲染。 */
 "use strict";
 const $ = (sel) => document.querySelector(sel);
-const api = async (path) => {
-  const r = await fetch(path);
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error || r.status);
-  return j;
-};
+
+/* ---------- tracked fetch: every request is visible ---------- */
+const ACTIVE = new Map();   // id -> {label, t0}
+let REQ_ID = 0;
+let LAST_ERR = null;
+async function api(path, label) {
+  const id = ++REQ_ID;
+  ACTIVE.set(id, { label: label || path, t0: Date.now() });
+  renderStatus();
+  try {
+    const r = await fetch(path);
+    let j;
+    try { j = await r.json(); }
+    catch { throw new Error(`响应不是 JSON(HTTP ${r.status})`); }
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    LAST_ERR = null;
+    return j;
+  } catch (err) {
+    LAST_ERR = { label: label || path, msg: String(err.message || err) };
+    throw err;
+  } finally {
+    ACTIVE.delete(id);
+    renderStatus();
+  }
+}
+let SERVER_STATUS = null;   // /api/status payload while requests are slow
+setInterval(async () => {
+  renderStatus();
+  const oldest = [...ACTIVE.values()].reduce((m, a) => Math.min(m, a.t0), Infinity);
+  if (ACTIVE.size && Date.now() - oldest > 2500) {
+    try {  // untracked on purpose: the probe must not feed the spinner
+      const r = await fetch("/api/status");
+      SERVER_STATUS = await r.json();
+    } catch { SERVER_STATUS = null; }
+  } else if (!ACTIVE.size) SERVER_STATUS = null;
+}, 1000);
+function renderStatus() {
+  const el = $("#g-status");
+  if (!el) return;
+  if (ACTIVE.size) {
+    const parts = [...ACTIVE.values()].map((a) => {
+      const s = ((Date.now() - a.t0) / 1000).toFixed(0);
+      return `${a.label} · ${s}s`;
+    });
+    let extra = "";
+    const loading = SERVER_STATUS && SERVER_STATUS.loading;
+    if (loading && Object.keys(loading).length) {
+      extra = " — 后端正在解压观察包:" + Object.entries(loading)
+        .map(([s, t]) => `step ${s}(已 ${t}s${sizeHint(s)})`).join("、");
+    }
+    el.className = "status busy";
+    el.innerHTML = `<span class="spin"></span> 加载中:${esc(parts.join(" | "))}${esc(extra)}`;
+  } else if (LAST_ERR) {
+    el.className = "status err";
+    el.innerHTML = `⚠ ${esc(LAST_ERR.label)} 失败:${esc(LAST_ERR.msg)}
+      <a href="javascript:location.reload()">刷新重试</a>`;
+  } else {
+    el.className = "status"; el.textContent = "";
+  }
+}
+function sizeHint(step) {
+  const mb = META && META.sizes_mb && META.sizes_mb[String(step)];
+  return mb ? `,${mb}MB,首次打开需数十秒` : "";
+}
+
 let META = null;
-let TRAJ = null;           // current /api/sample payload
+let TRAJ = null;           // { skeleton, tokens, tracks, repeat_mask } — 渐进填充
 let TRAJ_KEY = "";         // `${step}:${hash}`
 let SEL = -1;              // selected position
 
@@ -39,10 +103,9 @@ function route() {
     a.classList.toggle("active", a.dataset.view === path));
   document.querySelectorAll(".view").forEach((v) =>
     v.classList.toggle("active", v.id === `view-${path}`));
-  if (path === "samples") viewSamples(q);
-  else if (path === "traj") viewTraj(q);
-  else if (path === "explore") viewExplore(q);
-  else if (path === "evolution") viewEvolution(q);
+  const views = { samples: viewSamples, traj: viewTraj,
+                  explore: viewExplore, evolution: viewEvolution };
+  (views[path] || viewSamples)(q).catch(() => {});  // errors already on the status bar
 }
 function go(path, q) {
   location.hash = `#/${path}?${new URLSearchParams(q)}`;
@@ -66,7 +129,8 @@ async function viewSamples(q) {
   }
   const step = q.step != null ? +q.step : +sel.value || META.steps[META.steps.length - 1];
   sel.value = step;
-  window._rows = await api(`/api/samples?step=${step}`);
+  $("#s-count").textContent = "…";
+  window._rows = await api(`/api/samples?step=${step}`, `step ${step} 样本表`);
   renderSamples();
 }
 function renderSamples() {
@@ -95,7 +159,7 @@ function renderSamples() {
     go("traj", { step: tr.dataset.s, hash: tr.dataset.h }));
 }
 
-/* ---------- trajectory microscope ---------- */
+/* ---------- trajectory microscope (three-stage progressive load) ---------- */
 const TRACKS = ["kl_forward", "kl_reverse", "gap", "teacher_entropy",
   "student_entropy", "overlap_count", "token_loss"];
 const MINIMAP_TRACKS = ["kl_forward", "gap", "teacher_entropy", "student_entropy", "overlap_count"];
@@ -108,44 +172,111 @@ async function viewTraj(q) {
   if (q.track) trackSel.value = q.track;
   if (!q.step || !q.hash) { $("#t-title").textContent = "从样本页选择一条轨迹"; return; }
   const key = `${q.step}:${q.hash}`;
-  if (TRAJ_KEY !== key) {
-    $("#t-title").textContent = "载入中…";
-    TRAJ = await api(`/api/sample?step=${q.step}&hash=${q.hash}`);
-    TRAJ_KEY = key;
-    SEL = -1;
-    buildTokens();
+  if (TRAJ_KEY === key) {
+    if (q.pos != null && +q.pos !== SEL) selectPos(+q.pos, false);
+    return;
   }
-  const s = TRAJ.summary;
+  TRAJ_KEY = key;
+  TRAJ = { skeleton: null, tokens: null, tracks: null, repeat_mask: null,
+           tokensDone: 0, tracksDone: 0, n: 0 };
+  SEL = -1;
+  $("#t-title").innerHTML = `<span class="spin"></span> 载入骨架…${esc(sizeHint(q.step))}`;
+  $("#t-audit").textContent = "";
+  $("#t-tokens").innerHTML = `<div class="dim pad">等待骨架…</div>`;
+  $("#t-inspector").innerHTML = `<div class="dim pad">点击一个 token(指标就绪后)</div>`;
+
+  const stale = () => TRAJ_KEY !== key;
+  // 1) skeleton first (cheap): it carries resp_len, which drives the
+  //    chunked streams below — then tokens & tracks stream IN PARALLEL,
+  //    each 2000-token window rendering the moment it lands.
+  let sk;
+  try {
+    sk = await api(`/api/sample?step=${q.step}&hash=${q.hash}`, "轨迹骨架");
+  } catch {
+    if (!stale()) $("#t-title").textContent = "骨架加载失败(见顶部状态条)";
+    return;
+  }
+  if (stale()) return;
+  TRAJ.skeleton = sk;
+  TRAJ.n = sk.summary.resp_len;
+  renderSkeleton();
+  TRAJ.tokens = new Array(TRAJ.n).fill(null);
+  TRAJ.tracks = null;  // allocated on the first tracks chunk (keys unknown yet)
+  $("#t-tokens").innerHTML = "";
+  buildTokensShell();
+
+  const CHUNK = 2000;
+  const streamTokens = (async () => {
+    for (let lo = 0; lo < TRAJ.n; lo += CHUNK) {
+      if (stale()) return;
+      const part = await api(
+        `/api/sample_tokens?step=${q.step}&hash=${q.hash}&lo=${lo}&hi=${lo + CHUNK}`,
+        `token ${lo}–${Math.min(lo + CHUNK, TRAJ.n)}/${TRAJ.n}`);
+      if (stale()) return;
+      part.tokens.forEach((t, j) => { TRAJ.tokens[part.lo + j] = t; });
+      TRAJ.tokensDone = part.hi;
+      fillTokenChunk(part.lo, part.hi);
+    }
+  })().catch(() => { if (!stale()) $("#t-tokens").insertAdjacentHTML("beforeend",
+      `<div class="dim pad">token 流中断(见顶部状态条)</div>`); });
+
+  const streamTracks = (async () => {
+    for (let lo = 0; lo < TRAJ.n; lo += CHUNK) {
+      if (stale()) return;
+      const part = await api(
+        `/api/sample_tracks?step=${q.step}&hash=${q.hash}&lo=${lo}&hi=${lo + CHUNK}`,
+        lo === 0 ? "指标派生(首次较慢,之后走缓存)" :
+          `指标 ${lo}–${Math.min(lo + CHUNK, TRAJ.n)}/${TRAJ.n}`);
+      if (stale()) return;
+      if (!TRAJ.tracks) {
+        TRAJ.tracks = {}; TRAJ.repeat_mask = new Array(TRAJ.n).fill(0);
+        Object.keys(part.tracks).forEach((k) => TRAJ.tracks[k] = new Array(TRAJ.n).fill(null));
+      }
+      Object.entries(part.tracks).forEach(([k, arr]) =>
+        arr.forEach((v, j) => { TRAJ.tracks[k][part.lo + j] = v; }));
+      part.repeat_mask.forEach((v, j) => { TRAJ.repeat_mask[part.lo + j] = v; });
+      TRAJ.tracksDone = part.hi;
+      paintTokens(); paintMinimap(); applyMaskClasses();
+    }
+    if (!stale() && q.pos != null) selectPos(+q.pos, false);
+  })().catch(() => { if (!stale()) $("#t-inspector").innerHTML =
+      `<div class="dim pad">指标派生失败(见顶部状态条)</div>`; });
+
+  await Promise.allSettled([streamTokens, streamTracks]);
+}
+function renderSkeleton() {
+  const s = TRAJ.skeleton.summary;
   $("#t-title").innerHTML =
     `<b>${esc(s.task_id.slice(0, 40))}</b> · step ${s.step} · ` +
     `<span class="won-${s.won}">${s.won ? "WON" : "LOST"}</span> · ` +
-    `${s.resp_len} tok · ${s.turns} turns · ${TRAJ.loss_mode}`;
-  const a = TRAJ.audit;
+    `${s.resp_len} tok · ${s.turns} turns · ${TRAJ.skeleton.loss_mode}`;
+  const a = TRAJ.skeleton.audit;
   $("#t-audit").textContent =
-    `audit ${a.ok ? "✓" : "✗"} (${a.checked} tok, max_err ${(+a.max_err).toFixed(3)})`;
-  paintTokens(); paintMinimap();
-  if (q.pos != null && +q.pos !== SEL) selectPos(+q.pos, false);
+    `audit ${a.ok ? "✓" : "✗"} (${a.checked} tok, exceed ${a.n_exceed ?? 0}, ` +
+    `max_err ${(+a.max_err).toFixed(3)})`;
 }
-function buildTokens() {
+function buildTokensShell() {
+  // one placeholder span per position, filled chunk by chunk as text streams
   const host = $("#t-tokens");
   host.innerHTML = "";
-  const spans = TRAJ.turn_spans, starts = new Map(spans.map(([a], i) => [a, i]));
-  TRAJ.tokens.forEach((t, i) => {
+  const spans = (TRAJ.skeleton && TRAJ.skeleton.turn_spans) || [];
+  const starts = new Map(spans.map(([a], i) => [a, i]));
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < TRAJ.n; i++) {
     if (starts.has(i)) {
       const sep = document.createElement("span");
       sep.className = "turn-sep"; sep.textContent = `── turn ${starts.get(i) + 1} ──`;
-      host.appendChild(sep);
+      frag.appendChild(sep);
     }
     const el = document.createElement("span");
-    el.className = "tk"; el.dataset.i = i;
-    el.textContent = t.text.replace(/\n/g, "⏎\n");
-    if (!TRAJ.tracks.mask[i]) el.classList.add("obs");
-    if (!TRAJ.tracks.covered[i]) el.classList.add("uncov");
+    el.className = "tk pending"; el.dataset.i = i;
+    el.textContent = "·";
     el.onclick = () => selectPos(i, true);
-    host.appendChild(el);
-  });
+    frag.appendChild(el);
+  }
+  host.appendChild(frag);
   host.onkeydown = (ev) => {
-    if (SEL < 0) return;
+    if (SEL < 0 || !TRAJ.tracks) return;
     const kl = TRAJ.tracks.kl_forward;
     if (ev.key === "ArrowRight") selectPos(Math.min(SEL + 1, kl.length - 1), true);
     else if (ev.key === "ArrowLeft") selectPos(Math.max(SEL - 1, 0), true);
@@ -157,7 +288,24 @@ function buildTokens() {
     ev.preventDefault();
   };
 }
+function fillTokenChunk(lo, hi) {
+  for (let i = lo; i < hi; i++) {
+    const el = document.querySelector(`#t-tokens .tk[data-i="${i}"]`);
+    const t = TRAJ.tokens[i];
+    if (el && t) { el.textContent = t.text.replace(/\n/g, "⏎\n"); el.classList.remove("pending"); }
+  }
+  paintTokens();
+}
+function applyMaskClasses() {
+  if (!TRAJ.tracks) return;
+  document.querySelectorAll("#t-tokens .tk").forEach((el) => {
+    const i = +el.dataset.i;
+    el.classList.toggle("obs", !TRAJ.tracks.mask[i]);
+    el.classList.toggle("uncov", !TRAJ.tracks.covered[i]);
+  });
+}
 function paintTokens() {
+  if (!TRAJ || !TRAJ.tracks) return;
   const track = $("#t-track").value, vals = TRAJ.tracks[track] || [];
   const hi = quantile(vals, 0.98) || 1, lo = Math.min(0, quantile(vals, 0.02));
   document.querySelectorAll("#t-tokens .tk").forEach((el) => {
@@ -167,8 +315,9 @@ function paintTokens() {
   });
 }
 function paintMinimap() {
+  if (!TRAJ || !TRAJ.tracks) return;
   const cv = $("#t-minimap"), ctx = cv.getContext("2d");
-  const n = TRAJ.tokens.length;
+  const n = TRAJ.n;
   cv.width = cv.clientWidth * devicePixelRatio;
   const W = cv.width, rowH = cv.height / MINIMAP_TRACKS.length;
   ctx.clearRect(0, 0, W, cv.height);
@@ -207,9 +356,11 @@ async function selectPos(i, push) {
   const [step, hash] = TRAJ_KEY.split(":");
   if (push) history.replaceState(null, "",
     `#/traj?${new URLSearchParams({ step, hash, track: $("#t-track").value, pos: i })}`);
-  const p = await api(`/api/position?step=${step}&hash=${hash}&pos=${i}`);
-  if (seq !== SEL_SEQ) return;  // a newer selection superseded this response
-  renderInspector(p);
+  try {
+    const p = await api(`/api/position?step=${step}&hash=${hash}&pos=${i}`, `pos ${i}`);
+    if (seq !== SEL_SEQ) return;  // a newer selection superseded this response
+    renderInspector(p);
+  } catch { /* status bar already shows it */ }
 }
 function renderInspector(p) {
   const host = $("#t-inspector");
@@ -281,7 +432,7 @@ async function runExplore() {
     const rows = await api(`/api/leaderboard?` + new URLSearchParams({
       mode: $("#e-mode").value, metric: $("#e-metric").value,
       step_lo: $("#e-lo").value, step_hi: $("#e-hi").value, limit: 200,
-    }));
+    }), "检索扫描");
     $("#e-status").textContent = `${rows.length} 个位置`;
     $("#e-table tbody").innerHTML = rows.map((r) =>
       `<tr data-s="${r.step}" data-h="${r.hash}" data-p="${r.pos}">
@@ -299,7 +450,9 @@ async function viewEvolution(q) {
   const taskSel = $("#v-task"), mSel = $("#v-metric");
   if (!mSel.options.length) {
     META.metrics.forEach((x) => mSel.add(new Option(x, x)));
-    META.tasks.forEach((t) => taskSel.add(new Option(t.slice(0, 60), t)));
+    // task list is a full-dir scan — fetched lazily, only for this view
+    const tasks = await api("/api/tasks", "任务列表");
+    tasks.forEach((t) => taskSel.add(new Option(t.slice(0, 60), t)));
     taskSel.onchange = mSel.onchange = () =>
       go("evolution", { task: taskSel.value, metric: mSel.value });
   }
@@ -307,7 +460,7 @@ async function viewEvolution(q) {
   if (!task) return;
   taskSel.value = task;
   const data = await api(`/api/evolution?` + new URLSearchParams({
-    task, metric: q.metric || mSel.value }));
+    task, metric: q.metric || mSel.value }), "演化格(首次跨步扫描较慢)");
   drawEvolution(data);
 }
 function drawEvolution(data) {
@@ -338,7 +491,13 @@ function drawEvolution(data) {
 
 /* ---------- boot ---------- */
 (async () => {
-  META = await api("/api/meta");
+  try {
+    META = await api("/api/meta", "连接后端");
+  } catch (err) {
+    $("#meta").innerHTML = `<span class="err-inline">无法连接后端:${esc(String(err.message || err))}
+      — 确认 serve 进程与 SSH 隧道后<a href="javascript:location.reload()">刷新</a></span>`;
+    return;
+  }
   $("#meta").textContent =
     `${META.steps.length} steps · ${META.obs_dir}` +
     (META.tokenizer ? "" : " · ⚠ 无 tokenizer(仅显示 id)");

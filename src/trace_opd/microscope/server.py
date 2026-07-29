@@ -2,9 +2,22 @@
 
 Serves the observation packs behind a small JSON API and a single-page
 front-end (static/). All derived quantities are computed on demand from the
-raw packs (derive.py); cross-step aggregates (leaderboard, evolution) are
-memoised in process — the cache IS disposable, restart recomputes it, and a
-new analysis view is a code change plus a restart, never a resample.
+raw packs (derive.py) and memoised in process — the caches ARE disposable,
+restart recomputes them, and a new analysis view is a code change plus a
+restart, never a resample.
+
+USABILITY CONTRACT (user ruling 2026-07-29): the workbench must never leave
+the user staring at a silent page. Concretely:
+  * the detail view is SPLIT into three endpoints — /api/sample (skeleton,
+    instant once the pack is resident), /api/sample_tokens (batch-decoded
+    text), /api/sample_tracks (the heavy per-token derivation, cached per
+    row) — so the front-end renders progressively instead of all-or-nothing;
+  * pack loading is single-flight (a per-step lock) and OBSERVABLE:
+    /api/status reports what is being decompressed and for how long, and the
+    front-end shows it;
+  * /api/position reuses the cached tracks — clicking a token is instant
+    after the first tracks fetch;
+  * requests slower than 1 s are logged server-side with their duration.
 
 Run on the training server, browse through an SSH tunnel:
 
@@ -15,6 +28,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
+from collections import OrderedDict
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,17 +39,122 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from . import derive, segments
-from .reader import list_steps, load_step
+from .reader import StepPack, list_steps
 
 _STATIC = Path(__file__).parent / "static"
 _TOKENIZER = None
 _OBS_DIR: str = ""
 _MEMO: dict = {}
 
+# ------------------------------------------------- pack + tracks residency
+_PACKS: "OrderedDict[int, StepPack]" = OrderedDict()
+_PACK_CAP = 8
+_LOAD_LOCKS: dict[int, threading.Lock] = {}
+_LOADING: dict[int, float] = {}  # step -> load start ts (for /api/status)
+_STATE_LOCK = threading.Lock()
+
+_TRACKS: "OrderedDict[tuple, dict]" = OrderedDict()
+_TRACKS_CAP = 64
+_TRACKS_LOCK = threading.Lock()
+
 _METRICS = (
     "kl_forward", "kl_reverse", "token_loss", "gap", "teacher_entropy",
     "student_entropy", "overlap_count", "teacher_mass", "student_mass_own",
 )
+
+
+def _pack(step: int) -> StepPack:
+    """Resident pack with single-flight loading and status registration —
+    two concurrent requests for a cold step must not decompress it twice,
+    and the user must be able to SEE that a 300 MB decompress is running."""
+    with _STATE_LOCK:
+        if step in _PACKS:
+            _PACKS.move_to_end(step)
+            return _PACKS[step]
+        lock = _LOAD_LOCKS.setdefault(step, threading.Lock())
+    with lock:
+        with _STATE_LOCK:
+            if step in _PACKS:
+                _PACKS.move_to_end(step)
+                return _PACKS[step]
+            _LOADING[step] = time.time()
+        try:
+            pack = StepPack(Path(_OBS_DIR), step)
+        finally:
+            with _STATE_LOCK:
+                _LOADING.pop(step, None)
+        with _STATE_LOCK:
+            _PACKS[step] = pack
+            while len(_PACKS) > _PACK_CAP:
+                _PACKS.popitem(last=False)
+        return pack
+
+
+def _tracks_of(step: int, row: dict) -> dict:
+    """Per-row derived tracks: memory LRU -> persistent npz cache -> compute.
+    The heavy derivation happens ONCE per row EVER (survives restarts); every
+    colouring switch / minimap / position click after that is a lookup."""
+    key = (step, row["resp_hash"], len(row["response_ids"]))
+    with _TRACKS_LOCK:
+        if key in _TRACKS:
+            _TRACKS.move_to_end(key)
+            return _TRACKS[key]
+    sig = _pack_sig(step)
+    cache = _cache_dir(step) / f"tracks_{key[1]}_{key[2]}.npz"
+    tr = None
+    if cache.exists():
+        try:
+            with np.load(cache) as z:
+                if str(z["sig"][0]) == sig:
+                    tr = {k: z[k] for k in z.files if k != "sig"}
+        except Exception:  # noqa: BLE001 — cache corruption -> recompute
+            tr = None
+    if tr is None:
+        pack = _pack(step)
+        tr = derive.tracks(row, pack.log_prob_min_clamp)
+        try:
+            np.savez_compressed(
+                cache, sig=np.array([sig]),
+                **{k: v.astype(np.float32) for k, v in tr.items()},
+            )
+        except OSError:
+            pass
+    with _TRACKS_LOCK:
+        _TRACKS[key] = tr
+        while len(_TRACKS) > _TRACKS_CAP:
+            _TRACKS.popitem(last=False)
+    return tr
+
+
+def _pack_sig(step: int) -> str:
+    """Fingerprint of the step's SOURCE npz files — persistent derived caches
+    carry it and are rebuilt whenever the truth changes. The packs stay the
+    single source; every cache is disposable."""
+    import hashlib
+
+    parts = []
+    for f in sorted((Path(_OBS_DIR) / f"step_{step:05d}").glob("rank*.npz")):
+        st = f.stat()
+        parts.append(f"{f.name}:{st.st_size}:{st.st_mtime_ns}")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _cache_dir(step: int) -> Path:
+    d = Path(_OBS_DIR) / f"step_{step:05d}" / "_cache"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+@lru_cache(maxsize=1)
+def _step_sizes_mb() -> dict:
+    sizes = {}
+    for step in list_steps(Path(_OBS_DIR)):
+        total = sum(
+            p.stat().st_size
+            for p in (Path(_OBS_DIR) / f"step_{step:05d}").glob("rank*.npz")
+        )
+        sizes[str(step)] = round(total / 1e6, 1)
+    return sizes
 
 
 def _tok_text(token_id: int) -> str:
@@ -43,9 +164,18 @@ def _tok_text(token_id: int) -> str:
     return piece.replace("Ġ", " ").replace("Ċ", "\\n").replace("▁", " ")
 
 
+def _tok_texts(ids) -> list[str]:
+    """Batch display pieces — ONE tokenizer call for the whole row (the old
+    per-token loop made 4000+ single-id calls per detail view)."""
+    if _TOKENIZER is None:
+        return [f"<{int(t)}>" for t in ids]
+    toks = _TOKENIZER.convert_ids_to_tokens([int(t) for t in ids])
+    return [t.replace("Ġ", " ").replace("Ċ", "\\n").replace("▁", " ") for t in toks]
+
+
 def _tok_pieces(ids) -> list[str]:
     """Batch piece stream with REAL whitespace — the segment scanner's input
-    (unlike _tok_text, which escapes newlines for display)."""
+    (unlike _tok_texts, which escapes newlines for display)."""
     toks = _TOKENIZER.convert_ids_to_tokens([int(t) for t in ids])
     return [t.replace("Ġ", " ").replace("Ċ", "\n").replace("▁", " ") for t in toks]
 
@@ -60,18 +190,40 @@ def _clean(value):
     return value
 
 
-@lru_cache(maxsize=64)
 def _samples(step: int) -> list[dict]:
-    pack = load_step(_OBS_DIR, step)
-    return [derive.sample_summary(row) for row in pack.rows()]
+    """Listing rows, with a PERSISTENT summary cache: once computed, the
+    samples page opens in milliseconds — across restarts — without touching
+    the 300 MB pack at all."""
+    key = ("samples", step)
+    if key in _MEMO:
+        return _MEMO[key]
+    sig = _pack_sig(step)
+    cache = _cache_dir(step) / "summary.json"
+    if cache.exists():
+        try:
+            payload = json.loads(cache.read_text(encoding="utf-8"))
+            if payload.get("sig") == sig:
+                _MEMO[key] = payload["rows"]
+                return payload["rows"]
+        except Exception:  # noqa: BLE001 — cache corruption -> rebuild
+            pass
+    pack = _pack(step)
+    rows = [derive.sample_summary(row) for row in pack.rows()]
+    try:
+        cache.write_text(json.dumps({"sig": sig, "rows": rows}), encoding="utf-8")
+    except OSError:
+        pass  # read-only obs dir: in-memory memo still holds
+    _MEMO[key] = rows
+    return rows
 
 
-def _sample_payload(step: int, resp_hash: int) -> dict:
-    pack = load_step(_OBS_DIR, step)
+# ----------------------------------------------- detail view, split three ways
+
+def _sample_skeleton(step: int, resp_hash: int) -> dict:
+    """Everything the detail view needs to render its FRAME — cheap by
+    construction (no tracks, no per-token decode)."""
+    pack = _pack(step)
     row = pack.row(resp_hash)
-    tr = derive.tracks(row, pack.log_prob_min_clamp)
-    repeats = derive.repeat_positions(row)
-    tokens = [{"id": int(t), "text": _tok_text(t)} for t in row["response_ids"]]
     seg = (
         segments.segment_spans(_tok_pieces(row["response_ids"]))
         if _TOKENIZER is not None
@@ -81,18 +233,51 @@ def _sample_payload(step: int, resp_hash: int) -> dict:
         "summary": derive.sample_summary(row),
         "loss_mode": pack.loss_mode,
         "turn_spans": row["turn_spans"],
-        "tokens": tokens,
-        "tracks": {k: _clean(v) for k, v in tr.items()},
-        "repeat_mask": [int(x) for x in repeats.tolist()],
         "segments": seg,
         "audit": derive.audit_row(row, loss_mode=pack.loss_mode, clamp=pack.log_prob_min_clamp),
     }
 
 
-def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
-    pack = load_step(_OBS_DIR, step)
+def _window(n: int, q_lo, q_hi) -> tuple[int, int]:
+    lo = max(0, int(q_lo)) if q_lo is not None else 0
+    hi = min(n, int(q_hi)) if q_hi is not None else n
+    return lo, max(lo, hi)
+
+
+def _sample_tokens(step: int, resp_hash: int, q_lo=None, q_hi=None) -> dict:
+    """Windowed token text — the front-end streams [lo,hi) chunks and renders
+    each as it lands, so a 30k-token row appears progressively."""
+    pack = _pack(step)
     row = pack.row(resp_hash)
-    tr = derive.tracks(row, pack.log_prob_min_clamp)
+    lo, hi = _window(len(row["response_ids"]), q_lo, q_hi)
+    ids = row["response_ids"][lo:hi]
+    return {
+        "lo": lo, "hi": hi, "n": int(len(row["response_ids"])),
+        "tokens": [
+            {"id": int(t), "text": s} for t, s in zip(ids, _tok_texts(ids))
+        ],
+    }
+
+
+def _sample_tracks(step: int, resp_hash: int, q_lo=None, q_hi=None) -> dict:
+    """Windowed track values (full-row derivation is cached persistently; the
+    window only slices the response)."""
+    pack = _pack(step)
+    row = pack.row(resp_hash)
+    tr = _tracks_of(step, row)
+    lo, hi = _window(len(row["response_ids"]), q_lo, q_hi)
+    repeats = derive.repeat_positions(row)
+    return {
+        "lo": lo, "hi": hi, "n": int(len(row["response_ids"])),
+        "tracks": {k: _clean(v[lo:hi]) for k, v in tr.items()},
+        "repeat_mask": [int(x) for x in repeats[lo:hi].tolist()],
+    }
+
+
+def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
+    pack = _pack(step)
+    row = pack.row(resp_hash)
+    tr = _tracks_of(step, row)  # cached — a click costs one dict lookup
 
     def side(ids_key: str, lps_key: str) -> list[dict]:
         return [
@@ -107,7 +292,7 @@ def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
     lo, hi = max(0, pos - 30), min(len(row["response_ids"]), pos + 31)
     return {
         "pos": pos,
-        "label": derive.divergence_label(row, pos),
+        "label": derive.divergence_label(row, pos, tr=tr),
         "teacher": side("teacher_ids", "teacher_lps"),
         "student": side("student_ids", "student_lps"),
         "student_on_support": _clean(row["student_support_lps"][pos]),
@@ -122,7 +307,7 @@ def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
         "scalars": {k: _clean(float(tr[k][pos])) for k in _METRICS},
         "context": {
             "start": lo,
-            "tokens": [_tok_text(t) for t in row["response_ids"][lo:hi]],
+            "tokens": _tok_texts(row["response_ids"][lo:hi]),
         },
         "covered": bool(row["covered"][pos]),
         "masked": bool(row["response_mask"][pos]),
@@ -137,7 +322,7 @@ def _leaderboard(metric: str, step_lo: int, step_hi: int, mode: str, limit: int)
     for step in list_steps(Path(_OBS_DIR)):
         if not (step_lo <= step <= step_hi):
             continue
-        pack = load_step(_OBS_DIR, step)
+        pack = _pack(step)
         for row in pack.rows():
             tr = derive.tracks(row, pack.log_prob_min_clamp)
             m = row["response_mask"] & row["covered"]
@@ -181,7 +366,7 @@ def _evolution(task: str, metric: str) -> dict:
     acc: dict[tuple, list] = {}
     reps: dict[tuple, list] = {}
     for step in list_steps(Path(_OBS_DIR)):
-        pack = load_step(_OBS_DIR, step)
+        pack = _pack(step)
         for row in pack.rows():
             if row["task_id"] != task or row["sample_role"] != "bare":
                 continue
@@ -252,7 +437,7 @@ def _segment_report(step_lo: int, step_hi: int, role: str) -> dict:
     for step in list_steps(Path(_OBS_DIR)):
         if not (step_lo <= step <= step_hi):
             continue
-        pack = load_step(_OBS_DIR, step)
+        pack = _pack(step)
         groups: dict[str, list] = {"won": [], "lost": []}
         for row in pack.rows():
             if role and row["sample_role"] != role:
@@ -299,7 +484,7 @@ def _tasks() -> list[str]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):  # quiet
+    def log_message(self, *args):  # quiet (slow requests are logged in do_GET)
         pass
 
     def _json(self, payload, code=200):
@@ -311,23 +496,50 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802
+        t0 = time.time()
+        try:
+            self._route()
+        finally:
+            dt = time.time() - t0
+            if dt > 1.0:  # slow requests must be visible to the operator
+                print(f"[microscope] {self.path} took {dt:.1f}s", flush=True)
+
+    def _route(self):
         url = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
         try:
             if url.path == "/api/meta":
+                # Deliberately CHEAP (no task scan): the front-end must boot
+                # instantly even on a cold 5 GB obs dir.
                 return self._json(
                     {
                         "obs_dir": _OBS_DIR,
                         "steps": list_steps(Path(_OBS_DIR)),
                         "metrics": list(_METRICS),
                         "tokenizer": _TOKENIZER is not None,
-                        "tasks": _tasks(),
+                        "sizes_mb": _step_sizes_mb(),
                     }
                 )
+            if url.path == "/api/status":
+                with _STATE_LOCK:
+                    loading = {
+                        str(s): round(time.time() - ts, 1)
+                        for s, ts in _LOADING.items()
+                    }
+                    loaded = sorted(_PACKS)
+                return self._json({"loading": loading, "loaded": loaded})
+            if url.path == "/api/tasks":
+                return self._json(_tasks())
             if url.path == "/api/samples":
                 return self._json(_samples(int(q["step"])))
             if url.path == "/api/sample":
-                return self._json(_sample_payload(int(q["step"]), int(q["hash"])))
+                return self._json(_sample_skeleton(int(q["step"]), int(q["hash"])))
+            if url.path == "/api/sample_tokens":
+                return self._json(_sample_tokens(
+                    int(q["step"]), int(q["hash"]), q.get("lo"), q.get("hi")))
+            if url.path == "/api/sample_tracks":
+                return self._json(_sample_tracks(
+                    int(q["step"]), int(q["hash"]), q.get("lo"), q.get("hi")))
             if url.path == "/api/position":
                 return self._json(
                     _position_payload(int(q["step"]), int(q["hash"]), int(q["pos"]))

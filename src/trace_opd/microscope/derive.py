@@ -100,9 +100,11 @@ def tracks(row: dict[str, Any], clamp: float = LOG_PROB_MIN_CLAMP) -> dict[str, 
     return out
 
 
-def divergence_label(row: dict[str, Any], pos: int) -> str:
-    """Coarse per-position diagnosis for the inspector."""
-    tr = tracks(row)
+def divergence_label(row: dict[str, Any], pos: int, tr: dict | None = None) -> str:
+    """Coarse per-position diagnosis for the inspector. Pass the (cached)
+    tracks to avoid recomputing the full per-token sweep per click."""
+    if tr is None:
+        tr = tracks(row)
     if not row["covered"][pos] or not row["response_mask"][pos]:
         return "unmasked"
     t_ent, s_ent = tr["teacher_entropy"][pos], tr["student_entropy"][pos]
