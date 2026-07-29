@@ -13,12 +13,21 @@ const $ = (sel) => document.querySelector(sel);
 const ACTIVE = new Map();   // id -> {label, t0}
 let REQ_ID = 0;
 let LAST_ERR = null;
-async function api(path, label) {
+// One AbortController per view: re-entering a view CANCELS its stale
+// requests (the screenshot showed two identical "step 9 样本表" fetches in
+// flight — duplicated load that also doubled backend work).
+const VIEW_ABORT = {};
+function viewSignal(view) {
+  if (VIEW_ABORT[view]) VIEW_ABORT[view].abort();
+  VIEW_ABORT[view] = new AbortController();
+  return VIEW_ABORT[view].signal;
+}
+async function api(path, label, signal) {
   const id = ++REQ_ID;
   ACTIVE.set(id, { label: label || path, t0: Date.now() });
   renderStatus();
   try {
-    const r = await fetch(path);
+    const r = await fetch(path, signal ? { signal } : undefined);
     let j;
     try { j = await r.json(); }
     catch { throw new Error(`响应不是 JSON(HTTP ${r.status})`); }
@@ -26,11 +35,22 @@ async function api(path, label) {
     LAST_ERR = null;
     return j;
   } catch (err) {
-    LAST_ERR = { label: label || path, msg: String(err.message || err) };
+    if (err.name !== "AbortError")  // an aborted stale request is not an error
+      LAST_ERR = { label: label || path, msg: String(err.message || err) };
     throw err;
   } finally {
     ACTIVE.delete(id);
     renderStatus();
+  }
+}
+// Transient failures (backend busy decompressing) deserve retries, visibly.
+async function apiRetry(path, label, signal, tries = 3) {
+  for (let a = 1; ; a++) {
+    try { return await api(path, a > 1 ? `${label}(重试 ${a}/${tries})` : label, signal); }
+    catch (err) {
+      if (err.name === "AbortError" || a >= tries) throw err;
+      await new Promise((res) => setTimeout(res, 1500 * a * a));
+    }
   }
 }
 let SERVER_STATUS = null;   // /api/status payload while requests are slow
@@ -47,6 +67,7 @@ setInterval(async () => {
 function renderStatus() {
   const el = $("#g-status");
   if (!el) return;
+  let html = "";
   if (ACTIVE.size) {
     const parts = [...ACTIVE.values()].map((a) => {
       const s = ((Date.now() - a.t0) / 1000).toFixed(0);
@@ -58,16 +79,17 @@ function renderStatus() {
       extra = " — 后端正在解压观察包:" + Object.entries(loading)
         .map(([s, t]) => `step ${s}(已 ${t}s${sizeHint(s)})`).join("、");
     }
-    el.className = "status busy";
-    el.innerHTML = `<span class="spin"></span> 加载中:${esc(parts.join(" | "))}${esc(extra)}`;
-  } else if (LAST_ERR) {
-    el.className = "status err";
-    el.innerHTML = `⚠ ${esc(LAST_ERR.label)} 失败:${esc(LAST_ERR.msg)}
-      <a href="javascript:location.reload()">刷新重试</a>`;
-  } else {
-    el.className = "status"; el.textContent = "";
+    html += `<span class="spin"></span> 加载中:${esc(parts.join(" | "))}${esc(extra)}`;
   }
+  if (LAST_ERR) {  // shown ALONGSIDE busy — a failure must never be masked
+    html += `${html ? "<br>" : ""}<span class="errline">⚠ ${esc(LAST_ERR.label)} 失败:` +
+      `${esc(LAST_ERR.msg)}</span> <a href="javascript:location.reload()">刷新</a>` +
+      ` <a href="javascript:void(dismissErr())">知道了</a>`;
+  }
+  el.className = "status" + (LAST_ERR ? " err" : ACTIVE.size ? " busy" : "");
+  el.innerHTML = html;
 }
+function dismissErr() { LAST_ERR = null; renderStatus(); }
 function sizeHint(step) {
   const mb = META && META.sizes_mb && META.sizes_mb[String(step)];
   return mb ? `,${mb}MB,首次打开需数十秒` : "";
@@ -130,7 +152,8 @@ async function viewSamples(q) {
   const step = q.step != null ? +q.step : +sel.value || META.steps[META.steps.length - 1];
   sel.value = step;
   $("#s-count").textContent = "…";
-  window._rows = await api(`/api/samples?step=${step}`, `step ${step} 样本表`);
+  const signal = viewSignal("samples");  // cancels the previous step's fetch
+  window._rows = await apiRetry(`/api/samples?step=${step}`, `step ${step} 样本表`, signal);
   renderSamples();
 }
 function renderSamples() {
@@ -186,14 +209,20 @@ async function viewTraj(q) {
   $("#t-inspector").innerHTML = `<div class="dim pad">点击一个 token(指标就绪后)</div>`;
 
   const stale = () => TRAJ_KEY !== key;
+  const signal = viewSignal("traj");  // switching rows cancels the old streams
   // 1) skeleton first (cheap): it carries resp_len, which drives the
   //    chunked streams below — then tokens & tracks stream IN PARALLEL,
   //    each 2000-token window rendering the moment it lands.
   let sk;
   try {
-    sk = await api(`/api/sample?step=${q.step}&hash=${q.hash}`, "轨迹骨架");
-  } catch {
-    if (!stale()) $("#t-title").textContent = "骨架加载失败(见顶部状态条)";
+    sk = await apiRetry(`/api/sample?step=${q.step}&hash=${q.hash}`, "轨迹骨架", signal);
+  } catch (err) {
+    if (!stale() && err.name !== "AbortError") {
+      $("#t-title").innerHTML = `<span class="errline">骨架加载失败:` +
+        `${esc(String(err.message || err))}</span> ` +
+        `<a href="javascript:void(retryTraj())">重试</a>`;
+      window._retryQ = q;
+    }
     return;
   }
   if (stale()) return;
@@ -209,9 +238,9 @@ async function viewTraj(q) {
   const streamTokens = (async () => {
     for (let lo = 0; lo < TRAJ.n; lo += CHUNK) {
       if (stale()) return;
-      const part = await api(
+      const part = await apiRetry(
         `/api/sample_tokens?step=${q.step}&hash=${q.hash}&lo=${lo}&hi=${lo + CHUNK}`,
-        `token ${lo}–${Math.min(lo + CHUNK, TRAJ.n)}/${TRAJ.n}`);
+        `token ${lo}–${Math.min(lo + CHUNK, TRAJ.n)}/${TRAJ.n}`, signal);
       if (stale()) return;
       part.tokens.forEach((t, j) => { TRAJ.tokens[part.lo + j] = t; });
       TRAJ.tokensDone = part.hi;
@@ -223,10 +252,10 @@ async function viewTraj(q) {
   const streamTracks = (async () => {
     for (let lo = 0; lo < TRAJ.n; lo += CHUNK) {
       if (stale()) return;
-      const part = await api(
+      const part = await apiRetry(
         `/api/sample_tracks?step=${q.step}&hash=${q.hash}&lo=${lo}&hi=${lo + CHUNK}`,
         lo === 0 ? "指标派生(首次较慢,之后走缓存)" :
-          `指标 ${lo}–${Math.min(lo + CHUNK, TRAJ.n)}/${TRAJ.n}`);
+          `指标 ${lo}–${Math.min(lo + CHUNK, TRAJ.n)}/${TRAJ.n}`, signal);
       if (stale()) return;
       if (!TRAJ.tracks) {
         TRAJ.tracks = {}; TRAJ.repeat_mask = new Array(TRAJ.n).fill(0);
@@ -413,6 +442,7 @@ function renderInspector(p) {
       p.context.start + j === p.pos ? `<span class="cur">${esc(t)}</span>` : esc(t)
     ).join("")}</div>`;
 }
+function retryTraj() { TRAJ_KEY = ""; viewTraj(window._retryQ || {}); }
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 const rk = (r) => (r < 0 ? ">64" : `#${r + 1}`);
 

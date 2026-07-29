@@ -86,3 +86,4 @@ tbody tr { cursor: pointer; } tbody tr:hover { background: #20242e; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .pad { padding: 12px; }
 .tk.pending { color: #444; }
+.errline { color: #ffb3b3; }

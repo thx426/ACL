@@ -56,6 +56,7 @@ _STATE_LOCK = threading.Lock()
 _TRACKS: "OrderedDict[tuple, dict]" = OrderedDict()
 _TRACKS_CAP = 64
 _TRACKS_LOCK = threading.Lock()
+_SAMPLES_LOCKS: dict[int, threading.Lock] = {}
 
 _METRICS = (
     "kl_forward", "kl_reverse", "token_loss", "gap", "teacher_entropy",
@@ -195,6 +196,14 @@ def _samples(step: int) -> list[dict]:
     samples page opens in milliseconds — across restarts — without touching
     the 300 MB pack at all."""
     key = ("samples", step)
+    if key in _MEMO:
+        return _MEMO[key]
+    lock = _SAMPLES_LOCKS.setdefault(step, threading.Lock())
+    with lock:  # single-flight: a double-fired listing must not compute twice
+        return _samples_locked(step, key)
+
+
+def _samples_locked(step: int, key) -> list[dict]:
     if key in _MEMO:
         return _MEMO[key]
     sig = _pack_sig(step)
@@ -484,16 +493,27 @@ def _tasks() -> list[str]:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 keep-alive: the front-end polls /api/status every second while
+    # anything is loading — under HTTP/1.0 every poll opened a NEW connection,
+    # and with the default listen backlog of 5 a busy backend started
+    # REJECTING fresh connections (the skeleton request died at the network
+    # layer while long requests sat in flight). Persistent connections plus a
+    # deep backlog (see _Server) remove that whole failure class.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *args):  # quiet (slow requests are logged in do_GET)
         pass
 
     def _json(self, payload, code=200):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client aborted (view switch) — routine, not an error
 
     def do_GET(self):  # noqa: N802
         t0 = time.time()
@@ -600,4 +620,9 @@ def serve(obs_dir: str, tokenizer_path: str | None, host: str, port: int) -> Non
     print(f"[microscope] obs={obs_dir} steps={len(steps)} "
           f"tokenizer={'yes' if _TOKENIZER else 'NO (ids only)'}")
     print(f"[microscope] http://{host}:{port}  (ssh -L {port}:127.0.0.1:{port} <server>)")
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+
+    class _Server(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 128  # never bounce connections while decompressing
+
+    _Server((host, port), Handler).serve_forever()
