@@ -148,7 +148,9 @@ alfworld:
 # 稳定 profile 出处:CD-003 全量 run 第 4 次启动(铁稳配置,10240 天花板)
 # ---------------------------------------------------------------------------
 train:
-  model_path: "${TRACE_MODEL_PATH}"    # 基座:Qwen3-4B-Instruct-2507(PG-2)
+  model_path: "/data3/wushang/model/Qwen/Qwen3-1.7B"
+                            # [162-A2doc] 基座绝对路径写进配置。此前是 ${TRACE_MODEL_PATH}
+                            # 插值,在 162 上恰好与脚本默认值一致才没出事;写死以免路径变动。
   train_file: "${TRACE_TRAIN_FILE}"    # build_datasets 产出的 train parquet
   val_files:                            # 训练内 val = test 两 split 裸 greedy(RL 范式)
     - "${TRACE_VAL_SEEN_FILE}"
