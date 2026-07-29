@@ -438,8 +438,10 @@ def test_server_split_endpoints_cover_the_detail_view(fsdp_ns, tmp_path):
     server._step_sizes_mb.cache_clear()
 
     sk = server._sample_skeleton(3, 555)
-    assert sk["summary"]["resp_hash"] == 555
-    assert sk["audit"]["ok"] and "tracks" not in sk and "tokens" not in sk
+    # CD-006 req 3-AD: hashes cross the wire as STRINGS (64-bit ints lose
+    # precision in a browser's JSON.parse)
+    assert sk["summary"]["resp_hash"] == "555"
+    assert "audit" not in sk and "tracks" not in sk and "tokens" not in sk
     tk = server._sample_tokens(3, 555)
     assert len(tk["tokens"]) == R and tk["n"] == R
     # windowed (streaming) access returns the slice with its bounds
@@ -447,9 +449,11 @@ def test_server_split_endpoints_cover_the_detail_view(fsdp_ns, tmp_path):
     assert tk2["lo"] == 2 and tk2["hi"] == 5 and len(tk2["tokens"]) == 3
     tr = server._sample_tracks(3, 555)
     assert len(tr["tracks"]["kl_forward"]) == R
+    assert tr["audit"]["ok"]  # frame extras ride the first chunk (3-AC)
     assert (3, 555, R) in server._TRACKS  # cached for position clicks
     tr2 = server._sample_tracks(3, 555, "1", "4")
     assert len(tr2["tracks"]["kl_forward"]) == 3
+    assert "audit" not in tr2  # only the lo==0 chunk carries the extras
     # persistent derived caches landed next to the pack (rebuildable, signed)
     cache_dir = obs_dir / "step_00003" / "_cache"
     server._samples(3)
@@ -458,12 +462,59 @@ def test_server_split_endpoints_cover_the_detail_view(fsdp_ns, tmp_path):
     # a fresh process (cleared memory) must serve the listing WITHOUT the pack
     server._PACKS.clear(); server._MEMO.clear()
     rows = server._samples(3)
-    assert rows and rows[0]["resp_hash"] == 555
+    assert rows and rows[0]["resp_hash"] == "555"
     assert 3 not in server._PACKS  # summary came from the persistent cache
-    pos = server._position_payload(3, 555, 0)
+    # ...and the SKELETON too (3-AC fast path: no decompress on cached steps)
+    sk2 = server._sample_skeleton(3, 555)
+    assert sk2["summary"]["resp_hash"] == "555" and sk2["turn_spans"]
+    assert 3 not in server._PACKS
+
+
+def test_hashes_survive_a_browser_roundtrip(fsdp_ns):
+    """CD-006 req 3-AD: a hash above 2^53 must reach the front-end as a
+    string — float64 JSON parsing corrupts it otherwise (measured: 128/128
+    rows unusable in the browser)."""
+    import json
+
+    from trace_opd.microscope import server
+
+    ns, obs_ns, obs_dir = fsdp_ns
+    student_logits, nlp, nids = _mk_batch(seed=31)
+    out = ns["compute_forward_kl_topk"](student_logits, nlp, nids, _Cfg(), "thd")
+    obs = out["obs"]
+    R = student_logits.shape[1]
+    big = 8403814824414667099  # a real 64-bit hash from the field report
+    row = {
+        "resp_hash": big, "task_id": "t", "sample_role": "bare",
+        "won": 0, "reward": 0.0, "turn_spans": [[0, R]],
+        "response_ids": np.arange(R, dtype=np.int32) % 48,
+        "response_mask": np.ones(R, dtype=np.int8),
+        "realized_student_lp": np.zeros(R, dtype=np.float32),
+        "seg_start": 0, "seg_len": R,
+        "loss_mode": "forward_kl_topk", "log_prob_min_clamp": -10.0,
+    }
+    for key in ("teacher_ids", "teacher_lps", "student_ids", "student_lps",
+                "student_support_lps"):
+        row[key] = obs[key][0].float().numpy()
+    row["token_loss"] = out["distillation_losses"][0].detach().numpy()
+    obs_ns["_flush_step"](7, [row])
+
+    server._OBS_DIR = str(obs_dir)
+    server._TOKENIZER = None
+    server._PACKS.clear(); server._TRACKS.clear(); server._MEMO.clear()
+    server._step_sizes_mb.cache_clear()
+
+    rows = server._samples(7)
+    wire = json.dumps(rows[0])
+    assert f'"{big}"' in wire          # quoted on the wire
+    assert json.loads(wire)["resp_hash"] == str(big)
+    # the string round-trips back into the exact row
+    sk = server._sample_skeleton(7, rows[0]["resp_hash"])
+    assert sk["summary"]["resp_hash"] == str(big)
+    tk = server._sample_tokens(7, int(rows[0]["resp_hash"]))
+    assert tk["n"] == R
+    pos = server._position_payload(7, big, 0)
     assert pos["label"] and "scalars" in pos
     # every payload is JSON-serialisable (the wire contract)
-    for payload in (sk, tk, tr, pos):
+    for payload in (sk, tk, pos):
         json.dumps(payload)
-    # status endpoint state: the pack is resident, nothing loading
-    assert 3 in server._PACKS and not server._LOADING

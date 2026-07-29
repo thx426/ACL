@@ -264,6 +264,7 @@ async function viewTraj(q) {
         TRAJ.tracks = {}; TRAJ.repeat_mask = new Array(TRAJ.n).fill(0);
         Object.keys(part.tracks).forEach((k) => TRAJ.tracks[k] = new Array(TRAJ.n).fill(null));
       }
+      if (part.audit) renderAudit(part.audit);
       Object.entries(part.tracks).forEach(([k, arr]) =>
         arr.forEach((v, j) => { TRAJ.tracks[k][part.lo + j] = v; }));
       part.repeat_mask.forEach((v, j) => { TRAJ.repeat_mask[part.lo + j] = v; });
@@ -284,7 +285,9 @@ function renderSkeleton() {
     `<b>${esc(s.task_id.slice(0, 40))}</b> · step ${s.step} · ` +
     `<span class="won-${s.won}">${s.won ? "WON" : "LOST"}</span> · ` +
     `${s.resp_len} tok · ${s.turns} turns · ${TRAJ.skeleton.loss_mode}`;
-  const a = TRAJ.skeleton.audit;
+  $("#t-audit").textContent = "audit:随指标段载入…";
+}
+function renderAudit(a) {
   $("#t-audit").textContent =
     `audit ${a.ok ? "✓" : "✗"} (${a.checked} tok, exceed ${a.n_exceed ?? 0}, ` +
     `max_err ${(+a.max_err).toFixed(3)})`;

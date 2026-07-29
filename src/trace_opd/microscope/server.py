@@ -191,59 +191,88 @@ def _clean(value):
     return value
 
 
-def _samples(step: int) -> list[dict]:
-    """Listing rows, with a PERSISTENT summary cache: once computed, the
-    samples page opens in milliseconds — across restarts — without touching
-    the 300 MB pack at all."""
+def _summary_row(row: dict) -> dict:
+    """Listing row: derive's summary plus what the skeleton fast path needs.
+    resp_hash is serialised as a STRING — it is a 64-bit hash, and JSON
+    numbers above 2^53 lose precision the moment a browser parses them
+    (CD-006 req 3-AD: every hash round-tripped through JS came back wrong,
+    so the detail view could never open)."""
+    return {
+        **derive.sample_summary(row),
+        "resp_hash": str(row["resp_hash"]),
+        "turn_spans": [list(x) for x in row["turn_spans"]],
+    }
+
+
+def _samples_payload_cached(step: int):
+    """The summary payload if it is ALREADY available (memo or valid disk
+    cache) — never triggers a pack decompress. The skeleton fast path."""
     key = ("samples", step)
     if key in _MEMO:
         return _MEMO[key]
-    lock = _SAMPLES_LOCKS.setdefault(step, threading.Lock())
-    with lock:  # single-flight: a double-fired listing must not compute twice
-        return _samples_locked(step, key)
-
-
-def _samples_locked(step: int, key) -> list[dict]:
-    if key in _MEMO:
-        return _MEMO[key]
-    sig = _pack_sig(step)
     cache = _cache_dir(step) / "summary.json"
     if cache.exists():
         try:
             payload = json.loads(cache.read_text(encoding="utf-8"))
-            if payload.get("sig") == sig:
-                _MEMO[key] = payload["rows"]
-                return payload["rows"]
-        except Exception:  # noqa: BLE001 — cache corruption -> rebuild
+            if payload.get("sig") == _pack_sig(step) and payload.get("v") == 2:
+                _MEMO[key] = payload
+                return payload
+        except Exception:  # noqa: BLE001
             pass
-    pack = _pack(step)
-    rows = [derive.sample_summary(row) for row in pack.rows()]
-    try:
-        cache.write_text(json.dumps({"sig": sig, "rows": rows}), encoding="utf-8")
-    except OSError:
-        pass  # read-only obs dir: in-memory memo still holds
-    _MEMO[key] = rows
-    return rows
+    return None
+
+
+def _samples(step: int) -> list[dict]:
+    """Listing rows, with a PERSISTENT summary cache: once computed, the
+    samples page opens in milliseconds — across restarts — without touching
+    the 300 MB pack at all."""
+    payload = _samples_payload_cached(step)
+    if payload is not None:
+        return payload["rows"]
+    lock = _SAMPLES_LOCKS.setdefault(step, threading.Lock())
+    with lock:  # single-flight: a double-fired listing must not compute twice
+        payload = _samples_payload_cached(step)
+        if payload is not None:
+            return payload["rows"]
+        pack = _pack(step)
+        payload = {
+            "sig": _pack_sig(step), "v": 2, "loss_mode": pack.loss_mode,
+            "rows": [_summary_row(row) for row in pack.rows()],
+        }
+        try:
+            (_cache_dir(step) / "summary.json").write_text(
+                json.dumps(payload), encoding="utf-8")
+        except OSError:
+            pass  # read-only obs dir: in-memory memo still holds
+        _MEMO[("samples", step)] = payload
+        return payload["rows"]
 
 
 # ----------------------------------------------- detail view, split three ways
 
 def _sample_skeleton(step: int, resp_hash: int) -> dict:
-    """Everything the detail view needs to render its FRAME — cheap by
-    construction (no tracks, no per-token decode)."""
+    """The detail view's FRAME. Fast path (CD-006 req 3-AC): if the step's
+    summary cache exists, the skeleton is served from it WITHOUT touching the
+    pack — instant even on a cold 350 MB step the listing has visited.
+    audit/segments ride the first tracks chunk instead (they need the pack
+    anyway)."""
+    payload = _samples_payload_cached(step)
+    if payload is not None:
+        want = str(resp_hash)
+        for r in payload["rows"]:
+            if r["resp_hash"] == want:
+                return {
+                    "summary": r,
+                    "loss_mode": payload.get("loss_mode", ""),
+                    "turn_spans": r.get("turn_spans", []),
+                }
     pack = _pack(step)
     row = pack.row(resp_hash)
-    seg = (
-        segments.segment_spans(_tok_pieces(row["response_ids"]))
-        if _TOKENIZER is not None
-        else None
-    )
+    summary = _summary_row(row)
     return {
-        "summary": derive.sample_summary(row),
+        "summary": summary,
         "loss_mode": pack.loss_mode,
-        "turn_spans": row["turn_spans"],
-        "segments": seg,
-        "audit": derive.audit_row(row, loss_mode=pack.loss_mode, clamp=pack.log_prob_min_clamp),
+        "turn_spans": summary["turn_spans"],
     }
 
 
@@ -276,11 +305,19 @@ def _sample_tracks(step: int, resp_hash: int, q_lo=None, q_hi=None) -> dict:
     tr = _tracks_of(step, row)
     lo, hi = _window(len(row["response_ids"]), q_lo, q_hi)
     repeats = derive.repeat_positions(row)
-    return {
+    out = {
         "lo": lo, "hi": hi, "n": int(len(row["response_ids"])),
         "tracks": {k: _clean(v[lo:hi]) for k, v in tr.items()},
         "repeat_mask": [int(x) for x in repeats[lo:hi].tolist()],
     }
+    if lo == 0:  # frame extras ride the first chunk (they need the pack anyway)
+        out["audit"] = derive.audit_row(
+            row, loss_mode=pack.loss_mode, clamp=pack.log_prob_min_clamp)
+        out["segments"] = (
+            segments.segment_spans(_tok_pieces(row["response_ids"]))
+            if _TOKENIZER is not None else None
+        )
+    return out
 
 
 def _position_payload(step: int, resp_hash: int, pos: int) -> dict:
@@ -358,7 +395,7 @@ def _leaderboard(metric: str, step_lo: int, step_hi: int, mode: str, limit: int)
                 )
                 entries.append(
                     {
-                        "step": step, "hash": row["resp_hash"], "task": row["task_id"],
+                        "step": step, "hash": str(row["resp_hash"]), "task": row["task_id"],
                         "won": row["won"], "pos": int(pos),
                         "value": _clean(float(values[pos])), "snippet": snippet[:120],
                     }
@@ -392,7 +429,7 @@ def _evolution(task: str, metric: str) -> dict:
     # is the replica MEAN with n attached, never a last-writer-wins sample.
     cells = [
         {"step": step, "turn": turn, "value": _clean(float(np.mean(vals))),
-         "n": len(vals), "hash": reps[(step, turn)][0]}
+         "n": len(vals), "hash": str(reps[(step, turn)][0])}
         for (step, turn), vals in sorted(acc.items())
     ]
     out = {"task": task, "metric": metric, "cells": cells}

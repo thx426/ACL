@@ -42,8 +42,27 @@ class StepPack:
         self._load()
 
     def _load(self) -> None:
-        for path in sorted(self.dir.glob("rank*.npz")):
-            with np.load(path) as z:
+        # CD-006 req 3-AB: two decompression sinks fixed here. (1) NpzFile
+        # re-decompresses an array on EVERY z[key] access — the per-row loop
+        # below touched ~10 keys per row, so each array was decompressed
+        # hundreds of times per file. Materialise each file ONCE into a dict.
+        # (2) The rank files decompress in a thread pool (zlib releases the
+        # GIL), so multi-rank packs load in parallel.
+        from concurrent.futures import ThreadPoolExecutor
+
+        paths = sorted(self.dir.glob("rank*.npz"))
+
+        def materialise(path):
+            with np.load(path) as f:
+                return {k: f[k] for k in f.files}
+
+        if len(paths) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
+                datas = list(pool.map(materialise, paths))
+        else:
+            datas = [materialise(path) for path in paths]
+        for z in datas:
+            if True:
                 if "loss_mode" in z:
                     self.loss_mode = str(z["loss_mode"][0])
                     self.log_prob_min_clamp = float(z["log_prob_min_clamp"][0])
