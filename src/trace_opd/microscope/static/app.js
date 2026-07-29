@@ -100,6 +100,7 @@ let TRAJ = null;           // { skeleton, tokens, tracks, repeat_mask } — 渐�
 let TRAJ_KEY = "";         // `${step}:${hash}`
 let SEL = -1;              // selected position
 let TK_ELS = [];           // token span elements by position (no DOM queries)
+let LENS = null;           // magnifier lens state, reset per trajectory
 
 /* ---------- viridis-ish perceptual colormap ---------- */
 const VIRIDIS = [[68,1,84],[71,44,122],[59,81,139],[44,113,142],[33,144,141],
@@ -208,6 +209,9 @@ async function viewTraj(q) {
   TRAJ = { skeleton: null, tokens: null, tracks: null, repeat_mask: null,
            tokensDone: 0, tracksDone: 0, n: 0 };
   SEL = -1;
+  LENS = { center: null, pinned: false, touched: false,
+           lo: 0, hi: 0, cellW: 0, scaleVer: -1, scale: {} };
+  paintLens();
   $("#t-title").innerHTML = `<span class="spin"></span> 载入骨架…${esc(sizeHint(q.step))}`;
   $("#t-audit").textContent = "";
   $("#t-tokens").innerHTML = `<div class="dim pad">等待骨架…</div>`;
@@ -273,10 +277,10 @@ async function viewTraj(q) {
         arr.forEach((v, j) => { TRAJ.tracks[k][part.lo + j] = v; }));
       part.repeat_mask.forEach((v, j) => { TRAJ.repeat_mask[part.lo + j] = v; });
       TRAJ.tracksDone = part.hi;
-      paintTokens(part.lo, part.hi); paintMinimap(); paintHeat();
+      paintTokens(part.lo, part.hi); paintMinimap(); paintHeat(); paintLens();
       applyMaskClasses(part.lo, part.hi);
     }
-    if (!stale()) { paintTokens(); applyMaskClasses(); paintHeat(); }  // final pass
+    if (!stale()) { paintTokens(); applyMaskClasses(); paintHeat(); paintLens(); }  // final pass
     if (!stale() && q.pos != null) selectPos(+q.pos, false);
   })().catch(() => { if (!stale()) { window._retryQ = q; $("#t-inspector").innerHTML =
       `<div class="dim pad">指标派生中断 —
@@ -411,6 +415,7 @@ function paintMinimap() {
   }
   cv.onclick = (ev) => {
     const i = Math.floor((ev.offsetX / cv.clientWidth) * n);
+    if (LENS) { LENS.pinned = true; LENS.touched = true; LENS.center = i; }
     selectPos(i, true);
     if (TK_ELS[i]) TK_ELS[i].scrollIntoView({ block: "center" });
   };
@@ -433,8 +438,173 @@ function paintMinimap() {
     }
     hoverEl.textContent = text;
     hoverEl.style.display = "block";
+    if (LENS && !LENS.pinned) { LENS.touched = true; LENS.center = i; paintLens(); }
   };
   cv.onmouseleave = () => { hoverEl.style.display = "none"; };
+}
+/* ---------- local magnifier lens ----------
+ * A fixed-height strip under the overview band showing a token-level blow-up
+ * of the same five tracks around a focus position, on the SAME global color
+ * scale (so a token keeps its color across views). Follow mode: the focus
+ * tracks the mouse on the overview band. Click (band or lens) PINS the
+ * window; "解除固定" returns to follow mode. Clicking a lens cell selects
+ * that token like everywhere else. */
+function lensScale(track) {
+  if (LENS.scaleVer !== TRAJ.tracksDone) { LENS.scale = {}; LENS.scaleVer = TRAJ.tracksDone; }
+  if (!LENS.scale[track]) {
+    const vals = TRAJ.tracks[track];
+    LENS.scale[track] = [Math.min(0, quantile(vals, 0.02)), quantile(vals, 0.98) || 1];
+  }
+  return LENS.scale[track];
+}
+function lensDefaultCenter() {
+  if (SEL >= 0) return SEL;
+  const kl = (TRAJ.tracks && TRAJ.tracks.kl_forward) || [];
+  let best = 0, bv = -Infinity;
+  for (let i = 0; i < kl.length; i++)
+    if (kl[i] != null && kl[i] > bv) { bv = kl[i]; best = i; }
+  return best;
+}
+function turnOf(i) {
+  const spans = (TRAJ && TRAJ.skeleton && TRAJ.skeleton.turn_spans) || [];
+  let t = 0;
+  spans.forEach(([a], k) => { if (i >= a) t = k + 1; });
+  return t;
+}
+function paintLens() {
+  const cv = $("#t-lens");
+  if (!cv || !LENS) return;
+  const ctx = cv.getContext("2d"), dpr = devicePixelRatio;
+  cv.width = cv.clientWidth * dpr;
+  cv.height = cv.clientHeight * dpr;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!TRAJ || !TRAJ.tracks) {
+    ctx.font = `${12 * dpr}px monospace`;
+    ctx.fillStyle = "#7d8494";
+    ctx.fillText("指标载入后,在上方概览带移动鼠标即可局部放大", 12 * dpr, H / 2);
+    renderLensBar();
+    return;
+  }
+  if (!LENS.touched) LENS.center = lensDefaultCenter();
+  const n = TRAJ.n;
+  const tickH = 15 * dpr, footH = 14 * dpr;
+  const cellW = 14 * dpr;
+  const win = Math.max(8, Math.floor(W / cellW));
+  const lo = Math.max(0, Math.min(Math.max(0, n - win),
+    LENS.center - Math.floor(win / 2)));
+  const hi = Math.min(n, lo + win);
+  LENS.lo = lo; LENS.hi = hi; LENS.cellW = cellW;
+  LENS.tickH = tickH; LENS.footH = footH;
+  const rowH = (H - tickH - footH) / MINIMAP_TRACKS.length;
+
+  // turn boundaries inside the window (tick band + faint separators)
+  const spans = (TRAJ.skeleton && TRAJ.skeleton.turn_spans) || [];
+  ctx.font = `${10 * dpr}px monospace`;
+  spans.forEach(([a], t) => {
+    if (a < lo || a >= hi) return;
+    const x = (a - lo) * cellW;
+    ctx.fillStyle = "#3a4a5c";
+    ctx.fillRect(x, tickH, Math.max(1, dpr / 2), H - tickH - footH);
+    ctx.fillStyle = "#7f97ad";
+    ctx.fillRect(x, 2 * dpr, dpr, tickH - 4 * dpr);
+    ctx.fillStyle = "#a9bccc";
+    ctx.fillText(`t${t + 1}`, x + 3 * dpr, 12 * dpr);
+  });
+
+  MINIMAP_TRACKS.forEach((track, r) => {
+    const y0 = tickH + r * rowH;
+    const vals = TRAJ.tracks[track];
+    const [vlo, vhi] = lensScale(track);
+    for (let i = lo; i < hi; i++) {
+      const v = vals[i];
+      ctx.fillStyle = v == null ? "#20242c" : cmap((v - vlo) / (vhi - vlo || 1));
+      ctx.fillRect((i - lo) * cellW, y0, cellW - dpr, rowH - 2 * dpr);
+    }
+    ctx.font = `${11 * dpr}px monospace`;
+    const tw = ctx.measureText(track).width;
+    ctx.fillStyle = "rgba(8,10,14,0.78)";
+    ctx.fillRect(4 * dpr, y0 + 2 * dpr, tw + 10 * dpr, 15 * dpr);
+    ctx.fillStyle = "#e5edf5";
+    ctx.fillText(track, 9 * dpr, y0 + 13 * dpr);
+  });
+
+  // column markers: white = follow focus, accent = selected token
+  const markCol = (i, color) => {
+    if (i < lo || i >= hi) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1, dpr);
+    ctx.strokeRect((i - lo) * cellW - dpr / 2, tickH,
+                   cellW, H - tickH - footH);
+  };
+  if (!LENS.pinned && LENS.touched) markCol(LENS.center, "rgba(255,255,255,0.75)");
+  if (SEL >= 0) markCol(SEL, "#6ea8fe");
+
+  // position footer: pos labels every few tokens
+  ctx.font = `${10 * dpr}px monospace`;
+  const stepN = Math.max(5, Math.round(win / 40) * 5);
+  ctx.fillStyle = "#7d8494";
+  for (let i = Math.ceil(lo / stepN) * stepN; i < hi; i += stepN) {
+    const x = (i - lo) * cellW;
+    ctx.fillRect(x, H - footH, dpr, 3 * dpr);
+    ctx.fillText(String(i), x + 2 * dpr, H - 3 * dpr);
+  }
+
+  cv.onclick = (ev) => {
+    const i = lensIndexAt(ev.offsetX * dpr);
+    if (i == null) return;
+    LENS.pinned = true; LENS.touched = true;
+    selectPos(i, true);
+    if (TK_ELS[i]) TK_ELS[i].scrollIntoView({ block: "center" });
+  };
+  const hoverEl = $("#t-lenshover");
+  cv.onmousemove = (ev) => {
+    const i = lensIndexAt(ev.offsetX * dpr);
+    if (i == null) { hoverEl.style.display = "none"; return; }
+    const y = ev.offsetY * dpr;
+    let text;
+    if (y < tickH || y >= H - footH) {
+      text = `pos ${i} · turn ${turnOf(i) || "?"}`;
+    } else {
+      const r = Math.max(0, Math.min(MINIMAP_TRACKS.length - 1,
+        Math.floor((y - tickH) / rowH)));
+      const track = MINIMAP_TRACKS[r], v = TRAJ.tracks[track][i];
+      text = `${track} @ pos ${i}: ${v == null ? "—" : (+v).toFixed(4)}`;
+    }
+    hoverEl.textContent = text;
+    hoverEl.style.display = "block";
+  };
+  cv.onmouseleave = () => { hoverEl.style.display = "none"; };
+  renderLensBar();
+}
+function lensIndexAt(x) {
+  if (!LENS || !TRAJ || !TRAJ.tracks) return null;
+  const i = LENS.lo + Math.floor(x / LENS.cellW);
+  return i >= LENS.lo && i < LENS.hi ? i : null;
+}
+function lensUnpin() {
+  if (!LENS) return;
+  LENS.pinned = false;
+  paintLens();
+}
+function renderLensBar() {
+  const el = $("#t-lensbar");
+  if (!el) return;
+  if (!TRAJ || !TRAJ.tracks || !LENS) {
+    el.innerHTML = `<span class="dim">局部放大镜:指标载入后可用</span>`;
+    return;
+  }
+  const turn = turnOf(LENS.center);
+  const range = `窗口 ${LENS.lo}–${LENS.hi} / ${TRAJ.n} · 中心 pos ` +
+    `${LENS.center}${turn ? ` (turn ${turn})` : ""}`;
+  el.innerHTML = LENS.pinned
+    ? `<span class="pin">📌 已固定</span><span class="dim">${range} ·
+       点概览带或放大镜色块换位/选中</span>
+       <a id="t-lensunpin">解除固定,回到跟随模式</a>`
+    : `<span class="dim">跟随模式:随概览带鼠标移动 · ${range}${LENS.touched ? "" :
+       " · 默认定位 kl_forward 峰值"} · 点击即固定</span>`;
+  const unpin = $("#t-lensunpin");
+  if (unpin) unpin.onclick = lensUnpin;
 }
 /* ---------- wrapped per-token detail heatmap ----------
  * One CELL per token (always visible), one TURN per row (wrapping inside a
@@ -545,7 +715,14 @@ async function selectPos(i, push) {
   const el = TK_ELS[i];
   if (el) el.classList.add("sel");
   $("#t-tokens").focus({ preventScroll: true });
-  paintMinimap(); paintHeat(); heatScrollTo(i);
+  if (LENS) {
+    // pinned: re-center only when the selection leaves the window (so
+    // clicking cells inside a pinned lens never shifts it under the mouse);
+    // follow mode: keyboard/n-p navigation drags the lens along.
+    if (LENS.pinned ? (i < LENS.lo || i >= LENS.hi) : true) LENS.center = i;
+    LENS.touched = true;
+  }
+  paintMinimap(); paintHeat(); paintLens(); heatScrollTo(i);
   const [step, hash] = TRAJ_KEY.split(":");
   if (push) history.replaceState(null, "",
     `#/traj?${new URLSearchParams({ step, hash, track: $("#t-track").value, pos: i })}`);

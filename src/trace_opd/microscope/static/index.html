@@ -40,6 +40,44 @@
       <canvas id="t-minimap"></canvas>
       <div id="t-mmhover" class="mmhover"></div>
     </div>
+    <div id="t-lenswrap">
+      <div id="t-lensbar"><span class="dim">局部放大镜:指标载入后可用</span></div>
+      <canvas id="t-lens"></canvas>
+      <div id="t-lenshover" class="mmhover"></div>
+    </div>
+    <details id="t-legend">
+      <summary>热力图图例与指标说明</summary>
+      <div class="legend-body">
+        <div class="cbar-row"><span class="dim">低</span><div class="cbar"></div>
+          <span class="dim">高</span>
+          <span>每条轨道独立归一化:色标低端 = min(0, 全序列 2% 分位),高端 = 98% 分位,
+          超出两端按端点色饱和。概览带 / 局部放大 / 逐 token 细节图共用同一标度 ——
+          同一 token 在三个视图颜色一致,可直接对照。</span></div>
+        <div><span class="gray-sw"></span> 灰块 = 该位置此指标无值(prompt/observation 段、
+          teacher 未覆盖,或指标此处无定义,如 gap 在采样 token 落在 teacher top-K 之外时);
+          白竖线(概览带)/ 白框(细节图)/ <span style="color:var(--accent)">蓝框</span>(放大镜)
+          = 当前选中 token;概览带与放大镜顶部刻度带 = turn 边界与轮号;
+          放大镜白色列框 = 跟随模式下的鼠标焦点。</div>
+        <div class="legend-grid">
+          <b>kl_forward</b><span>前向 KL(teacher‖student),teacher top-K 支撑集(训练配置
+            K=64)上逐 token 计算;高 = teacher 想把该处分布拉向别处,蒸馏拉力大。</span>
+          <b>kl_reverse</b><span>反向 KL(student‖teacher),student top-K 支撑 + 尾桶修正,
+            与训练端 reverse_kl_topk 逐项同构;高 = student 把概率押在 teacher 不认可的候选上
+            (mode-seeking 的惩罚点)。</span>
+          <b>gap</b><span>实际生成 token 的 teacher logprob − student logprob;
+            正 = teacher 比 student 更看好这个已生成 token(student 尚未学到该处);
+            空值 = teacher 弃权(采样 token 不在其 top-K,本身即信号)。</span>
+          <b>teacher_entropy / student_entropy</b><span>各自 top-K 分布的熵;
+            高 = 该处分布发散、不确定。</span>
+          <b>overlap_count</b><span>teacher 与 student top-K 候选集的交集大小(0–K);
+            低 = 两侧候选几乎不重叠,分歧剧烈。</span>
+          <b>token_loss</b><span>训练端实收的逐 token loss(真值锚:直接读训练存档,
+            非前端派生);仅 mask=1 且 teacher 覆盖处有值。</span>
+        </div>
+        <div class="dim">文本区底纹 = 当前「着色」轨道数值;斜体暗色 = mask=0
+          (observation/框架 token,不进训练);半透明 = teacher 未覆盖。</div>
+      </div>
+    </details>
     <div id="t-heatwrap">
       <div id="t-heathover" class="mmhover"></div>
       <canvas id="t-heat"></canvas>
