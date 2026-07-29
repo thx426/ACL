@@ -400,7 +400,12 @@ def sft_ce_loss(model_output: dict, data: TensorDict) -> tuple[torch.Tensor, dic
     the distillation term uses (``agg_loss`` token-mean with an empty
     global_batch_info, which is what the pure-OPD path has always run), so
     ``sft_loss_coef`` weights one mean against another and means the same thing
-    in every ablation arm. It is computed here rather than through ``agg_loss``
+    in every ablation arm. NOTE (2026-07-29): that symmetry holds only while
+    the distillation term runs token-mean. Under ``loss_agg_mode=seq-mean-*``
+    the distillation term becomes a GLOBAL per-sequence mean while this term
+    stays a LOCAL per-micro-batch token mean — ``sft_loss_coef`` then weighs
+    two differently-shaped means, and its calibrated value does not carry over
+    across aggregation modes. It is computed here rather than through ``agg_loss``
     for one reason: a micro-batch may hold no expert token at all, and
     ``agg_loss`` would divide by that zero. Such a micro-batch contributes
     exactly 0 instead.
@@ -612,6 +617,37 @@ def distillation_loss(
             # the mask is non-empty and makes such a micro-batch contribute
             # exactly 0, which is what it has to say.
             batch_info = {"batch_num_tokens": response_mask.sum().clamp(min=1)}
+            if loss_agg_mode != "token-mean":
+                # CD-005 review of the seq-mean switch (2026-07-29). Equal
+                # weight per sequence means equal per GLOBAL sequence: without
+                # a global count, agg_loss's seq-mean branches divide by the
+                # LOCAL micro-batch row count, and the balanced partitioner
+                # packs long rows into few-row micro-batches — a 28k-token row
+                # riding alone would weigh ~10x a row sharing a 30-row
+                # micro-batch, handing long rows back almost exactly the
+                # length-proportional weight this mode is chosen to remove.
+                # And an all-masked micro-batch (expert rows) would make that
+                # local count zero -> 0/0 -> NaN into backward. The engine
+                # stamps the all-reduced non-empty-row count next to
+                # batch_num_tokens (forward_backward_batch); read it fail-loud,
+                # same contract as research_num_tokens. dp_size compensates
+                # FSDP's mean-allreduce of gradients, exactly as agg_loss
+                # expects. token-mean keeps the local denominator above,
+                # unchanged — every historical run trained on that contract.
+                try:
+                    global_seqs = float(data["batch_num_seqs"])
+                except KeyError as err:
+                    raise RuntimeError(
+                        f"loss_agg_mode={loss_agg_mode!r} needs the batch-global "
+                        "sequence count, but 'batch_num_seqs' is missing — the "
+                        "engine did not stamp it (forward_backward_batch)"
+                    ) from err
+                try:
+                    dp_size = float(data["dp_size"])
+                except KeyError:
+                    dp_size = 1.0
+                batch_info["global_batch_size"] = max(global_seqs, 1.0)
+                batch_info["dp_size"] = dp_size
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,

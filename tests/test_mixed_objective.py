@@ -479,15 +479,20 @@ def test_config_rejects_a_degenerate_gate_beta(tmp_path):
         _load(tmp_path, ", opd_gate_beta: 0")
 
 
-def test_fingerprint_is_byte_stable_for_the_default_mode(tmp_path):
-    """Three production arms were live on forward_kl_topk when the field landed.
-    The default mode must hash to EXACTLY the legacy 12-field material, or our
-    own resume guard refuses every one of their next restarts."""
+def test_fingerprint_is_byte_stable_for_the_legacy_objective(tmp_path):
+    """Three production arms were live on forward_kl_topk when the KL field
+    landed, and every historical run trained under token-mean aggregation.
+    Updated 2026-07-29: the loss_agg_mode DEFAULT is now seq-mean-token-mean,
+    so a default config is no longer the legacy objective — its fingerprint
+    must deviate (resuming a token-mean checkpoint under it is a cross-unit
+    resume the guard exists to refuse). Spelling token-mean back out IS the
+    legacy objective, and must hash to EXACTLY the legacy 12-field material,
+    or reproducing any historical run gets refused by our own guard."""
     import hashlib
 
     from trace_opd.common.config import objective_fingerprint
 
-    cfg, _ = _load(tmp_path)
+    cfg, _ = _load(tmp_path, overrides=["train.loss_agg_mode=token-mean"])
     t = cfg.train
     legacy_material = "|".join(
         str(x) for x in (
@@ -497,8 +502,11 @@ def test_fingerprint_is_byte_stable_for_the_default_mode(tmp_path):
             t.teacher_scoring_backend, cfg.research.enabled,
         )
     )
-    assert objective_fingerprint(cfg) == hashlib.sha1(
-        legacy_material.encode("utf-8")).hexdigest()[:12]
+    legacy_fp = hashlib.sha1(legacy_material.encode("utf-8")).hexdigest()[:12]
+    assert objective_fingerprint(cfg) == legacy_fp
+
+    default_cfg, _ = _load(tmp_path / "default")
+    assert objective_fingerprint(default_cfg) != legacy_fp
 
 
 def test_fingerprint_separates_kl_modes_and_beta_only_gates_the_gated_mode(tmp_path):

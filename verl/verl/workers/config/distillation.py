@@ -155,6 +155,12 @@ class DistillationLossConfig(BaseConfig):
     # warms its writer for ~30); document production and teacher selection run
     # from step one regardless — warmup gates the gradient, not the mechanism.
     research_warmup_steps: int = 0
+    # trace-opd intervention-OPD (its design 12): minimum number of rows with
+    # any distillation signal (non-zero response_mask) per training batch.
+    # Below the floor the WHOLE actor update is skipped — a batch whose loss
+    # is exactly 0 would still move the weights through AdamW's decoupled
+    # weight decay and advance the LR scheduler. 0 disables the floor.
+    min_signal_rows: int = 0
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -235,6 +241,8 @@ class DistillationLossConfig(BaseConfig):
                 raise ValueError(f"research_adv_clip must be finite and > 0, got {adv_clip}")
             if int(self.research_warmup_steps) < 0:
                 raise ValueError(f"research_warmup_steps must be >= 0, got {self.research_warmup_steps}")
+        if int(self.min_signal_rows) < 0:
+            raise ValueError(f"min_signal_rows must be >= 0 (0 disables), got {self.min_signal_rows}")
 
 
 @dataclass

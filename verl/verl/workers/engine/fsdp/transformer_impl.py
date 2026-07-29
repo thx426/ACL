@@ -663,6 +663,27 @@ class FSDPEngine(BaseEngine):
             )
             tu.assign_non_tensor(data, research_num_tokens=research_num_tokens.item())
 
+        # trace-opd seq-mean aggregation (CD-005 review 2026-07-29): the
+        # distillation term's seq-mean-* modes divide by a sequence count, and
+        # like batch_num_tokens above it has to be batch-GLOBAL — the local
+        # micro-batch row count is an artefact of the balanced partitioner
+        # (long rows land in few-row micro-batches and would win back the very
+        # length-proportional weight seq-mean removes), and an all-masked
+        # micro-batch would divide by zero. Counted over non-empty
+        # response_mask rows so all-zero rows (expert/pad) stay out of the
+        # denominator, matching agg_loss's seq_mask.
+        if "response_mask" in data.keys():
+            rmask = data["response_mask"]
+            if getattr(rmask, "is_nested", False):
+                batch_num_seqs = torch.stack([seg.any() for seg in rmask.unbind()]).sum()
+            else:
+                batch_num_seqs = (rmask.sum(dim=-1) > 0).sum()
+            batch_num_seqs = batch_num_seqs.to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_seqs, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_seqs=batch_num_seqs.item())
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )

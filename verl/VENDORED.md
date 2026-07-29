@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(9172da4)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(2ec0a65)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -54,6 +54,9 @@
 | 92f8ac9 | trace-opd:**自查加固(codex 轮之后)**。①vLLM 打分路径(1.7B 臂默认后端)此前对**每一行**做 prompt_logprobs 打分——16k 的 research 行会在 gpu_memory_utilization 预算之外分配 logprobs(R11a OOM 同型;expert 行的同款浪费也一直存在,loss 从不读它们的 teacher 列)⇒ sft/research 行改发对齐零 dummy(与 fsdp 后端跳过同形),行为等价、forward 不再烧;②separate 第二次 update 关 calculate_entropy(executor 侧曲线,对 research 长行是纯浪费的全词表 pass);③research 拆分行数不能被 dp 均分(failure prompt 残组)时响亮跳过该次 research update(短 rank 卡 collective 的廉价失败模式) |
 | 5389497+111c0e9 | trace-opd:**分布观察包(蒸馏显微镜数据层)**。`TRACE_OBS_DIR` 门控:两个 topk loss 函数内采集"最小完备源"四件套——teacher top-K(切片、clamp 前)/ student 在 teacher 支撑上的 logprobs(KL 自身中间量)/ student **自身** top-K(ids 本就为 overlap 诊断算过,lps 是唯一新增 gather,chunk 安全)/ pre-outer-clamp per-token loss(审计真值锚);分发层把每行 response 窗从 THD 打包流切出(no_padding_2_padding 同窗口)、与 ulysses 段求交,per-row 记录交给缓冲写盘器(每 step 每 rank 一个压缩 npz,下一 step 出现时 flush;Unicode dtype 免 pickle;loss_mode/clamp 元数据自包含)。KL/overlap/mass/熵/rank 全部由包离线可导 ⇒ 分析层可进化而数据不重采。best-effort 契约:任何失败自禁一次警告,训练零感知 |
 | 9172da4 | trace-opd:**观察包 codex 审阅修复(P0-1 + P1-9/10/11 + P2-4/9)**。P0-1:`global_steps` 在 TQ put 时逐行盖章 ⇒ 微批里是 NonTensorStack(list 语义),旧代码 `int()` 直接炸并在**首个微批永久自禁采集**(端到端测试手工构行、没走这条链)——现全形态解包;P1-9:`flush_all` 全仓零调用点 ⇒ 每个 run 的最后一个采样 step 必丢、单步冒烟零包——现 atexit 钩子 + join 在飞 writer;P1-10:`TRACE_OBS_*` 补进 Ray runtime-env 白名单(existing/remote 集群 worker 不继承 driver env,缺了就静默零包);P1-11:采样门提到一切 CPU 拷贝/组装之前(GPU 侧常量小开销如实注明);P2-4:SP 元数据随行;P2-9:非法 TRACE_OBS_EVERY 降级不外抛 |
+| 0f8bde1 | trace-opd:**min_signal_rows 低信号闸**(intervention-OPD design 12)。`DistillationLossConfig.min_signal_rows`(默认 0=关):全批带蒸馏信号(response_mask 非零)的行数低于阈值时整步跳过 actor update——零 loss 批仍会经 AdamW decoupled decay 与 LR scheduler 推动权重。trainer `_update_actor` 开头经 TQ 取 response_mask 计数 |
+| 224dd4e | trace-opd:min_signal 计数对 **NestedTensor** 掩码修复(CD-006 §3-X):`_count_signal_rows` shape-agnostic(nested 走 unbind、list/tuple 直用、张量按行迭代),干预机制的不等长训练行不再在首个 update 崩 `.tolist()` |
+| 2ec0a65 | trace-opd:**seq-mean 聚合的全局序列分母**(CD-005 审阅 CD-008 的 loss_agg_mode 切换)。engine `forward_backward_batch` 在 batch_num_tokens 旁 all-reduce 注入**全局非空 response_mask 行数** `batch_num_seqs`(nested 安全);蒸馏调用点在 `loss_agg_mode` 为 seq-mean-* 时 fail-loud 读取并向 `agg_loss` 传 `global_batch_size`+`dp_size`(FSDP 梯度 mean-allreduce 补偿)——否则 seq-mean 分母退化为**本地微批行数**,均衡分区器把长行装进少行微批,长行独占时权重可达同批短行的数十倍,几乎复刻 token-mean 的按长加权(P0-A);且全零掩码微批 0/0→NaN(P0-B)。**token-mean 分支逐字节不变**(历史 run 全部建立于本地 clamp 分母契约);另在 sft_ce_loss docstring 声明 sft_loss_coef 的 mean-对-mean 对称性仅在 token-mean 下成立 |
 
 ## 修改/更新流程(保持单一真源)
 

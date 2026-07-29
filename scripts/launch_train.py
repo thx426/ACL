@@ -227,6 +227,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # A tail sample longer than the budget rides in its own micro-batch
         # (verl 6d77dc7 clamps instead of asserting).
         f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={t.ppo_max_token_len_per_gpu}",
+        # 信用分配单位。蒸馏项也读它(distillation/losses.py 的 agg_loss 用
+        # actor config 的 loss_agg_mode),所以纯 OPD 下这一项就是 OPD 的聚合口径。
+        f"actor_rollout_ref.actor.loss_agg_mode={t.loss_agg_mode}",
         f"actor_rollout_ref.actor.strategy={t.fsdp_strategy}",
         f"actor_rollout_ref.ref.strategy={t.fsdp_strategy}",
         f"actor_rollout_ref.actor.fsdp_config.param_offload={t.param_offload}",

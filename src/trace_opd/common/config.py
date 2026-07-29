@@ -259,6 +259,21 @@ class TrainCfg:
     # 数据上不存在,自动缺席;显微镜仍落 per-token loss(gated 另有 gate 列)。
     opd_kl_mode: str = "forward_kl_topk"
     opd_gate_beta: float = 5.0        # 仅 reverse_kl_gated 消费;SDAR/SEED 均默认 5.0
+    # --- 损失的信用分配单位(verl actor.loss_agg_mode;蒸馏项与 policy 项共用)---
+    # token-mean(verl 默认,4B 主线 rkl/sp2 全部历史结论建立于此):
+    #   loss = Σ_token loss / batch_num_tokens —— 分母是全批 token 总数,
+    #   故**每条轨迹按其 token 数获得梯度权重**。CD-008 实测:step-17 时
+    #   85.5% 的 token 与 70.8% 的 loss 来自最终失败的轨迹,最长 10% 的行拿走
+    #   21.2% 的 token;而长尾恰恰是每 token 信息最低的部分
+    #   (ρ(length, loss mean) = −0.856),即长失败序列拥有最多"投票权"。
+    # seq-mean-token-mean(**现默认**,2026-07-29 用户裁定):每条轨迹先 token-mean,
+    #   再在序列间等权 ⇒ 信用单位从 token 变为轨迹,长尾不再按长度加权。
+    # ⚠️ 2026-07-29 起默认值由 verl 的 token-mean 改为 seq-mean-token-mean。
+    #    这会改变**所有未显式设置该项的配置**的有效梯度分布 —— 包括
+    #    162-4b-a0 / a800-4b-a0 / 162-1p7b-* 等既有实验配置。
+    #    要复现 2026-07-29 之前的任何 run,必须在其配置里显式写回
+    #    `loss_agg_mode: token-mean`(4B 主线 rkl/sp2 的全部历史结论建立于 token-mean)。
+    loss_agg_mode: str = "seq-mean-token-mean"
     # --- 混合目标(OPD × RL × SFT;docs/mixed-objective-design.md)---
     # 总损失 = OPD + mix_rl_weight × RL + mix_sft_weight × SFT。两个权重默认 0
     # ⇒ 与纯 OPD 逐字节一致(4B 主线无感知)。弱模型(1.7B)上 self-teacher 在
@@ -542,6 +557,15 @@ def _validate(cfg: "Config") -> None:
             f"train.opd_kl_mode={cfg.train.opd_kl_mode!r} must be one of "
             "forward_kl_topk / reverse_kl_k3 / reverse_kl_topk / reverse_kl_gated"
         )
+    if cfg.train.loss_agg_mode not in (
+        "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"
+    ):
+        # 与 verl ActorConfig.valid_loss_agg_modes 同集合;不同步会在 verl 侧才炸,
+        # 那时 ray 已起、researcher 端点已连,代价远高于这里一行校验。
+        problems.append(
+            f"train.loss_agg_mode={cfg.train.loss_agg_mode!r} must be one of "
+            "token-mean / seq-mean-token-sum / seq-mean-token-mean / seq-mean-token-sum-norm"
+        )
     if not (_math.isfinite(cfg.train.opd_gate_beta) and cfg.train.opd_gate_beta > 0):
         # β→0 把 gate 退化成平坦 0.5(半强度 logp-shift),负 β 反转到
         # teacher 否决的 token 上——都不是任何实验想表达的意思
@@ -772,6 +796,12 @@ def objective_fingerprint(cfg: "Config") -> str:
         material += f"|opd_kl_mode={t.opd_kl_mode}"
         if t.opd_kl_mode == "reverse_kl_gated":
             material += f"|opd_gate_beta={t.opd_gate_beta}"
+    # 聚合口径同一纪律,但基准取【历史隐含值 token-mean】而非当前默认
+    # (2026-07-29 起默认已是 seq-mean-token-mean):信用分配单位定义"优化什么",
+    # 跨口径 resume 必须被拒;而显式写回 token-mean 复现历史 run 时,指纹必须与
+    # 存量 manifest 逐字节一致——若以新默认为基准,复现 run 会被自家守卫拒掉。
+    if t.loss_agg_mode != "token-mean":
+        material += f"|loss_agg_mode={t.loss_agg_mode}"
     # self-research 通道同一纪律:默认关断(weight=0)不进 hash ⇒ 存量 run 指纹
     # 逐字节不变;开启后 N/K/模式/warmup 都定义"优化什么",跨值 resume 拒绝。
     rrl = cfg.research_rl

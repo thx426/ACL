@@ -118,6 +118,28 @@ def _tq_supports_checkpoint() -> bool:
     )
 
 
+def _count_signal_rows(sig_masks) -> int:
+    """Rows with any non-zero response-mask entry, shape-agnostically.
+
+    trace-opd intervention rows are truncated per row, so TransferQueue hands
+    the masks back as a NestedTensor — ``.tolist()`` RAISES on tensor
+    subclasses (CD-006 req 3-X; ``hasattr`` cannot tell, the attribute exists
+    and the call throws). Plain padded tensors, lists and numpy arrays all
+    take the row-iteration path below; nested tensors go through ``unbind``.
+    """
+    if getattr(sig_masks, "is_nested", False):
+        mask_rows = sig_masks.unbind()
+    elif isinstance(sig_masks, (list, tuple)):
+        mask_rows = sig_masks
+    else:
+        mask_rows = list(sig_masks)
+    n_signal = 0
+    for mask_row in mask_rows:
+        has = mask_row.any() if hasattr(mask_row, "any") else any(mask_row)
+        n_signal += int(bool(has))
+    return n_signal
+
+
 class PPOTrainer(ABC):
     """Base class for PPO trainer.
 
@@ -1751,6 +1773,35 @@ class PPOTrainer(ABC):
                 # on), so the memory-saving shortcut must stay off with it.
                 and float(getattr(distillation_loss_cfg, "research_loss_coef", 0.0) or 0.0) <= 0.0
             )
+        # trace-opd intervention-OPD (its design 12): the verified-intervention
+        # mechanism ships fixed-shape batches where slots without an admitted
+        # sample are ZERO-MASK pad rows. A batch below the signal floor still
+        # produces loss==0, but AdamW's decoupled weight decay would move the
+        # weights anyway and the LR scheduler would tick — skip the whole
+        # update, loudly, and let the step account for itself in the metrics.
+        min_signal = 0
+        if is_distillation_enabled(self.config.get("distillation")):
+            min_signal = int(
+                getattr(self.distillation_config.distillation_loss, "min_signal_rows", 0) or 0
+            )
+        if min_signal > 0:
+            sig_data = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["response_mask"]
+            )
+            sig_masks = sig_data.pop("response_mask")
+            n_signal = _count_signal_rows(sig_masks)
+            metrics["distill/signal_rows"] = float(n_signal)
+            if n_signal < min_signal:
+                metrics["distill/skipped_low_signal"] = 1.0
+                logger.error(
+                    "intervention-OPD: only %d rows carry distillation signal "
+                    "(< min_signal_rows=%d) — SKIPPING the actor update this step "
+                    "(no optimizer step, no scheduler tick)",
+                    n_signal, min_signal,
+                )
+                return batch
+            metrics["distill/skipped_low_signal"] = 0.0
+
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
