@@ -63,23 +63,29 @@ narration:
 # ---------------------------------------------------------------------------
 roles:
   researcher:               # research.backend=external 时使用
-    endpoint: "${TRACE_RESEARCHER_ENDPOINT}"   # 例 http://127.0.0.1:8302/v1(162 单机;跨机走 SSH 隧道)
-    model: "${TRACE_RESEARCHER_MODEL}"         # 例 Qwen3.6-27B
-    api_key_env: ""          # 需要鉴权时填**环境变量名**(如 TRACE_RESEARCHER_API_KEY);
-                            # 口令本身永不进配置文件
-    mode: local_sidecar      # local_sidecar = 本 run 起服并驱动其睡/醒
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"   # [A800-4B] 到第三台机 35B 的隧道池
+                            # (A800:1888x → 162:1888x → 跳板 183.174.61.200 → 173.0.69.2:888x)
+    model: qwen3.6-35b-a3b     # [A800-4B] 端点声明的 served-model-name(已对端点 /v1/models 核验)
+    api_key_env: TRACE_RESEARCHER_API_KEY   # [A800-4B] 只声明变量名,口令不入配置
+    mode: external_pool      # [A800-4B] 外部池:八张卡全留给训练,不起本地 27B
+                            # ⚠ 本键此前是模板默认 local_sidecar,而该形态会在本机起
+                            # 27B 抢卡(2026-07-26 已有同型事故);A800 无 27B 分时预算。
+                            # local_sidecar = 本 run 起服并驱动其睡/醒
                             # external_pool = 别人跑的端点(endpoint 可列多个,
                             # PooledClient 会话粘性+均衡+故障切换)。这一项取代了
                             # 脚本里的 EXTERNAL_RESEARCHER/REMOTE_RESEARCHER 开关;
                             # 端口不另设配置项——endpoint 是唯一真源,需要端口的
                             # 脚本从它解析,否则两者会漂移
-    sidecar_sleep: true     # 162 单机分时复用(用户定):研究/rollout 阶段 27B 唤醒,
+    sidecar_sleep: false    # [A800-4B] 远程池不适用 sleep/wake(加载校验强制这套组合)
+                            # 原注:162 单机分时复用(用户定):研究/rollout 阶段 27B 唤醒,
                             # 训练阶段 verl 经 /sleep?level=1 令其权重下沉 CPU RAM、
                             # KV 释放,FSDP 拿满 4 卡(verl sidecar patch,1e03590)。
                             # 27B 起服需 --enable-sleep-mode + VLLM_SERVER_DEV_MODE=1
                             # (serve_researcher.sh 已固化);27B 部署在独立机器时改 false
     sidecar_sleep_level: 1  # 1=权重下沉 CPU RAM(可快速唤醒)| 2=丢弃权重
-    dp_size: 2              # 27B server 的 vLLM data-parallel 实例数(DP2×TP2 部署)。
+    dp_size: 0              # [A800-4B] 独立副本池自己做 session-sticky 均衡,客户端不发
+                            # X-data-parallel-rank 头。原注(local_sidecar 形态):
+                            # 27B server 的 vLLM data-parallel 实例数(DP2×TP2 部署)。
                             # >0 ⇒ 客户端按 crc32(task_id) % dp_size 发
                             # X-data-parallel-rank 头,把同任务多轮会话钉在同一
                             # engine 的 prefix cache 上(vLLM 该头优先于 least-loaded,
@@ -157,7 +163,10 @@ train:
     - "${TRACE_VAL_UNSEEN_FILE}"
   experiment_name: trace_opd_v1
   project_name: trace_opd
-  n_gpus: 8                 # 2026-07-24 起 162 与他人共享,只用卡 0/1(用户裁定;恢复 4 卡等通知)。原 4 卡注释:
+  n_gpus: 8                 # [A800-4B 2026-07-27 用户裁定]**A800 八卡全给这一个 A0 臂**
+                            # (启动须配 CARDS=0,1,2,3,4,5,6,7;n_gpus 与 CARDS 数必须一致)。
+                            # 下面这行是从 162 模板带过来的残留注释,与本机无关:
+                            # 2026-07-24 起 162 与他人共享,只用卡 0/1(用户裁定;恢复 4 卡等通知)。原 4 卡注释:
                             # 分时:AgentLoop 阶段共存,训练阶段 sidecar_sleep 释放
                             # | 拓扑详见 design.md §9
   rollout_tp: 1             # rollout 引擎 TP(4 卡 ⇒ 2 replica)| 用户裁定方向:为长程
@@ -193,7 +202,17 @@ train:
   # 容量声明,不是机制上限——机制对轨迹长度无假设;包络变大时按 design.md
   # §6.1 伸缩:rollout 侧 TP/显存配比,训练侧 token 预算 + Ulysses 序列并行 +
   # 多机,而非让任务迁就配置。三项必须联动(见各自注释)。----
-  response_length: 32768    # episode 响应流预算(训练+研究实验共用;=评测预算,训评
+  response_length: 16384    # [A800-4B 2026-07-27 用户指令"减少训练序列长度避免 OOM"]
+                            # 32768 → 16384。**依据是 narpar(同机同拓扑 8 卡)的真实
+                            # 分布**,不是估算:前 15 步 p99 ≤ 15628、max ≤ 15689
+                            # ⇒ 本上限在正常训练期**几乎零截断**;而 step-16 max 22266
+                            # (撞顶 81193MiB)、step-17 p90 已达 22995、max 32704 顶格
+                            # ——右尾失控恰是 OOM 的触发源,本上限正是对它的兜底。
+                            # 显存账:单微批 fp32 全词表 logits = seqlen×151936×4B,
+                            # 32768→18.6GiB、22266→12.6GiB、16384+2048→10.4GiB。
+                            # ⚠ 口径影响:`eval.response_budget` 仍为 32768(独立键),
+                            # 故右尾上训评不再严格同构;99% 分位以下无差别。
+                            # 原注:episode 响应流预算(训练+研究实验共用;=评测预算,训评
                             # 同构)| 用户裁定:50 步 episode 永不截断,不因输出长就
                             # 不训练。h3 曾在 52GB/卡 时代 32k OOM(其 10240 系显存
                             # 妥协);新分时拓扑训练阶段 ~76GB/卡 —— 32k 稳定性为
@@ -201,12 +220,18 @@ train:
   max_prompt_length: 2048   # 首轮 prompt(scaffold+初始 obs)上限,超长 fail-loud
                             # (truncation=error,非静默截断)| ALFWorld 实测 <1k;
                             # 首轮观测大的新环境(如表格类)按其包络调大
-  max_token_len_per_gpu: 34816   # **单序列容量声明**(仅此语义):本值 × ulysses_sp
-                                 # ≥ max_prompt+response=34816(加载强校验)。
+  max_token_len_per_gpu: 18432   # **单序列容量声明**(仅此语义):本值 × ulysses_sp
+                                 # ≥ max_prompt+response(加载强校验)。
+                                 # [A800-4B] 随 response_length 32768→16384 联动:
+                                 # 2048 + 16384 = 18432,sp=1 ⇒ 本值即 18432。
                                  # 2026-07-23 起**不再直接用作微批预算**——那曾把
                                  # 21.2GiB logits 喂进训练前反向连炸两次(feedback
                                  # P0);微批打包预算解耦为下面两个独立参数
-  ppo_max_token_len_per_gpu: 8192     # actor 训练前反向的微批**打包预算**/卡 |
+  ppo_max_token_len_per_gpu: 4096     # [A800-4B] 8192 → 4096:**4096 才是 narpar 在本机
+                                 # 8 卡上实际生效的值**(launch_manifest_20260726_071654
+                                 # 实证),配置里的 8192 从未在 A800 4B 上真跑过;而
+                                 # narpar 就是在 4096 下于 step-16 撞顶 ⇒ 不可再放宽。
+                                 # 原注:actor 训练前反向的微批**打包预算**/卡 |
                                  # **用户裁定 2026-07-23(8192 → 16384):训练阶段
                                  # 显存富余,适当上调提吞吐,前提是绝不 OOM。**
                                  # 依据 CD-006 smoke7 实测:ppo=8192 时
@@ -224,7 +249,8 @@ train:
                                  # +警告,超长条独占微批(显存不足则 loud OOM)。
                                  # cap30 实测 response_length/max=4243,离逼近余量的
                                  # ~14k 单条很远,长尾风险低
-  log_prob_max_token_len_per_gpu: 8192  # old_log_prob 推理阶段打包预算/卡(纯
+  log_prob_max_token_len_per_gpu: 4096  # [A800-4B] 随上条同步(narpar 实证值)。原注:
+                                 # old_log_prob 推理阶段打包预算/卡(纯
                                  # 推理逐 token 独立,数值等价;此阶段同时产出
                                  # actor/entropy 曲线故不可跳过)| 随上条同步
                                  # 12288 → 16384(用户裁定);该阶段无梯度激活、
@@ -242,10 +268,16 @@ train:
                             # sp == 0(加载校验)+ 注意力头数 % sp == 0(verl 启动
                             # 强校验)。部署前提:venv_train 须有可用 flash-attn
                             # (162 未验证,列冒烟 SP 首验项;不可用则回退多机)
-  rollout_max_model_len: 40960   # rollout 引擎单序列 ctx,须 ≥ teacher 前缀(scaffold
+  rollout_max_model_len: 24576   # [A800-4B] 随 response_length 联动:teacher 前缀
+                                 # (scaffold+文档+obs ≈3-4k)+ 16384 = 20480,取 24576
+                                 # 留 4k 余量。顺带降 vLLM 单序列 KV 上限。原注:
+                                 # rollout 引擎单序列 ctx,须 ≥ teacher 前缀(scaffold
                                  # +文档+obs ≈3-4k)+ response_length(teacher 打分
                                  # 序列最长)| h3 脚本 32k 档原生联动值;启动前有硬校验
-  rollout_max_num_batched_tokens: 2048   # vLLM chunked-prefill 每步 token 预算。
+  rollout_max_num_batched_tokens: 8192   # vLLM chunked-prefill 每步 token 预算。
+                            # ★ 2026-07-28 模板级默认由 2048 提到 8192(用户裁定;完整理由与
+                            #   显存账见 configs/trace.yaml 同键注释:step-17 CUDA 越界绕过 +
+                            #   27B 下线后余量由 7.5GB 增至 ~24GB)。回到大 sidecar 共存拓扑须调回。
                             # **同时决定 self-teacher 打分时的 logits 临时显存**:
                             # 每 chunk 物化全 vocab logits = 本值 × vocab 151936 ×
                             # 2B(TP all_gather 输出再 +1 份全量)——冒烟 OOM 根因
@@ -253,7 +285,11 @@ train:
                             # 降半 ⇒ 峰值 ≈0.58+0.29 GiB(账见 rollout_gpu_mem)。
                             # chunk 大小不影响 logprobs 数值(纯分块计算),decode
                             # 并发预算 2048 仍远高于实际并发,吞吐影响可忽略
-  rollout_gpu_mem: 0.7      # verl vLLM 显存占比(4 卡统一)| 2026-07-24 researcher 迁外部
+  rollout_gpu_mem: 0.4      # [A800-4B] 0.7 → 0.4:**0.4 是 narpar 在本机 8 卡 4B 上实际
+                            # 生效的值**(同 manifest 实证);0.7 只在 1.7B 上跑过,4B 的
+                            # 训练段峰值高得多,rollout 段多占 KV 会挤压 vLLM wake_up 时
+                            # 能拿到的物理页(2026-07-25 cumem_allocator OOM 的机理)。
+                            # 原注:verl vLLM 显存占比(4 卡统一)| 2026-07-24 researcher 迁外部
                             # 35B 池后 27B 下线、四卡归 policy 独占,0.35→0.7(CD-006 决策:训练阶段引擎 sleep 释放 KV 池,占比只影响 rollout 阶段;
                             # KV 扩容提 rollout 吞吐;训练阶段引擎休眠不受影响)。
                             # 0.35 = 与 27B 共存时的 h3 第 4 次启动铁稳值(回切 27B 时改回)。
@@ -311,12 +347,23 @@ train:
   distill_sample_every: 4   # 抽样率 1/N(确定性内容哈希,跨 rank 一致)
   total_epochs: 2           # 全量 3553、batch 16、drop_last ⇒ 222 step/epoch,
                             # 2 epoch = 444 step(每 epoch 仅 1 任务随 shuffle 轮空)
-  test_freq: 20             # 每 20 step 跑 val(seen140+unseen134 greedy)| 用户裁定
+  test_freq: 10             # [A800-4B] 20 → 10:**4B 的关键窗口全在 step-20 之前**——
+                            # 顿悟精确落在 step-9(162 sp2 与 trace_opd_v1 双重复现,
+                            # 行为签名逐位吻合),narpar 在 step-16 撞顶。test_freq=20
+                            # 会让第一个 val 点落在整个起飞过程之后,拿不到起飞前后
+                            # 的对照读数。10 = narpar 实际用值。原注:
+                            # 每 20 step 跑 val(seen140+unseen134 greedy)| 用户裁定
                             # (2026-07-23 第二次裁定:batch 32→16 后**仍保持 20**
                             # ——444/20 = 22 个 val 点,每 val 间隔 320 个任务,比
                             # h3(110/10=11 点、间隔 640)**时间分辨率更细一倍**;
                             # 用户明确以 val 墙钟 ≈6.6h 的代价换拐点分辨率)
-  save_freq: 20             # 每 20 step 存 checkpoint(含 hf_model)| 与 test_freq
+  save_freq: 5              # [A800-4B] 20 → 5:PG-5 的"峰值 checkpoint 存档"安全带要求
+                            # 崩塌**之前**的权重存得下来;4B 从起飞(step-9)到撞顶
+                            # (step-16)只有 7 步,20 步一存等于整段窗口无存档。
+                            # 磁盘账:launch_train.py 已钉死 save_contents 去 hf_model
+                            # + max_actor_ckpt_to_keep=3(:192,:195),单份 ~45G ⇒ 约
+                            # 135G 上限,/fs/fast 余 40T,无压力。5 = narpar 实际用值。
+                            # 原注:每 20 step 存 checkpoint(含 hf_model)| 与 test_freq
                             # 联动(每个 val 点都有对应 ckpt,峰值可回溯)
   # --- 从环境变量迁入(CD-006 requirements §3-F;用户 2026-07-26 裁定)---------
   # 这些原先只存在于启动脚本的 export,而代码侧另有一套 fallback 默认——两套真源,

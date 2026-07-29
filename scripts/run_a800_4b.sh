@@ -5,10 +5,13 @@ set -euo pipefail
 W=/fs/fast/u2021000902/wushang/workspace/TRACE-OPD
 T=$W/trace_opd
 PY=$W/env_vllm/bin/python
-CARDS=${CARDS:-0,1,2,3}
+CARDS=${CARDS:-0,1,2,3,4,5,6,7}
 NGPU=$(echo $CARDS | tr "," "\n" | wc -l)
-RUN_NAME=${RUN_NAME:-trace_opd_4b_a800}
 say(){ echo "[a800] $*"; }
+# RUN_NAME 的解析下移到 CONFIG 之后 —— run 名的单一真源是实验配置的 run.name。
+# 旧写法 `RUN_NAME=${RUN_NAME:-trace_opd_4b_a800}` 会用一个脚本内的默认值经 --run-name
+# **覆盖配置**,而 runs/trace_opd_4b_a800 已存在;resume_mode=auto 下这等于静默续跑
+# 另一个实验。同型 bug 已在 run_experiment_1p7b.sh 上修过一次(93f3d01),本脚本漏了。
 
 # ---- 资产门 ----
 export ALFWORLD_DATA=/fs/fast/u2021000902/wushang/workspace/data/alfworld_data
@@ -86,6 +89,17 @@ CONFIG_NAME=${CONFIG_NAME:-a800-4b-a0}
 CONFIG=$T/configs/experiments/${CONFIG_NAME}.yaml
 [[ -f "$CONFIG" ]] || { echo "FATAL 实验配置不存在: $CONFIG(先 config_tool new $CONFIG_NAME)"; exit 1; }
 say "配置: $CONFIG(解析后写入 <run_dir>/effective_config.yaml,所有进程读它)"
+
+# run 名的单一真源 = 配置的 run.name;RUN_NAME 只作显式覆盖(留空即用配置值)。
+CFG_RUN_NAME=$($PY -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])) or {}; print((d.get("run") or {}).get("name") or "")' "$CONFIG")
+RUN_NAME=${RUN_NAME:-$CFG_RUN_NAME}
+[[ -n "$RUN_NAME" ]] || { echo "FATAL run 名为空:配置缺 run.name 且未给 RUN_NAME"; exit 1; }
+say "run 名: $RUN_NAME(来源: ${RUN_NAME:+$([[ "$RUN_NAME" == "$CFG_RUN_NAME" ]] && echo 配置 run.name || echo RUN_NAME 显式覆盖)})"
+
+# CARDS 数与配置 n_gpus 必须一致 —— 两者不一致时 verl 按 n_gpus 建 world,
+# 而 CUDA_VISIBLE_DEVICES 只暴露 CARDS 张卡,表现为启动期卡死或索引越界。
+CFG_NGPU=$($PY -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])) or {}; print((d.get("train") or {}).get("n_gpus") or 0)' "$CONFIG")
+[[ "$NGPU" == "$CFG_NGPU" ]] || { echo "FATAL CARDS 给了 $NGPU 张卡($CARDS),但配置 train.n_gpus=$CFG_NGPU"; exit 1; }
 
 # ---- 单卡显存:optimizer 状态 offload 到 CPU(468G RAM) ----
 # 单卡不再有 FSDP 4 路分片:模型状态从 12GB/卡 涨到 48GB,不 offload 必 OOM
