@@ -214,8 +214,8 @@ student 没有的信息(在哪、什么形态);对于"student 一开始思路就
 - 训练日志与崩溃存档:`logs/`(每步标量打印)、
   `logs/crash_rkl_step17_0729_094827/`(step-17 崩溃完整日志)。
 - ⚠ `trace_opd_4b_rkl` 曾于 `2026-07-29T09:50:14` 从 ckpt_15 恢复重跑 16–17,
-  这两步目录混有新旧两批文件,**统计必须按文件 mtime 切分**(方法见
-  mixed-objective 分支 `docs/mixed-objective-runbook.md` §5.3)。
+  这两步目录混有新旧两批文件,**统计必须按文件 mtime 切分**(方法见本分支
+  `docs/mixed-objective-runbook.md` §5.3)。
 - 训练标量曲线:swanlab 在线(凭据 CD-006 持有,不在本文档);本地可从训练日志
   `logs/` 提取。**严禁运行 `swanlab sync`**(已实证会终结在跑 run 的云端记录)。
 
@@ -243,10 +243,11 @@ student 没有的信息(在哪、什么形态);对于"student 一开始思路就
 代码:`trace_opd` 仓 `src/trace_opd/microscope/`(reader/derive/segments/server)。
 两种用法,**批量统计走库,个例下钻走工作台**。
 
-**分支与版本说明**:被观察实验跑在 `mixed-objective` 分支,显微镜子系统在
-`mixed-objective` 与 `intervention-opd` 两分支**同步维护且已验证逐字节一致**
-(`git diff intervention-opd mixed-objective -- src/trace_opd/microscope/` 为空,
-截至 mixed-objective `c9e9fa9` / intervention-opd `5f0aa94`),本手册对两分支同样
+**分支与版本说明**:**本分支(`mixed-objective`)即被观察实验的代码分支**——
+`trace_opd_4b_rkl` 由本分支代码训练并落盘 obs 数据,分析应默认在本分支代码树上
+执行。显微镜子系统在本分支与 `intervention-opd` 两分支**同步维护且已验证逐字节
+一致**(`git diff intervention-opd mixed-objective -- src/trace_opd/microscope/`
+为空,截至本分支 `c9e9fa9` / intervention-opd `5f0aa94`),本手册在两分支同样
 成立;数据格式兼容为**实证**(CD-006 已用本工具在 rkl 全 17 步数据上跑通,见
 requirements §3-Z)。执行前自查:所用代码树的 `git log -1 -- src/trace_opd/microscope/`
 须不早于上述 commit(旧版本缺 audit 新判据、字符串 hash 等修复);162 生产树若旧,
