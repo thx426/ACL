@@ -99,6 +99,7 @@ let META = null;
 let TRAJ = null;           // { skeleton, tokens, tracks, repeat_mask } — 渐进填充
 let TRAJ_KEY = "";         // `${step}:${hash}`
 let SEL = -1;              // selected position
+let TK_ELS = [];           // token span elements by position (no DOM queries)
 
 /* ---------- viridis-ish perceptual colormap ---------- */
 const VIRIDIS = [[68,1,84],[71,44,122],[59,81,139],[44,113,142],[33,144,141],
@@ -222,6 +223,7 @@ async function viewTraj(q) {
         `${esc(String(err.message || err))}</span> ` +
         `<a href="javascript:void(retryTraj())">重试</a>`;
       window._retryQ = q;
+      TRAJ_KEY = "";  // unlock: re-clicking the same row restarts the view
     }
     return;
   }
@@ -246,8 +248,9 @@ async function viewTraj(q) {
       TRAJ.tokensDone = part.hi;
       fillTokenChunk(part.lo, part.hi);
     }
-  })().catch(() => { if (!stale()) $("#t-tokens").insertAdjacentHTML("beforeend",
-      `<div class="dim pad">token 流中断(见顶部状态条)</div>`); });
+  })().catch(() => { if (!stale()) { window._retryQ = q; $("#t-tokens").insertAdjacentHTML(
+      "beforeend", `<div class="dim pad">token 流中断 —
+      <a href="javascript:void(retryTraj())">重新载入本轨迹</a></div>`); } });
 
   const streamTracks = (async () => {
     for (let lo = 0; lo < TRAJ.n; lo += CHUNK) {
@@ -265,11 +268,13 @@ async function viewTraj(q) {
         arr.forEach((v, j) => { TRAJ.tracks[k][part.lo + j] = v; }));
       part.repeat_mask.forEach((v, j) => { TRAJ.repeat_mask[part.lo + j] = v; });
       TRAJ.tracksDone = part.hi;
-      paintTokens(); paintMinimap(); applyMaskClasses();
+      paintTokens(part.lo, part.hi); paintMinimap(); applyMaskClasses(part.lo, part.hi);
     }
+    if (!stale()) { paintTokens(); applyMaskClasses(); }  // final full pass (scale settles)
     if (!stale() && q.pos != null) selectPos(+q.pos, false);
-  })().catch(() => { if (!stale()) $("#t-inspector").innerHTML =
-      `<div class="dim pad">指标派生失败(见顶部状态条)</div>`; });
+  })().catch(() => { if (!stale()) { window._retryQ = q; $("#t-inspector").innerHTML =
+      `<div class="dim pad">指标派生中断 —
+      <a href="javascript:void(retryTraj())">重新载入本轨迹</a></div>`; } });
 
   await Promise.allSettled([streamTokens, streamTracks]);
 }
@@ -291,6 +296,7 @@ function buildTokensShell() {
   const spans = (TRAJ.skeleton && TRAJ.skeleton.turn_spans) || [];
   const starts = new Map(spans.map(([a], i) => [a, i]));
   const frag = document.createDocumentFragment();
+  TK_ELS = new Array(TRAJ.n);
   for (let i = 0; i < TRAJ.n; i++) {
     if (starts.has(i)) {
       const sep = document.createElement("span");
@@ -301,6 +307,7 @@ function buildTokensShell() {
     el.className = "tk pending"; el.dataset.i = i;
     el.textContent = "·";
     el.onclick = () => selectPos(i, true);
+    TK_ELS[i] = el;
     frag.appendChild(el);
   }
   host.appendChild(frag);
@@ -319,29 +326,33 @@ function buildTokensShell() {
 }
 function fillTokenChunk(lo, hi) {
   for (let i = lo; i < hi; i++) {
-    const el = document.querySelector(`#t-tokens .tk[data-i="${i}"]`);
-    const t = TRAJ.tokens[i];
+    const el = TK_ELS[i], t = TRAJ.tokens[i];
     if (el && t) { el.textContent = t.text.replace(/\n/g, "⏎\n"); el.classList.remove("pending"); }
   }
-  paintTokens();
+  paintTokens(lo, hi);
 }
-function applyMaskClasses() {
+function applyMaskClasses(lo = 0, hi = Infinity) {
   if (!TRAJ.tracks) return;
-  document.querySelectorAll("#t-tokens .tk").forEach((el) => {
-    const i = +el.dataset.i;
+  const end = Math.min(hi, TK_ELS.length);
+  for (let i = lo; i < end; i++) {
+    const el = TK_ELS[i];
+    if (!el) continue;
     el.classList.toggle("obs", !TRAJ.tracks.mask[i]);
     el.classList.toggle("uncov", !TRAJ.tracks.covered[i]);
-  });
+  }
 }
-function paintTokens() {
+function paintTokens(lo = 0, hi = Infinity) {
   if (!TRAJ || !TRAJ.tracks) return;
   const track = $("#t-track").value, vals = TRAJ.tracks[track] || [];
-  const hi = quantile(vals, 0.98) || 1, lo = Math.min(0, quantile(vals, 0.02));
-  document.querySelectorAll("#t-tokens .tk").forEach((el) => {
-    const v = vals[+el.dataset.i];
+  const q98 = quantile(vals, 0.98) || 1, q02 = Math.min(0, quantile(vals, 0.02));
+  const end = Math.min(hi, TK_ELS.length);
+  for (let i = lo; i < end; i++) {
+    const el = TK_ELS[i];
+    if (!el) continue;
+    const v = vals[i];
     el.style.background = v == null ? "transparent"
-      : cmap((v - lo) / (hi - lo || 1)) + "55";
-  });
+      : cmap((v - q02) / (q98 - q02 || 1)) + "55";
+  }
 }
 function paintMinimap() {
   if (!TRAJ || !TRAJ.tracks) return;
@@ -369,8 +380,7 @@ function paintMinimap() {
   cv.onclick = (ev) => {
     const i = Math.floor((ev.offsetX / cv.clientWidth) * n);
     selectPos(i, true);
-    const el = document.querySelector(`#t-tokens .tk[data-i="${i}"]`);
-    if (el) el.scrollIntoView({ block: "center" });
+    if (TK_ELS[i]) TK_ELS[i].scrollIntoView({ block: "center" });
   };
 }
 let SEL_SEQ = 0;
@@ -378,7 +388,7 @@ async function selectPos(i, push) {
   SEL = i;
   const seq = ++SEL_SEQ;
   document.querySelectorAll("#t-tokens .tk.sel").forEach((e) => e.classList.remove("sel"));
-  const el = document.querySelector(`#t-tokens .tk[data-i="${i}"]`);
+  const el = TK_ELS[i];
   if (el) el.classList.add("sel");
   $("#t-tokens").focus({ preventScroll: true });
   paintMinimap();
