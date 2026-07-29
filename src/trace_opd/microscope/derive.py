@@ -135,14 +135,37 @@ def repeat_positions(row: dict[str, Any], n: int = 4, min_repeats: int = 2) -> n
 
 
 def sample_summary(row: dict[str, Any]) -> dict[str, Any]:
-    tr = tracks(row)
-    m = row["response_mask"] & row["covered"]
-    def agg(track):
-        vals = tr[track][m]
-        vals = vals[np.isfinite(vals)]
-        return (float(vals.mean()), float(vals.max())) if len(vals) else (0.0, 0.0)
-    kl_mean, kl_max = agg("kl_forward")
-    gap_mean, _ = agg("gap")
+    """Listing-page scalars, computed WITHOUT the full tracks() sweep
+    (CD-006 req 3-Z: the old path burned 500+ s per step computing 14
+    per-token tracks — one of them an O(L·K²) broadcast — to keep four
+    means). Key set and semantics are unchanged, except kl_mean/kl_max now
+    read the TRAINED objective (the token_loss truth anchor, i.e. reverse
+    values under reverse_kl_topk) instead of always re-deriving forward KL —
+    strictly more honest for a listing of what trained."""
+    m = row["response_mask"].astype(bool) & row["covered"].astype(bool)
+    loss = row["token_loss"]
+    lm = m & np.isfinite(loss)
+    kl_mean = float(loss[lm].mean()) if lm.any() else 0.0
+    kl_max = float(loss[lm].max()) if lm.any() else 0.0
+
+    r_t = realized_teacher_lp(row)  # O(L·K)
+    gap = r_t - row["realized_student_lp"]
+    gm = m & np.isfinite(gap)
+    gap_mean = float(gap[gm].mean()) if gm.any() else 0.0
+
+    t_clamped = _clamp(row["teacher_lps"], LOG_PROB_MIN_CLAMP)
+    t_ent = -(np.exp(t_clamped) * t_clamped).sum(-1)  # O(L·K)
+    teacher_entropy_mean = float(t_ent[m].mean()) if m.any() else 0.0
+
+    overlap_mean = 0.0
+    idx = np.nonzero(m)[0]
+    if len(idx):
+        t_ids, s_ids = row["teacher_ids"], row["student_ids"]
+        total = 0
+        for i in idx:  # per-position isin: O(L·K log K), not O(L·K²)
+            total += int(np.isin(t_ids[i], s_ids[i]).sum())
+        overlap_mean = total / float(len(idx))
+
     return {
         "resp_hash": row["resp_hash"],
         "step": row["step"],
@@ -155,28 +178,45 @@ def sample_summary(row: dict[str, Any]) -> dict[str, Any]:
         "kl_mean": kl_mean,
         "kl_max": kl_max,
         "gap_mean": gap_mean,
-        "overlap_mean": float(tr["overlap_count"][m].mean()) if m.any() else 0.0,
-        "teacher_entropy_mean": float(tr["teacher_entropy"][m].mean()) if m.any() else 0.0,
+        "overlap_mean": overlap_mean,
+        "teacher_entropy_mean": teacher_entropy_mean,
         "turns": len(row["turn_spans"]),
     }
 
 
 def audit_row(
     row: dict[str, Any], atol: float = 0.05, loss_mode: str = "forward_kl_topk",
-    clamp: float = LOG_PROB_MIN_CLAMP,
+    clamp: float = LOG_PROB_MIN_CLAMP, max_exceed_frac: float = 0.005,
 ) -> dict[str, Any]:
     """Re-derive the TRAINED objective (per the pack's recorded loss_mode)
     from the quartet and compare against the training-side truth anchor
-    (fp16 both ways → tolerance ~5e-2)."""
+    (fp16 both ways → tolerance ~5e-2).
+
+    Verdict is on the EXCEED FRACTION, not the per-row max (CD-006 req 3-V):
+    the reverse tail term ``s_tail·(log s_tail − log t_tail)`` loses 4-5
+    significant digits when teacher mass ≈ 1−1e-4 survives an fp16 round
+    trip — a handful of such tokens in a 3000-token row is a storage-precision
+    artefact, not a data fault (measured: 0.1% of tokens failed 89% of rows).
+    A row passes when at most ``max_exceed_frac`` of its checked tokens
+    exceed ``atol``; the exceed count/fraction are reported so a reader never
+    mistakes 3/3000 for a broken row."""
     m = row["response_mask"] & row["covered"] & np.isfinite(row["token_loss"])
     if not m.any():
         # codex review P1-16: absent data is a FAILURE, not a pass — a gate
         # reporting OK on zero checked tokens hides every upstream loss.
-        return {"checked": 0, "max_err": 0.0, "ok": False}
+        return {"checked": 0, "max_err": 0.0, "n_exceed": 0, "exceed_frac": 0.0,
+                "ok": False}
     if loss_mode not in ("forward_kl_topk", "reverse_kl_topk"):
-        return {"checked": 0, "max_err": float("inf"), "ok": False}
+        return {"checked": 0, "max_err": float("inf"), "n_exceed": 0,
+                "exceed_frac": 1.0, "ok": False}
     formula = reverse_kl if loss_mode == "reverse_kl_topk" else forward_kl
     rederived = formula(row, clamp)[m]
     truth = row["token_loss"][m]
     err = np.abs(rederived - truth)
-    return {"checked": int(m.sum()), "max_err": float(err.max()), "ok": bool((err <= atol).all())}
+    n_exceed = int((err > atol).sum())
+    frac = n_exceed / float(len(err))
+    return {
+        "checked": int(m.sum()), "max_err": float(err.max()),
+        "n_exceed": n_exceed, "exceed_frac": round(frac, 6),
+        "ok": bool(frac <= max_exceed_frac),
+    }

@@ -342,3 +342,62 @@ def test_reader_refuses_a_row_key_collision(fsdp_ns):
     with pytest.raises(RuntimeError, match="collision"):
         StepPack(obs_dir, 5)
 
+
+
+def test_audit_verdict_is_fraction_based_not_max_based():
+    """CD-006 req 3-V: a handful of fp16-tail-cancellation tokens in a long
+    row is a storage artefact — the row passes on exceed FRACTION, with the
+    count reported; a broadly wrong row still fails."""
+    R, K = 1000, 4
+    rng = np.random.RandomState(0)
+    lps = np.log(rng.dirichlet(np.ones(8), size=R)[:, :K]).astype(np.float64)
+    row = {
+        "response_mask": np.ones(R, dtype=bool),
+        "covered": np.ones(R, dtype=bool),
+        "teacher_lps": lps,
+        "student_support_lps": lps - 0.1,
+    }
+    truth = derive.forward_kl(row)
+    # 3/1000 tokens off by a lot (cancellation-shaped): row must PASS
+    bad3 = truth.copy(); bad3[[10, 500, 900]] += 1.0
+    res = derive.audit_row({**row, "token_loss": bad3})
+    assert res["ok"] and res["n_exceed"] == 3
+    assert res["exceed_frac"] == pytest.approx(0.003)
+    assert res["max_err"] > 0.5  # max alone would have failed it
+    # 20/1000 off: broadly wrong, must FAIL
+    bad20 = truth.copy(); bad20[:20] += 1.0
+    res = derive.audit_row({**row, "token_loss": bad20})
+    assert not res["ok"] and res["n_exceed"] == 20
+
+
+def test_sample_summary_light_path_matches_tracks(fsdp_ns):
+    """CD-006 req 3-Z: the listing summary no longer runs the full tracks()
+    sweep — pin the light path against the heavy one on a real pack row."""
+    ns, obs_ns, obs_dir = fsdp_ns
+    student_logits, nlp, nids = _mk_batch(seed=5)
+    out = ns["compute_forward_kl_topk"](student_logits, nlp, nids, _Cfg(), "thd")
+    obs = out["obs"]
+    R = student_logits.shape[1]
+    row = {
+        "resp_hash": 7, "step": 1, "task_id": "t", "sample_role": "bare",
+        "won": 0, "reward": 0.0, "turn_spans": [[0, R]],
+        "response_ids": np.arange(R, dtype=np.int64) % 48,
+        "response_mask": np.ones(R, dtype=bool),
+        "covered": np.ones(R, dtype=bool),
+        "realized_student_lp": -np.random.RandomState(1).rand(R).astype(np.float32),
+    }
+    for key in ("teacher_ids", "teacher_lps", "student_ids", "student_lps",
+                "student_support_lps"):
+        row[key] = obs[key][0].float().numpy()
+    row["token_loss"] = out["distillation_losses"][0].detach().numpy()
+
+    summary = derive.sample_summary(row)
+    tr = derive.tracks(row)
+    m = row["response_mask"] & row["covered"]
+    assert summary["kl_mean"] == pytest.approx(float(tr["kl_forward"][m].mean()), abs=5e-2)
+    assert summary["overlap_mean"] == pytest.approx(float(tr["overlap_count"][m].mean()))
+    assert summary["teacher_entropy_mean"] == pytest.approx(
+        float(tr["teacher_entropy"][m].mean()), abs=1e-4)
+    gap = tr["gap"][m]
+    assert summary["gap_mean"] == pytest.approx(
+        float(gap[np.isfinite(gap)].mean()), abs=1e-4)

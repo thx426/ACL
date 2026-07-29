@@ -41,8 +41,11 @@ def main() -> int:
             checked_rows += 1
             if not res["ok"]:
                 bad += 1
+                # CD-006 req 3-V: say HOW MANY tokens exceeded, not just the
+                # max — 3/3000 must never read as "the whole row is wrong".
                 print(f"AUDIT FAIL step={step} hash={row['resp_hash']} "
-                      f"max_err={res['max_err']:.4f} checked={res['checked']}")
+                      f"exceed={res['n_exceed']}/{res['checked']} "
+                      f"({res['exceed_frac']:.2%}) max_err={res['max_err']:.4f}")
     if not steps or not checked_rows:
         # codex review P1-16: no packs / no rows is a data-integrity FAILURE,
         # not a pass — the P0 failure mode looked exactly like this.
