@@ -14,6 +14,8 @@ def main() -> int:
     s.add_argument("--tokenizer", default=None, help="model path for token text")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8643)
+    s.add_argument("--preload", type=int, default=2, metavar="N",
+                   help="background warm-up workers (newest step first; 0=off)")
     a = sub.add_parser("audit", help="re-derive the trained objective from packs "
                                      "and compare against the stored truth anchor")
     a.add_argument("--obs-dir", required=True)
@@ -23,7 +25,8 @@ def main() -> int:
     if args.cmd == "serve":
         from .server import serve
 
-        serve(args.obs_dir, args.tokenizer, args.host, args.port)
+        serve(args.obs_dir, args.tokenizer, args.host, args.port,
+              preload_workers=args.preload)
         return 0
 
     from . import derive

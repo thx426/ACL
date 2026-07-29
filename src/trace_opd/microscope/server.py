@@ -57,6 +57,10 @@ _TRACKS: "OrderedDict[tuple, dict]" = OrderedDict()
 _TRACKS_CAP = 64
 _TRACKS_LOCK = threading.Lock()
 _SAMPLES_LOCKS: dict[int, threading.Lock] = {}
+# Background preload progress (user ruling 2026-07-29: the listing must warm
+# itself — nobody should have to CLICK a step to trigger its first, slow
+# computation). Reported via /api/status, shown in the front-end meta line.
+_WARM = {"active": False, "total": 0, "done": 0, "current": None}
 
 _METRICS = (
     "kl_forward", "kl_reverse", "token_loss", "gap", "teacher_entropy",
@@ -584,7 +588,8 @@ class Handler(BaseHTTPRequestHandler):
                         for s, ts in _LOADING.items()
                     }
                     loaded = sorted(_PACKS)
-                return self._json({"loading": loading, "loaded": loaded})
+                    warm = dict(_WARM)
+                return self._json({"loading": loading, "loaded": loaded, "warm": warm})
             if url.path == "/api/tasks":
                 return self._json(_tasks())
             if url.path == "/api/samples":
@@ -646,7 +651,40 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(err).__name__}: {err}"}, 500)
 
 
-def serve(obs_dir: str, tokenizer_path: str | None, host: str, port: int) -> None:
+def _preload(workers: int) -> None:
+    """Warm every step's summary cache in the background, NEWEST FIRST (the
+    steps a user opens first), and keep the newest packs resident so the
+    first detail click skips the decompress too. User requests that land on
+    a step mid-warm share the same single-flight computation — never a
+    duplicate. Failures skip the step and keep warming."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    steps = sorted(list_steps(Path(_OBS_DIR)), reverse=True)
+    with _STATE_LOCK:
+        _WARM.update(active=True, total=len(steps), done=0, current=None)
+
+    def warm(step: int) -> None:
+        with _STATE_LOCK:
+            _WARM["current"] = step
+        try:
+            _samples(step)  # builds summary.json if missing (may decompress)
+            if steps.index(step) < _PACK_CAP:
+                _pack(step)  # newest packs stay resident for detail clicks
+        except Exception as err:  # noqa: BLE001 — warm what can be warmed
+            print(f"[microscope] preload step {step} failed: {err}", flush=True)
+        finally:
+            with _STATE_LOCK:
+                _WARM["done"] += 1
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        list(pool.map(warm, steps))
+    with _STATE_LOCK:
+        _WARM.update(active=False, current=None)
+    print(f"[microscope] preload complete: {len(steps)} steps warm", flush=True)
+
+
+def serve(obs_dir: str, tokenizer_path: str | None, host: str, port: int,
+          preload_workers: int = 2) -> None:
     global _OBS_DIR, _TOKENIZER
     _OBS_DIR = str(obs_dir)
     if tokenizer_path:
@@ -657,6 +695,10 @@ def serve(obs_dir: str, tokenizer_path: str | None, host: str, port: int) -> Non
     print(f"[microscope] obs={obs_dir} steps={len(steps)} "
           f"tokenizer={'yes' if _TOKENIZER else 'NO (ids only)'}")
     print(f"[microscope] http://{host}:{port}  (ssh -L {port}:127.0.0.1:{port} <server>)")
+    if preload_workers > 0 and steps:
+        threading.Thread(target=_preload, args=(preload_workers,), daemon=True).start()
+        print(f"[microscope] background preload started "
+              f"({preload_workers} workers, newest step first)", flush=True)
 
     class _Server(ThreadingHTTPServer):
         daemon_threads = True

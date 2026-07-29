@@ -533,6 +533,10 @@ function drawEvolution(data) {
 }
 
 /* ---------- boot ---------- */
+function baseMeta() {
+  return `${META.steps.length} steps · ${META.obs_dir}` +
+    (META.tokenizer ? "" : " · ⚠ 无 tokenizer(仅显示 id)");
+}
 (async () => {
   try {
     META = await api("/api/meta", "连接后端");
@@ -541,8 +545,23 @@ function drawEvolution(data) {
       — 确认 serve 进程与 SSH 隧道后<a href="javascript:location.reload()">刷新</a></span>`;
     return;
   }
-  $("#meta").textContent =
-    `${META.steps.length} steps · ${META.obs_dir}` +
-    (META.tokenizer ? "" : " · ⚠ 无 tokenizer(仅显示 id)");
+  $("#meta").textContent = baseMeta();
   route();
+  // background warm-up progress in the meta corner (server preloads every
+  // step's summary newest-first so nobody waits on a first click)
+  const warmTimer = setInterval(async () => {
+    try {
+      const r = await fetch("/api/status");
+      const w = (await r.json()).warm;
+      if (!w || !w.active) {
+        $("#meta").textContent = baseMeta() +
+          (w && w.total ? " · 预热完成" : "");
+        clearInterval(warmTimer);
+        return;
+      }
+      $("#meta").textContent = baseMeta() +
+        ` · 后台预热 ${w.done}/${w.total}` +
+        (w.current != null ? `(step ${w.current})` : "");
+    } catch { /* transient; keep polling */ }
+  }, 5000);
 })();

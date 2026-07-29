@@ -518,3 +518,46 @@ def test_hashes_survive_a_browser_roundtrip(fsdp_ns):
     # every payload is JSON-serialisable (the wire contract)
     for payload in (sk, tk, pos):
         json.dumps(payload)
+
+
+def test_background_preload_warms_every_step(fsdp_ns):
+    """User ruling 2026-07-29: the listing warms ITSELF — after preload every
+    step has a persistent summary cache and nobody's first click computes."""
+    ns, obs_ns, obs_dir = fsdp_ns
+    from trace_opd.microscope import server
+
+    for step in (11, 12):
+        student_logits, nlp, nids = _mk_batch(seed=40 + step)
+        out = ns["compute_forward_kl_topk"](student_logits, nlp, nids, _Cfg(), "thd")
+        obs = out["obs"]
+        R = student_logits.shape[1]
+        row = {
+            "resp_hash": 1000 + step, "task_id": "t", "sample_role": "bare",
+            "won": 0, "reward": 0.0, "turn_spans": [[0, R]],
+            "response_ids": np.arange(R, dtype=np.int32) % 48,
+            "response_mask": np.ones(R, dtype=np.int8),
+            "realized_student_lp": np.zeros(R, dtype=np.float32),
+            "seg_start": 0, "seg_len": R,
+            "loss_mode": "forward_kl_topk", "log_prob_min_clamp": -10.0,
+        }
+        for key in ("teacher_ids", "teacher_lps", "student_ids", "student_lps",
+                    "student_support_lps"):
+            row[key] = obs[key][0].float().numpy()
+        row["token_loss"] = out["distillation_losses"][0].detach().numpy()
+        obs_ns["_flush_step"](step, [row])
+
+    server._OBS_DIR = str(obs_dir)
+    server._TOKENIZER = None
+    server._PACKS.clear(); server._TRACKS.clear(); server._MEMO.clear()
+    server._step_sizes_mb.cache_clear()
+
+    server._preload(workers=2)
+    assert server._WARM["done"] == server._WARM["total"] >= 2
+    assert not server._WARM["active"]
+    for step in (11, 12):
+        assert (obs_dir / f"step_{step:05d}" / "_cache" / "summary.json").exists()
+    # a cleared process serves both listings pack-free
+    server._PACKS.clear(); server._MEMO.clear()
+    for step in (11, 12):
+        assert server._samples(step)
+    assert not server._PACKS  # all from persistent caches
