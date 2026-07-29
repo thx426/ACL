@@ -282,14 +282,33 @@ train:
   rollout_max_model_len: 40960   # rollout 引擎单序列 ctx,须 ≥ teacher 前缀(scaffold
                                  # +文档+obs ≈3-4k)+ response_length(teacher 打分
                                  # 序列最长)| h3 脚本 32k 档原生联动值;启动前有硬校验
-  rollout_max_num_batched_tokens: 2048   # vLLM chunked-prefill 每步 token 预算。
+  rollout_max_num_batched_tokens: 8192   # vLLM chunked-prefill 每步 token 预算。
                             # **同时决定 self-teacher 打分时的 logits 临时显存**:
                             # 每 chunk 物化全 vocab logits = 本值 × vocab 151936 ×
                             # 2B(TP all_gather 输出再 +1 份全量)——冒烟 OOM 根因
                             # (feedback P0)。h3 铁稳值 4096 系独占拓扑;共存拓扑
                             # 降半 ⇒ 峰值 ≈0.58+0.29 GiB(账见 rollout_gpu_mem)。
                             # chunk 大小不影响 logprobs 数值(纯分块计算),decode
-                            # 并发预算 2048 仍远高于实际并发,吞吐影响可忽略
+                            # 并发预算仍远高于实际并发,吞吐影响可忽略
+                            #
+                            # ★ 2026-07-28 由 2048 提到 8192(用户裁定,模板级默认,
+                            #   此后所有派生配置遵循)。两条理由:
+                            #   ① **故障驱动**:162 4B/SP2 的 step-17 在 2048 下连崩
+                            #      两次,同一 `CUDA error: illegal memory access`、同一
+                            #      位置(31/32 条),崩的都是还在生成的长序列。2048 配
+                            #      max_model_len=40960 会把多轮 append-only 构流的长
+                            #      prompt 切成极多 chunk,是最可疑的越界边界;提大分块
+                            #      粒度是**不改生成语义**的绕过(纯分块计算,logprobs
+                            #      数值不变)。
+                            #   ② **显存账已换拓扑**:上面 0.58/0.29 GiB 与下面
+                            #      rollout_gpu_mem 里的 7.5GB 余量都是 **27B 共存期**
+                            #      的账(27B 43GB + verl 28GB)。27B 下线、四卡归 policy
+                            #      独占后,vLLM 实测占 55.4GB/80GB,余量 ≈24GB;
+                            #      8192 ⇒ logits 峰值 ≈8192×151936×2B×2 ≈ 4.6GiB,
+                            #      仍在余量内。
+                            #   ⚠ 回到与 27B(或任何大 sidecar)共存的拓扑时**必须调回
+                            #      2048 或更低** —— 那时余量只有 ~7.5GB,4.6GiB 峰值会
+                            #      重演 feedback P0 的 OOM。
   rollout_gpu_mem: 0.7      # verl vLLM 显存占比(4 卡统一)| 2026-07-24 researcher 迁外部
                             # 35B 池后 27B 下线、四卡归 policy 独占,0.35→0.7(CD-006 决策:训练阶段引擎 sleep 释放 KV 池,占比只影响 rollout 阶段;
                             # KV 扩容提 rollout 吞吐;训练阶段引擎休眠不受影响)。

@@ -236,7 +236,10 @@ train:
   rollout_max_model_len: 40960   # rollout 引擎单序列 ctx,须 ≥ teacher 前缀(scaffold
                                  # +文档+obs ≈3-4k)+ response_length(teacher 打分
                                  # 序列最长)| h3 脚本 32k 档原生联动值;启动前有硬校验
-  rollout_max_num_batched_tokens: 2048   # vLLM chunked-prefill 每步 token 预算。
+  rollout_max_num_batched_tokens: 8192   # vLLM chunked-prefill 每步 token 预算。
+                            # ★ 2026-07-28 模板级默认由 2048 提到 8192(用户裁定;完整理由与
+                            #   显存账见 configs/trace.yaml 同键注释:step-17 CUDA 越界绕过 +
+                            #   27B 下线后余量由 7.5GB 增至 ~24GB)。回到大 sidecar 共存拓扑须调回。
                             # **同时决定 self-teacher 打分时的 logits 临时显存**:
                             # 每 chunk 物化全 vocab logits = 本值 × vocab 151936 ×
                             # 2B(TP all_gather 输出再 +1 份全量)——冒烟 OOM 根因
