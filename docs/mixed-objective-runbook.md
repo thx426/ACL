@@ -468,6 +468,19 @@ PYTHONPATH=src python3 -m trace_opd.microscope serve \
 - 分布对检查器(点击任意 token):双侧 top-64 合并条形、realized 金框、rank
   位移、质量外流条、分歧标签、±30 上下文。
 
+### 11.2b 2026-07-29 可用性大修后的行为变化(commit `a911157`)
+
+- **audit 判据变化(req 3-V)**:整行判定改为 **exceed_frac ≤ 0.5%**(不再按
+  per-row max)——fp16 尾桶抵消的极少数 token 不再打死整行,reverse 系门禁恢复
+  有效;FAIL 行输出 `exceed=N/total (x%)`,读法:先看占比再看 max。
+- **列表页毫秒开**:持久摘要缓存(`obs/step_*/_cache/summary.json`)——首次现算
+  一次后跨重启生效,不再解压 pack;req 3-Z 的 502s 场景消除。
+- **详情页三段流式**:骨架即刻 → token/指标按 2000-token 窗口并行流式渲染,
+  首块即可交互;每行指标派生一生一次(`_cache/tracks_*.npz`)。
+- **顶部状态条=真相来源**:在途请求+已等秒数+后端解压进度全部可见;失败红条
+  +重试。`_cache/` 为纯派生物,带真源指纹,可随意删除重建;obs 只读时自动跳过。
+- 重启 serve 即生效,无配置变化。
+
 ### 11.3 审计与服务器首验(上正式观察 run 前一次性完成)
 
 ```bash
