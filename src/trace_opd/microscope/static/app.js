@@ -360,31 +360,76 @@ function paintTokens(lo = 0, hi = Infinity) {
 function paintMinimap() {
   if (!TRAJ || !TRAJ.tracks) return;
   const cv = $("#t-minimap"), ctx = cv.getContext("2d");
-  const n = TRAJ.n;
-  cv.width = cv.clientWidth * devicePixelRatio;
-  const W = cv.width, rowH = cv.height / MINIMAP_TRACKS.length;
-  ctx.clearRect(0, 0, W, cv.height);
+  const n = TRAJ.n, dpr = devicePixelRatio;
+  cv.width = cv.clientWidth * dpr;
+  cv.height = cv.clientHeight * dpr;
+  const W = cv.width, H = cv.height;
+  const tickH = 16 * dpr;                                 // turn-boundary band
+  const rowH = (H - tickH) / MINIMAP_TRACKS.length;       // ~38px per track
+  ctx.clearRect(0, 0, W, H);
+
+  // turn boundaries: tick band on top, faint separators through the tracks
+  const spans = (TRAJ.skeleton && TRAJ.skeleton.turn_spans) || [];
+  ctx.font = `${9 * dpr}px monospace`;
+  const labelEvery = Math.max(1, Math.ceil(spans.length / 40));
+  spans.forEach(([a], t) => {
+    const x = (a / n) * W;
+    ctx.fillStyle = "#3a4a5c";
+    ctx.fillRect(x, tickH, Math.max(1, dpr / 2), H - tickH);
+    ctx.fillStyle = "#7f97ad";
+    ctx.fillRect(x, 2 * dpr, Math.max(1, dpr), tickH - 4 * dpr);
+    if (t % labelEvery === 0) {
+      ctx.fillText(String(t + 1), x + 2 * dpr, 11 * dpr);
+    }
+  });
+
   MINIMAP_TRACKS.forEach((track, r) => {
+    const y0 = tickH + r * rowH;
     const vals = TRAJ.tracks[track];
     const hi = quantile(vals, 0.98) || 1, lo = Math.min(0, quantile(vals, 0.02));
     for (let x = 0; x < W; x++) {
       const i = Math.floor((x / W) * n), v = vals[i];
       ctx.fillStyle = v == null ? "#222" : cmap((v - lo) / (hi - lo || 1));
-      ctx.fillRect(x, r * rowH, 1, rowH - 2);
+      ctx.fillRect(x, y0, 1, rowH - 3 * dpr);
     }
+    // readable label chip on its own backdrop
+    ctx.font = `${11 * dpr}px monospace`;
+    const tw = ctx.measureText(track).width;
+    ctx.fillStyle = "rgba(8,10,14,0.78)";
+    ctx.fillRect(4 * dpr, y0 + 3 * dpr, tw + 10 * dpr, 16 * dpr);
+    ctx.fillStyle = "#e5edf5";
+    ctx.fillText(track, 9 * dpr, y0 + 15 * dpr);
   });
-  ctx.fillStyle = "#ffffffcc";
-  ctx.font = `${10 * devicePixelRatio}px monospace`;
-  MINIMAP_TRACKS.forEach((t, r) => ctx.fillText(t, 4, r * rowH + 10 * devicePixelRatio));
   if (SEL >= 0) {
     ctx.fillStyle = "#fff";
-    ctx.fillRect((SEL / n) * W, 0, 2, cv.height);
+    ctx.fillRect((SEL / n) * W, 0, 2 * dpr, H);
   }
   cv.onclick = (ev) => {
     const i = Math.floor((ev.offsetX / cv.clientWidth) * n);
     selectPos(i, true);
     if (TK_ELS[i]) TK_ELS[i].scrollIntoView({ block: "center" });
   };
+  // hover readout: which track, which position, what value
+  const hoverEl = $("#t-mmhover");
+  cv.onmousemove = (ev) => {
+    const i = Math.max(0, Math.min(n - 1,
+      Math.floor((ev.offsetX / cv.clientWidth) * n)));
+    const yLogical = ev.offsetY * dpr;
+    let text;
+    if (yLogical < tickH) {
+      let turn = 0;
+      spans.forEach(([a], t) => { if (i >= a) turn = t + 1; });
+      text = `pos ${i} · turn ${turn || "?"}`;
+    } else {
+      const r = Math.max(0, Math.min(MINIMAP_TRACKS.length - 1,
+        Math.floor((yLogical - tickH) / rowH)));
+      const track = MINIMAP_TRACKS[r], v = TRAJ.tracks[track][i];
+      text = `${track} @ pos ${i}: ${v == null ? "—" : (+v).toFixed(4)}`;
+    }
+    hoverEl.textContent = text;
+    hoverEl.style.display = "block";
+  };
+  cv.onmouseleave = () => { hoverEl.style.display = "none"; };
 }
 let SEL_SEQ = 0;
 async function selectPos(i, push) {

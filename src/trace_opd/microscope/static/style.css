@@ -87,3 +87,11 @@ tbody tr { cursor: pointer; } tbody tr:hover { background: #20242e; }
 .pad { padding: 12px; }
 .tk.pending { color: #444; }
 .errline { color: #ffb3b3; }
+
+/* ---- minimap: full-size heatmap block (user ruling 2026-07-29) ---- */
+#t-mmwrap { position: relative; }
+#t-minimap { width: 100%; height: 210px; display: block; cursor: crosshair; }
+.mmhover { position: absolute; top: 4px; right: 8px; padding: 2px 8px;
+  font: 12px/1.5 monospace; color: #dfe7ef; background: #10141bd9;
+  border: 1px solid #2b3a4a; border-radius: 3px; pointer-events: none;
+  display: none; }
