@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(2ec0a65)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(f783026)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -57,6 +57,7 @@
 | 0f8bde1 | trace-opd:**min_signal_rows 低信号闸**(intervention-OPD design 12)。`DistillationLossConfig.min_signal_rows`(默认 0=关):全批带蒸馏信号(response_mask 非零)的行数低于阈值时整步跳过 actor update——零 loss 批仍会经 AdamW decoupled decay 与 LR scheduler 推动权重。trainer `_update_actor` 开头经 TQ 取 response_mask 计数 |
 | 224dd4e | trace-opd:min_signal 计数对 **NestedTensor** 掩码修复(CD-006 §3-X):`_count_signal_rows` shape-agnostic(nested 走 unbind、list/tuple 直用、张量按行迭代),干预机制的不等长训练行不再在首个 update 崩 `.tolist()` |
 | 2ec0a65 | trace-opd:**seq-mean 聚合的全局序列分母**(CD-005 审阅 CD-008 的 loss_agg_mode 切换)。engine `forward_backward_batch` 在 batch_num_tokens 旁 all-reduce 注入**全局非空 response_mask 行数** `batch_num_seqs`(nested 安全);蒸馏调用点在 `loss_agg_mode` 为 seq-mean-* 时 fail-loud 读取并向 `agg_loss` 传 `global_batch_size`+`dp_size`(FSDP 梯度 mean-allreduce 补偿)——否则 seq-mean 分母退化为**本地微批行数**,均衡分区器把长行装进少行微批,长行独占时权重可达同批短行的数十倍,几乎复刻 token-mean 的按长加权(P0-A);且全零掩码微批 0/0→NaN(P0-B)。**token-mean 分支逐字节不变**(历史 run 全部建立于本地 clamp 分母契约);另在 sft_ce_loss docstring 声明 sft_loss_coef 的 mean-对-mean 对称性仅在 token-mean 下成立 |
+| f783026 | trace-opd:**seq-mean 下所有目标项共用同一全局分母**(CD-005 审阅 P0-1/P0-3/P1-1 + P0-2 拦截;用户 2026-07-30 裁定,为 seq-mean × RL 实验解锁)。①混合 RL 聚合器在 clear 窗口内按模式预填 engine 注入的全局序列统计——蒸馏项经 batch_info 快照、RL 项(task_reward_pg)经 policy_loss_fn 的 `**global_batch_info` 消费**同一个分母**,名义 1:1 系数真等于 1:1(此前 RL 项退化为本地微批行数分母,实际 ≈N:1 且随序列长度漂移);②use_policy_gradient 路径同补(save/restore 防跨微批残留);③`dp_size` 与 `batch_num_seqs` 双 fail-loud(公共 helper `_stamped_global_seq_info`;engine 无条件注入,缺失即引擎坏,静默 1.0 会让 loss 落在真值 1/dp);④`sft_loss_coef>0 × seq-mean-*` 响亮拒绝——SFT 项是本地专家 token 均值,与全局行均值蒸馏项不可通约,SFT 臂在其单位裁定前只准 token-mean。**token-mean 全路径逐字节不变** |
 
 ## 修改/更新流程(保持单一真源)
 

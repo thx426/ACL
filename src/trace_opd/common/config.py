@@ -176,6 +176,16 @@ class EpisodeCfg:
     max_env_steps: int = 30          # user ruling 2026-07-23 (was 50); cap=30
                                      # keeps 94.2% of h3 successes (CD-006 data)
     max_assistant_turns: int = 40    # env budget + format-failure slack
+    # 单轮生成上限(reasoning+action)。此前是 protocol.py 的硬编码常量 2048;
+    # 2026-07-30 用户裁定提到 4096 并改为配置项。
+    # 依据(CD-008 实测,原 rkl):打满该上限的轮 step1-8 恒 0、s16 越 1%、s17 达 3.97%,
+    # 而**任一轮打满该轨迹的 won 率只剩 10.5%**(未打满的 70.4%)——打满的那一轮拿不到
+    # </action> 闭合,动作解析必然失败,于是"卡住→写更长→打满→新的无效动作"闭环。
+    # ⚠️ 它不进 objective_fingerprint(见 protocol.configure_episode_caps 的说明):
+    #    改的是采样协议不是优化目标,故跨值 resume 是允许的。要还原历史 run 的采样
+    #    行为,在其配置里显式写回 2048。
+    # ⚠️ 总预算 train.response_length 不变,单轮放宽会更快耗尽它 ⇒ 轮数可能减少。
+    max_tokens_per_turn: int = 2048
 
 
 @dataclass
@@ -557,14 +567,21 @@ def _validate(cfg: "Config") -> None:
             f"train.opd_kl_mode={cfg.train.opd_kl_mode!r} must be one of "
             "forward_kl_topk / reverse_kl_k3 / reverse_kl_topk / reverse_kl_gated"
         )
-    if cfg.train.loss_agg_mode not in (
-        "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"
-    ):
-        # 与 verl ActorConfig.valid_loss_agg_modes 同集合;不同步会在 verl 侧才炸,
-        # 那时 ray 已起、researcher 端点已连,代价远高于这里一行校验。
+    if not (128 <= cfg.episode.max_tokens_per_turn <= cfg.train.response_length):
+        # 下界:低于 ~128 连 <action> 标签都放不下,每轮必然格式失败;
+        # 上界:单轮不可能超过整条 response 的总预算,写大了是配置笔误。
+        problems.append(
+            f"episode.max_tokens_per_turn={cfg.episode.max_tokens_per_turn} must be in "
+            f"[128, train.response_length={cfg.train.response_length}]"
+        )
+    if cfg.train.loss_agg_mode not in ("token-mean", "seq-mean-token-mean"):
+        # 只放行两个经用户裁定的信用分配单位(2026-07-30 收窄,审阅 P1-2):
+        # verl 另有 seq-mean-token-sum[-norm],但 -norm 的 scale 因子取微批
+        # padded 宽度、随打包漂移,-sum 从未被裁定使用——在这里 fail-early
+        # 好过在 verl 侧以未定义口径静默跑完一个 run。
         problems.append(
             f"train.loss_agg_mode={cfg.train.loss_agg_mode!r} must be one of "
-            "token-mean / seq-mean-token-sum / seq-mean-token-mean / seq-mean-token-sum-norm"
+            "token-mean / seq-mean-token-mean (the two ruled-on units)"
         )
     if not (_math.isfinite(cfg.train.opd_gate_beta) and cfg.train.opd_gate_beta > 0):
         # β→0 把 gate 退化成平坦 0.5(半强度 logp-shift),负 β 反转到

@@ -188,6 +188,35 @@ def compute_topk_loss(
     return outputs
 
 
+def _stamped_global_seq_info(data) -> dict:
+    """Batch-global sequence-count info for seq-mean-* aggregation.
+
+    Read from the engine's stamps (``forward_backward_batch`` all-reduces the
+    non-empty response_mask row count next to batch_num_tokens), fail-loud on
+    BOTH fields: without the global count the seq-mean denominator degrades to
+    the LOCAL micro-batch row count (partitioner-dependent weighting, 0/0 on
+    an all-masked micro-batch); without dp_size the loss lands at 1/dp of the
+    true value under FSDP's gradient mean-allreduce (CD-005 review P1-1 —
+    the engine stamps it unconditionally, absence means a broken engine)."""
+    try:
+        global_seqs = float(data["batch_num_seqs"])
+    except KeyError as err:
+        raise RuntimeError(
+            "seq-mean aggregation needs the batch-global sequence count, but "
+            "'batch_num_seqs' is missing — the engine did not stamp it "
+            "(forward_backward_batch)"
+        ) from err
+    try:
+        dp_size = float(data["dp_size"])
+    except KeyError as err:
+        raise RuntimeError(
+            "seq-mean aggregation needs 'dp_size' to compensate FSDP's "
+            "gradient mean-allreduce, but the engine did not stamp it — "
+            "without it the loss lands at 1/dp of the true value"
+        ) from err
+    return {"global_batch_size": max(global_seqs, 1.0), "dp_size": dp_size}
+
+
 def distillation_ppo_loss(
     config: ActorConfig,
     distillation_config: Optional[DistillationConfig],
@@ -278,6 +307,20 @@ def distillation_ppo_loss(
         # scalar, neither of which should be scaled by an RL weight.
         saved_batch_info = dict(config.global_batch_info)
         config.global_batch_info.clear()
+        if config.loss_agg_mode != "token-mean":
+            # CD-005 review P0-1: under seq-mean-* BOTH terms must divide by
+            # the SAME batch-global sequence count, or the nominal
+            # mix_rl_weight ratio silently becomes ~N:1 (task_reward_pg
+            # aggregates through policy_loss_fn's `**config.global_batch_info`
+            # and, with the cleared window empty, agg_loss falls back to the
+            # LOCAL micro-batch row count — the exact defect the distillation
+            # branch routes around). Stage the engine-stamped info INSIDE the
+            # cleared window: distillation_loss consumes it via its
+            # `batch_info = dict(config.global_batch_info)` snapshot, the RL
+            # term through policy_loss_fn — one denominator, so 1:1 means 1:1.
+            # Under token-mean the window stays empty and both terms keep the
+            # historical local per-micro-batch mean, byte-for-byte.
+            config.global_batch_info.update(_stamped_global_seq_info(data))
         try:
             distill_loss, distill_metrics = distillation_loss(
                 config, distillation_config, model_output, data
@@ -320,6 +363,20 @@ def distillation_ppo_loss(
     # they have with the SFT arm off, and this term is a pure addition.
     sft_loss_coef = float(getattr(distillation_loss_config, "sft_loss_coef", 0.0) or 0.0)
     if sft_loss_coef > 0.0:
+        if config.loss_agg_mode != "token-mean":
+            # CD-005 review P0-2 guard: the SFT term is a LOCAL per-micro-batch
+            # expert-token mean while the distillation term is a GLOBAL
+            # per-sequence mean under seq-mean-* — sft_loss_coef would weigh
+            # two differently-shaped means and its effective strength would
+            # drift with how expert rows land in micro-batches. Blocked loud
+            # until the SFT term's unit under seq-mean is ruled on; run mixed
+            # SFT arms with loss_agg_mode: token-mean.
+            raise RuntimeError(
+                f"sft_loss_coef > 0 with loss_agg_mode={config.loss_agg_mode!r}: "
+                "the SFT term's local token-mean is incommensurable with the "
+                "global seq-mean distillation term — use token-mean for SFT "
+                "arms until the seq-mean SFT unit is defined"
+            )
         sft_loss, sft_metrics = sft_ce_loss(model_output, data)
         policy_loss = policy_loss + sft_loss * sft_loss_coef
         policy_metrics.update(sft_metrics)
@@ -581,8 +638,17 @@ def distillation_loss(
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
+        saved_pg_info = dict(loss_config.global_batch_info)
         for k, v in config.global_batch_info.items():
             loss_config.global_batch_info[k] = v
+        if loss_agg_mode != "token-mean" and not loss_config.global_batch_info:
+            # CD-005 review P0-3: with no upstream info this path would fall
+            # back to the LOCAL micro-batch row count under seq-mean-* (and
+            # 0/0 -> NaN on an all-masked micro-batch) — the same defect the
+            # direct branch below routes around, same cure. Restored in the
+            # finally: the config object outlives the micro-batch loop and
+            # batch_num_seqs changes across mini-batches.
+            loss_config.global_batch_info.update(_stamped_global_seq_info(data))
         log_prob = no_padding_2_padding(model_output["log_probs"], data)
         old_log_prob = data["old_log_probs"]
         if old_log_prob.is_nested:
@@ -590,15 +656,19 @@ def distillation_loss(
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
-        distillation_loss, pg_metrics = policy_loss_fn(
-            old_log_prob=old_log_prob,
-            log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
-            response_mask=response_mask,
-            loss_agg_mode=loss_agg_mode,
-            config=loss_config,
-            rollout_is_weights=rollout_is_weights,
-        )
+        try:
+            distillation_loss, pg_metrics = policy_loss_fn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=-distillation_losses.detach(),
+                response_mask=response_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=loss_config,
+                rollout_is_weights=rollout_is_weights,
+            )
+        finally:
+            loss_config.global_batch_info.clear()
+            loss_config.global_batch_info.update(saved_pg_info)
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
     else:
@@ -629,25 +699,14 @@ def distillation_loss(
                 # And an all-masked micro-batch (expert rows) would make that
                 # local count zero -> 0/0 -> NaN into backward. The engine
                 # stamps the all-reduced non-empty-row count next to
-                # batch_num_tokens (forward_backward_batch); read it fail-loud,
-                # same contract as research_num_tokens. dp_size compensates
-                # FSDP's mean-allreduce of gradients, exactly as agg_loss
-                # expects. token-mean keeps the local denominator above,
-                # unchanged — every historical run trained on that contract.
-                try:
-                    global_seqs = float(data["batch_num_seqs"])
-                except KeyError as err:
-                    raise RuntimeError(
-                        f"loss_agg_mode={loss_agg_mode!r} needs the batch-global "
-                        "sequence count, but 'batch_num_seqs' is missing — the "
-                        "engine did not stamp it (forward_backward_batch)"
-                    ) from err
-                try:
-                    dp_size = float(data["dp_size"])
-                except KeyError:
-                    dp_size = 1.0
-                batch_info["global_batch_size"] = max(global_seqs, 1.0)
-                batch_info["dp_size"] = dp_size
+                # batch_num_tokens (forward_backward_batch); read it fail-loud
+                # via _stamped_global_seq_info (both fields — dp_size too,
+                # CD-005 review P1-1), same contract as research_num_tokens.
+                # dp_size compensates FSDP's mean-allreduce of gradients,
+                # exactly as agg_loss expects. token-mean keeps the local
+                # denominator above, unchanged — every historical run trained
+                # on that contract.
+                batch_info.update(_stamped_global_seq_info(data))
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,

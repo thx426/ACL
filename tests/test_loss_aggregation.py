@@ -250,3 +250,97 @@ def test_launcher_carries_loss_agg_mode_to_verl(tmp_path):
                         overrides=["train.loss_agg_mode=token-mean"])
     cmd_t = mod.build_command(cfg_t, tmp_path / "run2")
     assert "actor_rollout_ref.actor.loss_agg_mode=token-mean" in cmd_t
+
+
+def test_call_site_fails_loud_when_dp_size_is_missing(distillation_ns):
+    """P1-1: dp_size is stamped unconditionally by the engine — absence means
+    a broken engine, and a silent 1.0 fallback would land the loss at 1/dp."""
+    ns, _ = distillation_ns
+    data = {"response_mask": torch.tensor([[True, True], [True, False]]),
+            "batch_num_seqs": 7}
+    with pytest.raises(RuntimeError, match="dp_size"):
+        _call_distillation(ns, "seq-mean-token-mean", data)
+
+
+class _TD(dict):
+    """Just enough TensorDict surface for task_reward_pg."""
+    def select(self, *fields):
+        return _TD({k: self[k] for k in fields})
+
+    def to_padded_tensor(self):
+        return self
+
+
+def _call_aggregator(ns, loss_agg_mode, *, rl_coef=0.0, sft_coef=0.0,
+                     pg_snapshots=None):
+    losses = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    ns["get_distillation_loss_fn"] = lambda mode: (
+        lambda config, distillation_config, model_output, data: (losses, {}))
+
+    def spy_policy_fn(**kw):
+        if pg_snapshots is not None:
+            pg_snapshots.append(dict(kw["config"].global_batch_info))
+        return torch.tensor(0.5), {}
+
+    ns["get_policy_loss_fn"] = lambda mode: spy_policy_fn
+    config = types.SimpleNamespace(loss_agg_mode=loss_agg_mode,
+                                   global_batch_info={},
+                                   policy_loss={"loss_mode": "vanilla"})
+    loss_cfg = types.SimpleNamespace(
+        loss_mode="fake", loss_max_clamp=None, use_policy_gradient=False,
+        use_task_rewards=False, rl_loss_coef=rl_coef, sft_loss_coef=sft_coef,
+        research_loss_coef=0.0, opd_loss_coef=1.0)
+    distillation_config = types.SimpleNamespace(distillation_loss=loss_cfg)
+    mask = torch.tensor([[True, True], [True, False]])
+    data = _TD({"response_mask": mask,
+                "old_log_probs": torch.zeros(2, 2),
+                "advantages": torch.tensor([[1.0, 0.0], [0.0, -1.0]]),
+                "batch_num_seqs": 5, "dp_size": 2})
+    model_output = {"log_probs": torch.zeros(2, 2)}
+    return ns["distillation_ppo_loss"](config, distillation_config,
+                                       model_output, data), config
+
+
+def test_aggregator_stages_one_denominator_for_both_terms_under_seq_mean(distillation_ns):
+    """P0-1: with RL on and seq-mean, the distillation agg_loss call AND the
+    policy_loss_fn must see the SAME engine-stamped global sequence count —
+    nominal 1:1 coefficients mean an actual 1:1."""
+    ns, calls = distillation_ns
+    snapshots = []
+    (_, config) = _call_aggregator(ns, "seq-mean-token-mean", rl_coef=1.0,
+                                   pg_snapshots=snapshots)
+    distill_kw = calls[-1]
+    assert distill_kw["global_batch_size"] == 5.0 and distill_kw["dp_size"] == 2.0
+    assert snapshots == [{"global_batch_size": 5.0, "dp_size": 2.0}]
+    # the staged window is restored afterwards — nothing leaks across batches
+    assert config.global_batch_info == {}
+
+
+def test_aggregator_token_mean_keeps_both_terms_on_the_local_contract(distillation_ns):
+    ns, calls = distillation_ns
+    snapshots = []
+    _call_aggregator(ns, "token-mean", rl_coef=1.0, pg_snapshots=snapshots)
+    distill_kw = calls[-1]
+    assert "global_batch_size" not in distill_kw and "dp_size" not in distill_kw
+    assert snapshots == [{}]
+
+
+def test_aggregator_blocks_sft_arms_under_seq_mean(distillation_ns):
+    """P0-2 guard: the SFT term's local expert-token mean is incommensurable
+    with a global per-sequence distillation mean — refuse loud, don't drift."""
+    ns, _ = distillation_ns
+    with pytest.raises(RuntimeError, match="sft_loss_coef"):
+        _call_aggregator(ns, "seq-mean-token-mean", sft_coef=0.5)
+
+
+def test_config_rejects_the_unruled_aggregation_modes(tmp_path):
+    """P1-2: only the two ruled-on units load; verl's -sum/-sum-norm are
+    refused fail-early (the -norm scale factor is packing-dependent)."""
+    from test_mixed_objective import _TEMPLATE_YAML, _write
+
+    from trace_opd.common.config import load_config
+
+    for bad in ("seq-mean-token-sum", "seq-mean-token-sum-norm"):
+        with pytest.raises(ValueError, match="loss_agg_mode"):
+            load_config(_write(tmp_path / bad, "c.yaml", _TEMPLATE_YAML),
+                        overrides=[f"train.loss_agg_mode={bad}"])
