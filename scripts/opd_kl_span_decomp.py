@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Lost-region OPD-KL thought/action span decomposition.
+"""OPD-KL / tg-soft-CE thought/action span decomposition.
 
-Design §动力学(teacher-grounding-design.md)预注册机理判据:tg 治教师的良性
-循环第二环——教师在 LOST 前缀上给学生的 per-token 目标是否变健康。读数 =
-lost(won=0)bare 行的 OPD per-token KL 按 thought/action 段分解:
+Design §动力学(teacher-grounding-design.md)预注册机理判据,两个镜像模式:
+
+--role bare(默认):良性循环**第二环**——教师在 LOST 前缀上给学生的
+per-token 目标是否变健康。读数 = lost(won=0)bare 行的 OPD per-token KL 按
+thought/action 段分解:
   * thought 段 per-token KL 均值 vs action 段 per-token KL 均值;
   * thought 段 KL 总量份额(并报 token 份额对照,排除"份额涨只是 token 变多");
 T1 预测:thought 段份额随训练下降/持平;基线预测:随叙述通胀上升。
+
+--role tg:良性循环**第一环**的显微版——教师被 tg 纠正的梯度花在哪。tg 行的
+token_loss 是 per-token soft-CE(q 离健康标签 p̄ 的距离),按同一 span 分解:
+  * 初期预测 thought 段占大头(教师叙述倾向 vs 学生健康标签的分歧集中区),
+    随训练收敛下降——即"教师的叙述形态被纠回学生健康形态"的逐 token 证据;
+  * tg 行 obs 的字段语义:teacher_* = 标签 p̄(裸分布 renorm top-64),
+    student_support_lps = q 在标签支持集上的 log-prob,student_* = q 自身
+    top-k(tg 行训练前向即 doc 条件的 q)。
 
 数据源:TRACE_OBS_DIR 观察包(verl observation.py 契约)——token_loss 是训练
 时 per-token KL 真值锚(pre-outer-clamp),turn_spans 是 response 坐标下的
@@ -137,12 +147,17 @@ def decompose_row(row, decode_one):
     return thought, action, partial
 
 
-def step_summary(rows, decode_one):
-    """Aggregate LOST bare rows of one step. Rows with incomplete SP coverage
-    are EXCLUDED and counted — a silently partial table reads as complete."""
+def step_summary(rows, decode_one, role="bare"):
+    """Aggregate one step. role="bare": LOST bare rows (OPD-KL, loop link 2);
+    role="tg": tg rows (soft-CE, loop link 1 — all tg rows are won by
+    construction). Rows with incomplete SP coverage are EXCLUDED and counted
+    — a silently partial table reads as complete."""
     th_all, ac_all, n_rows, n_partial = [], [], 0, 0
     for row in rows.values():
-        if row["won"] or row["role"] != "bare":
+        if role == "bare":
+            if row["won"] or row["role"] != "bare":
+                continue
+        elif row["role"] != "tg":
             continue
         th, ac, partial = decompose_row(row, decode_one)
         if partial:
@@ -158,7 +173,7 @@ def step_summary(rows, decode_one):
     total = th_sum + ac_sum
     n_th, n_ac = len(th_all), len(ac_all)
     return {
-        "lost_rows": n_rows,
+        "rows_used": n_rows,
         "partial_rows_excluded": n_partial,
         "thought_tokens": n_th,
         "action_tokens": n_ac,
@@ -176,6 +191,9 @@ def main():
                     help="HF tokenizer path (decode-only use, CPU)")
     ap.add_argument("--steps", default=None,
                     help="comma list to restrict, e.g. 2,4,6")
+    ap.add_argument("--role", choices=("bare", "tg"), default="bare",
+                    help="bare = lost-region OPD-KL (loop link 2); "
+                         "tg = tg-row soft-CE (loop link 1 microscope)")
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
@@ -203,22 +221,24 @@ def main():
         raise SystemExit(f"no step_*/ dirs under {obs} — was TRACE_OBS_DIR on for this run?")
 
     out = {}
-    hdr = (f"{'step':>5} {'rows':>5} {'part':>5} {'th_kl/tok':>10} "
-           f"{'ac_kl/tok':>10} {'th_share':>9} {'th_tok%':>8}")
+    metric = "kl" if args.role == "bare" else "soft-CE"
+    print(f"role={args.role}  (token_loss semantics: per-token {metric})")
+    hdr = (f"{'step':>5} {'rows':>5} {'part':>5} {'th_' + metric + '/tok':>12} "
+           f"{'ac_' + metric + '/tok':>12} {'th_share':>9} {'th_tok%':>8}")
     print(hdr)
     print("-" * len(hdr))
     for step, d in sorted(found):
         if args.steps and str(step) not in args.steps.split(","):
             continue
-        summ = step_summary(load_step(d), decode_one)
+        summ = step_summary(load_step(d), decode_one, role=args.role)
         if summ is None:
-            print(f"{step:>5}  (no lost bare rows)")
+            print(f"{step:>5}  (no {args.role} rows)")
             continue
         out[step] = summ
-        print(f"{step:>5} {summ['lost_rows']:>5} "
+        print(f"{step:>5} {summ['rows_used']:>5} "
               f"{summ['partial_rows_excluded']:>5} "
-              f"{summ['thought_kl_per_token']:>10.4f} "
-              f"{summ['action_kl_per_token']:>10.4f} "
+              f"{summ['thought_kl_per_token']:>12.4f} "
+              f"{summ['action_kl_per_token']:>12.4f} "
               f"{summ['thought_kl_share']:>9.3f} "
               f"{summ['thought_token_share']:>8.3f}")
     if args.json_out:

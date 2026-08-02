@@ -119,7 +119,7 @@ def test_sp_reassembly_and_lost_bare_aggregation(mod, tmp_path):
     assert rows["fp:0"]["covered"].all()
 
     summ = mod.step_summary(rows, _decode)
-    assert summ["lost_rows"] == 1 and summ["partial_rows_excluded"] == 0
+    assert summ["rows_used"] == 1 and summ["partial_rows_excluded"] == 0
     assert summ["thought_tokens"] == 3 and summ["action_tokens"] == 3
     assert summ["thought_kl_per_token"] == pytest.approx(2.0)
     assert summ["action_kl_per_token"] == pytest.approx(0.5)
@@ -140,7 +140,7 @@ def test_identical_responses_stay_distinct_rows_via_uid(mod, tmp_path):
     rows = mod.load_step(step)
     assert len(rows) == 2
     summ = mod.step_summary(rows, _decode)
-    assert summ["lost_rows"] == 2
+    assert summ["rows_used"] == 2
     assert summ["thought_kl_per_token"] == pytest.approx(2.0)  # mean of 1 & 3
 
 
@@ -156,6 +156,29 @@ def test_legacy_pack_key_collision_fails_loud(mod, tmp_path):
     _npz(step, 1, row_hash=88, won=1, role="bare", **kw)   # same key, won flips
     with pytest.raises(SystemExit, match="collides"):
         mod.load_step(step)
+
+
+def test_tg_role_mode_decomposes_soft_ce(mod, tmp_path):
+    # --role tg (loop link 1 microscope): tg rows are selected regardless of
+    # won (they are won by construction), bare rows are excluded, and the
+    # token_loss semantics is the per-token soft-CE.
+    step = tmp_path / "step_00010"
+    step.mkdir()
+    ids = [1, 2, 3, 4, 5, 6]
+    _npz(step, 0, row_hash=1, resp_ids=ids, token_loss=[4.0, 4.0, 4.0, 1.0, 1.0, 1.0],
+         seg_start=0, turn_spans=[(0, 6)], won=1, role="tg", row_uid="fp:0")
+    _npz(step, 1, row_hash=2, resp_ids=ids, token_loss=[9.0] * 6,
+         seg_start=0, turn_spans=[(0, 6)], won=0, role="bare", row_uid="fp:1")
+    rows = mod.load_step(step)
+    summ = mod.step_summary(rows, _decode, role="tg")
+    assert summ["rows_used"] == 1
+    assert summ["thought_kl_per_token"] == pytest.approx(4.0)
+    assert summ["action_kl_per_token"] == pytest.approx(1.0)
+    assert summ["thought_kl_share"] == pytest.approx(12.0 / 15.0)
+    # And the bare mode on the same step still sees only the lost bare row.
+    summ_bare = mod.step_summary(rows, _decode, role="bare")
+    assert summ_bare["rows_used"] == 1
+    assert summ_bare["thought_kl_per_token"] == pytest.approx(9.0)
 
 
 def test_mask_and_coverage_filtering(mod, tmp_path):
@@ -174,6 +197,6 @@ def test_mask_and_coverage_filtering(mod, tmp_path):
          seg_start=0, turn_spans=[(0, 6)], won=0, role="bare", row_uid="fp:1")
     rows = mod.load_step(step)
     summ = mod.step_summary(rows, _decode)
-    assert summ["lost_rows"] == 1 and summ["partial_rows_excluded"] == 1
+    assert summ["rows_used"] == 1 and summ["partial_rows_excluded"] == 1
     assert summ["thought_tokens"] == 3 and summ["action_tokens"] == 0
     assert summ["thought_kl_per_token"] == pytest.approx(2.0)

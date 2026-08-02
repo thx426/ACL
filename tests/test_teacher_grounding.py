@@ -758,7 +758,7 @@ def test_dispatch_decoupling_contracts(losses_ns):
     seen = {}
 
     def fake_tg(student_logits, tg_label_log_probs, tg_label_ids,
-                tg_token_mask, config):
+                tg_token_mask, config, obs_sink=None):
         seen["mask"] = tg_token_mask.clone()
         return torch.full(student_logits.shape[:2], 7.0)
 
@@ -952,6 +952,145 @@ def test_config_health_gate_rejects_inf(tmp_path):
 def test_verl_config_objective_presence_includes_tg():
     src = (_VERL / "workers" / "config" / "distillation.py").read_text(encoding="utf-8")
     assert "or self.tg_loss_coef" in src
+
+
+def _obs_stub(enabled=True, spy=None):
+    mod = types.ModuleType("verl.trainer.distillation.observation")
+    mod.observation_enabled = lambda: enabled
+    mod._step_wanted = lambda step: True
+    mod.collect_micro_batch = spy if spy is not None else (lambda **kw: None)
+    mod._disable = lambda why: None
+    return mod
+
+
+def test_tg_soft_ce_obs_sink_ships_label_and_q(fsdp_losses_ns):
+    """tg 行分布级观察(环1 显微):enabled 时 sink 收到三个 [1,T,K] 数组 —
+    标签 p̄ / 其 id / q 在标签支持集上的 log-prob,tg 位置与输入逐位一致、
+    非 tg 位置零;disabled 时 sink 保持空(零开销契约)。"""
+    torch.manual_seed(1)
+    T, V, K = 4, 12, 3
+    logits = torch.randn(1, T, V)
+    mask = torch.tensor([[True, True, False, False]])
+    ref_lp = torch.log_softmax(torch.randn(T, V), dim=-1)
+    top_lp, top_ids = torch.topk(ref_lp, k=K, dim=-1)
+    lab_lp = top_lp - torch.logsumexp(top_lp, dim=-1, keepdim=True)
+    lab_full = torch.zeros(T, K)
+    ids_full = torch.zeros(T, K, dtype=torch.int32)
+    lab_full[:2] = lab_lp[:2]
+    ids_full[:2] = top_ids[:2].to(torch.int32)
+    nt_lp = torch.nested.nested_tensor([lab_full], layout=torch.jagged)
+    nt_id = torch.nested.nested_tensor([ids_full], layout=torch.jagged)
+    cfg = types.SimpleNamespace(
+        distillation_loss=types.SimpleNamespace(chunked_topk_chunk_size=4096))
+
+    saved = sys.modules.get("verl.trainer.distillation.observation")
+    sys.modules["verl.trainer.distillation.observation"] = _obs_stub(enabled=True)
+    try:
+        sink = {}
+        fsdp_losses_ns["compute_tg_soft_ce"](logits, nt_lp, nt_id, mask, cfg,
+                                             obs_sink=sink)
+        assert set(sink) == {"tg_label_ids", "tg_label_lps", "tg_q_lps"}
+        for v in sink.values():
+            assert v.shape == (1, T, K)
+        assert torch.equal(sink["tg_label_ids"][0, :2], top_ids[:2].to(torch.int32))
+        assert torch.allclose(sink["tg_label_lps"][0, :2], lab_lp[:2])
+        q_ref = torch.log_softmax(logits[0, :2].float(), dim=-1).gather(
+            -1, top_ids[:2])
+        assert torch.allclose(sink["tg_q_lps"][0, :2], q_ref, atol=1e-5)
+        assert (sink["tg_label_ids"][0, 2:] == 0).all()
+        assert (sink["tg_q_lps"][0, 2:] == 0).all()
+
+        # disabled -> empty sink; no sink -> no side effects.
+        sys.modules["verl.trainer.distillation.observation"] = _obs_stub(enabled=False)
+        sink2 = {}
+        fsdp_losses_ns["compute_tg_soft_ce"](logits, nt_lp, nt_id, mask, cfg,
+                                             obs_sink=sink2)
+        assert sink2 == {}
+    finally:
+        if saved is None:
+            sys.modules.pop("verl.trainer.distillation.observation", None)
+        else:
+            sys.modules["verl.trainer.distillation.observation"] = saved
+
+
+def test_collect_observation_tg_rows_use_their_own_pack(losses_ns):
+    """collect 层(环1 显微落盘):真 tg 行的 teacher_* 字段来自 tg_label 包、
+    student_support_lps 来自 tg_q_lps、token_loss 来自 tg 矩阵;OPD 行照旧;
+    占位行(teacher_mode=tg_skip)跳过。"""
+    ns, _ = losses_ns
+    K = 2
+    rows_seen = {}
+
+    def spy(**kw):
+        rows_seen.update(kw)
+
+    stubs = {
+        "verl.trainer.distillation.observation": _obs_stub(enabled=True, spy=spy),
+        "verl.utils.ulysses": types.SimpleNamespace(
+            get_ulysses_sequence_parallel_world_size=lambda: 1,
+            get_ulysses_sequence_parallel_rank=lambda: 0),
+    }
+    saved = {k: sys.modules.get(k) for k in stubs}
+    for k, v in stubs.items():
+        mod = v if isinstance(v, types.ModuleType) else types.ModuleType(k)
+        if not isinstance(v, types.ModuleType):
+            for a, val in vars(v).items():
+                setattr(mod, a, val)
+        sys.modules[k] = mod
+    try:
+        nested = lambda rows_: torch.nested.nested_tensor(rows_, layout=torch.jagged)
+        prompts = nested([torch.zeros(1, dtype=torch.long)] * 3)
+        responses = nested([torch.tensor([5, 6])] * 3)
+        T = 9  # packed: 3 rows x (P=1 + R=2)
+        data = {
+            "prompts": prompts, "responses": responses,
+            "old_log_probs": nested([torch.zeros(2)] * 3),
+            "response_mask": nested([torch.tensor([1, 1]), torch.tensor([1, 1]),
+                                     torch.tensor([0, 0])]),
+            "rm_scores": nested([torch.tensor([0.0, 0.0]),
+                                 torch.tensor([1.0, 0.0]),
+                                 torch.tensor([1.0, 0.0])]),
+            "extra_fields": [
+                {"sample_role": "bare", "won": 0, "task_id": "a",
+                 "turn_spans": [[0, 2]]},
+                {"sample_role": "tg", "teacher_mode": "tg", "won": 1,
+                 "task_id": "b", "turn_spans": [[0, 2]]},
+                {"sample_role": "tg", "teacher_mode": "tg_skip", "won": 1,
+                 "task_id": "c"},
+            ],
+            "global_steps": [4, 4, 4],
+        }
+        obs = {
+            "teacher_ids": torch.ones(1, T, K, dtype=torch.int32),
+            "teacher_lps": torch.full((1, T, K), -1.0),
+            "student_ids": torch.ones(1, T, K, dtype=torch.int32),
+            "student_lps": torch.full((1, T, K), -9.0),
+            "student_support_lps": torch.full((1, T, K), -3.0),
+            "tg_label_ids": torch.full((1, T, K), 2, dtype=torch.int32),
+            "tg_label_lps": torch.full((1, T, K), -2.0),
+            "tg_q_lps": torch.full((1, T, K), -4.0),
+        }
+        ns["_collect_observation_rows"](
+            data, obs, torch.full((1, T), 0.5),
+            loss_mode="reverse_kl_topk", log_prob_min_clamp=-10.0,
+            tg_token_losses=torch.full((1, T), 7.5))
+        rows = rows_seen["rows"]
+        assert [r["sample_role"] for r in rows] == ["bare", "tg"]
+        bare, tg = rows
+        assert float(bare["teacher_lps"][0, 0]) == -1.0
+        assert float(bare["token_loss"][0]) == 0.5
+        assert float(bare["student_support_lps"][0, 0]) == -3.0
+        assert int(tg["teacher_ids"][0, 0]) == 2       # label ids, not stubs
+        assert float(tg["teacher_lps"][0, 0]) == -2.0  # label p̄
+        assert float(tg["student_support_lps"][0, 0]) == -4.0  # q on support
+        assert float(tg["token_loss"][0]) == 7.5       # soft-CE matrix
+        assert tg["turn_spans"] == [[0, 2]]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
 
 
 def test_tg_gradient_bounded_under_extreme_q():

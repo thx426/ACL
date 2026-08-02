@@ -3,8 +3,8 @@
 > 面向 CD-006。机制设计真源 `docs/teacher-grounding-design.md`(v2,含解耦
 > §5、二轮实施审阅台账 §11.5 与双盲台账 §12);本手册只讲怎么跑、怎么看、
 > 怎么停、报回什么。代码:trace_opd 分支 **`mixed-objective-r2`**(含二轮
-> 审阅修复批),vendored verl = 真源 trace-opd **`189d789`** 导出;
-> **298 测试全绿**。
+> 审阅修复批 + tg 行观察补全),vendored verl = 真源 trace-opd **`d6ac87e`**
+> 导出;**301 测试全绿**。
 > v2 相对 v1 的两个结构变化:①解耦落地 ⇒ **T1 直接叠 rkl_seqmean 底座,
 > 原 T0(forward 新跑)取消**;②新增三判据件(标签质量曲线/健康门[默认关]/
 > KL 段分解)。
@@ -13,8 +13,8 @@
 
 1. tar-over-ssh 推送 `mixed-objective-r2`(GitHub 不通;macOS rsync 段错误);
    同步前备份现场(`backup_presync_<date>/`),同步后全量 md5 清单比对。
-2. 服务器侧 `python -m pytest tests/ -q` 须 **298 passed**(289=缺二轮审阅
-   修复批,278=cff8a45 旧代码——数字不对说明同步不完整)。
+2. 服务器侧 `python -m pytest tests/ -q` 须 **301 passed**(298/289/278 均为
+   旧代码——数字不对说明同步不完整)。
 3. 生产改造保护:同步后 `git status` 核对,勿 stash、勿覆盖你们的工作件。
 4. 一切以 **effective_config.yaml(run 目录落盘)** 为真值;启动前
    `config_tool diff` 过一遍。
@@ -108,9 +108,12 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 - **won 分层锐判据**:`python3 scripts/won_traj_evolution.py --rollouts
   <run>/rollouts`——基线 thought/turn ×6(315→1986);T1 预测平坦/显著压缓。
   跑完(或崩后)T1 与基线各出一份表报回。
-- **机理判据(段分解)**:`scripts/opd_kl_span_decomp.py` 出 lost 区 thought
-  份额随步曲线——T1 预测下降/持平。注:基线 run 未开 obs,无对照数据,此
-  判据看 **T1 自身趋势**;若你们重跑基线可顺手开 obs 补对照(非必须)。
+- **机理判据(段分解,双模式)**:`scripts/opd_kl_span_decomp.py`
+  ①`--role bare`:lost 区 OPD-KL thought 份额随步——T1 预测下降/持平;
+  ②`--role tg`:tg 行 soft-CE 的 thought 份额随步——预测初期高、随训练
+  收敛下降(教师叙述被纠回健康形态的逐 token 证据)。注:基线 run 未开
+  obs,无对照数据,两个模式均看 **T1 自身趋势**;若你们重跑基线可顺手开
+  obs 补对照(非必须)。
 - 效果判据:裸 val 三件套(峰值高度/时刻/峰后形态,±5pp 误差棒)。
 
 ## 6. 判停表
@@ -131,7 +134,8 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 2. 长度三曲线(mean/p95/resp_clip)对基线对照 + 崩塌步(如崩)。
 3. `won_traj_evolution` T1 输出表(json 留档;基线表已有)。
 4. 标签质量曲线(chars/turns/cpt)全程截图或数值导出。
-5. `opd_kl_span_decomp` 表 + json(thought 份额随步)。
+5. `opd_kl_span_decomp` 两模式表 + json(`--role bare` 环2 与 `--role tg`
+   环1 的 thought 份额随步)。
 6. 裸 val 三件套逐 val 点。
 7. tg 曲线族数值(loss/rows/role/dropped×3/min_preclamp/loss_max)。
 8. 冒烟八项逐项结果;任何 fail-loud 文本原样。

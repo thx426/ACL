@@ -228,19 +228,29 @@ def compute_topk_loss(
                         f"tg rows present but '{key}' is missing — the scorer did not ship "
                         "the decoupled tg label channel (teacher_topk_fsdp)"
                     )
+            # The tg observation pack (label p̄ / q-on-support / soft-CE
+            # matrix) rides the same obs stream — the microscope's tg mirror
+            # of the OPD per-token quartet.
+            tg_obs_sink = {}
             outputs["tg_losses"] = fsdp_losses.compute_tg_soft_ce(
                 student_logits=student_logits,
                 tg_label_log_probs=data["tg_label_logprobs"],
                 tg_label_ids=data["tg_label_ids"],
                 tg_token_mask=tg_token_mask,
                 config=distillation_config,
+                obs_sink=tg_obs_sink,
             )
+            if tg_obs_sink:
+                if outputs.get("obs") is None:
+                    outputs["obs"] = {}
+                outputs["obs"].update(tg_obs_sink)
     obs = outputs.pop("obs", None)
     if obs is not None:
         _collect_observation_rows(
             data, obs, outputs["distillation_losses"],
             loss_mode=loss_mode,
             log_prob_min_clamp=distillation_config.distillation_loss.log_prob_min_clamp,
+            tg_token_losses=outputs.get("tg_losses"),
         )
 
     expected_shape = student_logits.shape[:2]
@@ -910,7 +920,7 @@ def _response_id_rows(data: TensorDict):
 
 def _collect_observation_rows(
     data: TensorDict, obs: dict, token_losses: torch.Tensor,
-    *, loss_mode: str, log_prob_min_clamp,
+    *, loss_mode: str, log_prob_min_clamp, tg_token_losses: torch.Tensor = None,
 ) -> None:
     """trace-opd observation packs: cut each row's RESPONSE window out of this
     rank's packed-sequence segment and hand per-row numpy records to the
@@ -997,12 +1007,25 @@ def _collect_observation_rows(
             if lo >= hi:
                 continue
             extra = extras[i] if isinstance(extras[i], dict) else {}
-            if extra.get("sample_role") == "tg":
-                # trace-opd teacher grounding (decoupled channels): a tg row's
-                # teacher_* fields are zero stubs and its OPD per-token matrix
-                # is masked garbage — the microscope is an OPD instrument, so
-                # tg rows stay out of its packs entirely.
+            # trace-opd teacher grounding (decoupled channels): a REAL tg row
+            # observes through its OWN pack — teacher_* fields carry the bare
+            # label p̄, student_support_lps carries q on the label support, and
+            # token_loss carries the soft-CE matrix (the tg mirror of the OPD
+            # quartet; the row's student_* top-k IS q's own top-k since the tg
+            # training forward runs under the doc prefix). Dropped-won
+            # placeholders (sample_role "tg", teacher_mode "tg_skip") have no
+            # label and nothing to observe.
+            is_real_tg = extra.get("teacher_mode") == "tg"
+            if extra.get("sample_role") == "tg" and not is_real_tg:
                 continue
+            if is_real_tg and (tg_token_losses is None or "tg_label_ids" not in obs):
+                continue  # tg row but no tg pack shipped — skip, never mix
+            if is_real_tg:
+                t_ids_src, t_lps_src = obs["tg_label_ids"], obs["tg_label_lps"]
+                sup_src, loss_src = obs["tg_q_lps"], tg_token_losses
+            else:
+                t_ids_src, t_lps_src = obs["teacher_ids"], obs["teacher_lps"]
+                sup_src, loss_src = obs["student_support_lps"], token_losses
             seg_slice = (lo - rank_lo, hi - rank_lo)
             rows.append(
                 {
@@ -1018,12 +1041,12 @@ def _collect_observation_rows(
                     "realized_student_lp": old_lp_rows[i],
                     "seg_start": lo - win_lo,
                     "seg_len": hi - lo,
-                    "teacher_ids": seg_np(obs["teacher_ids"], *seg_slice),
-                    "teacher_lps": seg_np(obs["teacher_lps"], *seg_slice),
+                    "teacher_ids": seg_np(t_ids_src, *seg_slice),
+                    "teacher_lps": seg_np(t_lps_src, *seg_slice),
                     "student_ids": seg_np(obs["student_ids"], *seg_slice),
                     "student_lps": seg_np(obs["student_lps"], *seg_slice),
-                    "student_support_lps": seg_np(obs["student_support_lps"], *seg_slice),
-                    "token_loss": seg_np(token_losses.detach(), *seg_slice),
+                    "student_support_lps": seg_np(sup_src, *seg_slice),
+                    "token_loss": seg_np(loss_src.detach(), *seg_slice),
                 }
             )
         if rows:

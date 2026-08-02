@@ -315,6 +315,7 @@ def compute_tg_soft_ce(
     tg_label_ids: torch.Tensor,
     tg_token_mask: torch.Tensor,
     config: DistillationConfig,
+    obs_sink: dict = None,
 ) -> torch.Tensor:
     """trace-opd teacher grounding: per-token soft cross-entropy over tg rows.
 
@@ -342,6 +343,15 @@ def compute_tg_soft_ce(
             carry zero stubs that are never read (masked out below).
         tg_token_mask: (bsz, seqlen) packed bool, True on the full span of tg
             rows; sliced here for SP exactly like the label tensors.
+        obs_sink: optional dict the caller passes to receive the tg
+            observation pack (microscope layer). When observation is enabled,
+            three [1, T/sp, K] tensors land in it — tg_label_ids /
+            tg_label_lps (the bare-policy renormalised label p̄) and tg_q_lps
+            (q's log-probs on the label support) — zero outside tg positions,
+            detached, same SP coordinate system as the OPD obs arrays. This is
+            the data behind the tg-loss thought/action span decomposition
+            (the mirror of the lost-region OPD-KL decomposition): where is q
+            being corrected — narration tokens or action tokens.
 
     Returns:
         (bsz, seqlen/sp_size) fp32 per-token losses, zero outside tg positions.
@@ -381,4 +391,28 @@ def compute_tg_soft_ce(
     )[0]  # [nnz_tg, K]
     ce = (flat_lps.exp() * (flat_lps - q_lp)).sum(dim=-1)  # [nnz_tg]
     out[0][mask] = ce
+
+    if obs_sink is not None:
+        # Best-effort observation contract (same as the OPD formulas): the
+        # absolute import keeps this stubbable in the vendored-source tests.
+        try:
+            from verl.trainer.distillation.observation import observation_enabled
+        except Exception:  # noqa: BLE001 — no module, no packs
+            observation_enabled = None
+        if observation_enabled is not None and observation_enabled():
+            with torch.no_grad():
+                K = flat_ids.shape[-1]
+                shp = (1, student_logits.shape[1], K)
+                dev = student_logits.device
+                full_ids = torch.zeros(shp, dtype=torch.int32, device=dev)
+                full_lab = torch.zeros(shp, dtype=torch.float32, device=dev)
+                full_q = torch.zeros(shp, dtype=torch.float32, device=dev)
+                full_ids[0][mask] = flat_ids.to(torch.int32)
+                full_lab[0][mask] = flat_lps
+                full_q[0][mask] = q_lp.detach()
+                obs_sink.update({
+                    "tg_label_ids": full_ids,
+                    "tg_label_lps": full_lab,
+                    "tg_q_lps": full_q,
+                })
     return out

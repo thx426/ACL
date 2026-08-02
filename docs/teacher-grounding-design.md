@@ -129,13 +129,21 @@ OPD 的 top-64 目标变健康 → 学生学到健康行为 → 下一批 won �
    null(单变量纪律);凭曲线 2 决定启用;阈值锚定健康期(基线 ~315 的 2–3
    倍),**严禁随当前模型滚动上调**;非 null 条件式进 fingerprint。
 
-**4.3 机理判据:lost 区 OPD-KL thought/action 段分解(已实施,离线)**。
-`scripts/opd_kl_span_decomp.py` 读 TRACE_OBS_DIR 观察包(token_loss = 训练
-per-token KL 真值锚 + turn_spans),对 lost bare 行按 `</reasoning>` 闭合分
-thought/action 段,输出 per-token KL 均值对、KL 总量份额与 token 份额对照。
-这是良性循环**第二环**的直接读数(教师在输局前缀上给学生的目标是否变健康),
-也覆盖本方案的一个诚实软肋:tg 在赢局前缀训教师、教师的打分功能消费在输局
-前缀,中间靠"叙述病是全局风格属性"泛化——段分解就是对该泛化假设的检验。
+**4.3 机理判据:thought/action 段分解(已实施,离线,双镜像模式)**。
+`scripts/opd_kl_span_decomp.py` 读 TRACE_OBS_DIR 观察包,按 `</reasoning>`
+闭合分 thought/action 段,输出 per-token 均值对、总量份额与 token 份额对照:
+
+- `--role bare`(环2 读数):lost bare 行的 OPD per-token KL——教师在输局前
+  缀上给学生的目标是否变健康。覆盖本方案的诚实软肋:tg 在赢局前缀训教师、
+  教师的打分功能消费在输局前缀,靠"叙述病是全局风格属性"泛化——此即对该
+  泛化假设的检验。
+- `--role tg`(环1 显微,2026-08-02 补全):tg 行的 per-token soft-CE(q 离
+  健康标签的距离)——**教师被纠正的梯度花在叙述 token 还是行动 token**。预
+  测:初期 thought 段占大头(教师叙述倾向与学生健康标签的分歧集中区),随
+  训练收敛下降。数据层:tg 行以专属观察包落盘(teacher_*=标签 p̄、
+  student_support_lps=q-on-support、token_loss=soft-CE;q 自身 top-k 即行内
+  student_*),占位行无标签不落。
+
 判据数据前提:run 开 TRACE_OBS_DIR(runbook 注明)。
 
 ## 5. 解耦(用户裁定 2026-08-02,已实施)
