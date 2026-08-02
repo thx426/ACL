@@ -416,3 +416,20 @@ def test_curve_mixed_tg_keys():
     off = build_curve_metrics(validate=False, research_enabled=False,
                               mixed_tg=False, fields=fields)
     assert "tg_role" not in off
+
+
+# ---------------------------------------------------------------------------
+# 7. tg rows leave the on-policy machinery (0d653b0 self-review fixes)
+# ---------------------------------------------------------------------------
+def test_tg_rows_excluded_from_metrics_grpo_group_and_padding_template():
+    trainer = (_VERL / "trainer" / "ppo" / "v1" / "trainer_base.py").read_text(encoding="utf-8")
+    # Behaviour metrics: a tg row is a WON trajectory whose share grows with
+    # training — leaking it into critic/score/mean would fake improvement on
+    # the very curve that gates the run.
+    assert 'in ("sft", "research", "tg")' in trainer
+    # Own GRPO group: under the won split the task's bare rows are all lost;
+    # a reward-1.0 group-mate would hand each a negative advantage baseline.
+    assert 'if role in ("sft", "research", "tg") else uid' in trainer
+    padding = (_VERL / "trainer" / "ppo" / "padding_utils.py").read_text(encoding="utf-8")
+    assert 'if "tg_mask" in template_sample:' in padding
+    assert 'template_sample["tg_mask"] = torch.zeros_like(response_mask)' in padding

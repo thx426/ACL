@@ -221,12 +221,12 @@ def test_self_research_channel_wired_on_the_executed_paths():
 
     trainer = _read("trainer/ppo/v1/trainer_base.py")
     assert "_grouped_uid" in trainer                  # own GRPO group per role
-    assert 'if role in ("sft", "research")' in trainer
+    assert 'if role in ("sft", "research", "tg")' in trainer  # (+tg 0d653b0)
     assert "_research_channel_enabled" in trainer
     assert "research_update_mode" in trainer          # joint/separate routing
     assert "research_warmup_steps" in trainer
     assert "num_mini_batch" in trainer                # af6a8d3 subset sizing fix
-    assert 'in ("sft", "research")' in trainer        # e3bd3bf metrics exclusion
+    assert 'in ("sft", "research", "tg")' in trainer  # e3bd3bf metrics exclusion (+tg 0d653b0)
 
     engine = _read("workers/engine/fsdp/transformer_impl.py")
     assert "research_num_tokens" in engine            # all-reduced pre-micro-batch

@@ -126,6 +126,12 @@ def construct_minimal_padding_template(
     # stale advantage into the loss.
     if "research_mask" in template_sample:
         template_sample["research_mask"] = torch.zeros_like(response_mask)
+    # trace-opd teacher grounding: same shape discipline — a padding row cloned
+    # off a tg sample must not ship a full-length tg label mask; the tg loss's
+    # shape assertion would kill the run on the mismatch (fail-loud by design,
+    # but a padding row is not the defect it is there to catch).
+    if "tg_mask" in template_sample:
+        template_sample["tg_mask"] = torch.zeros_like(response_mask)
     if "research_advantage" in template_sample:
         template_sample["research_advantage"] = torch.zeros_like(
             response_mask, dtype=torch.float32

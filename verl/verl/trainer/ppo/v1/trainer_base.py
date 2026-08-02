@@ -1616,7 +1616,12 @@ class PPOTrainer(ABC):
                 # binary outcome, and their advantage is recomputed below with
                 # the research formula anyway — the isolation keeps the
                 # executor groups' statistics untouched, same reason as :sft.
-                return f"{uid}:{role}" if role in ("sft", "research") else uid
+                # trace-opd teacher grounding: a tg row is a WON trajectory
+                # with reward 1.0 and an all-zero response_mask; under the won
+                # split the bare rows of its task are all lost, so leaving it
+                # in the task group would hand every lost bare row a negative
+                # advantage baseline. Own group, same honesty argument.
+                return f"{uid}:{role}" if role in ("sft", "research", "tg") else uid
 
             data.non_tensor_batch["uid"] = np.array(
                 [_grouped_uid(uid, extra) for uid, extra in zip(uids, roles)],
@@ -2041,10 +2046,15 @@ class PPOTrainer(ABC):
             # from the on-policy behaviour metrics — the former would inflate
             # them (~96% success), the latter would deflate them (a research
             # session has no task outcome; its reward is a doc success rate).
+            # tg rows (teacher grounding) are excluded for the sft reason in
+            # its sharpest form: every tg row is a WON trajectory (reward 1.0)
+            # and the conversion rate GROWS with training, so leaking them in
+            # would inflate critic/score/mean monotonically — indistinguishable
+            # from a real improvement on the very curve that gates the run.
             is_expert = np.array(
                 [
                     isinstance(extra_field, dict)
-                    and extra_field.get("sample_role") in ("sft", "research")
+                    and extra_field.get("sample_role") in ("sft", "research", "tg")
                     for extra_field in rollout_extra_fields.tolist()
                 ],
                 dtype=bool,
