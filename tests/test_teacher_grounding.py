@@ -421,15 +421,134 @@ def test_curve_mixed_tg_keys():
 # ---------------------------------------------------------------------------
 # 7. tg rows leave the on-policy machinery (0d653b0 self-review fixes)
 # ---------------------------------------------------------------------------
-def test_tg_rows_excluded_from_metrics_grpo_group_and_padding_template():
+def test_tg_rows_in_behaviour_metrics_but_isolated_from_grpo_and_padding():
     trainer = (_VERL / "trainer" / "ppo" / "v1" / "trainer_base.py").read_text(encoding="utf-8")
-    # Behaviour metrics: a tg row is a WON trajectory whose share grows with
-    # training — leaking it into critic/score/mean would fake improvement on
-    # the very curve that gates the run.
-    assert 'in ("sft", "research", "tg")' in trainer
-    # Own GRPO group: under the won split the task's bare rows are all lost;
-    # a reward-1.0 group-mate would hand each a negative advantage baseline.
+    # codex tg-review P0-1: a tg row is a bare rollout the policy actually
+    # WON — it BELONGS in the behaviour metrics (excluding it makes
+    # critic/score/mean a lost-only ~0 curve). The on-policy exclusion list
+    # must therefore NOT contain tg...
+    i = trainer.index("on_policy_mask = non_padding_mask")
+    excl = trainer[i : i + 1200]
+    assert 'in ("sft", "research")' in excl and '"tg"' not in excl.split("is_expert")[1][:400]
+    # ...while the GRPO group isolation DOES (a reward-1.0 group-mate would
+    # hand every lost bare row a negative advantage baseline)...
     assert 'if role in ("sft", "research", "tg") else uid' in trainer
+    # ...and the gate that enables the role machinery must see the tg arm
+    # (codex P1-3: without this the isolation is unreachable in T1).
+    gate = trainer.split("def _mixed_objective_enabled")[1][:1600]
+    assert "tg_loss_coef" in gate
+    # codex P1-2: the min-signal floor counts tg signal too.
+    sig = trainer.split("min_signal > 0:")[1][:1600]
+    assert "tg_mask" in sig
     padding = (_VERL / "trainer" / "ppo" / "padding_utils.py").read_text(encoding="utf-8")
     assert 'if "tg_mask" in template_sample:' in padding
     assert 'template_sample["tg_mask"] = torch.zeros_like(response_mask)' in padding
+
+
+# ---------------------------------------------------------------------------
+# 8. codex tg-review P0-2: the -10 log-prob floor made the tg "KL" genuinely
+#    negative; tg positions are exempt. Hand-computed trigger case.
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def fsdp_losses_ns():
+    stub_names = ["verl", "verl.utils", "verl.utils.ulysses", "verl.workers",
+                  "verl.workers.config"]
+    saved = {k: sys.modules.get(k) for k in stub_names}
+
+    def _register(name, **attrs):
+        mod = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        sys.modules[name] = mod
+
+    _register("verl")
+    _register("verl.utils")
+    _register("verl.utils.ulysses",
+              get_ulysses_sequence_parallel_world_size=lambda: 1,
+              slice_input_tensor=lambda t, dim: t)
+    _register("verl.workers")
+    _register("verl.workers.config", DistillationConfig=object,
+              DistillationLossConfig=object)
+    ns = {}
+    src = (_VERL / "trainer" / "distillation" / "fsdp" / "losses.py").read_text(encoding="utf-8")
+    exec(compile(src, "vendored_fsdp_losses.py", "exec"), ns)
+    yield ns
+    for k, v in saved.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
+
+
+def _tg_clamp_case(fsdp_losses_ns, tg_mask_on):
+    # Renormalised label [0.99995, 2.5e-5, 2.5e-5]: tail log-prob -10.6 sits
+    # BELOW the -10 floor. q from logits [30,0,0,0,0]: top ~1, tail ~9e-14
+    # (log ~ -30). Unclamped soft-CE ~ +9.2e-4 > 0; with both sides floored
+    # at -10 the tail term vanishes and the top term ~ -5e-5 < 0 survives.
+    label = torch.log(torch.tensor([[[0.99995, 2.5e-5, 2.5e-5]]]))
+    ids = torch.tensor([[[0, 1, 2]]], dtype=torch.int64)
+    label_nested = torch.nested.nested_tensor([label[0]], layout=torch.jagged)
+    ids_nested = torch.nested.nested_tensor([ids[0]], layout=torch.jagged)
+    logits = torch.zeros(1, 1, 5)
+    logits[0, 0, 0] = 30.0
+    loss_cfg = types.SimpleNamespace(log_prob_min_clamp=-10.0,
+                                     use_chunked_topk=False)
+    cfg = types.SimpleNamespace(distillation_loss=loss_cfg)
+    kwargs = {}
+    if tg_mask_on:
+        kwargs["tg_token_mask"] = torch.tensor([[True]])
+    out = fsdp_losses_ns["compute_forward_kl_topk"](
+        student_logits=logits, teacher_topk_log_probs=label_nested,
+        teacher_topk_ids=ids_nested, config=cfg, data_format="thd", **kwargs)
+    return out["distillation_losses"][0, 0].item()
+
+
+def test_tg_positions_exempt_from_logprob_floor(fsdp_losses_ns):
+    clamped = _tg_clamp_case(fsdp_losses_ns, tg_mask_on=False)
+    exempt = _tg_clamp_case(fsdp_losses_ns, tg_mask_on=True)
+    # Pin the defect on the legacy path: the floored "KL" is genuinely
+    # negative (not fp jitter), so clamp_min(0) would erase signal + gradient.
+    assert clamped < -1e-5
+    # The exempt path restores the true non-negative soft-CE.
+    assert exempt > 0
+    assert exempt == pytest.approx(9.2e-4, rel=0.2)
+
+
+def test_tg_branch_drops_loss_max_clamp_and_reports_preclamp_min(losses_ns):
+    ns, calls = losses_ns
+    tg_mask = torch.tensor([[True, True]])
+    data = {"response_mask": torch.tensor([[False, False]]),
+            "tg_mask": tg_mask, "batch_num_seqs": 1, "dp_size": 1,
+            "batch_num_tg_seqs": 1}
+    # A legitimate large tg loss (q far off-support) must reach the spy
+    # un-truncated even with loss_max_clamp configured.
+    losses = torch.tensor([[27.0, 2.0]])
+    ns["get_distillation_loss_fn"] = lambda mode: (
+        lambda config, distillation_config, model_output, data: (losses, {}))
+    config = types.SimpleNamespace(loss_agg_mode="seq-mean-token-mean",
+                                   global_batch_info={})
+    loss_cfg = types.SimpleNamespace(
+        loss_mode="fake", loss_max_clamp=10.0, use_policy_gradient=False,
+        use_task_rewards=False, rl_loss_coef=0.0, sft_loss_coef=0.0,
+        research_loss_coef=0.0, tg_loss_coef=1.0,
+        distillation_loss_coef=1.0, opd_loss_coef=1.0)
+    distillation_config = types.SimpleNamespace(distillation_loss=loss_cfg)
+    _, metrics = ns["distillation_ppo_loss"](
+        config, distillation_config, {"distillation_losses": losses}, data)
+    tg_calls = [c for c in calls if torch.equal(c.get("loss_mask"), tg_mask)]
+    assert tg_calls[-1]["loss_mat"].max().item() == pytest.approx(27.0)
+    assert "tg/loss_min_preclamp" in metrics and "tg/loss_max" in metrics
+
+
+def test_research_replica_curve_call_carries_mixed_tg():
+    # codex tg-review P0-3: the curve key set must be batch-uniform.
+    src = (_ROOT / "src" / "trace_opd" / "train" / "agent_loop.py").read_text(encoding="utf-8")
+    calls = src.split("build_curve_metrics(")[1:]
+    assert len(calls) == 2 and all("mixed_tg" in c[:700] for c in calls)
+
+
+def test_config_rejects_tg_with_token_mean(tmp_path):
+    # codex tg-review P1-5: the token-mean fallback is a different estimand.
+    with pytest.raises(ValueError, match="seq-mean-token-mean"):
+        _load(tmp_path, "tm", ["train.mix_tg_weight=1.0", "train.opd_lost_only=true",
+                               "train.loss_agg_mode=token-mean"])

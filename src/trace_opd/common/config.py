@@ -498,6 +498,14 @@ def _validate(cfg: "Config") -> None:
                 f"(tg rows reuse its per-token formula as their soft-CE), "
                 f"got {cfg.train.opd_kl_mode!r}"
             )
+        if cfg.train.loss_agg_mode != "seq-mean-token-mean":
+            problems.append(
+                f"train.mix_tg_weight>0 requires loss_agg_mode='seq-mean-token-mean' "
+                f"(the ruled tg estimand is the per-sequence conditional mean; the "
+                f"token-mean fallback weights long responses and depends on "
+                f"micro-batch packing — a different objective), got "
+                f"{cfg.train.loss_agg_mode!r}"
+            )
         if cfg.train.teacher_scoring_backend != "fsdp":
             problems.append(
                 "train.mix_tg_weight>0 requires teacher_scoring_backend='fsdp' — the "

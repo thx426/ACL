@@ -145,6 +145,29 @@ def compute_topk_loss(
     - teacher_mass: (bsz, seqlen/cp_size)
     """
     loss_mode = distillation_config.distillation_loss.loss_mode
+    # codex tg-review P0-2: build the packed per-token tg flag (full P+R span
+    # per tg row) so the fsdp loss can exempt tg positions from the OPD
+    # log-prob floor. Zero-cost when no row is a tg row.
+    tg_token_mask = None
+    extras = data.get("extra_fields", None)
+    if extras is not None:
+        extras_list = list(extras.tolist() if hasattr(extras, "tolist") else extras)
+        if any(isinstance(e, dict) and e.get("sample_role") == "tg" for e in extras_list):
+            prompts, responses = data["prompts"], data["responses"]
+            if not (getattr(prompts, "is_nested", False) and getattr(responses, "is_nested", False)):
+                raise RuntimeError(
+                    "teacher-grounding rows require the nested (THD) batch layout - "
+                    "the dense path does not carry the per-row tg clamp exemption"
+                )
+            p_lens = prompts.offsets().diff().tolist()
+            r_lens = responses.offsets().diff().tolist()
+            flags = [
+                torch.full((int(pl) + int(rl),),
+                           bool(isinstance(e, dict) and e.get("sample_role") == "tg"),
+                           dtype=torch.bool)
+                for pl, rl, e in zip(p_lens, r_lens, extras_list)
+            ]
+            tg_token_mask = torch.cat(flags).unsqueeze(0).to(student_logits.device)
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         # fsdp2 shares the FSDP data layout as well (H3 pilot fix: the upstream
@@ -158,6 +181,10 @@ def compute_topk_loss(
             else:
                 distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
+            if tg_token_mask is not None:
+                raise NotImplementedError(
+                    "teacher-grounding rows are implemented for the FSDP family only"
+                )
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             if loss_mode == "reverse_kl_topk":
@@ -166,12 +193,16 @@ def compute_topk_loss(
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
 
+    loss_fn_kwargs = {}
+    if tg_token_mask is not None:
+        loss_fn_kwargs["tg_token_mask"] = tg_token_mask
     outputs = distillation_loss_fn(
         student_logits=student_logits,
         teacher_topk_log_probs=data["teacher_logprobs"],
         teacher_topk_ids=data["teacher_ids"],
         config=distillation_config,
         data_format=data_format,
+        **loss_fn_kwargs,
     )
     obs = outputs.pop("obs", None)
     if obs is not None:
@@ -408,14 +439,20 @@ def distillation_ppo_loss(
                 f"tg_mask shape {tuple(tg_mask.shape)} does not match the per-token loss "
                 f"layout {tuple(tg_losses.shape)} — a tg row is out of step with its responses"
             )
-        # Same post-processing the OPD branch applies to the same matrix: the
-        # renormalised label makes the tg soft-CE non-negative up to fp error,
-        # so clamp_min(0) is lossless; the outer clamp is symmetry.
-        if distillation_loss_config.loss_max_clamp is not None:
-            tg_losses = tg_losses.clamp(
-                min=-distillation_loss_config.loss_max_clamp,
-                max=distillation_loss_config.loss_max_clamp,
-            )
+        # codex tg-review P0-2: with tg positions exempt from the log-prob
+        # floor (fsdp loss), the soft-CE is non-negative by construction and
+        # clamp_min(0) is genuinely lossless. loss_max_clamp is deliberately
+        # NOT applied: a large tg loss is legitimate supervision (q parking
+        # its mass outside the label support) and torch.clamp would zero its
+        # gradient exactly there. Telemetry keeps the invariant observable -
+        # a materially negative pre-clamp minimum means the exemption broke.
+        with torch.no_grad():
+            tg_valid_losses = tg_losses[tg_mask]
+            if tg_valid_losses.numel():
+                policy_metrics["tg/loss_min_preclamp"] = Metric(
+                    AggregationType.MIN, tg_valid_losses.min())
+                policy_metrics["tg/loss_max"] = Metric(
+                    AggregationType.MAX, tg_valid_losses.max())
         tg_losses = tg_losses.clamp_min(0.0)
         if config.loss_agg_mode == "token-mean":
             # Local per-micro-batch token mean with the SFT arm's zero-safe

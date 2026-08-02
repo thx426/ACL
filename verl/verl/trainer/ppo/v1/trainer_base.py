@@ -1558,8 +1558,11 @@ class PPOTrainer(ABC):
         return batch
 
     def _mixed_objective_enabled(self) -> bool:
-        """trace-opd: whether the RL or SFT arm of the mixed objective, or the
-        self-research channel, is on (all three key the sample_role machinery)."""
+        """trace-opd: whether the RL or SFT arm of the mixed objective, the
+        self-research channel, or the teacher-grounding arm is on (all four key
+        the sample_role machinery — codex tg-review P1-3: without tg here the
+        tg GRPO isolation below is UNREACHABLE in the T1 configuration, since
+        tg is mutually exclusive with rl/sft and research defaults off)."""
         if not is_distillation_enabled(self.config.get("distillation")):
             return False
         loss_cfg = self.distillation_config.distillation_loss
@@ -1567,6 +1570,7 @@ class PPOTrainer(ABC):
             float(getattr(loss_cfg, "rl_loss_coef", 0.0) or 0.0) > 0.0
             or float(getattr(loss_cfg, "sft_loss_coef", 0.0) or 0.0) > 0.0
             or float(getattr(loss_cfg, "research_loss_coef", 0.0) or 0.0) > 0.0
+            or float(getattr(loss_cfg, "tg_loss_coef", 0.0) or 0.0) > 0.0
         )
 
     def _research_channel_enabled(self) -> bool:
@@ -1790,11 +1794,22 @@ class PPOTrainer(ABC):
                 getattr(self.distillation_config.distillation_loss, "min_signal_rows", 0) or 0
             )
         if min_signal > 0:
+            # codex tg-review P1-2: tg rows clear response_mask and carry
+            # their signal in tg_mask — counting response_mask alone would
+            # skip the whole actor update exactly when the policy is winning
+            # (few lost rows, many tg rows). Count either signal. tg_mask is
+            # only requested when the arm is on (rows carry no such field
+            # otherwise, and the fetch must not invent one).
+            tg_on = float(getattr(
+                self.distillation_config.distillation_loss, "tg_loss_coef", 0.0
+            ) or 0.0) > 0.0
+            fields = ["response_mask"] + (["tg_mask"] if tg_on else [])
             sig_data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["response_mask"]
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=fields
             )
-            sig_masks = sig_data.pop("response_mask")
-            n_signal = _count_signal_rows(sig_masks)
+            n_signal = _count_signal_rows(sig_data.pop("response_mask"))
+            if tg_on:
+                n_signal += _count_signal_rows(sig_data.pop("tg_mask"))
             metrics["distill/signal_rows"] = float(n_signal)
             if n_signal < min_signal:
                 metrics["distill/skipped_low_signal"] = 1.0
@@ -2046,15 +2061,18 @@ class PPOTrainer(ABC):
             # from the on-policy behaviour metrics — the former would inflate
             # them (~96% success), the latter would deflate them (a research
             # session has no task outcome; its reward is a doc success rate).
-            # tg rows (teacher grounding) are excluded for the sft reason in
-            # its sharpest form: every tg row is a WON trajectory (reward 1.0)
-            # and the conversion rate GROWS with training, so leaking them in
-            # would inflate critic/score/mean monotonically — indistinguishable
-            # from a real improvement on the very curve that gates the run.
+            # tg rows are deliberately NOT excluded (codex tg-review P0-1): a
+            # tg row is a bare rollout the policy actually WON — its outcome
+            # belongs in the behaviour curves exactly like any bare row, and
+            # excluding it turns critic/score/mean into a lost-only ~0 curve
+            # (with an all-won batch snapping back to 1 through the empty-mask
+            # fallback). Its per-token tensors carry a zero response_mask, so
+            # mask-weighted training statistics ignore it either way; only the
+            # scalar behaviour metrics see it — which is the point.
             is_expert = np.array(
                 [
                     isinstance(extra_field, dict)
-                    and extra_field.get("sample_role") in ("sft", "research", "tg")
+                    and extra_field.get("sample_role") in ("sft", "research")
                     for extra_field in rollout_extra_fields.tolist()
                 ],
                 dtype=bool,

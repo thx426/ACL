@@ -57,7 +57,10 @@ L_tg = mean_{τ~p, won=1} [ (1/|gen|) Σ_{t∈gen} KL( sg[p_θ̄(·|h_t)] ‖ q_
 
 soft-CE 形式:梯度 −Σ_v p̄(v)∇log q_θ(v|doc,h_t),只经 teacher(带 doc)前向
 回传;p̄ 取 rollout 权重的裸分布 top-64 重归一化(student 在自己轨迹上 top-64
-质量实测 ~0.9995,截断偏差可忽略),detach。
+质量实测 ~0.9995,截断偏差可忽略),detach。精确性注解(codex 审阅):复用
+forward_kl_topk 公式得到的是 CE(p̄,q)−H(p̄)——与 soft-CE **梯度等价**、数值差
+一个与 q 无关的标签熵常数;q 侧不重归一是**正确**的(保留把质量拉进标签支持
+集的梯度压力)。tg 位置豁免 log_prob_min_clamp 与 loss_max_clamp(P0-2)。
 
 **won 分割**(用户裁定):成功轨迹退出 OPD,失败轨迹退出 tg——
 
@@ -67,8 +70,15 @@ L = mean_{won=0}[ L_OPD ] + w_tg · mean_{won=1}[ L_tg ],   w_tg = 1.0
 
 两项均 **seq-mean-token-mean**(行内 token-mean → 行间 batch 全局 mean),各带
 自己的 batch 全局行数分母(见 §4)。分工:**失败区 doc 出手教学生;成功区学生
-校准老师**。每状态区单向信息流,无同状态对冲;won 率上升 ⇒ OPD 数据自动减少、
-tg 数据自动增多——**渐进停机由数据分布内生实现**。
+校准老师**。每状态区单向信息流,无同状态对冲。
+
+**条件均值语义修正(codex 审阅 P1-1,2026-08-02)**:此前"won 率上升 ⇒ OPD
+自动退火/渐进停机"的表述**不成立**——两项是各自独立归一的**条件均值**,期望
+权重不随 won/lost 频率变化;won 率升高只是让 OPD 项由更少的失败样本做高方差
+估计(单条 lost 行也代表整个 OPD 项),直到 lost=0 才从满权重硬切到 0。两种
+语义都有科学理由:①保持条件均值(现状)= 残余失败任务始终被全力教;②频率
+加权(各项乘 N_区/N_total)= 真退火。**该选择待用户裁定**;若保持现状,后备
+保护为 rare-lost 最小样本数/权重上限(防单行决定整臂梯度)。
 
 **机理预测**(实验判据的来源):①指导分布被拉回裸可执行流形 → 长度相变推迟/
 消失;②成功区 PMI 推力显式归零 → "信号耗尽→噪声传递→崩"改写为"耗尽→归
@@ -189,5 +199,26 @@ GPU 等 162 空窗,跑单经 cd009-cd006 交 CD-006。
 - **P3 contextual collapse 溢出**(W022 teacher-only 警告):won 限定数据 +
   doc 持续刷新是结构对冲;探针分层监控;后备 = 降 w_tg / 间歇施加。
 - **P4 次优固化**(won≠每步都优):探索期接受;后备 per-step 加权。
+- **P5 失败条件化选择偏差**(codex 设计层):OPD 信号被系统性条件化到失败轨
+  迹,随能力提升越发集中于困难/长尾状态——学到的可能是"失败条件下模仿
+  teacher"而非全分布蒸馏。保护选项:小权重 bare-won RFT anchor(即 P2 后备)
+  或频率加权臂;T1′ 归因臂本身即是该偏差的对照。
+
+## 10. Codex 深审处置台账(gpt-5.6-sol xhigh,2026-08-02;报告全文见会话记录)
+
+| # | 裁决 | 处置 |
+|---|---|---|
+| P0-1 行为曲线口径(tg 排除反了) | **属实——我方 0d653b0 过度修复** | revert:tg 行回到行为曲线(裸策略真实赢局);GRPO 隔离与 padding 修复保留 |
+| P0-2 log_prob_min_clamp 破坏 tg soft-CE | **属实(真数学缺陷)** | fsdp loss 行级豁免 tg 位置的 -10 地板;tg 分支撤 loss_max_clamp、保 clamp_min(0)(恢复无损);telemetry tg/loss_min_preclamp |
+| P0-3 tg×research 曲线键集异构 | 属实 | research replica 补传 mixed_tg |
+| P1-1 渐进停机不成立 | 属实(设计叙述错误) | 本文档 §2 修正;语义选择**待用户裁定** |
+| P1-2 min_signal_rows 漏 tg 信号 | 属实(默认 0 不触发) | 计数并入 tg_mask(臂开时) |
+| P1-3 GRPO 隔离门控不可达 | 属实(0d653b0 修复被门挡) | _mixed_objective_enabled 纳入 tg_loss_coef |
+| P1-4 tg 监控盲区 | 属实 | telemetry 首批已加;context 探针列 **T1 前置**(非二期) |
+| P1-5 token-mean 回退非同一 estimand | 属实 | config 拒绝 tg×token-mean |
+| P2-1 sentinel 对 renorm 失效 | 属实 | 测试改进项(挂账) |
+| P2-2 tg 关闭仍分配零 tg_mask | 属实(违零传输契约,无数值影响) | 挂账(独立 tg stamp) |
+| 数学等价性表述 | 修正:soft-CE **梯度**等价,数值差标签熵常数 | 本文档 §2 注解 |
+| 总判"不可进 T1" | 接受 | P0 全修后再排跑单 |
 - 曲线语义变化入档:分割后训练侧熵/OPD 曲线只覆盖 lost 行(won 行为指标一律
   rollout 侧)。

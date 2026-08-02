@@ -113,6 +113,7 @@ def compute_forward_kl_topk(
     teacher_topk_ids: torch.Tensor,
     config: DistillationConfig,
     data_format: str,
+    tg_token_mask: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute forward KL distillation loss using top-k log probabilities.
 
@@ -165,8 +166,25 @@ def compute_forward_kl_topk(
         teacher_topk_log_probs, teacher_topk_ids, loss_config, use_chunked_topk,
     )
     if loss_config.log_prob_min_clamp is not None:
-        student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-        teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        clamped_student = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        clamped_teacher = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        if tg_token_mask is not None:
+            # codex tg-review P0-2: the -10 floor is an OPD numerical guard;
+            # applied to a tg row it LIFTS the renormalised label tail above
+            # its true probability (sum > 1) and KILLS the gradient exactly
+            # where q parks mass outside the label support (log q < -10) — the
+            # combination makes the "KL" genuinely negative and clamp_min(0)
+            # then zeroes both loss and gradient. tg positions therefore keep
+            # the raw log-probs (label is renormalised and finite by
+            # construction; q comes off a log_softmax and is finite too).
+            if get_ulysses_sequence_parallel_world_size() > 1:
+                tg_token_mask = slice_input_tensor(tg_token_mask, dim=1)
+            keep = tg_token_mask.unsqueeze(-1)
+            student_topk_log_probs = torch.where(keep, student_topk_log_probs, clamped_student)
+            teacher_topk_log_probs = torch.where(keep, teacher_topk_log_probs, clamped_teacher)
+        else:
+            student_topk_log_probs = clamped_student
+            teacher_topk_log_probs = clamped_teacher
     distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
 
     # Diagnostics for tracking teacher/student top-k overlap in OPD, following

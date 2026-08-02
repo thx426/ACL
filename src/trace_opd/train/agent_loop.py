@@ -1050,6 +1050,12 @@ class TraceAgentLoop(AgentLoopBase):
             research_enabled=True,
             mixed_sft=self.cfg.train.mix_sft_weight > 0
             and self.cfg.train.mix_sft_rollouts > 0,
+            # codex tg-review P0-3: the curve key set must be batch-uniform —
+            # verl takes the key list from the FIRST row and indexes every
+            # other row with it, so a research row missing the tg_* keys
+            # either KeyErrors the batch (ordinary first row) or silently
+            # drops the tg curves (research first row).
+            mixed_tg=self.cfg.train.mix_tg_weight > 0 or self.cfg.train.opd_lost_only,
             research_rl=True,
             fields=output.extra_fields,
         )
