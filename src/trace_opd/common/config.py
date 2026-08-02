@@ -481,10 +481,12 @@ def _validate(cfg: "Config") -> None:
         problems.append(
             f"train.mix_sft_rollouts={cfg.train.mix_sft_rollouts} must be >= 0"
         )
-    if not (cfg.train.mix_opd_weight or cfg.train.mix_rl_weight or cfg.train.mix_sft_weight):
+    # codex impl-review P1-6:tg 是完整目标项,TG-only(opd 0、tg>0)是合法消融。
+    if not (cfg.train.mix_opd_weight or cfg.train.mix_rl_weight
+            or cfg.train.mix_sft_weight or cfg.train.mix_tg_weight):
         problems.append(
-            "train.mix_opd_weight / mix_rl_weight / mix_sft_weight are all 0 — "
-            "there is no objective left to optimise"
+            "train.mix_opd_weight / mix_rl_weight / mix_sft_weight / mix_tg_weight "
+            "are all 0 — there is no objective left to optimise"
         )
     # teacher grounding 的结构约束(docs/teacher-grounding-design.md §5):
     if cfg.train.mix_tg_weight > 0:
@@ -535,10 +537,13 @@ def _validate(cfg: "Config") -> None:
                 "train.mix_tg_health_gate is set but mix_tg_weight is 0 — the gate "
                 "filters won->tg conversion and has no meaning without the tg arm"
             )
-        elif not cfg.train.mix_tg_health_gate > 0:
+        elif not (_math.isfinite(cfg.train.mix_tg_health_gate)
+                  and cfg.train.mix_tg_health_gate > 0):
+            # codex impl-review P2-1:inf 能过 >0 却永不拦截,而 fingerprint
+            # 会记录"门已配置"——语义谎言,拒掉。
             problems.append(
-                f"train.mix_tg_health_gate must be a positive char/turn threshold, "
-                f"got {cfg.train.mix_tg_health_gate!r}"
+                f"train.mix_tg_health_gate must be a finite positive char/turn "
+                f"threshold, got {cfg.train.mix_tg_health_gate!r}"
             )
     if cfg.train.mix_sft_prefix not in ("doc", "bare"):
         problems.append(

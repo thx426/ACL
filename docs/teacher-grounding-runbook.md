@@ -1,9 +1,10 @@
 # Teacher Grounding(tg)T1 运行手册(v2,2026-08-02)
 
 > 面向 CD-006。机制设计真源 `docs/teacher-grounding-design.md`(v2,含解耦
-> §5 与双盲台账 §12);本手册只讲怎么跑、怎么看、怎么停、报回什么。
-> 代码:trace_opd 分支 **`mixed-objective-r2`**(机制链至 `8c83246`),
-> vendored verl = 真源 trace-opd **`0a4bb30`** 导出;**289 测试全绿**。
+> §5、二轮实施审阅台账 §11.5 与双盲台账 §12);本手册只讲怎么跑、怎么看、
+> 怎么停、报回什么。代码:trace_opd 分支 **`mixed-objective-r2`**(含二轮
+> 审阅修复批),vendored verl = 真源 trace-opd **`189d789`** 导出;
+> **298 测试全绿**。
 > v2 相对 v1 的两个结构变化:①解耦落地 ⇒ **T1 直接叠 rkl_seqmean 底座,
 > 原 T0(forward 新跑)取消**;②新增三判据件(标签质量曲线/健康门[默认关]/
 > KL 段分解)。
@@ -12,8 +13,8 @@
 
 1. tar-over-ssh 推送 `mixed-objective-r2`(GitHub 不通;macOS rsync 段错误);
    同步前备份现场(`backup_presync_<date>/`),同步后全量 md5 清单比对。
-2. 服务器侧 `python -m pytest tests/ -q` 须 **289 passed**(cff8a45 时代是
-   278——数字不对说明同步不完整)。
+2. 服务器侧 `python -m pytest tests/ -q` 须 **298 passed**(289=缺二轮审阅
+   修复批,278=cff8a45 旧代码——数字不对说明同步不完整)。
 3. 生产改造保护:同步后 `git status` 核对,勿 stash、勿覆盖你们的工作件。
 4. 一切以 **effective_config.yaml(run 目录落盘)** 为真值;启动前
    `config_tool diff` 过一遍。
@@ -81,8 +82,11 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
    ... missing` fail-loud 文本。
 4. **P0-2 不变量(解耦后仍监控)**:`tg/loss_min_preclamp ≥ -1e-6`(独立
    soft-CE 数学非负;显著负值 = 公式破,停下报机制侧)。
-5. **标签质量曲线活着**:`tg_label_thought_chars`/`tg_label_thought_turns`
-   两键有值;cpt = 两曲线相除应落在健康区(基线 step5-7 参考 ~284–315)。
+5. **标签质量曲线活着**:`tg_label_thought_cpt`/`_chars`/`_turns` 三键有值;
+   **判读口径 = mean(tg_label_thought_cpt) ÷ mean(tg_role)**(标签行的逐轨迹
+   均值,与离线 won_traj_evolution 同 estimand)——应落健康区(基线 step5-7
+   实测 284–315)。chars÷turns 是 turn 加权总量视图,只作辅助,勿与 284–315
+   直比。
 6. **行为曲线口径**:`critic/score/mean` ≈ 该 step rollout 全量胜率(won 行
    分流后仍计入——对不上说明 P0-1 口径破了)。
 7. **算力持平**:step 耗时/显存与基线同量级(镜像对称;偏差 >30% 报回)。
@@ -96,8 +100,9 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 - tg 专属:`tg/loss`(应下降收敛)、`tg/rows` 与 `tg_role`(随胜率上升)、
   `tg/loss_min_preclamp`(恒 ≥ -1e-6)、`tg/loss_max`(大值合法=q 支持集外
   质量,应随训练回落)、dropped 三计数。
-- **枢纽变量(标签质量)**:cpt 曲线(chars÷turns)——若相对健康期持续上行
-  (>2×),报回并附曲线,等待健康门启用裁定(阈值锚健康期,严禁滚动上调)。
+- **枢纽变量(标签质量)**:cpt 判读 = mean(tg_label_thought_cpt)÷mean(tg_role)
+  ——若相对健康期(284–315)持续上行 >2×,报回并附曲线,等待健康门启用裁定
+  (阈值锚健康期,严禁滚动上调)。
 - **预注册主判据(病的终点)**:response length / p95 / resp_clip——step-9
   相变是否推迟/压平;崩塌步 > 基线×1.5 或预算内不崩 ⇒ 正向。
 - **won 分层锐判据**:`python3 scripts/won_traj_evolution.py --rollouts

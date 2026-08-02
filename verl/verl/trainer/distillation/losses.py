@@ -153,7 +153,13 @@ def compute_topk_loss(
     extras = data.get("extra_fields", None)
     if extras is not None:
         extras_list = list(extras.tolist() if hasattr(extras, "tolist") else extras)
-        if any(isinstance(e, dict) and e.get("sample_role") == "tg" for e in extras_list):
+        # codex impl-review P0-1: the predicate must MATCH the scorer's
+        # (teacher_mode == "tg"), not sample_role — dropped-won placeholders
+        # (nodoc/overflow/health-gate) carry sample_role "tg" with
+        # teacher_mode "tg_skip" and NO label; keying on sample_role makes a
+        # placeholder-only shard demand a label channel the scorer never
+        # shipped (RuntimeError inside the forward -> collective hang).
+        if any(isinstance(e, dict) and e.get("teacher_mode") == "tg" for e in extras_list):
             prompts, responses = data["prompts"], data["responses"]
             if not (getattr(prompts, "is_nested", False) and getattr(responses, "is_nested", False)):
                 raise RuntimeError(
@@ -164,7 +170,7 @@ def compute_topk_loss(
             r_lens = responses.offsets().diff().tolist()
             flags = [
                 torch.full((int(pl) + int(rl),),
-                           bool(isinstance(e, dict) and e.get("sample_role") == "tg"),
+                           bool(isinstance(e, dict) and e.get("teacher_mode") == "tg"),
                            dtype=torch.bool)
                 for pl, rl, e in zip(p_lens, r_lens, extras_list)
             ]
@@ -974,6 +980,13 @@ def _collect_observation_rows(
         def seg_np(t: torch.Tensor, lo: int, hi: int):
             return t[0, lo:hi].detach().float().cpu().numpy() if t.dtype.is_floating_point else t[0, lo:hi].detach().cpu().numpy()
 
+        # codex impl-review P1-3: resp_hash alone is NOT a row key — identical
+        # short responses (8 rollouts of one task, or across tasks) collide
+        # and the offline reader would merge distinct rows. A per-call batch
+        # fingerprint + the row's batch index is stable across the SP group
+        # (same micro-batch data, same enumeration) and unique across
+        # micro-batches, so (mb_fp, i) identifies the row.
+        mb_fp = _resp_hash([_resp_hash(r) for r in resp_rows])
         rows = []
         start = 0
         for i, resp in enumerate(resp_rows):
@@ -994,6 +1007,7 @@ def _collect_observation_rows(
             rows.append(
                 {
                     "resp_hash": _resp_hash(resp),
+                    "row_uid": f"{mb_fp:x}:{i}",
                     "task_id": extra.get("task_id", ""),
                     "sample_role": extra.get("sample_role", "bare"),
                     "won": extra.get("won", 0),
@@ -1113,17 +1127,23 @@ def compute_forward_kl_topk(
         valid_overlap_count = overlap_count[response_mask_bool]
         k = distillation_config.distillation_loss.topk
         assert k is not None
-        # Diagnostics for tracking teacher/student top-k overlap in OPD, following
-        # "Rethinking On-Policy Distillation of Large Language Models" (arXiv:2604.13016):
-        # overlap ratio and average teacher-token KL contribution on overlapped tokens.
-        overlap_metrics["distillation/overlap_ratio"] = (valid_overlap_count.float().mean() / k).item()
-        overlap_position_mask = response_mask_bool & (overlap_count > 0)
-        if overlap_position_mask.any():
-            overlap_metrics["distillation/overlap_token_advantage"] = (
-                overlap_token_advantage[overlap_position_mask].mean().item()
-            )
-        else:
-            overlap_metrics["distillation/overlap_token_advantage"] = 0.0
+        # codex impl-review P1-1: an all-tg micro-batch has an empty
+        # response_mask — mean() over the empty selection is NaN and would
+        # poison the OPD diagnostics stream. No OPD tokens, no overlap
+        # metrics for this micro-batch (same absent-not-zero contract as the
+        # mass diagnostics below).
+        if valid_overlap_count.numel():
+            # Diagnostics for tracking teacher/student top-k overlap in OPD, following
+            # "Rethinking On-Policy Distillation of Large Language Models" (arXiv:2604.13016):
+            # overlap ratio and average teacher-token KL contribution on overlapped tokens.
+            overlap_metrics["distillation/overlap_ratio"] = (valid_overlap_count.float().mean() / k).item()
+            overlap_position_mask = response_mask_bool & (overlap_count > 0)
+            if overlap_position_mask.any():
+                overlap_metrics["distillation/overlap_token_advantage"] = (
+                    overlap_token_advantage[overlap_position_mask].mean().item()
+                )
+            else:
+                overlap_metrics["distillation/overlap_token_advantage"] = 0.0
 
     # Padded per-token views for the microscope dump, saved before the metric
     # code below flattens them through the response mask.

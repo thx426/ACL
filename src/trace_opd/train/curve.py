@@ -50,10 +50,14 @@ _MIXED_TG = (
     "tg_dropped_nodoc",     # research 失败无 doc 的占位行
     "tg_dropped_lostonly",  # tg 臂关、仅 opd_lost_only 的占位行(T1' 形态)
     "tg_dropped_unhealthy", # 健康门拦截的膨胀 won 行(mix_tg_health_gate)
-    # 标签质量(预注册锐判据在线版):cpt = chars 曲线 ÷ turns 曲线
-    # (= 全部标签行的 turn 加权 per-turn 均值;仅完整 tg 行非零)。
+    # 标签质量(预注册锐判据在线版;仅完整 tg 行非零):
+    #   主判读 = mean(tg_label_thought_cpt) ÷ mean(tg_role)
+    #          = 标签行的 trajectory-mean cpt,与离线 won_traj_evolution
+    #            同 estimand(codex impl-review P1-5,健康基线 284–315 可直用);
+    #   chars ÷ turns 两曲线相除 = turn-weighted 总量视图,作辅助。
     "tg_label_thought_chars",
     "tg_label_thought_turns",
+    "tg_label_thought_cpt",
 )
 _MIXED_SFT = (
     "sft_role", "sft_won", "sft_accepted", "sft_dropped_ref",

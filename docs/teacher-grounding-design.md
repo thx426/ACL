@@ -193,12 +193,13 @@ fingerprint:三键条件式(默认不进 hash,存量指纹逐字节不变)。关
 ## 8. 改动清单(实施完成,commit 链)
 
 verl 真源 trace-opd:f783026 → 608b6aa(tg 臂首版)→ 0d653b0+037c3cf(两轮
-审阅修复)→ 01a9a06(频率加权)→ **0a4bb30(解耦:双通道/独立公式/白名单/
-forward 还原/obs 跳过)**。vendored = 0a4bb30 导出(VENDORED.md 对账)。
+审阅修复)→ 01a9a06(频率加权)→ 0a4bb30(解耦:双通道/独立公式/白名单/
+forward 还原/obs 跳过)→ **189d789(二轮实施审阅修复批,§11.5)**。
+vendored = 189d789 导出(VENDORED.md 对账)。
 
 trace_opd mixed-objective-r2:b4e97a5 → … → cff8a45(runbook v1)→ cc419b0
-(解耦落地 + 测试 278→284)→ 442200b(判据件:标签质量曲线/健康门/白名单落
-config,284→286)→ 8c83246(B3 段分解脚本,286→**289 全绿**)。
+(解耦落地 + 测试 278→284)→ 442200b(判据件,284→286)→ 8c83246(B3 段分解
+脚本,286→289)→ 5beecec(文档批)→ **二轮审阅修复批(289→298 全绿)**。
 
 ## 9. 验证实验(T1,预注册判读;rkl 底座)
 
@@ -246,6 +247,28 @@ config,284→286)→ 8c83246(B3 段分解脚本,286→**289 全绿**)。
 | P2-1 sentinel 对 renorm 失效 | 属实 | 挂账 |
 | P2-2 tg 关闭仍分配零 tg_mask | 属实(无数值影响) | 挂账 |
 | 总判"不可进 T1" | 接受 | P0 全修 + 解耦后就绪 |
+
+## 11.5 Codex 二轮实施审阅台账(gpt-5.6-sol max,fresh 线程,2026-08-02;全文见会话记录)
+
+对解耦实施批(0a4bb30/cc419b0→8c83246)的对抗审阅:3 P0 + 6 P1 + 2 P2,
+**全部核实属实、全部修复**(verl 189d789 + trace_opd 对应批,测试 289→298):
+
+| # | 缺陷 | 处置 |
+|---|---|---|
+| P0-1 | tg 谓词生产/消费不一致:占位行(sample_role="tg"+teacher_mode="tg_skip")触发消费端索要不存在的标签通道 ⇒ 占位-only 分片前向 RuntimeError/collective 挂死 | 消费端谓词统一 `teacher_mode=="tg"`(与打分器 has_tg 同源);占位-only/混排两用例入测试 |
+| P0-2 | `_chunked_topk_log_probs` 回写 bf16:~1e-3 log-prob 误差把近收敛 KL(~1e-5)翻负,clamp_min(0) 恰在 tg 精修区杀 loss+梯度 | helper 增 out_dtype(默认 None=历史行为,OPD 基线逐字节不动),tg 全程 fp32;bf16 近邻分布测试(新路径非负对拍 fp64、旧回写复现负值) |
+| P0-3 | 条件发射的 MIN/MAX Metric 在动态装箱下各 rank 计数不同,aggregate_dp 等长断言崩训练(tg telemetry 与全 tg 微批的 OPD 极值双向触发) | 等长断言只留 SUM/MEAN(矩阵均值真需要);MIN/MAX ragged flatten 取极值(数学等价,既有等长场景行为不变);ragged 测试 |
+| P1-1 | 全 tg 微批 overlap 空集 `.mean()`=NaN 污染 OPD 诊断 | 空集缺席而非零(与 mass 诊断同契约) |
+| P1-2 | 段分解脚本解析不了真实目录名 `step_00004`(测试用了假名) | 严格正则 `^step_?0*(\d+)$`;测试改真名 |
+| P1-3 | resp_hash 当行主键:相同短回答跨样本合并覆盖 | 观察包新增稳定 `row_uid`(微批指纹+行号,SP 组内一致);reader 优先 uid、旧包回退 (task,hash) 复合键 + 元数据冲突 fail-loud |
+| P1-4 | 脚本忽略 response_mask、SP 覆盖残缺静默出完整表 | 统计条件 = mask ∧ covered ∧ finite;残缺行记 partial 剔除并计数入表 |
+| P1-5 | 在线 cpt(chars÷turns=turn 加权)与离线基准(逐轨迹均值)非同一 estimand,284–315 健康区判读会错位 | 新增行级 `tg_label_thought_cpt` 键:mean(cpt)/mean(tg_role) = 标签行 trajectory-mean,与离线基线同 estimand 直用;chars/turns 留作总量视图 |
+| P1-6 | TG-only(opd 0、tg>0)合法消融被两层 objective-presence 判断误拒 | 两处判断纳入 tg 系数 |
+| P2-1 | health_gate=inf 过校验但永不拦截,fingerprint 却记录门已配置 | isfinite 校验 |
+| P2-2 | verl 字段注释仍写公式复用旧语义 | 注释同步解耦 |
+
+审阅同时独立确认:vendored 与真源逐字节一致、forward 公式还原、gather 链通、
+rkl 零占位有限、关断零回归、rkl 底座 top-64 映射——解耦核心正确性无恙。
 
 ## 12. 双盲验证台账(2026-08-02)
 

@@ -140,20 +140,32 @@ class Metric:
         if not metric_lists:
             raise ValueError("Cannot aggregate an empty list of metrics.")
         value_lists = [ml.values for ml in metric_lists]
-        if not all(len(ls) == len(value_lists[0]) for ls in value_lists):
-            raise ValueError(
-                f"All Metric instances must have the same number of values "
-                f"for dp aggregation: {[len(ls) for ls in value_lists]}"
-            )
-        value_arrays = np.array(value_lists)  # [num_dp, num_grad_accumulation]
         aggregation = metric_lists[0].aggregation
         match aggregation:
             case AggregationType.SUM | AggregationType.MEAN:
+                # The [num_dp, num_grad_accumulation] matrix mean genuinely
+                # needs equal lengths — keep the invariant where it matters.
+                if not all(len(ls) == len(value_lists[0]) for ls in value_lists):
+                    raise ValueError(
+                        f"All Metric instances must have the same number of values "
+                        f"for dp aggregation: {[len(ls) for ls in value_lists]}"
+                    )
+                value_arrays = np.array(value_lists)  # [num_dp, num_grad_accumulation]
                 return cls._aggregate(
                     values=np.mean(value_arrays, axis=0), aggregation=aggregation
                 )  # mean over dp ranks
             case AggregationType.MIN | AggregationType.MAX:
-                return cls._aggregate(values=value_arrays.flatten(), aggregation=aggregation)  # min/max over all values
+                # trace-opd (codex impl-review P0-3): extrema are ragged-safe
+                # by definition (min of mins == min of the flattened union), and
+                # conditionally-emitted metrics — tg min/max only on micro-
+                # batches holding a tg token, OPD mass min/max absent on all-tg
+                # micro-batches — legitimately give ranks DIFFERENT value
+                # counts under dynamic batch packing. The old unconditional
+                # equal-length assert crashed training on exactly that.
+                flat = [v for ls in value_lists for v in ls]
+                if not flat:
+                    raise ValueError("Cannot aggregate MIN/MAX metrics with no values.")
+                return cls._aggregate(values=flat, aggregation=aggregation)
 
     @classmethod
     def from_dict(cls, data: dict[str, Numeric], aggregation: str | AggregationType) -> dict[str, "Metric"]:

@@ -639,9 +639,17 @@ class TraceAgentLoop(AgentLoopBase):
                 output.extra_fields["sample_role"] = "tg"
                 output.extra_fields["tg_role"] = 1
                 # 只有真正成为标签的行才计入标签质量曲线(被门挡掉/降级的
-                # 占位行不是标签)。
+                # 占位行不是标签)。cpt 键与离线基准同 estimand(codex
+                # impl-review P1-5):离线 won_traj_evolution 是逐轨迹
+                # chars/turns 再平均(trajectory-weighted),chars÷turns 两曲线
+                # 相除则是 turn-weighted,轨迹长短差异大时二者分离——判读用
+                # mean(cpt)/mean(tg_role) 恢复标签行的 trajectory mean,直接
+                # 对齐 284–315 健康基线;chars/turns 两键保留作总量视图。
                 output.extra_fields["tg_label_thought_chars"] = thought_chars
                 output.extra_fields["tg_label_thought_turns"] = thought_turns
+                output.extra_fields["tg_label_thought_cpt"] = (
+                    thought_chars / max(thought_turns, 1)
+                )
             else:
                 # 无 doc / 前缀溢出 / 健康门拦截 / tg 臂关:won 行按
                 # opd_lost_only 语义零贡献占位(role="tg" + 全零 mask ⇒ TQ 侧

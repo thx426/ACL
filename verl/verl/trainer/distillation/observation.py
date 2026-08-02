@@ -175,6 +175,10 @@ def _flush_step(step: int, rows: list[dict]) -> None:
             [row["realized_student_lp"] for row in rows]
         ).astype(np.float16, copy=False)
         arrays["row_hash"] = np.array([row["resp_hash"] for row in rows], dtype=np.int64)
+        # codex impl-review P1-3: stable per-row identity for the offline
+        # reader — resp_hash collides on identical responses. Readers prefer
+        # row_uid and fall back to (task, hash) on packs written before it.
+        arrays["row_uid"] = np.array([str(row.get("row_uid", "")) for row in rows], dtype="U")
         arrays["row_won"] = np.array([int(row.get("won", 0)) for row in rows], dtype=np.int8)
         arrays["row_reward"] = np.array(
             [float(row.get("reward", 0.0)) for row in rows], dtype=np.float32

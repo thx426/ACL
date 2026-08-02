@@ -507,19 +507,25 @@ def test_curve_mixed_tg_keys():
 
     fields = {"env_steps": 3, "invalid_format": 0, "truncated": 0,
               "tg_role": 1, "tg_dropped_overflow": 0,
-              "tg_label_thought_chars": 946, "tg_label_thought_turns": 3}
+              "tg_label_thought_chars": 946, "tg_label_thought_turns": 3,
+              "tg_label_thought_cpt": 946 / 3}
     on = build_curve_metrics(validate=False, research_enabled=False,
                              mixed_tg=True, fields=fields)
     assert on["tg_role"] == 1.0 and on["tg_dropped_nodoc"] == 0.0
     assert "tg_dropped_lostonly" in on and "tg_dropped_unhealthy" in on
-    # Label-quality pair (pre-registered sharp readout, online form):
-    # cpt = chars-curve / turns-curve; placeholder rows default both to 0.
+    # Label-quality triple (pre-registered sharp readout, online form):
+    # cpt key is the per-row chars/turns — mean(cpt)/mean(tg_role) recovers
+    # the trajectory-mean of label rows, the SAME estimand as the offline
+    # won_traj_evolution baseline (codex impl-review P1-5); chars/turns stay
+    # as the turn-weighted totals view. Placeholder rows default all to 0.
     assert on["tg_label_thought_chars"] == 946.0
     assert on["tg_label_thought_turns"] == 3.0
+    assert on["tg_label_thought_cpt"] == pytest.approx(946 / 3)
     on_placeholder = build_curve_metrics(
         validate=False, research_enabled=False, mixed_tg=True,
         fields={"env_steps": 1, "invalid_format": 0, "truncated": 0})
     assert on_placeholder["tg_label_thought_chars"] == 0.0
+    assert on_placeholder["tg_label_thought_cpt"] == 0.0
     off = build_curve_metrics(validate=False, research_enabled=False,
                               mixed_tg=False, fields=fields)
     assert "tg_role" not in off
@@ -786,17 +792,45 @@ def test_dispatch_decoupling_contracts(losses_ns):
         out = ns["compute_topk_loss"](config, dcfg, data, logits, "thd")
         assert torch.equal(out["tg_losses"], torch.zeros(1, T)) and not seen
 
-        # (b) tg rows, label channel missing -> fail loud
+        # (a') codex impl-review P0-1: a PLACEHOLDER-only shard (dropped won
+        # rows: sample_role "tg" but teacher_mode "tg_skip", no label shipped)
+        # must take the zero-matrix path, NOT demand the label channel — the
+        # predicate is teacher_mode, matching the scorer's has_tg.
+        data_ph = dict(data)
+        data_ph["extra_fields"] = [
+            {"sample_role": "bare"},
+            {"sample_role": "tg", "teacher_mode": "tg_skip",
+             "tg_dropped_nodoc": 1},
+        ]
+        out = ns["compute_topk_loss"](config, dcfg, data_ph, logits, "thd")
+        assert torch.equal(out["tg_losses"], torch.zeros(1, T)) and not seen
+
+        # (b) REAL tg rows, label channel missing -> fail loud
         data_tg = dict(data)
-        data_tg["extra_fields"] = [{"sample_role": "bare"}, {"sample_role": "tg"}]
+        data_tg["extra_fields"] = [
+            {"sample_role": "bare"},
+            {"sample_role": "tg", "teacher_mode": "tg"},
+        ]
         with pytest.raises(RuntimeError, match="tg_label_ids"):
             ns["compute_topk_loss"](config, dcfg, data_tg, logits, "thd")
 
-        # (c) tg rows + labels -> standalone output ships, mask marks row 2
+        # (c) tg rows + labels -> standalone output ships, mask marks ONLY the
+        # real tg row's span
         data_tg["tg_label_ids"] = "stub"
         data_tg["tg_label_logprobs"] = "stub"
         out = ns["compute_topk_loss"](config, dcfg, data_tg, logits, "thd")
         assert (out["tg_losses"] == 7.0).all()
+        assert torch.equal(seen["mask"],
+                           torch.tensor([[False, False, True, True]]))
+
+        # (c') a placeholder row NEXT TO a real tg row stays out of the mask
+        seen.clear()
+        data_mix = dict(data_tg)
+        data_mix["extra_fields"] = [
+            {"sample_role": "tg", "teacher_mode": "tg_skip"},
+            {"sample_role": "tg", "teacher_mode": "tg"},
+        ]
+        ns["compute_topk_loss"](config, dcfg, data_mix, logits, "thd")
         assert torch.equal(seen["mask"],
                            torch.tensor([[False, False, True, True]]))
     finally:
@@ -814,6 +848,110 @@ def test_verl_config_tg_whitelist_source_pin():
     assert "loss_mode not in (" in src
     seg = src.split("tg_loss_coef) > 0.0 and self.loss_mode not in (")[1][:400]
     assert "forward_kl_topk" in seg and "reverse_kl_topk" in seg
+
+
+def test_tg_soft_ce_bf16_near_converged_stays_nonneg(fsdp_losses_ns):
+    """codex impl-review P0-2: with BF16 logits the q_lp gather must stay
+    fp32 end to end. A BF16 round-trip of the log-probs carries ~1e-3
+    absolute error — it flips the near-converged KL (~1e-5) negative, and
+    clamp_min(0) then kills loss AND gradient exactly in the fine-tuning
+    regime. Pin: the shipped path matches a float64 reference and stays
+    non-negative; the legacy round-trip provably goes negative on the same
+    input."""
+    torch.manual_seed(3)
+    V = 8
+    # Label: renormalised two-bucket distribution ~ (0.397, 0.603).
+    lab_p = torch.tensor([0.397, 0.603], dtype=torch.float64)
+    lab_lp64 = torch.log(lab_p)
+    # q: the same buckets at (0.399, 0.601) — near-converged teacher.
+    q_target = torch.full((V,), 1e-8, dtype=torch.float64)
+    q_target[3], q_target[5] = 0.399, 0.601
+    logits64 = torch.log(q_target)
+    logits_bf16 = logits64.to(torch.bfloat16)
+
+    lab_lp_full = torch.zeros(1, 2)
+    lab_lp_full[0] = lab_lp64.float()
+    lab_ids_full = torch.tensor([[3, 5]], dtype=torch.int32)
+    nt_lp = torch.nested.nested_tensor([lab_lp_full], layout=torch.jagged)
+    nt_id = torch.nested.nested_tensor([lab_ids_full], layout=torch.jagged)
+    cfg = types.SimpleNamespace(
+        distillation_loss=types.SimpleNamespace(chunked_topk_chunk_size=4096))
+
+    x = logits_bf16.reshape(1, 1, V).clone().requires_grad_(True)
+    out = fsdp_losses_ns["compute_tg_soft_ce"](
+        x, nt_lp, nt_id, torch.ones(1, 1, dtype=torch.bool), cfg)
+
+    # float64 reference on the SAME bf16-quantised logits. The shipped path
+    # computes in fp32, so allow the fp32-vs-fp64 tolerance at this magnitude
+    # (~1e-6 KL); the load-bearing claims are non-negativity + the right
+    # order of magnitude, against the legacy round-trip's -1e-3 below.
+    ref_lp = torch.log_softmax(logits_bf16.double(), dim=-1)[[3, 5]]
+    ref = float((lab_lp64.exp() * (lab_lp64 - ref_lp)).sum())
+    assert ref > 0
+    assert out[0, 0].item() == pytest.approx(ref, rel=0.05)
+    assert out[0, 0].item() >= 0.0
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    # The legacy behaviour (round-tripping q_lp through bf16) is genuinely
+    # negative on this input — the defect the fp32 path removes.
+    legacy_q_lp = torch.log_softmax(logits_bf16.float(), dim=-1)[[3, 5]]
+    legacy_q_lp = legacy_q_lp.to(torch.bfloat16).float()
+    legacy = float((lab_lp64.exp().float() * (lab_lp64.float() - legacy_q_lp)).sum())
+    assert legacy < 0
+
+
+def test_metric_min_max_aggregate_dp_accepts_ragged():
+    """codex impl-review P0-3: conditionally-emitted MIN/MAX metrics (tg
+    telemetry only on micro-batches holding a tg token; OPD mass extrema
+    absent on all-tg micro-batches) legitimately give DP ranks different
+    value counts under dynamic packing. Extrema are ragged-safe; SUM/MEAN
+    keep the equal-length invariant."""
+    src = (_VERL / "utils" / "metric" / "utils.py").read_text(encoding="utf-8")
+    ns = {}
+    exec(compile(src, "vendored_metric_utils.py", "exec"), ns)
+    Metric, AggregationType = ns["Metric"], ns["AggregationType"]
+
+    m_a = Metric(aggregation=AggregationType.MIN, value=0.5)
+    m_b = Metric(aggregation=AggregationType.MIN, value=0.2)
+    m_b.append(0.9)
+    assert Metric.aggregate_dp([m_a, m_b]) == pytest.approx(0.2)
+
+    x_a = Metric(aggregation=AggregationType.MAX, value=1.0)
+    x_b = Metric(aggregation=AggregationType.MAX, value=3.0)
+    x_b.append(2.0)
+    assert Metric.aggregate_dp([x_a, x_b]) == pytest.approx(3.0)
+
+    s_a = Metric(aggregation=AggregationType.SUM, value=1.0)
+    s_b = Metric(aggregation=AggregationType.SUM, value=1.0)
+    s_b.append(1.0)
+    with pytest.raises(ValueError, match="same number of values"):
+        Metric.aggregate_dp([s_a, s_b])
+
+
+def test_config_tg_only_objective_is_legal(tmp_path):
+    # codex impl-review P1-6: tg is a full objective — OPD 0 + tg > 0 loads.
+    cfg = _load(tmp_path, "tgo", ["train.mix_opd_weight=0.0",
+                                  "train.mix_tg_weight=1.0",
+                                  "train.opd_lost_only=true"])
+    assert cfg.train.mix_opd_weight == 0.0 and cfg.train.mix_tg_weight == 1.0
+    # All four zero is still rejected.
+    with pytest.raises(ValueError, match="no objective"):
+        _load(tmp_path, "tgz", ["train.mix_opd_weight=0.0"])
+
+
+def test_config_health_gate_rejects_inf(tmp_path):
+    # codex impl-review P2-1: inf passes ">0" but never drops a row while the
+    # fingerprint claims a configured gate.
+    with pytest.raises(ValueError, match="finite"):
+        _load(tmp_path, "hginf", ["train.mix_tg_weight=1.0",
+                                  "train.opd_lost_only=true",
+                                  "train.mix_tg_health_gate=.inf"])
+
+
+def test_verl_config_objective_presence_includes_tg():
+    src = (_VERL / "workers" / "config" / "distillation.py").read_text(encoding="utf-8")
+    assert "or self.tg_loss_coef" in src
 
 
 def test_tg_gradient_bounded_under_extreme_q():

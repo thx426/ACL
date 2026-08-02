@@ -27,6 +27,7 @@ def _chunked_topk_log_probs(
     logits: torch.Tensor,
     topk_ids: torch.Tensor,
     chunk_size: int = 4096,
+    out_dtype: torch.dtype = None,
 ) -> torch.Tensor:
     """Compute log_softmax(logits).gather(topk_ids) without materializing [B, T, V].
 
@@ -39,10 +40,19 @@ def _chunked_topk_log_probs(
         logits:    [B, T, V] student logits.
         topk_ids:  [B, T, K] indices to gather.
         chunk_size: number of tokens per chunk; only affects memory, not numerics.
+        out_dtype: dtype of the returned tensor. Default None keeps the
+            historical behaviour (logits.dtype — BF16 on the training path).
+            codex impl-review P0-2: the tg soft-CE needs fp32 here — a BF16
+            round-trip carries ~1e-3 absolute error on log-probs, which
+            swamps the near-converged KL (~1e-5) and flips it negative, and
+            clamp_min(0) then kills the loss AND the gradient exactly in the
+            fine-tuning regime. OPD callers keep the default so their
+            baselines stay byte-identical.
 
     Returns:
-        [B, T, K] tensor with the same dtype as `logits`.
+        [B, T, K] tensor in `out_dtype` (or `logits.dtype` if None).
     """
+    out_dtype = out_dtype if out_dtype is not None else logits.dtype
     B, T, V = logits.shape
     K = topk_ids.shape[-1]
     flat_logits = logits.reshape(-1, V)  # [N, V]
@@ -51,15 +61,15 @@ def _chunked_topk_log_probs(
 
     # Edge case: empty input (e.g. fully-padded micro-batch).
     if N == 0:
-        return torch.empty((B, T, K), dtype=logits.dtype, device=logits.device)
+        return torch.empty((B, T, K), dtype=out_dtype, device=logits.device)
 
-    out = torch.empty((N, K), dtype=logits.dtype, device=logits.device)
+    out = torch.empty((N, K), dtype=out_dtype, device=logits.device)
     for s in range(0, N, chunk_size):
         e = min(s + chunk_size, N)
         chunk_logits_fp32 = flat_logits[s:e].float()
         log_z = torch.logsumexp(chunk_logits_fp32, dim=-1, keepdim=True)  # [c, 1]
         chunk_topk_logits = torch.gather(chunk_logits_fp32, dim=-1, index=flat_topk[s:e])
-        out[s:e] = (chunk_topk_logits - log_z).to(logits.dtype)
+        out[s:e] = (chunk_topk_logits - log_z).to(out_dtype)
     return out.reshape(B, T, K)
 
 
@@ -360,11 +370,15 @@ def compute_tg_soft_ce(
     flat_ids = label_ids[0][mask].to(torch.long)  # [nnz_tg, K]
     flat_lps = label_lps[0][mask].float()  # [nnz_tg, K] renormalised label
     loss_config: DistillationLossConfig = config.distillation_loss
+    # codex impl-review P0-2: q_lp stays fp32 end to end — a BF16 round-trip
+    # would flip near-converged KL negative and clamp_min(0) would zero both
+    # loss and gradient exactly where tg is doing its fine-grained work.
     q_lp = _chunked_topk_log_probs(
         flat_logits.unsqueeze(0),
         flat_ids.unsqueeze(0),
         chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
-    )[0].float()  # [nnz_tg, K]
+        out_dtype=torch.float32,
+    )[0]  # [nnz_tg, K]
     ce = (flat_lps.exp() * (flat_lps - q_lp)).sum(dim=-1)  # [nnz_tg]
     out[0][mask] = ce
     return out

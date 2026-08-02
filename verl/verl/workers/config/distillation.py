@@ -134,12 +134,15 @@ class DistillationLossConfig(BaseConfig):
     # distillation on bare SUCCESS trajectories — rows with sample_role == "tg"
     # carry the doc-prefixed sequence as their TRAINING prompt (the forward is
     # the doc-conditioned teacher q) and the bare policy's renormalised top-k
-    # as their label (shipped through the teacher_ids/teacher_logprobs channel,
-    # scored under the BARE prompt via teacher_prefix_ids). The per-token math
-    # is byte-identical to forward_kl_topk — sum p_label*(log p_label - log q) —
-    # so the logits processor needs no new mode; the term aggregates the SAME
-    # per-token matrix under ``tg_mask`` with its own batch-global sequence
-    # count (seq-mean-token-mean). 0.0 = arm off, byte-identical.
+    # as their label. Decoupled from the OPD family end to end (user ruling
+    # 2026-08-02, codex impl-review P2-2 doc sync): the label ships on its OWN
+    # tg_label_ids/tg_label_logprobs channel (scored under the BARE prompt via
+    # teacher_prefix_ids; teacher_* holds zero stubs on tg rows), the per-token
+    # soft-CE — sum p_label*(log p_label - log q) — is computed by the
+    # standalone compute_tg_soft_ce (fp32, no OPD clamps), and the term
+    # aggregates the dedicated ``tg_losses`` matrix under ``tg_mask`` with the
+    # frequency-weighted total denominator (seq-mean-token-mean). 0.0 = arm
+    # off, byte-identical.
     #     ... + tg_loss_coef * TG
     tg_loss_coef: float = 0.0
 
@@ -243,10 +246,12 @@ class DistillationLossConfig(BaseConfig):
             # the teacher-rejected tokens. Neither is ever what an experiment means.
             raise ValueError(f"gate_beta must be finite and > 0, got {gate_beta}")
 
-        if not (self.opd_loss_coef or self.rl_loss_coef or self.sft_loss_coef):
+        # codex impl-review P1-6: tg is a full objective term — a TG-only
+        # configuration (opd 0, tg > 0) is a legal ablation.
+        if not (self.opd_loss_coef or self.rl_loss_coef or self.sft_loss_coef or self.tg_loss_coef):
             raise ValueError(
-                "opd_loss_coef, rl_loss_coef and sft_loss_coef are all zero — there is no "
-                "objective left to optimise"
+                "opd_loss_coef, rl_loss_coef, sft_loss_coef and tg_loss_coef are all zero — "
+                "there is no objective left to optimise"
             )
 
         if self.rl_loss_coef > 0.0 and self.use_task_rewards:

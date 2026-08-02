@@ -21,32 +21,49 @@ tag 均为 ASCII,单 token decode 的多字节碎片误差不影响 tag 定位)�
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
 
 CLOSE_TAG = "</reasoning>"
 ACTION_TAG = "<action>"
+_STEP_DIR = re.compile(r"^step_?0*(\d+)$")  # writer emits step_00004
+
+
+def _row_key(z, i):
+    """codex impl-review P1-3: resp_hash collides on identical responses —
+    prefer the writer's stable row_uid, fall back to (task, hash) on packs
+    written before the field existed."""
+    if "row_uid" in z.files:
+        uid = str(z["row_uid"][i])
+        if uid:
+            return uid
+    return (str(z["row_task"][i]), int(z["row_hash"][i]))
 
 
 def load_step(step_dir: Path):
-    """Merge all rank npz of one step -> {row_hash: row dict with full-length
-    token_loss (NaN where no rank covered it), turn_spans, won, role}."""
+    """Merge all rank npz of one step -> {row_key: row dict with full-length
+    token_loss / covered / response_mask, turn_spans, won, role}."""
     rows = {}
     for npz_path in sorted(step_dir.glob("rank*.npz")):
         z = np.load(npz_path, allow_pickle=False)
         n = len(z["row_hash"])
         for i in range(n):
-            h = int(z["row_hash"][i])
+            key = _row_key(z, i)
             resp_len = int(z["resp_len"][i])
-            row = rows.get(h)
+            r0, r1 = z["resp_offsets"][i], z["resp_offsets"][i + 1]
+            row = rows.get(key)
             if row is None:
-                r0, r1 = z["resp_offsets"][i], z["resp_offsets"][i + 1]
                 s0, s1 = z["turn_spans_offsets"][i], z["turn_spans_offsets"][i + 1]
                 spans_flat = z["turn_spans"][s0:s1]
-                row = rows[h] = {
+                row = rows[key] = {
                     "token_loss": np.full(resp_len, np.nan, dtype=np.float64),
+                    "covered": np.zeros(resp_len, dtype=bool),
                     "response_ids": z["response_ids"][r0:r1],
+                    # codex impl-review P1-4: the writer ships response_mask —
+                    # tokens with no training signal must not enter the stats.
+                    "response_mask": z["response_mask"][r0:r1].astype(bool),
                     "turn_spans": [
                         (int(spans_flat[j]), int(spans_flat[j + 1]))
                         for j in range(0, len(spans_flat), 2)
@@ -54,10 +71,22 @@ def load_step(step_dir: Path):
                     "won": int(z["row_won"][i]),
                     "role": str(z["row_role"][i]),
                 }
+            else:
+                # Merging a second SP segment: the metadata must agree — a
+                # clash means the key collided across distinct rows. Fail,
+                # never overwrite.
+                if (row["won"] != int(z["row_won"][i])
+                        or row["role"] != str(z["row_role"][i])
+                        or len(row["token_loss"]) != resp_len):
+                    raise SystemExit(
+                        f"row key {key!r} collides across distinct rows "
+                        f"(won/role/resp_len mismatch) in {step_dir}"
+                    )
             g0, g1 = z["seg_offsets"][i], z["seg_offsets"][i + 1]
             seg = z["token_loss"][g0:g1].astype(np.float64)
             a = int(z["seg_start"][i])
             row["token_loss"][a : a + len(seg)] = seg
+            row["covered"][a : a + len(seg)] = True
     return rows
 
 
@@ -82,29 +111,43 @@ def classify_span_tokens(span_ids, decode_one):
 
 
 def decompose_row(row, decode_one):
-    """-> (thought_kls, action_kls) lists of finite per-token KL values."""
+    """-> (thought_kls, action_kls, partial) — per-token KL values under the
+    statistic condition response_mask & covered & finite (codex impl-review
+    P1-4); partial=True when a masked span position was NOT covered by any SP
+    segment (missing rank file) — the row's readout would silently understate."""
     tl = row["token_loss"]
     ids = row["response_ids"]
+    mask = row["response_mask"]
+    covered = row["covered"]
     thought, action = [], []
+    partial = False
     for a, b in row["turn_spans"]:
         b = min(b, len(ids))
         if b <= a:
             continue
         cats = classify_span_tokens(ids[a:b], decode_one)
         for off, cat in enumerate(cats):
-            v = tl[a + off]
-            if math.isfinite(v):
-                (thought if cat == "thought" else action).append(float(v))
-    return thought, action
+            t = a + off
+            if not mask[t]:
+                continue
+            if not covered[t] or not math.isfinite(tl[t]):
+                partial = True
+                continue
+            (thought if cat == "thought" else action).append(float(tl[t]))
+    return thought, action, partial
 
 
 def step_summary(rows, decode_one):
-    """Aggregate LOST bare rows of one step."""
-    th_all, ac_all, n_rows = [], [], 0
+    """Aggregate LOST bare rows of one step. Rows with incomplete SP coverage
+    are EXCLUDED and counted — a silently partial table reads as complete."""
+    th_all, ac_all, n_rows, n_partial = [], [], 0, 0
     for row in rows.values():
         if row["won"] or row["role"] != "bare":
             continue
-        th, ac = decompose_row(row, decode_one)
+        th, ac, partial = decompose_row(row, decode_one)
+        if partial:
+            n_partial += 1
+            continue
         if th or ac:
             n_rows += 1
             th_all.extend(th)
@@ -116,6 +159,7 @@ def step_summary(rows, decode_one):
     n_th, n_ac = len(th_all), len(ac_all)
     return {
         "lost_rows": n_rows,
+        "partial_rows_excluded": n_partial,
         "thought_tokens": n_th,
         "action_tokens": n_ac,
         "thought_kl_per_token": th_sum / max(n_th, 1),
@@ -146,20 +190,24 @@ def main():
         return cache[tid]
 
     obs = Path(args.obs_dir)
-    step_dirs = sorted(
-        (d for d in obs.iterdir() if d.is_dir() and d.name.startswith("step")),
-        key=lambda d: int(d.name.replace("step", "") or 0),
-    )
+    # codex impl-review P1-2: the writer emits step_00004 — parse strictly.
+    found = []
+    for d in obs.iterdir():
+        if not d.is_dir():
+            continue
+        m = _STEP_DIR.match(d.name)
+        if m:
+            found.append((int(m.group(1)), d))
+    step_dirs = [d for _, d in sorted(found)]
     if not step_dirs:
-        raise SystemExit(f"no step*/ dirs under {obs} — was TRACE_OBS_DIR on for this run?")
+        raise SystemExit(f"no step_*/ dirs under {obs} — was TRACE_OBS_DIR on for this run?")
 
     out = {}
-    hdr = (f"{'step':>5} {'rows':>5} {'th_kl/tok':>10} {'ac_kl/tok':>10} "
-           f"{'th_share':>9} {'th_tok%':>8}")
+    hdr = (f"{'step':>5} {'rows':>5} {'part':>5} {'th_kl/tok':>10} "
+           f"{'ac_kl/tok':>10} {'th_share':>9} {'th_tok%':>8}")
     print(hdr)
     print("-" * len(hdr))
-    for d in step_dirs:
-        step = int(d.name.replace("step", "") or 0)
+    for step, d in sorted(found):
         if args.steps and str(step) not in args.steps.split(","):
             continue
         summ = step_summary(load_step(d), decode_one)
@@ -168,6 +216,7 @@ def main():
             continue
         out[step] = summ
         print(f"{step:>5} {summ['lost_rows']:>5} "
+              f"{summ['partial_rows_excluded']:>5} "
               f"{summ['thought_kl_per_token']:>10.4f} "
               f"{summ['action_kl_per_token']:>10.4f} "
               f"{summ['thought_kl_share']:>9.3f} "
