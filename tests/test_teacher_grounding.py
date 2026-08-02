@@ -423,12 +423,48 @@ def test_config_tg_mutually_exclusive_with_rl_and_sft(tmp_path):
         _load(tmp_path, "c", base + ["train.mix_sft_weight=0.5"])
 
 
-def test_config_tg_requires_forward_kl_topk_and_fsdp_backend(tmp_path):
+def test_config_tg_kl_mode_whitelist_and_fsdp_backend(tmp_path):
+    # Decoupling ruling (2026-08-02): the OPD divergence is free within the
+    # top-k family — reverse_kl_topk is a legal T1 base (rkl_seqmean reuse) —
+    # while k3/gated (teacher_topk=0 single-column layout) stays structurally
+    # incompatible with the tg top-k label.
     base = ["train.mix_tg_weight=1.0", "train.opd_lost_only=true"]
-    with pytest.raises(ValueError, match="forward_kl_topk"):
-        _load(tmp_path, "d", base + ["train.opd_kl_mode=reverse_kl_k3"])
+    cfg = _load(tmp_path, "d0", base + ["train.opd_kl_mode=reverse_kl_topk"])
+    assert cfg.train.opd_kl_mode == "reverse_kl_topk"
+    with pytest.raises(ValueError, match="single-column"):
+        _load(tmp_path, "d1", base + ["train.opd_kl_mode=reverse_kl_k3"])
+    with pytest.raises(ValueError, match="single-column"):
+        _load(tmp_path, "d2", base + ["train.opd_kl_mode=reverse_kl_gated"])
     with pytest.raises(ValueError, match="fsdp"):
         _load(tmp_path, "e", base + ["train.teacher_scoring_backend=vllm"])
+
+
+def test_config_health_gate_rules(tmp_path):
+    # The gate is meaningless without the tg arm, must be positive, and a
+    # legal combo loads with the value intact.
+    with pytest.raises(ValueError, match="health_gate"):
+        _load(tmp_path, "hg0", ["train.mix_tg_health_gate=900"])
+    with pytest.raises(ValueError, match="positive"):
+        _load(tmp_path, "hg1", ["train.mix_tg_weight=1.0",
+                                "train.opd_lost_only=true",
+                                "train.mix_tg_health_gate=-1"])
+    cfg = _load(tmp_path, "hg2", ["train.mix_tg_weight=1.0",
+                                  "train.opd_lost_only=true",
+                                  "train.mix_tg_health_gate=900"])
+    assert cfg.train.mix_tg_health_gate == 900.0
+
+
+def test_fingerprint_health_gate_is_conditional(tmp_path):
+    from trace_opd.common.config import objective_fingerprint
+
+    base = ["train.mix_tg_weight=1.0", "train.opd_lost_only=true"]
+    fp_tg = objective_fingerprint(_load(tmp_path, "fg0", base))
+    fp_gate = objective_fingerprint(
+        _load(tmp_path, "fg1", base + ["train.mix_tg_health_gate=900"]))
+    assert fp_gate != fp_tg                # the gate changes the label set
+    fp_gate2 = objective_fingerprint(
+        _load(tmp_path, "fg2", base + ["train.mix_tg_health_gate=600"]))
+    assert fp_gate2 != fp_gate             # and so does its threshold
 
 
 def test_config_tg_valid_combo_loads(tmp_path):
@@ -470,11 +506,20 @@ def test_curve_mixed_tg_keys():
     from trace_opd.train.curve import build_curve_metrics
 
     fields = {"env_steps": 3, "invalid_format": 0, "truncated": 0,
-              "tg_role": 1, "tg_dropped_overflow": 0}
+              "tg_role": 1, "tg_dropped_overflow": 0,
+              "tg_label_thought_chars": 946, "tg_label_thought_turns": 3}
     on = build_curve_metrics(validate=False, research_enabled=False,
                              mixed_tg=True, fields=fields)
     assert on["tg_role"] == 1.0 and on["tg_dropped_nodoc"] == 0.0
-    assert "tg_dropped_lostonly" in on
+    assert "tg_dropped_lostonly" in on and "tg_dropped_unhealthy" in on
+    # Label-quality pair (pre-registered sharp readout, online form):
+    # cpt = chars-curve / turns-curve; placeholder rows default both to 0.
+    assert on["tg_label_thought_chars"] == 946.0
+    assert on["tg_label_thought_turns"] == 3.0
+    on_placeholder = build_curve_metrics(
+        validate=False, research_enabled=False, mixed_tg=True,
+        fields={"env_steps": 1, "invalid_format": 0, "truncated": 0})
+    assert on_placeholder["tg_label_thought_chars"] == 0.0
     off = build_curve_metrics(validate=False, research_enabled=False,
                               mixed_tg=False, fields=fields)
     assert "tg_role" not in off

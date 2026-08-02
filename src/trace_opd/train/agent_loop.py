@@ -613,8 +613,20 @@ class TraceAgentLoop(AgentLoopBase):
         lost_only = self.cfg.train.opd_lost_only and not validate
         tg_converted = False
         if traj.won and not is_expert and (tg_arm or lost_only):
+            # 标签质量(设计 §动力学:枢纽变量 = won 标签的 thinking 健康度)。
+            # 口径与 scripts/won_traj_evolution.py 的 thought_chars_per_turn
+            # 逐字节同源:Σ len(steps[].thought) / len(steps)。在线曲线发
+            # chars/turns 两个和,cpt = 两条曲线相除(= 全部标签行的 turn 加权
+            # per-turn 均值;预注册锐判据的在线版,基线 315→1986 ×6)。
+            thought_chars = sum(len(s.thought or "") for s in traj.steps)
+            thought_turns = len(traj.steps)
+            gate = self.cfg.train.mix_tg_health_gate
+            unhealthy = (
+                gate is not None
+                and thought_chars / max(thought_turns, 1) > gate
+            )
             tg_prompt_ids = None
-            if tg_arm and doc:
+            if tg_arm and doc and not unhealthy:
                 tg_prompt_ids = self._teacher_prompt_ids(
                     adapter, doc, result.tokens.prompt_ids, traj.initial_obs
                 )
@@ -626,13 +638,18 @@ class TraceAgentLoop(AgentLoopBase):
                 )
                 output.extra_fields["sample_role"] = "tg"
                 output.extra_fields["tg_role"] = 1
+                # 只有真正成为标签的行才计入标签质量曲线(被门挡掉/降级的
+                # 占位行不是标签)。
+                output.extra_fields["tg_label_thought_chars"] = thought_chars
+                output.extra_fields["tg_label_thought_turns"] = thought_turns
             else:
-                # 无 doc / 前缀溢出 / tg 臂关:won 行按 opd_lost_only 语义
-                # 零贡献占位(role="tg" + 全零 mask ⇒ TQ 侧 tg_mask 亦零,
-                # 打分侧判 tg_skip,损失两侧都看不见它)。
+                # 无 doc / 前缀溢出 / 健康门拦截 / tg 臂关:won 行按
+                # opd_lost_only 语义零贡献占位(role="tg" + 全零 mask ⇒ TQ 侧
+                # tg_mask 亦零,打分侧判 tg_skip,损失两侧都看不见它)。
                 output.response_mask = [0] * len(output.response_ids)
                 output.extra_fields["sample_role"] = "tg"
                 reason = (
+                    "unhealthy" if (tg_arm and doc and unhealthy) else
                     "overflow" if (tg_arm and doc) else
                     ("nodoc" if tg_arm else "lostonly")
                 )

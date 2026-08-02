@@ -395,8 +395,16 @@ train:
                             # 指导),而非 SFT-doc 的"doc 条件自走能力"。0 = 关断,
                             # 逐字节现状(不做裸打分、不构造 tg 行、不传 label)。
                             # 开启硬前提(config 拦):opd_lost_only=true、
-                            # opd_kl_mode=forward_kl_topk、teacher_scoring_backend=
-                            # fsdp、research.enabled;与 mix_rl/mix_sft 首版互斥。
+                            # opd_kl_mode ∈ {forward_kl_topk, reverse_kl_topk}
+                            # (解耦裁定 2026-08-02:tg 有独立标签通道与公式,
+                            # k3/gated 的单列打分布局与 tg 结构不兼容)、
+                            # teacher_scoring_backend=fsdp、research.enabled;
+                            # 与 mix_rl/mix_sft 首版互斥。
+  mix_tg_health_gate: null  # 标签健康门(默认关;T1 首跑保持 null,单变量纪律)。
+                            # 非 null = thought 字符/turn 阈值:超阈的 won 轨迹不转
+                            # tg 行(tg_dropped_unhealthy 占位,曲线可见)。防标签
+                            # ratchet;阈值锚定健康期(基线 step5-7 ≈315 的 2-3 倍),
+                            # 严禁随当前模型滚动上调。非 null 条件式进 fingerprint。
   opd_lost_only: false      # won 分割:true 时 won=1 的 bare 行退出 OPD(成功区的
                             # OPD 推力本就是噪声/叙述偏置共犯——Rethinking-OPD 的
                             # 冗余梯度;tg 开时该行转换为 tg 行,tg 关时零 mask 占位

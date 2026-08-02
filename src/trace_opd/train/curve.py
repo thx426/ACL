@@ -49,6 +49,11 @@ _MIXED_TG = (
     "tg_dropped_overflow",  # doc 前缀溢出而降级的占位行
     "tg_dropped_nodoc",     # research 失败无 doc 的占位行
     "tg_dropped_lostonly",  # tg 臂关、仅 opd_lost_only 的占位行(T1' 形态)
+    "tg_dropped_unhealthy", # 健康门拦截的膨胀 won 行(mix_tg_health_gate)
+    # 标签质量(预注册锐判据在线版):cpt = chars 曲线 ÷ turns 曲线
+    # (= 全部标签行的 turn 加权 per-turn 均值;仅完整 tg 行非零)。
+    "tg_label_thought_chars",
+    "tg_label_thought_turns",
 )
 _MIXED_SFT = (
     "sft_role", "sft_won", "sft_accepted", "sft_dropped_ref",

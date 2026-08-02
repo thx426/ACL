@@ -314,13 +314,21 @@ class TrainCfg:
     # --- teacher grounding(教师接地,docs/teacher-grounding-design.md)---
     # 反向蒸馏臂:bare 成功轨迹换 doc 前缀作训练前向(q),裸分布 top-64 重归一
     # 作软标签,soft-CE 只经 teacher 前向回传——首次直接训练 q 的"教师功能"。
-    # won 分割(用户裁定 2026-08-02):L = mean_lost[OPD] + mix_tg_weight ×
-    # mean_won[tg],两项均 seq-mean-token-mean、各带自己的 batch 全局行数分母。
+    # won 分割 + 频率加权(用户裁定 2026-08-02):
+    #   L = (N_lost/N)·mean_lost[OPD] + w·(N_won/N)·mean_won[tg], N=N_lost+N_won
+    # 两项同除 batch 全局总信号行数,won 率上升 ⇒ OPD 份额真退火。
     # 0 = 关断,逐字节现状(不做裸打分、不构造 tg 行、不传 label 字段)。
     mix_tg_weight: float = 0.0
     # OPD 只训失败轨迹:won=1 的 bare 行不再进 OPD(tg 开时转换为 tg 行;
     # tg 关时以零 mask 占位行存在——T1' 归因臂形态)。False = 现状。
     opd_lost_only: bool = False
+    # 标签健康门(设计 §动力学三防线之三,默认关):非 null 时,thought 字符/
+    # turn 超过该阈值的 won 轨迹不转换为 tg 行(以 tg_dropped_unhealthy 占位
+    # 行退出,曲线可见)。防标签质量 ratchet(病理若抢先污染 won 轨迹,tg 会
+    # 把膨胀形态固化进教师)。T1 首跑保持 null(单变量纪律),凭标签质量曲线
+    # (tg_label_thought_* 族)决定是否启用;阈值应锚定健康期(如基线 step5-7
+    # 的 ~315 字符/turn 的 2-3 倍),严禁随当前模型滚动上调。
+    mix_tg_health_gate: float | None = None
     # --- 分布观察包(docs/microscope-design.md;显微镜工作台的数据层)--------
     # 存"最小完备源":每训练样本每 response 位置的 teacher top-K / student top-K /
     # student-on-teacher-support / realized 双侧 + 训练 per-token loss 真值锚。
@@ -492,11 +500,15 @@ def _validate(cfg: "Config") -> None:
                 "mix_sft_weight in this version: removing won rows from response_mask "
                 "changes the GRPO group / SFT data semantics (composition unruled)"
             )
-        if cfg.train.opd_kl_mode != "forward_kl_topk":
+        if cfg.train.opd_kl_mode not in ("forward_kl_topk", "reverse_kl_topk"):
+            # 解耦裁定(2026-08-02)后 tg 有独立标签通道与公式,OPD 散度在
+            # top-k 族内自由;k3/gated 用 teacher_topk=0 单列打分,与 tg 的
+            # top-64 标签在同一 batch 的统一列宽下结构不兼容(非折中)。
             problems.append(
-                f"train.mix_tg_weight>0 requires opd_kl_mode='forward_kl_topk' "
-                f"(tg rows reuse its per-token formula as their soft-CE), "
-                f"got {cfg.train.opd_kl_mode!r}"
+                f"train.mix_tg_weight>0 requires opd_kl_mode in "
+                f"('forward_kl_topk', 'reverse_kl_topk') — the k3/gated "
+                f"single-column (topk=0) scoring layout cannot share a batch "
+                f"with the tg top-k label, got {cfg.train.opd_kl_mode!r}"
             )
         if cfg.train.loss_agg_mode != "seq-mean-token-mean":
             problems.append(
@@ -516,6 +528,17 @@ def _validate(cfg: "Config") -> None:
             problems.append(
                 "train.mix_tg_weight>0 requires research.enabled — a tg row needs the "
                 "task's document to build the doc-prefixed training prompt"
+            )
+    if cfg.train.mix_tg_health_gate is not None:
+        if cfg.train.mix_tg_weight <= 0:
+            problems.append(
+                "train.mix_tg_health_gate is set but mix_tg_weight is 0 — the gate "
+                "filters won->tg conversion and has no meaning without the tg arm"
+            )
+        elif not cfg.train.mix_tg_health_gate > 0:
+            problems.append(
+                f"train.mix_tg_health_gate must be a positive char/turn threshold, "
+                f"got {cfg.train.mix_tg_health_gate!r}"
             )
     if cfg.train.mix_sft_prefix not in ("doc", "bare"):
         problems.append(
@@ -877,6 +900,10 @@ def objective_fingerprint(cfg: "Config") -> str:
         material += f"|mix_tg_weight={t.mix_tg_weight}"
     if t.opd_lost_only:
         material += "|opd_lost_only=1"
+    # 健康门改变 tg 的数据分布(哪些 won 行成为标签)⇒ 定义"优化什么",
+    # 条件式参与:null(默认关)不进 hash,存量指纹逐字节不变。
+    if t.mix_tg_health_gate is not None:
+        material += f"|mix_tg_health_gate={t.mix_tg_health_gate}"
     # self-research 通道同一纪律:默认关断(weight=0)不进 hash ⇒ 存量 run 指纹
     # 逐字节不变;开启后 N/K/模式/warmup 都定义"优化什么",跨值 resume 拒绝。
     rrl = cfg.research_rl
