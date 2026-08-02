@@ -1,13 +1,14 @@
-# Teacher Grounding(tg)T1 运行手册(v2,2026-08-02)
+# Teacher Grounding(tg)T1 运行手册(v3,2026-08-02,正式跑单版)
 
 > 面向 CD-006。机制设计真源 `docs/teacher-grounding-design.md`(v2,含解耦
 > §5、二轮实施审阅台账 §11.5 与双盲台账 §12);本手册只讲怎么跑、怎么看、
-> 怎么停、报回什么。代码:trace_opd 分支 **`mixed-objective-r2`**(含二轮
-> 审阅修复批 + tg 行观察补全),vendored verl = 真源 trace-opd **`d6ac87e`**
-> 导出;**301 测试全绿**。
-> v2 相对 v1 的两个结构变化:①解耦落地 ⇒ **T1 直接叠 rkl_seqmean 底座,
-> 原 T0(forward 新跑)取消**;②新增三判据件(标签质量曲线/健康门[默认关]/
-> KL 段分解)。
+> 怎么停、报回什么。代码:trace_opd 分支 **`mixed-objective-r2`**(HEAD
+> `ec4f66f`),vendored verl = 真源 trace-opd **`d6ac87e`** 导出;
+> **301 测试全绿**。
+> v3 相对 v2(用户确认的运行形态定稿):①**不设独立 SMOKE run——起跑核验
+> 并入正式跑头 2 step,fail-fast**;②`test_freq: 5`、30 步延长规则与判读
+> 阈值全部预注册(§6b);③段分解升双镜像模式,tg 行观察包已补全;④起跑前
+> gate 四件(§3b)。
 
 ## 0. 同步安全(老纪律,逐条执行)
 
@@ -45,12 +46,15 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 | (既有)rkl 纯 OPD | trace_opd_4b_rkl_seqmean | — | 历史锚(已崩;won 膨胀实证同族) |
 | **T1** | trace_opd_4b_rkl_seqmean_t1 | 仅加 `mix_tg_weight: 1.0` + `opd_lost_only: true`(+ 环境变量 `TRACE_OBS_DIR` 开观察包,见 §5) | 主验证臂;**必须 step-0 开臂**(中途接入会把已膨胀成功形态固化进教师,设计 §4 防线 1) |
 
-- 口径:16×8、同 caps、`save_freq: 2`(崩塌窗密存档)、`test_freq: 10`、
-  ≥30 步(覆盖基线崩塌窗 + 延后观察)。
+- 口径:16×8、同 caps、`save_freq: 2`(崩塌窗密存档)、**`test_freq: 5`**
+  (val 纯评测不改权重,加密只花墙钟;与基线在共同点 10/20/30 照常对比)、
+  **≥30 步**;**预注册延长规则(一次性)**:step-30 未触发判停且 val 未
+  衰退 ⇒ 延至 **step-40** 终评,不再继续延。
 - `mix_tg_health_gate` **保持 null**(默认关,单变量纪律;启用与阈值由标签
   质量曲线走势定,须报回裁定)。
-- T1′(仅 `opd_lost_only: true`,归因臂)、T3(标签 one-hot CE 退化版)按 T1
-  结果决定,不首发。
+- **T1′(仅 `opd_lost_only: true`,归因臂)在 T1 出结果后默认排跑**(预算
+  许可下):T1 正向时分离"切成功区 OPD"与"加 tg"两成分的贡献,T1 失败时
+  定位失败成分。T3(标签 one-hot CE 退化版)列 T2 池按 T1 结果定。
 - GPU:等 162 空窗(用户裁定);沿用与既有基线可比的卡数配置。
 
 ## 3. 配置制备(diff 规范)
@@ -64,12 +68,24 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 - config 校验会强制:opd_kl_mode ∈ {forward_kl_topk, **reverse_kl_topk**}(白
   名单,rkl 底座合法)/ teacher_scoring_backend=fsdp / research.enabled /
   loss_agg_mode=seq-mean-token-mean / 与 rl/sft 互斥——任一不满足启动即拒。
-- 环境变量:启动脚本导出 `TRACE_OBS_DIR=<run>/obs`(§4.3 段分解判据的数据
-  源;抽样调度按 observation.py 默认)。
+- 环境变量:启动脚本导出 `TRACE_OBS_DIR=<run>/obs`(两条段分解判据的数据
+  源;`TRACE_OBS_EVERY` 默认 1 = **每步全存**,保持默认——相变窗覆盖靠它)。
+  **忘导出 = 环1/环2 机理判据整条数据不存在,不可事后补。**
 
-## 4. 冒烟(全量前必做,SMOKE 快速档数 step)
+## 3b. 起跑前 gate(四件,分钟级)
 
-八项首验:
+1. **同步校验**:服务器侧 `python -m pytest tests/ -q` 须 **301 passed**。
+2. **基线 won 分层补算**:`python3 scripts/won_traj_evolution.py --rollouts
+   runs/trace_opd_4b_rkl_seqmean/rollouts` ——锐判据的**同臂配对数**(现有
+   ×6 实证表来自 rkl+RL 臂,纯 rkl 臂必须有自己的对照表);产出随首次报回。
+3. **续跑预检**:读 launcher 代码确认 T1 崩溃后可从 ckpt resume(不信文档
+   承诺,代码级确认)。
+4. **磁盘余量**:obs 全存 40 步约 12–19GB + `save_freq: 2` 的 ckpt 体量。
+
+## 4. 起跑核验(并入正式跑头 2 step,fail-fast——不设独立 SMOKE run)
+
+正式跑起跑后,前 1–2 个 step 内就地核验八项;**任一不过立即停跑**、保留
+现场与日志原样报回;全过即继续,该跑就是正式 run:
 
 1. **参数实收**:`effective_config.yaml` 两键正确;启动日志 build_command 含
    `+distillation.distillation_loss.tg_loss_coef=1.0`;`launch_manifest` 的
@@ -90,9 +106,10 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 6. **行为曲线口径**:`critic/score/mean` ≈ 该 step rollout 全量胜率(won 行
    分流后仍计入——对不上说明 P0-1 口径破了)。
 7. **算力持平**:step 耗时/显存与基线同量级(镜像对称;偏差 >30% 报回)。
-8. **观察包落盘**:`<run>/obs/step*/rank*.npz` 出现(抽样步);smoke 结束跑
-   一次 `python3 scripts/opd_kl_span_decomp.py --obs-dir <run>/obs
-   --tokenizer <Qwen3-4B 路径>` 出表即通。
+8. **观察包落盘**:`<run>/obs/step_*/rank*.npz` 出现;头 2 step 内各跑一次
+   `python3 scripts/opd_kl_span_decomp.py --obs-dir <run>/obs --tokenizer
+   <Qwen3-4B 路径>`(`--role bare` 与 `--role tg`)出表即通(`part` 列应
+   恒 0)。
 
 ## 5. 全量监控(在跑期)
 
@@ -128,14 +145,40 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 | 标签 cpt 持续 >2× 健康期 | ratchet 前兆 | 记录继续 + 报回(健康门启用裁定) |
 | teacher 自走成功率(K=8 doc 注入)骤降 | q 执行功能受损 | 记录继续,报回(P3 溢出候选) |
 
+## 6b. 预注册判读与结果分型(2026-08-02 定稿;终评时对号入座,防事后合理化)
+
+阈值(预注册,基线 = `trace_opd_4b_rkl_seqmean`,崩于 ~step-19):
+
+- **主判据**:崩塌步 ≥ 基线×1.5(≈29)或预算内不崩 ⇒ 正向;
+- **锐判据(cpt,`tg_label_thought_cpt` 口径,健康期 284–315)**:全程 <2×
+  (~630)= 压平;2–4× = 压缓;>4× 且持续上行 = 失败;
+- **效果判据**:val 峰值 ≥ 基线峰值 −5pp(greedy 非确定性误差棒内不劣)且
+  峰后平台化(不出现基线式不可逆崩形态);
+- **机理判据**:段分解两模式的 thought 份额趋势(T1 自身趋势,无基线对照)。
+
+结果四型(终评归入其一,连同证据链报回):
+
+| 型 | 观测 | 解读 → 下一步 |
+|---|---|---|
+| A 强正向 | 不崩 + cpt 压平 + val 不劣且平台 | 机制成立 → T1′ 归因 |
+| B 正向 | 崩塌显著推迟 + cpt 压缓 | 方向对、力度不足 → 看环2 段分解定加强点(健康门启用走裁定) |
+| C 中介成立终点未达 | cpt 压平但 val 无改善 | 教师治了、学生未受益 → 查环2/环3 断点(段分解 + val 截断率口径) |
+| D 失败 | 同窗崩 + cpt 同样飙升 | 恶性分支抢跑 → 健康门(阈值锚 ~630,严禁滚动上调)优先,余走 T2 池裁定 |
+
+D 型的预埋提醒:tg 份额 = won 率(频率加权内生),早期 won 率低则推力弱——
+若曲线显示"tg 未起力病已发",按上行处置,勿改 w_tg(裁定值)。
+
 ## 7. 报回清单(experiment-feedback.md)
 
 1. run 目录 + effective_config + fingerprint;与基线互 diff 确认单变量。
 2. 长度三曲线(mean/p95/resp_clip)对基线对照 + 崩塌步(如崩)。
-3. `won_traj_evolution` T1 输出表(json 留档;基线表已有)。
+3. `won_traj_evolution` 两份表:T1 输出 + **基线补算表(gate 2 产出,纯 rkl
+   臂同口径对照)**(json 一并留档)。
 4. 标签质量曲线(chars/turns/cpt)全程截图或数值导出。
 5. `opd_kl_span_decomp` 两模式表 + json(`--role bare` 环2 与 `--role tg`
    环1 的 thought 份额随步)。
 6. 裸 val 三件套逐 val 点。
 7. tg 曲线族数值(loss/rows/role/dropped×3/min_preclamp/loss_max)。
-8. 冒烟八项逐项结果;任何 fail-loud 文本原样。
+8. 起跑核验八项逐项结果;任何 fail-loud 文本原样。
+9. **终评归型**:§6b 四型对号入座 + 逐条判据的数值证据链(数字必须带
+   可追溯路径)。
