@@ -234,19 +234,36 @@ def test_tg_call_site_fails_loud_without_tg_mask(losses_ns):
         _call_ppo(ns, 1.0, "seq-mean-token-mean", data)
 
 
-def test_tg_call_site_seq_mean_uses_engine_stamped_tg_count(losses_ns):
+def test_tg_call_site_seq_mean_uses_frequency_weighted_total(losses_ns):
+    # User ruling 2026-08-02 (codex P1-1): BOTH terms divide by the TOTAL
+    # signal-row count N_lost + N_tg, so each term's effective weight is its
+    # batch share (true annealing), not an unconditional conditional mean.
     ns, calls = losses_ns
     tg_mask = torch.tensor([[False, False], [True, True]])
-    data = {"response_mask": torch.tensor([[True, True], [False, False]]),
-            "tg_mask": tg_mask,
+    rmask = torch.tensor([[True, True], [False, False]])
+    data = {"response_mask": rmask, "tg_mask": tg_mask,
             "batch_num_seqs": 5, "dp_size": 2, "batch_num_tg_seqs": 3}
     _, metrics = _call_ppo(ns, 1.0, "seq-mean-token-mean", data)
     tg_calls = [c for c in calls if c.get("loss_mask") is not None
                 and torch.equal(c["loss_mask"], tg_mask)]
-    assert len(tg_calls) == 1
-    assert tg_calls[0]["global_batch_size"] == 3.0
+    opd_calls = [c for c in calls if c.get("loss_mask") is not None
+                 and torch.equal(c["loss_mask"], rmask)]
+    assert len(tg_calls) == 1 and len(opd_calls) == 1
+    assert tg_calls[0]["global_batch_size"] == 8.0    # 5 lost + 3 tg
+    assert opd_calls[0]["global_batch_size"] == 8.0   # same total for OPD
     assert tg_calls[0]["dp_size"] == 2.0
     assert "tg/loss" in metrics and "tg/rows" in metrics and "tg/tokens" in metrics
+
+
+def test_opd_denominator_unchanged_without_tg_stamp(losses_ns):
+    # tg off (no engine stamp): the historical lost-only denominator is
+    # byte-identical — frequency weighting must not leak into pure-OPD runs.
+    ns, calls = losses_ns
+    rmask = torch.tensor([[True, True], [True, False]])
+    data = {"response_mask": rmask, "batch_num_seqs": 5, "dp_size": 2}
+    _call_ppo(ns, 0.0, "seq-mean-token-mean", data)
+    opd_calls = [c for c in calls if c.get("loss_mask") is not None]
+    assert opd_calls[0]["global_batch_size"] == 5.0
 
 
 def test_tg_call_site_seq_mean_fails_loud_without_stamp(losses_ns):
@@ -552,3 +569,24 @@ def test_config_rejects_tg_with_token_mean(tmp_path):
     with pytest.raises(ValueError, match="seq-mean-token-mean"):
         _load(tmp_path, "tm", ["train.mix_tg_weight=1.0", "train.opd_lost_only=true",
                                "train.loss_agg_mode=token-mean"])
+
+
+
+def test_tg_gradient_bounded_under_extreme_q():
+    """User-requested extreme-case pin (2026-08-02): the tg soft-CE has NO
+    1/q term — the log singularity cancels against the softmax Jacobian, so
+    the per-logit gradient is bounded by 1 (and per-token L1 by 2) no matter
+    how small q gets on the label support. A ratio-type estimator (p/q) would
+    explode on the same input; the tg formula is structurally immune."""
+    V = 50
+    logits = torch.zeros(V, requires_grad=True)
+    with torch.no_grad():
+        logits[10] = 35.0  # q on the label support ~ 6e-16
+    label_ids = torch.tensor([0, 1, 2])
+    label_p = torch.tensor([0.99995, 2.5e-5, 2.5e-5])  # tail below e^-10
+    log_q = torch.log_softmax(logits, dim=-1)[label_ids]
+    loss = (label_p * (label_p.log() - log_q)).sum()
+    loss.backward()
+    assert loss.item() > 30            # the loss IS large — that is fine
+    assert logits.grad.abs().max().item() <= 1.0 + 1e-6
+    assert logits.grad.abs().sum().item() <= 2.0 + 1e-6

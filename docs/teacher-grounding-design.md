@@ -72,13 +72,20 @@ L = mean_{won=0}[ L_OPD ] + w_tg · mean_{won=1}[ L_tg ],   w_tg = 1.0
 自己的 batch 全局行数分母(见 §4)。分工:**失败区 doc 出手教学生;成功区学生
 校准老师**。每状态区单向信息流,无同状态对冲。
 
-**条件均值语义修正(codex 审阅 P1-1,2026-08-02)**:此前"won 率上升 ⇒ OPD
-自动退火/渐进停机"的表述**不成立**——两项是各自独立归一的**条件均值**,期望
-权重不随 won/lost 频率变化;won 率升高只是让 OPD 项由更少的失败样本做高方差
-估计(单条 lost 行也代表整个 OPD 项),直到 lost=0 才从满权重硬切到 0。两种
-语义都有科学理由:①保持条件均值(现状)= 残余失败任务始终被全力教;②频率
-加权(各项乘 N_区/N_total)= 真退火。**该选择待用户裁定**;若保持现状,后备
-保护为 rare-lost 最小样本数/权重上限(防单行决定整臂梯度)。
+**频率加权(用户裁定 2026-08-02,取代条件均值)**:codex P1-1 指出独立条件
+均值下"won 率上升 ⇒ OPD 自动退火"不成立(权重不随频率变,单条 lost 行代表
+整个 OPD 项)。裁定改为**频率加权**:两项统一除以 batch 全局**总**信号行数
+N = N_lost + N_tg——
+
+```
+L = (N_lost/N)·mean_lost[OPD] + w_tg·(N_tg/N)·mean_won[tg]
+```
+
+每项的有效权重 = 其批内份额,won 率上升真正退火 OPD、增强 tg;lost→0 时
+OPD 连续归零(无硬切),单条 lost 行只携带 1/N 的权重(方差防护内生)。
+实现:`_stamped_global_seq_info` 在 tg 戳存在时给 OPD 分母加上
+`batch_num_tg_seqs`,tg 项用同一 helper——两项同分母,份额相加为 1;tg 关
+(无戳)时逐字节回到历史 lost-only 分母。w_tg=1.0 语义回归纯偏好系数。
 
 **机理预测**(实验判据的来源):①指导分布被拉回裸可执行流形 → 长度相变推迟/
 消失;②成功区 PMI 推力显式归零 → "信号耗尽→噪声传递→崩"改写为"耗尽→归
@@ -111,12 +118,12 @@ per-step 现产、同 step 消费,无陈旧配对。
 
 - OPD 项:现状不动——f783026 的 `batch_num_seqs`(非空 response_mask 行的
   batch 全局计数)+ dp_size 补偿。tg 行 response_mask 全零,**天然不进该分母**。
-- tg 项:`agg_loss(tg_losses, tg_mask, "seq-mean-token-mean",
-  global_batch_size=batch_num_tg_seqs, dp_size=dp)`——引擎在
-  forward_backward_batch 处新打戳 `batch_num_tg_seqs`(非空 tg_mask 行的
-  all-reduce 全局计数),fail-loud 契约与 batch_num_seqs/research_num_tokens
-  同款。微批边界自动正确:无 tg 行的微批贡献 0(分子零/全局分母非零);全 tg
-  行微批的 OPD 项走全局分母(f783026 已修)。
+- tg 项与 OPD 项**同用总分母** `batch_num_seqs + batch_num_tg_seqs`(频率
+  加权裁定;引擎在 forward_backward_batch 打戳 `batch_num_tg_seqs` = 非空
+  tg_mask 行的 all-reduce 全局计数),fail-loud 契约与既有戳同款;tg 戳缺失
+  单独 fail-loud(不许静默回退 lost-only 分母)。微批边界自动正确:无 tg 行
+  的微批贡献 0;全 tg 行微批的 OPD 项走全局分母(f783026 已修)。被 drop 的
+  won 占位行两个计数都不进(零 mask 无监督信号,不参与频率份额)。
 - 任一区行数为 0 的 step:该项恰为 0(数据层面;不需要 min_rows 特判——但
   won 全无时 tg 打分/构造整体跳过,见零开销契约)。
 
@@ -209,9 +216,9 @@ GPU 等 162 空窗,跑单经 cd009-cd006 交 CD-006。
 | # | 裁决 | 处置 |
 |---|---|---|
 | P0-1 行为曲线口径(tg 排除反了) | **属实——我方 0d653b0 过度修复** | revert:tg 行回到行为曲线(裸策略真实赢局);GRPO 隔离与 padding 修复保留 |
-| P0-2 log_prob_min_clamp 破坏 tg soft-CE | **属实(真数学缺陷)** | fsdp loss 行级豁免 tg 位置的 -10 地板;tg 分支撤 loss_max_clamp、保 clamp_min(0)(恢复无损);telemetry tg/loss_min_preclamp |
+| P0-2 log_prob_min_clamp 破坏 tg soft-CE | **属实(真数学缺陷)** | fsdp loss 行级豁免 tg 位置的 -10 地板;tg 分支撤 loss_max_clamp、保 clamp_min(0)(恢复无损);telemetry tg/loss_min_preclamp。**极端情况复核(用户要求)**:豁免不引入梯度爆炸——公式无 1/q 项,log 奇异性被 softmax 雅可比精确抵消,per-logit 梯度恒有界 ≤1(数值验证 q=6e-16 时 grad_max=1.0、L1=2.0;ratio 型才会爆 p/q~1.6e15);loss 上限受 bf16 logits 动态范围(~40 nats)钳制、fp32 无溢出;全局 grad_clip=1.0 兜底。梯度有界性已入回归测试 |
 | P0-3 tg×research 曲线键集异构 | 属实 | research replica 补传 mixed_tg |
-| P1-1 渐进停机不成立 | 属实(设计叙述错误) | 本文档 §2 修正;语义选择**待用户裁定** |
+| P1-1 渐进停机不成立 | 属实(设计叙述错误) | 用户裁定**频率加权**(两项同除总行数 N_lost+N_tg,真退火;已实施) |
 | P1-2 min_signal_rows 漏 tg 信号 | 属实(默认 0 不触发) | 计数并入 tg_mask(臂开时) |
 | P1-3 GRPO 隔离门控不可达 | 属实(0d653b0 修复被门挡) | _mixed_objective_enabled 纳入 tg_loss_coef |
 | P1-4 tg 监控盲区 | 属实 | telemetry 首批已加;context 探针列 **T1 前置**(非二期) |

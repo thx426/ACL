@@ -237,6 +237,16 @@ def _stamped_global_seq_info(data) -> dict:
             "'batch_num_seqs' is missing — the engine did not stamp it "
             "(forward_backward_batch)"
         ) from err
+    # trace-opd teacher grounding, frequency weighting (user ruling
+    # 2026-08-02, codex tg-review P1-1): with the tg arm on, BOTH objective
+    # terms divide by the TOTAL signal-row count N_lost + N_tg, so each term's
+    # effective weight scales with its share of the batch —
+    #   L = (N_lost/N)*mean_lost[OPD] + w_tg*(N_tg/N)*mean_won[tg]
+    # — the won rate genuinely anneals OPD instead of leaving a lone lost row
+    # carrying the full arm (the conditional-mean defect). tg off (no stamp):
+    # byte-identical to the historical denominator.
+    if "batch_num_tg_seqs" in data.keys():
+        global_seqs += float(data["batch_num_tg_seqs"])
     try:
         dp_size = float(data["dp_size"])
     except KeyError as err:
@@ -459,25 +469,19 @@ def distillation_ppo_loss(
             # denominator: a micro-batch may hold no tg token at all.
             tg_batch_info = {"batch_num_tokens": tg_mask.sum().clamp(min=1)}
         else:
-            # seq-mean-*: the tg term divides by ITS OWN batch-global sequence
-            # count (engine-stamped over non-empty tg_mask rows), same
-            # fail-loud contract as _stamped_global_seq_info for the OPD term.
-            try:
-                tg_num_seqs = float(data["batch_num_tg_seqs"])
-            except KeyError as err:
+            # seq-mean-*: frequency weighting (user ruling 2026-08-02) — the
+            # tg term divides by the same TOTAL signal-row count the OPD term
+            # uses (_stamped_global_seq_info adds batch_num_tg_seqs when
+            # present), so the two shares sum to the batch. The tg stamp's own
+            # presence stays fail-loud: a tg batch the engine did not count
+            # must not silently fall back to the lost-only denominator.
+            if "batch_num_tg_seqs" not in data.keys():
                 raise RuntimeError(
                     "tg seq-mean aggregation needs the batch-global tg sequence count, "
                     "but 'batch_num_tg_seqs' is missing — the engine did not stamp it "
                     "(forward_backward_batch)"
-                ) from err
-            try:
-                tg_dp_size = float(data["dp_size"])
-            except KeyError as err:
-                raise RuntimeError(
-                    "tg seq-mean aggregation needs 'dp_size' to compensate FSDP's "
-                    "gradient mean-allreduce, but the engine did not stamp it"
-                ) from err
-            tg_batch_info = {"global_batch_size": max(tg_num_seqs, 1.0), "dp_size": tg_dp_size}
+                )
+            tg_batch_info = dict(_stamped_global_seq_info(data))
         tg_loss = agg_loss(
             loss_mat=tg_losses,
             loss_mask=tg_mask,
