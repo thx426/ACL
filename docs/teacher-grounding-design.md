@@ -20,6 +20,32 @@ epistemic 通道机理。**病根:teacher 的指导分布不在"裸上下文可�
 估、被消费)——教师角色此前从未被直接训练,其在学生前缀上的可靠性只靠跨分布
 外推,而 CD-003 实证外推恰好在此断裂(自走 87.5% vs 错误前缀零抓地力)。
 
+**成功轨迹实证(2026-08-02,`trace_opd_4b_rkl_seqmean_rl` won 分层复盘)**:
+won 分割的动机由推断升级为实证——该 run(rkl+RL,崩于 step-17)的**成功轨迹
+本身**在 OPD 下呈单调加速膨胀:
+
+| 训练段 | won tok 均值 | thought 字符/turn | thought/action 比 | env_steps |
+|---|---|---|---|---|
+| step 5–7 | 1216–1453 | 284–315 | 14–17 | 10–13 |
+| step 9(相变) | 3300 | 481 | 26 | 20 |
+| step 13–15 | 2598–2822 | 568–604 | 30–31 | 14–15 |
+| step 17–20(崩塌窗) | 3539–5199 | 1164–1986 | 59–110 | 8–10 |
+
+总 token ×3–4、每 turn reasoning ×6、thought/action 比 ×6;同期 env_steps
+**下降**(10–13→8)——膨胀纯来自叙述而非行为,"每个动作前说更多话"。相邻
+逐字重复率恒 0:不是复读,是**新写的合法叙述**(KL 的合法最优解形态)。定性
+形态三种(step-20 won 样本,单 turn 1365 字符):无依据断言物体位置
+("Despite the simulation output showing only book, cd, pen on sidetable 1,
+the task requires the laptop to be there")、循环自我说服("This is the only
+logical step … This is the correct action.")、receptacle 罗列复述——与
+v2.2 SFT 的 23.6% 泄漏发现同型:特权措辞已遗传进成功轨迹。数据:162
+`runs/trace_opd_4b_rkl_seqmean_rl/rollouts/step_*`,won 分层脚本见会话
+scratchpad(won_traj_evolution.py)。
+
+该实证同时给出一条**时机约束**:tg 的 label 是成功轨迹的行为分布——若中途
+接入(膨胀已发生),会把膨胀后的成功形态固化进 teacher。**T1 必须从 step-0
+起开臂**,不作中途接入。
+
 ## 2. 机制定义
 
 **Teacher Grounding(tg)**:首次按 q 的真实角色训练 q——在 bare student 的
@@ -143,6 +169,9 @@ GPU 等 162 空窗,跑单经 cd009-cd006 交 CD-006。
 
 - **主判据(病的终点)**:response length / p95 / resp_clip——T1 的 step-9 长
   度相变是否推迟/压平;崩塌步数 > T0×1.5 或预算内不崩 ⇒ 正向。
+- **won 分层机理判据(2026-08-02 实证新增,比总长度更锐利)**:won 轨迹的
+  `thought_chars_per_turn` 曲线——rkl+RL 基线上它 ×6(315→1986);T1 预测其
+  平坦或显著压缓。won 分层脚本对 T1 的 rollout dump 直接复用。
 - **效果判据**:裸 val 峰值高度/时刻/峰后形态(平台化 vs 不可逆崩)。
 - **机理判据**:①tg/loss 下降且 won 区(即 tg 行)soft-CE 收敛;②探针 KL
   lost 区不被动收缩(塌缩溢出报警 → 降 w_tg 或转间歇);③teacher 自走成功率
