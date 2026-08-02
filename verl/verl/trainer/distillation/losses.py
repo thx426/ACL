@@ -381,6 +381,81 @@ def distillation_ppo_loss(
         policy_loss = policy_loss + sft_loss * sft_loss_coef
         policy_metrics.update(sft_metrics)
 
+    # trace-opd teacher grounding (docs/teacher-grounding-design.md): reverse
+    # distillation over the tg rows — bare SUCCESS trajectories re-prompted
+    # with the doc prefix, labelled by the bare policy's renormalised top-k.
+    # The logits processor already computed their per-token soft-CE (the
+    # forward_kl_topk formula applied to the tg label IS the tg soft-CE), so
+    # this term re-reads the SAME per-token matrix under ``tg_mask``. tg rows
+    # carry an all-zero response_mask, so every term above is blind to them
+    # and this term is a pure addition, exactly like the SFT arm.
+    tg_loss_coef = float(getattr(distillation_loss_config, "tg_loss_coef", 0.0) or 0.0)
+    if tg_loss_coef > 0.0:
+        tg_mask = data.get("tg_mask", None)
+        if tg_mask is None:
+            # Fail loud: a silently dropped tg arm reads as "teacher grounding
+            # does not help", the one conclusion this experiment must not fake.
+            raise RuntimeError(
+                "tg_loss_coef > 0 but the batch carries no 'tg_mask' field — the rollout "
+                "side did not mark tg samples (expected sample_role == 'tg' rows)"
+            )
+        if tg_mask.is_nested:
+            tg_mask = tg_mask.to_padded_tensor(0)
+        tg_mask = tg_mask.to(torch.bool)
+        tg_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+        if tg_losses.shape != tg_mask.shape:
+            raise RuntimeError(
+                f"tg_mask shape {tuple(tg_mask.shape)} does not match the per-token loss "
+                f"layout {tuple(tg_losses.shape)} — a tg row is out of step with its responses"
+            )
+        # Same post-processing the OPD branch applies to the same matrix: the
+        # renormalised label makes the tg soft-CE non-negative up to fp error,
+        # so clamp_min(0) is lossless; the outer clamp is symmetry.
+        if distillation_loss_config.loss_max_clamp is not None:
+            tg_losses = tg_losses.clamp(
+                min=-distillation_loss_config.loss_max_clamp,
+                max=distillation_loss_config.loss_max_clamp,
+            )
+        tg_losses = tg_losses.clamp_min(0.0)
+        if config.loss_agg_mode == "token-mean":
+            # Local per-micro-batch token mean with the SFT arm's zero-safe
+            # denominator: a micro-batch may hold no tg token at all.
+            tg_batch_info = {"batch_num_tokens": tg_mask.sum().clamp(min=1)}
+        else:
+            # seq-mean-*: the tg term divides by ITS OWN batch-global sequence
+            # count (engine-stamped over non-empty tg_mask rows), same
+            # fail-loud contract as _stamped_global_seq_info for the OPD term.
+            try:
+                tg_num_seqs = float(data["batch_num_tg_seqs"])
+            except KeyError as err:
+                raise RuntimeError(
+                    "tg seq-mean aggregation needs the batch-global tg sequence count, "
+                    "but 'batch_num_tg_seqs' is missing — the engine did not stamp it "
+                    "(forward_backward_batch)"
+                ) from err
+            try:
+                tg_dp_size = float(data["dp_size"])
+            except KeyError as err:
+                raise RuntimeError(
+                    "tg seq-mean aggregation needs 'dp_size' to compensate FSDP's "
+                    "gradient mean-allreduce, but the engine did not stamp it"
+                ) from err
+            tg_batch_info = {"global_batch_size": max(tg_num_seqs, 1.0), "dp_size": tg_dp_size}
+        tg_loss = agg_loss(
+            loss_mat=tg_losses,
+            loss_mask=tg_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **tg_batch_info,
+        )
+        policy_loss = policy_loss + tg_loss * tg_loss_coef
+        policy_metrics["tg/loss"] = Metric(value=tg_loss, aggregation=AggregationType.SUM)
+        policy_metrics["tg/tokens"] = Metric(
+            value=tg_mask.sum(), aggregation=AggregationType.SUM
+        )
+        policy_metrics["tg/rows"] = Metric(
+            value=(tg_mask.sum(dim=-1) > 0).sum(), aggregation=AggregationType.SUM
+        )
+
     # trace-opd self-research (docs/self-research-design.md 7.1, joint mode):
     # the research role's own PG term, over research_mask tokens only, with its
     # OWN batch-global denominator — a pure addition, exactly like the SFT arm.

@@ -232,7 +232,8 @@ def test_self_research_channel_wired_on_the_executed_paths():
     assert "research_num_tokens" in engine            # all-reduced pre-micro-batch
 
     fsdp = _read("trainer/distillation/teacher_topk_fsdp.py")
-    assert 'in ("sft", "research")' in fsdp           # no scoring forward burned
+    assert 'in ("sft", "research", "tg_skip")' in fsdp  # no scoring forward burned
+    # (teacher grounding: tg_skip placeholders ride the same dummy channel)
 
     agent = _read("experimental/agent_loop/agent_loop.py")
     assert '"teacher_mode"] = "research"' in agent
@@ -249,7 +250,8 @@ def test_codex_review_fixes_present_on_the_executed_paths():
     fsdp = _read("trainer/distillation/teacher_topk_fsdp.py")
     # P0-1: the M4 structural gate must admit research rows, or the skip
     # branch behind it is unreachable and every research batch dies.
-    assert '("privileged", "bare", "sft", "research")' in fsdp
+    # (608b6aa extends the whitelist with the teacher-grounding modes.)
+    assert '("privileged", "bare", "sft", "research", "tg", "tg_skip")' in fsdp
 
     trainer = _read("trainer/ppo/v1/trainer_base.py")
     # P0-2: the memory shortcut must stay off while the research term is on

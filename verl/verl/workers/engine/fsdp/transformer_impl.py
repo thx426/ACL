@@ -684,6 +684,24 @@ class FSDPEngine(BaseEngine):
             )
             tu.assign_non_tensor(data, batch_num_seqs=batch_num_seqs.item())
 
+        # trace-opd teacher grounding: the tg term's seq-mean-token-mean needs
+        # ITS OWN batch-global sequence count for exactly the reasons above —
+        # tg rows carry an all-zero response_mask, so batch_num_seqs cannot see
+        # them, and the tg denominator must not depend on micro-batch packing.
+        # Counted over non-empty tg_mask rows (dropped-won placeholders ship an
+        # all-zero tg_mask and stay out).
+        if "tg_mask" in data.keys():
+            tmask = data["tg_mask"]
+            if getattr(tmask, "is_nested", False):
+                batch_num_tg_seqs = torch.stack([seg.any() for seg in tmask.unbind()]).sum()
+            else:
+                batch_num_tg_seqs = (tmask.sum(dim=-1) > 0).sum()
+            batch_num_tg_seqs = batch_num_tg_seqs.to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_tg_seqs, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_tg_seqs=batch_num_tg_seqs.item())
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )

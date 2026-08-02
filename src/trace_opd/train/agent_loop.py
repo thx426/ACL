@@ -599,11 +599,55 @@ class TraceAgentLoop(AgentLoopBase):
             },
         )
 
+        # Teacher grounding(docs/teacher-grounding-design.md):won=1 的 bare 行
+        # 按用户裁定退出 OPD——tg 臂开时**转换**为 tg 行(训练 prompt 换成 doc
+        # 前缀版 = q 的前向;打分前缀换成裸 prompt = p̄ 的标签;response 原样,
+        # v2.2 已锁的同构性质保证换前缀合法),tg 臂关而 opd_lost_only 开时以
+        # 零 mask 占位行存在(T1' 归因臂;verl 合约要求每 replica 一行,物理
+        # 上不能不 put)。expert/research 行与 val 不经此路。
+        tg_arm = (
+            not validate
+            and self.cfg.train.mix_tg_weight > 0
+            and self.cfg.research.enabled
+        )
+        lost_only = self.cfg.train.opd_lost_only and not validate
+        tg_converted = False
+        if traj.won and not is_expert and (tg_arm or lost_only):
+            tg_prompt_ids = None
+            if tg_arm and doc:
+                tg_prompt_ids = self._teacher_prompt_ids(
+                    adapter, doc, result.tokens.prompt_ids, traj.initial_obs
+                )
+            if tg_prompt_ids is not None:
+                # 完整 tg 行:doc 前缀训练前向 + 裸前缀打分标签。
+                output.prompt_ids = list(tg_prompt_ids)
+                output.extra_fields["teacher_prompt_ids"] = list(
+                    result.tokens.prompt_ids
+                )
+                output.extra_fields["sample_role"] = "tg"
+                output.extra_fields["tg_role"] = 1
+            else:
+                # 无 doc / 前缀溢出 / tg 臂关:won 行按 opd_lost_only 语义
+                # 零贡献占位(role="tg" + 全零 mask ⇒ TQ 侧 tg_mask 亦零,
+                # 打分侧判 tg_skip,损失两侧都看不见它)。
+                output.response_mask = [0] * len(output.response_ids)
+                output.extra_fields["sample_role"] = "tg"
+                reason = (
+                    "overflow" if (tg_arm and doc) else
+                    ("nodoc" if tg_arm else "lostonly")
+                )
+                output.extra_fields[f"tg_dropped_{reason}"] = 1
+            tg_converted = True
+
         if sft_arm:
             # Stamped on every row of the batch, and ONLY when the SFT arm is
             # on: the trainer keys the whole expert-sample machinery off this
             # field's presence, so with the arm off it allocates and ships
             # nothing. Expert rows already carry "sft" from expert_fields.
+            output.extra_fields.setdefault("sample_role", "bare")
+        if tg_arm or lost_only:
+            # 同一纪律:臂开时每行携带 stamp,TQ 侧据此统一分配 tg_mask,
+            # batch 布局在有无 tg 行时保持一致;关断时零字段零传输。
             output.extra_fields.setdefault("sample_role", "bare")
         if research_rl_arm:
             # Same discipline for the research channel: the stamp on EVERY row
@@ -612,12 +656,12 @@ class TraceAgentLoop(AgentLoopBase):
             output.extra_fields.setdefault("sample_role", "bare")
             output.extra_fields["research_arm"] = 1
 
-        if not validate and not is_expert:
+        if not validate and not is_expert and not tg_converted:
             # Teacher scoring joins the task's sticky replica too (verl pops
             # this key and uses it as the routing id for the scoring request —
             # the 8 copies then share one prefill of the doc prefix).
             output.extra_fields["teacher_routing_key"] = route
-        if doc and not validate and not is_expert:
+        if doc and not validate and not is_expert and not tg_converted:
             teacher_prompt_ids = self._teacher_prompt_ids(
                 adapter, doc, result.tokens.prompt_ids, traj.initial_obs
             )
@@ -633,6 +677,7 @@ class TraceAgentLoop(AgentLoopBase):
             validate=validate,
             research_enabled=self.cfg.research.enabled,
             mixed_sft=self.cfg.train.mix_sft_weight > 0 and self.cfg.train.mix_sft_rollouts > 0,
+            mixed_tg=self.cfg.train.mix_tg_weight > 0 or self.cfg.train.opd_lost_only,
             research_rl=self.cfg.research_rl.weight > 0,
             fields=output.extra_fields,
         )

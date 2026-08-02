@@ -130,6 +130,19 @@ class DistillationLossConfig(BaseConfig):
     rl_loss_coef: float = 0.0
     sft_loss_coef: float = 0.0
 
+    # trace-opd teacher grounding (docs/teacher-grounding-design.md): reverse
+    # distillation on bare SUCCESS trajectories — rows with sample_role == "tg"
+    # carry the doc-prefixed sequence as their TRAINING prompt (the forward is
+    # the doc-conditioned teacher q) and the bare policy's renormalised top-k
+    # as their label (shipped through the teacher_ids/teacher_logprobs channel,
+    # scored under the BARE prompt via teacher_prefix_ids). The per-token math
+    # is byte-identical to forward_kl_topk — sum p_label*(log p_label - log q) —
+    # so the logits processor needs no new mode; the term aggregates the SAME
+    # per-token matrix under ``tg_mask`` with its own batch-global sequence
+    # count (seq-mean-token-mean). 0.0 = arm off, byte-identical.
+    #     ... + tg_loss_coef * TG
+    tg_loss_coef: float = 0.0
+
     # trace-opd self-research module (docs/self-research-design.md): the research
     # ROLE's own RL term, orthogonal to the executor-side mix above (those three
     # optimise "execute better"; this one optimises "research better"; the only
@@ -200,10 +213,21 @@ class DistillationLossConfig(BaseConfig):
 
         # trace-opd mixed objective: a negative or non-finite coefficient flips or
         # blows up the corresponding term silently, so reject it at config time.
-        for name in ("opd_loss_coef", "rl_loss_coef", "sft_loss_coef"):
+        for name in ("opd_loss_coef", "rl_loss_coef", "sft_loss_coef", "tg_loss_coef"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0 (0 disables the term), got {value}")
+
+        # trace-opd teacher grounding: the tg rows ride the teacher_ids /
+        # teacher_logprobs channel and their per-token loss is computed by the
+        # forward_kl_topk logits-processor formula (which IS the tg soft-CE when
+        # the label is the renormalised bare top-k). Any other loss_mode would
+        # silently apply the wrong math to tg rows.
+        if float(self.tg_loss_coef) > 0.0 and self.loss_mode != "forward_kl_topk":
+            raise ValueError(
+                f"tg_loss_coef > 0 requires loss_mode='forward_kl_topk' (the tg rows reuse its "
+                f"per-token formula as their soft-CE), got loss_mode={self.loss_mode!r}"
+            )
 
         gate_beta = float(self.gate_beta)
         if not math.isfinite(gate_beta) or gate_beta <= 0.0:

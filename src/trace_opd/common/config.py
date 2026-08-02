@@ -310,6 +310,17 @@ class TrainCfg:
     #           文档才知道东西在哪,重放到裸条件后这些断言没有依据,而 expert 轨迹里
     #           没有一条演示「猜错了怎么回退」⇒ 学到自信断言 + 无法恢复。保留作对照臂。
     mix_sft_prefix: str = "doc"       # doc | bare
+
+    # --- teacher grounding(教师接地,docs/teacher-grounding-design.md)---
+    # 反向蒸馏臂:bare 成功轨迹换 doc 前缀作训练前向(q),裸分布 top-64 重归一
+    # 作软标签,soft-CE 只经 teacher 前向回传——首次直接训练 q 的"教师功能"。
+    # won 分割(用户裁定 2026-08-02):L = mean_lost[OPD] + mix_tg_weight ×
+    # mean_won[tg],两项均 seq-mean-token-mean、各带自己的 batch 全局行数分母。
+    # 0 = 关断,逐字节现状(不做裸打分、不构造 tg 行、不传 label 字段)。
+    mix_tg_weight: float = 0.0
+    # OPD 只训失败轨迹:won=1 的 bare 行不再进 OPD(tg 开时转换为 tg 行;
+    # tg 关时以零 mask 占位行存在——T1' 归因臂形态)。False = 现状。
+    opd_lost_only: bool = False
     # --- 分布观察包(docs/microscope-design.md;显微镜工作台的数据层)--------
     # 存"最小完备源":每训练样本每 response 位置的 teacher top-K / student top-K /
     # student-on-teacher-support / realized 双侧 + 训练 per-token loss 真值锚。
@@ -454,6 +465,7 @@ def _validate(cfg: "Config") -> None:
         ("mix_opd_weight", cfg.train.mix_opd_weight),
         ("mix_rl_weight", cfg.train.mix_rl_weight),
         ("mix_sft_weight", cfg.train.mix_sft_weight),
+        ("mix_tg_weight", cfg.train.mix_tg_weight),
     ):
         if not (_math.isfinite(_value) and _value >= 0):
             problems.append(f"train.{_name}={_value} must be finite and >= 0 (0 disables the arm)")
@@ -466,6 +478,37 @@ def _validate(cfg: "Config") -> None:
             "train.mix_opd_weight / mix_rl_weight / mix_sft_weight are all 0 — "
             "there is no objective left to optimise"
         )
+    # teacher grounding 的结构约束(docs/teacher-grounding-design.md §5):
+    if cfg.train.mix_tg_weight > 0:
+        if not cfg.train.opd_lost_only:
+            problems.append(
+                "train.mix_tg_weight>0 requires opd_lost_only=true — a won trajectory "
+                "is CONVERTED into a tg row; letting it also stay in the OPD term would "
+                "train the same tokens from both sides of the mirror at once"
+            )
+        if cfg.train.mix_rl_weight > 0 or cfg.train.mix_sft_weight > 0:
+            problems.append(
+                "train.mix_tg_weight>0 is mutually exclusive with mix_rl_weight/"
+                "mix_sft_weight in this version: removing won rows from response_mask "
+                "changes the GRPO group / SFT data semantics (composition unruled)"
+            )
+        if cfg.train.opd_kl_mode != "forward_kl_topk":
+            problems.append(
+                f"train.mix_tg_weight>0 requires opd_kl_mode='forward_kl_topk' "
+                f"(tg rows reuse its per-token formula as their soft-CE), "
+                f"got {cfg.train.opd_kl_mode!r}"
+            )
+        if cfg.train.teacher_scoring_backend != "fsdp":
+            problems.append(
+                "train.mix_tg_weight>0 requires teacher_scoring_backend='fsdp' — the "
+                "vLLM prompt_logprobs path does not implement the tg (bare-prefix, "
+                "renormalised) label"
+            )
+        if not cfg.research.enabled:
+            problems.append(
+                "train.mix_tg_weight>0 requires research.enabled — a tg row needs the "
+                "task's document to build the doc-prefixed training prompt"
+            )
     if cfg.train.mix_sft_prefix not in ("doc", "bare"):
         problems.append(
             f"train.mix_sft_prefix={cfg.train.mix_sft_prefix!r} must be 'doc' or 'bare'"
@@ -819,6 +862,13 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 存量 manifest 逐字节一致——若以新默认为基准,复现 run 会被自家守卫拒掉。
     if t.loss_agg_mode != "token-mean":
         material += f"|loss_agg_mode={t.loss_agg_mode}"
+    # teacher grounding 同一纪律:默认关断不进 hash ⇒ 存量指纹逐字节不变;
+    # 开启后权重与 won 分割都定义"优化什么",跨值 resume 拒绝。opd_lost_only
+    # 单开(T1' 归因臂)同样改变 OPD 的数据分布,必须独立参与。
+    if t.mix_tg_weight > 0.0:
+        material += f"|mix_tg_weight={t.mix_tg_weight}"
+    if t.opd_lost_only:
+        material += "|opd_lost_only=1"
     # self-research 通道同一纪律:默认关断(weight=0)不进 hash ⇒ 存量 run 指纹
     # 逐字节不变;开启后 N/K/模式/warmup 都定义"优化什么",跨值 resume 拒绝。
     rrl = cfg.research_rl

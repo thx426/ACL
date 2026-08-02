@@ -157,7 +157,7 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     for i in range(n):
         ex = extras[i] or {}
         mode = ex.get("teacher_mode", None)
-        if mode not in ("privileged", "bare", "sft", "research"):
+        if mode not in ("privileged", "bare", "sft", "research", "tg", "tg_skip"):
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} has teacher_mode={mode!r} "
                                "— provenance lost in transit (codex H1)")
         k = ex.get("teacher_topk", None)
@@ -172,15 +172,28 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
         if mode == "privileged" and prefix is None:
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} is 'privileged' but "
                                "teacher_prefix_ids is missing (codex H1)")
+        # trace-opd teacher grounding: a tg row's TRAINING prompt is the
+        # doc-prefixed sequence, so its label MUST be scored under the bare
+        # prompt carried in teacher_prefix_ids — the exact mirror of the
+        # privileged mode. A tg row whose bare prefix got lost cannot fall
+        # back to its own (doc) prompt: that would make the label the
+        # teacher's own distribution and the loss a silent no-op.
+        if mode == "tg":
+            if prefix is None:
+                raise RuntimeError(f"teacher_topk_fsdp: sample {i} is 'tg' but "
+                                   "teacher_prefix_ids (bare prompt) is missing")
+            if topk <= 0:
+                raise RuntimeError("teacher_topk_fsdp: 'tg' rows need topk > 0 "
+                                   "(the soft label is a top-k distribution)")
         resp = responses[i]
-        if mode in ("sft", "research"):
+        if mode in ("sft", "research", "tg_skip"):
             # trace-opd: an expert (SFT) row is supervised by the cross-entropy
             # alone, a research row by its own PG term over research_mask; both
             # have their response_mask cleared at TQ put time,
             # so whatever sits in teacher_ids/teacher_logprobs is masked out of
             # the distillation loss and its metrics — scoring it would burn a
             # full forward per expert rollout for a value nothing reads.
-            plan.append((None, resp, int(prompts[i].numel()), int(resp.numel())))
+            plan.append((None, resp, int(prompts[i].numel()), int(resp.numel()), mode))
             continue
         if mode == "bare":
             # vLLM-path semantics: research failed => score under the BARE
@@ -196,7 +209,7 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
         if T + R > MAX_TEACHER_SEQ:
             raise RuntimeError(f"teacher_topk_fsdp: sample {i} teacher seq {T + R} "
                                f"exceeds budget {MAX_TEACHER_SEQ} (codex H3 guard)")
-        plan.append((prefix, resp, P, R))
+        plan.append((prefix, resp, P, R, mode))
 
     module = _unwrap_module(engine)
     if not _LOGGED_BACKEND:
@@ -221,8 +234,8 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
         module.eval()
         try:
             device = next(module.parameters()).device
-            for i, (prefix, resp, P, R) in enumerate(plan):
-                if prefix is None:  # expert (SFT) row: no teacher, no forward
+            for i, (prefix, resp, P, R, mode) in enumerate(plan):
+                if prefix is None:  # sft/research/tg_skip row: no label, no forward
                     out_ids.append(torch.zeros((P + R, width), dtype=torch.int32))
                     out_lps.append(torch.zeros((P + R, width), dtype=torch.float32))
                     continue
@@ -237,6 +250,16 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
                     ids_i, lps_i = _score_rows_topk(rows, topk, chunk)
                 else:
                     ids_i, lps_i = _score_rows_realized(rows, resp, chunk)
+                if mode == "tg":
+                    # trace-opd teacher grounding: the tg label is the bare
+                    # policy's top-k RENORMALISED to a proper distribution
+                    # (design ruling: the label semantics must be clean and the
+                    # resulting soft-CE non-negative; the truncated mass is
+                    # ~5e-4 on the policy's own trajectory). Done here, once,
+                    # at the only point that knows which rows are tg rows —
+                    # the logits processor then applies the unchanged
+                    # forward_kl_topk formula to an already-proper label.
+                    lps_i = lps_i - torch.logsumexp(lps_i, dim=-1, keepdim=True)
                 del logits, rows
                 # Alignment sentinel across the first few rows, not just row 0:
                 # with a single column (topk == 0) one saturated glue token can

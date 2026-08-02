@@ -386,6 +386,22 @@ train:
                             #         重放到裸条件后这些断言没依据,而 expert 轨迹里没有
                             #         一条演示「猜错了怎么回退」⇒ 学到自信断言+无法恢复。
                             #         保留作对照臂(要用须先换掉只查字面引用的过滤器)。
+
+  # --- teacher grounding(教师接地,docs/teacher-grounding-design.md)------------
+  mix_tg_weight: 0.0        # 反向蒸馏臂权重(用户 2026-08-02 裁定机制;T1 臂取 1.0)。
+                            # bare 成功轨迹换 doc 前缀作训练前向(q),裸分布 top-64
+                            # 重归一作软标签,soft-CE 只经 teacher 前向回传——首次
+                            # 直接训练 q 的**教师功能**(在学生状态分布上给出可执行
+                            # 指导),而非 SFT-doc 的"doc 条件自走能力"。0 = 关断,
+                            # 逐字节现状(不做裸打分、不构造 tg 行、不传 label)。
+                            # 开启硬前提(config 拦):opd_lost_only=true、
+                            # opd_kl_mode=forward_kl_topk、teacher_scoring_backend=
+                            # fsdp、research.enabled;与 mix_rl/mix_sft 首版互斥。
+  opd_lost_only: false      # won 分割:true 时 won=1 的 bare 行退出 OPD(成功区的
+                            # OPD 推力本就是噪声/叙述偏置共犯——Rethinking-OPD 的
+                            # 冗余梯度;tg 开时该行转换为 tg 行,tg 关时零 mask 占位
+                            # = T1' 归因臂)。won 率上升 ⇒ OPD 数据自动退火、tg 数据
+                            # 自动增长——渐进停机由数据分布内生实现。false = 现状。
   distill_microscope: true  # 蒸馏显微镜:per-token 蒸馏量按轨迹哈希 1/N 抽样落
                             # <run>/microscope/(verl 6f3d089;~几 MB/step,离线经
                             # analysis.collect 与 rollout dump join 出深度剖面/

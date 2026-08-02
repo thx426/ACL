@@ -1067,6 +1067,18 @@ class AgentLoopWorker:
                 # long) trajectory would burn a full forward whose output the
                 # loss masks out. Same skip contract as the expert rows.
                 output.extra_fields["teacher_mode"] = "research"
+            elif output.extra_fields.get("sample_role") == "tg":
+                # trace-opd teacher grounding: the row's TRAINING prompt is the
+                # doc-prefixed sequence; its label is the bare policy's top-k,
+                # scored under the bare prompt that rides in teacher_prompt_ids
+                # (the exact mirror of the privileged mode). A tg row that lost
+                # its bare prefix, or a dropped-won placeholder (all-zero mask,
+                # opd_lost_only without a usable doc prefix), skips scoring the
+                # same way sft/research rows do.
+                has_signal = any(output.response_mask) if output.response_mask else False
+                output.extra_fields["teacher_mode"] = (
+                    "tg" if (_tp is not None and has_signal) else "tg_skip"
+                )
             else:
                 output.extra_fields["teacher_mode"] = "privileged" if _tp is not None else "bare"
             # codex M2: K rides with the sample; trainer asserts consistency.
@@ -1095,6 +1107,16 @@ class AgentLoopWorker:
             # aligned dummy columns instead (same shape the fsdp skip emits);
             # the loss masks them out, so behaviour is identical and the
             # forward is simply not burned.
+            if output.extra_fields.get("sample_role") == "tg":
+                # First version of teacher grounding supports the fsdp scoring
+                # backend only: the vLLM prompt_logprobs path would need the
+                # renormalisation and mirror-prefix plumbing duplicated here,
+                # and the production profile (162) runs fsdp anyway. Loud, not
+                # silent: a tg arm on the wrong backend must not degrade.
+                raise RuntimeError(
+                    "teacher-grounding (tg) rows require TRACE_TEACHER_SCORING_BACKEND=fsdp; "
+                    "the vLLM prompt_logprobs scoring path does not implement the tg label"
+                )
             if output.extra_fields.get("sample_role") in ("sft", "research"):
                 dummy_width = max(int(getattr(self, "self_teacher_num_logprobs", 1) or 1), 1)
                 total_len = len(prompt_ids) + len(response_ids)

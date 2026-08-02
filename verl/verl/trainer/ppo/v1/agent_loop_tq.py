@@ -210,6 +210,21 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     field["response_mask"] = torch.zeros_like(response_mask)
                 else:
                     field["sft_mask"] = torch.zeros_like(response_mask)
+                # trace-opd teacher grounding (docs/teacher-grounding-design.md):
+                # a tg row — a bare SUCCESS trajectory re-prompted with the doc
+                # prefix — supervises through ``tg_mask`` and nothing else.
+                # Same discipline as the SFT arm above: clearing response_mask
+                # keeps the row out of the on-policy terms AND out of every
+                # denominator derived from response_mask (batch_num_seqs counts
+                # non-empty response_mask rows, so the OPD seq-mean denominator
+                # cannot be rescaled by switching the tg arm on). A dropped-won
+                # placeholder arrives with an already-cleared mask, so its
+                # tg_mask is all-zero and the row contributes nothing anywhere.
+                if sample_role == "tg":
+                    field["tg_mask"] = field["response_mask"]
+                    field["response_mask"] = torch.zeros_like(field["response_mask"])
+                else:
+                    field["tg_mask"] = torch.zeros_like(response_mask)
             # trace-opd self-research (docs/self-research-design.md): a research
             # row is the researcher session itself — its researcher-generated
             # tokens live in response_mask exactly like an executor row's

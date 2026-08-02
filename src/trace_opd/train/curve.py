@@ -44,6 +44,12 @@ _RESEARCH_RL = (
     "research_rl_best_p",
 )
 # Mixed objective, SFT arm (docs/mixed-objective-design.md).
+_MIXED_TG = (
+    "tg_role",              # 该行是否为完整 tg 行(批均值 = won 转换率)
+    "tg_dropped_overflow",  # doc 前缀溢出而降级的占位行
+    "tg_dropped_nodoc",     # research 失败无 doc 的占位行
+    "tg_dropped_lostonly",  # tg 臂关、仅 opd_lost_only 的占位行(T1' 形态)
+)
 _MIXED_SFT = (
     "sft_role", "sft_won", "sft_accepted", "sft_dropped_ref",
     # An expert slot that could not produce supervision. Kept as a slot (masked
@@ -60,6 +66,7 @@ def build_curve_metrics(
     research_enabled: bool,
     fields: dict[str, Any],
     mixed_sft: bool = False,
+    mixed_tg: bool = False,
     research_rl: bool = False,
 ) -> dict[str, float]:
     """Assemble the per-sample curve scalars from the sample's extra_fields.
@@ -80,6 +87,9 @@ def build_curve_metrics(
             metrics[key] = float(fields.get(key, 0) or 0)
     if not validate and mixed_sft:
         for key in _MIXED_SFT:
+            metrics[key] = float(fields.get(key, 0) or 0)
+    if not validate and mixed_tg:
+        for key in _MIXED_TG:
             metrics[key] = float(fields.get(key, 0) or 0)
     if not validate and research_rl:
         for key in _RESEARCH_RL:

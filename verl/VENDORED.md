@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(f783026)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(608b6aa)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -38,6 +38,7 @@
 
 | a61c654 | trace-opd:**混合目标 OPD × RL × SFT**(`docs/mixed-objective-design.md`)——`DistillationLossConfig` 新增 `rl_loss_coef`/`sft_loss_coef`(均默认 0 ⇒ 与纯蒸馏逐字节一致);RL 项复用上游 `ppo_loss`(GRPO 任务 reward)但带显式权重(与 `use_task_rewards` 互斥,config 拦);SFT 项 = 新 `sft_ce_loss` 对 `sft_mask` 选中的专家 token 做 CE;三项共用 `loss_agg_mode` 与全局 `batch_num_tokens` 分母 ⇒ 系数按 token 可直接互比。expert 行在 **TQ put 时清空 `response_mask`**(`agent_loop_tq`),故不进 OPD/PG 分子、也不进 `batch_num_tokens` ⇒ 开 SFT 臂不改变 OPD 尺度(消融臂可比);零专家轨迹的 step 贡献恰为 0 而非 NaN。另:expert 行独立 GRPO 组(uid 后缀,防 96% 成功率抬高 bare 组均值使成功的 bare 行拿到负 advantage)、fsdp 打分对其跳过前向(`teacher_mode="sft"`)、`distillation_only` 在任一臂开启时关闭 |
 | 93a0109 | trace-opd:**expert 行的观测隔离**——`_compute_metrics` 由 `sample_role` 导出 on-policy mask,`compute_data_metrics`/方差代理/`num_turns`/除 `sft_*` 外的 reward_extra 键一律只读 on-policy 行(否则 `critic/score/mean` 被 96% 成功率的专家行抬高,而它正是判停曲线);吞吐/计时仍计全部行(专家行确实耗算力)。显微镜落盘跳过全零 mask 行(专家行 + hang guard 取消的 prompt),否则离线 join 的 span-vs-mask 完整性自检会误报 mismatch |
+| 608b6aa | trace-opd:**teacher grounding(tg)反向蒸馏臂**(`docs/teacher-grounding-design.md`)——`DistillationLossConfig` 新增 `tg_loss_coef`(默认 0 ⇒ 逐字节现状);tg 行 = bare 成功轨迹换 doc 前缀作训练前向(q)、裸前缀打分的**重归一化** top-64 作软标签(`teacher_mode="tg"`,占位行 `"tg_skip"` 走 sft 同款 dummy 跳过);per-token 数学复用 forward_kl_topk 公式(重归一标签下即 tg soft-CE),logits processor 零改动;tg 项以 `tg_mask` 重聚合同一 per-token 矩阵,seq-mean 下用引擎新打戳的 `batch_num_tg_seqs` 全局行数分母(token-mean 下 sft 式零安全局部分母);tg 行 TQ put 时清 `response_mask`(sft 先例)⇒ 既有各项/分母/诊断/显微镜全部对其失明;vLLM 打分后端 fail-loud(首版仅 fsdp) |
 
 | f27eb65 | trace-opd:混合目标的两处归一化定正——①`config.global_batch_info` 只由 `ppo_loss` 写入,而纯 OPD 路径从不调它 ⇒ 现行 OPD 一直是「每微批 token 平均」;开 RL 臂后该 config 跨微批存活,使 OPD 从第二个微批起静默换成全局分母(尺度跳 ~微批数×dp_size)且**只发生在开 RL 的臂** ⇒ 消融失效。现 OPD 项在 `rl_loss_coef>0` 时对清空后的快照求值,各臂钉死纯 OPD 口径。②SFT 项改为自算「每微批 expert token 平均」(clamp 分母)——同族口径使 `sft_loss_coef` 跨臂含义一致,且规避 `agg_loss` token-mean 在「该微批无 expert token」时的 0/0 → NaN |
 | c7c2194 | trace-opd:混合目标的三处收口——①`construct_minimal_padding_template` 会 clone 源行**全部**字段再覆盖一份固定清单,`sft_mask` 不在其中 ⇒ 合成的 padding 行带着**别的行的全长 mask**(很可能是真专家行的),而其 responses 已截到 1 token ⇒ SFT loss 形状崩溃,或(宽度恰好相同时)**静默虚增 `sft/expert_tokens`**——正是判定该臂是否生效的指标。现按需收缩(字段存在才改,SFT 关时不凭空造字段);`sft_ce_loss` 另加形状断言,任何未来"合成整行"的路径都会 fail loud 而非错数。②TQ 侧 mask 切分原为无条件执行,SFT 关时仍每行分配零 `sft_mask` 并入 TQ(每 step 数十 MB 纯浪费)⇒ 改由 `sample_role` 标记 gate(trace agent loop 仅在该臂开启时给所有行盖章)⇒ **关臂即零开销**。③`global_batch_info` 快照仅在 RL 臂开启时执行 |
