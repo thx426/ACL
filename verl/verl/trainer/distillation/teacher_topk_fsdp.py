@@ -229,6 +229,14 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
     # token), and extract_prompt_logprobs pads dummies at max(k, 1) width.
     width = max(topk, 1)
     out_ids, out_lps = [], []
+    # trace-opd teacher grounding (decoupling ruling 2026-08-02): tg labels
+    # ship on their OWN channel. teacher_ids/teacher_logprobs stay pure OPD
+    # (tg rows hold zero stubs there, like sft/research rows), so the OPD
+    # loss family never sees a bare-policy distribution wearing a teacher
+    # field name. The tg fields exist only when the batch has a tg row —
+    # tg off means zero extra fields, zero extra transfer.
+    has_tg = any(p[4] == "tg" for p in plan)
+    tg_ids, tg_lps = [], []
     # codex H2: run under the engine's eval contract (offload load/unload, mode).
     with engine.eval_mode(zero_grad_on_exit=False):
         module.eval()
@@ -238,6 +246,9 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
                 if prefix is None:  # sft/research/tg_skip row: no label, no forward
                     out_ids.append(torch.zeros((P + R, width), dtype=torch.int32))
                     out_lps.append(torch.zeros((P + R, width), dtype=torch.float32))
+                    if has_tg:
+                        tg_ids.append(torch.zeros((P + R, width), dtype=torch.int32))
+                        tg_lps.append(torch.zeros((P + R, width), dtype=torch.float32))
                     continue
                 T = int(prefix.numel())
                 seq = torch.cat([prefix.cpu(), resp.cpu()]).to(device).unsqueeze(0)
@@ -257,8 +268,7 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
                     # resulting soft-CE non-negative; the truncated mass is
                     # ~5e-4 on the policy's own trajectory). Done here, once,
                     # at the only point that knows which rows are tg rows —
-                    # the logits processor then applies the unchanged
-                    # forward_kl_topk formula to an already-proper label.
+                    # compute_tg_soft_ce consumes an already-proper label.
                     lps_i = lps_i - torch.logsumexp(lps_i, dim=-1, keepdim=True)
                 del logits, rows
                 # Alignment sentinel across the first few rows, not just row 0:
@@ -273,8 +283,19 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
                 zlp = torch.zeros((P - 1, width), dtype=torch.float32)
                 did = torch.zeros((1, width), dtype=torch.int32)
                 dlp = torch.zeros((1, width), dtype=torch.float32)
-                out_ids.append(torch.cat([zid, ids_i, did], dim=0))
-                out_lps.append(torch.cat([zlp, lps_i, dlp], dim=0))
+                full_ids = torch.cat([zid, ids_i, did], dim=0)
+                full_lps = torch.cat([zlp, lps_i, dlp], dim=0)
+                if mode == "tg":
+                    tg_ids.append(full_ids)
+                    tg_lps.append(full_lps)
+                    out_ids.append(torch.zeros((P + R, width), dtype=torch.int32))
+                    out_lps.append(torch.zeros((P + R, width), dtype=torch.float32))
+                else:
+                    out_ids.append(full_ids)
+                    out_lps.append(full_lps)
+                    if has_tg:
+                        tg_ids.append(torch.zeros((P + R, width), dtype=torch.int32))
+                        tg_lps.append(torch.zeros((P + R, width), dtype=torch.float32))
         finally:
             if was_training:
                 module.train()
@@ -282,4 +303,7 @@ def compute_teacher_topk_fsdp(data, engine, chunk: int = 2048):
 
     data["teacher_ids"] = torch.nested.nested_tensor(out_ids, layout=torch.jagged)
     data["teacher_logprobs"] = torch.nested.nested_tensor(out_lps, layout=torch.jagged)
+    if has_tg:
+        data["tg_label_ids"] = torch.nested.nested_tensor(tg_ids, layout=torch.jagged)
+        data["tg_label_logprobs"] = torch.nested.nested_tensor(tg_lps, layout=torch.jagged)
     return data

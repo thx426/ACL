@@ -218,15 +218,22 @@ class DistillationLossConfig(BaseConfig):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0 (0 disables the term), got {value}")
 
-        # trace-opd teacher grounding: the tg rows ride the teacher_ids /
-        # teacher_logprobs channel and their per-token loss is computed by the
-        # forward_kl_topk logits-processor formula (which IS the tg soft-CE when
-        # the label is the renormalised bare top-k). Any other loss_mode would
-        # silently apply the wrong math to tg rows.
-        if float(self.tg_loss_coef) > 0.0 and self.loss_mode != "forward_kl_topk":
+        # trace-opd teacher grounding (decoupling ruling 2026-08-02): the tg
+        # rows run their OWN soft-CE on their OWN tg_label channel, so the OPD
+        # loss_mode is free — within the top-k family. The k3/gated modes score
+        # with teacher_topk=0 (a single realized-token column), the scorer
+        # enforces ONE batch-wide column width, and the tg label needs the full
+        # top-k distribution: the two layouts cannot coexist in the same nested
+        # batch. Structural incompatibility, so fail loud at config time.
+        if float(self.tg_loss_coef) > 0.0 and self.loss_mode not in (
+            "forward_kl_topk",
+            "reverse_kl_topk",
+        ):
             raise ValueError(
-                f"tg_loss_coef > 0 requires loss_mode='forward_kl_topk' (the tg rows reuse its "
-                f"per-token formula as their soft-CE), got loss_mode={self.loss_mode!r}"
+                f"tg_loss_coef > 0 requires loss_mode in ('forward_kl_topk', 'reverse_kl_topk'): "
+                f"the tg label is a top-k distribution while the k3/gated single-column "
+                f"(teacher_topk=0) scoring layout cannot share a batch with it, "
+                f"got loss_mode={self.loss_mode!r}"
             )
 
         gate_beta = float(self.gate_beta)

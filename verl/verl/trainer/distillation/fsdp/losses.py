@@ -113,7 +113,6 @@ def compute_forward_kl_topk(
     teacher_topk_ids: torch.Tensor,
     config: DistillationConfig,
     data_format: str,
-    tg_token_mask: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute forward KL distillation loss using top-k log probabilities.
 
@@ -166,25 +165,8 @@ def compute_forward_kl_topk(
         teacher_topk_log_probs, teacher_topk_ids, loss_config, use_chunked_topk,
     )
     if loss_config.log_prob_min_clamp is not None:
-        clamped_student = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-        clamped_teacher = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-        if tg_token_mask is not None:
-            # codex tg-review P0-2: the -10 floor is an OPD numerical guard;
-            # applied to a tg row it LIFTS the renormalised label tail above
-            # its true probability (sum > 1) and KILLS the gradient exactly
-            # where q parks mass outside the label support (log q < -10) — the
-            # combination makes the "KL" genuinely negative and clamp_min(0)
-            # then zeroes both loss and gradient. tg positions therefore keep
-            # the raw log-probs (label is renormalised and finite by
-            # construction; q comes off a log_softmax and is finite too).
-            if get_ulysses_sequence_parallel_world_size() > 1:
-                tg_token_mask = slice_input_tensor(tg_token_mask, dim=1)
-            keep = tg_token_mask.unsqueeze(-1)
-            student_topk_log_probs = torch.where(keep, student_topk_log_probs, clamped_student)
-            teacher_topk_log_probs = torch.where(keep, teacher_topk_log_probs, clamped_teacher)
-        else:
-            student_topk_log_probs = clamped_student
-            teacher_topk_log_probs = clamped_teacher
+        student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
     distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
 
     # Diagnostics for tracking teacher/student top-k overlap in OPD, following
@@ -315,3 +297,74 @@ def compute_reverse_kl_topk(
         "teacher_topk_entropy": teacher_topk_entropy,
         "obs": obs,
     }
+
+
+def compute_tg_soft_ce(
+    student_logits: torch.Tensor,
+    tg_label_log_probs: torch.Tensor,
+    tg_label_ids: torch.Tensor,
+    tg_token_mask: torch.Tensor,
+    config: DistillationConfig,
+) -> torch.Tensor:
+    """trace-opd teacher grounding: per-token soft cross-entropy over tg rows.
+
+    A tg row is a bare-policy SUCCESS trajectory whose TRAINING prompt was
+    swapped to the doc prefix, so on these rows ``student_logits`` ARE the
+    teacher q(.|doc, h). The label is the bare policy's top-k distribution,
+    renormalised and detached at scoring time. Per token:
+
+        loss_t = sum_k  label_k * (log label_k - log q_k)
+
+    i.e. KL(sg[label] || q) restricted to the label support — non-negative by
+    construction (label sums to 1, q's support mass <= 1), gradient q - label
+    bounded by 2 per logit. Standalone by design (user decoupling ruling
+    2026-08-02): NO OPD clamp applies here — log_prob_min_clamp would lift the
+    renormalised label tail above its true probability and kill the gradient
+    exactly where q parks mass outside the label support (codex tg-review
+    P0-2), and loss_max_clamp would zero the gradient on legitimately large
+    supervision. The gather runs chunked (logit - logsumexp), so no
+    [.., V] log_softmax buffer and no duplicated OPD compute.
+
+    Args:
+        student_logits: (bsz, seqlen/sp_size, vocab) — SP-sliced like the OPD
+            formulas' input.
+        tg_label_log_probs / tg_label_ids: nested (rows, P+R, K); non-tg rows
+            carry zero stubs that are never read (masked out below).
+        tg_token_mask: (bsz, seqlen) packed bool, True on the full span of tg
+            rows; sliced here for SP exactly like the label tensors.
+
+    Returns:
+        (bsz, seqlen/sp_size) fp32 per-token losses, zero outside tg positions.
+    """
+    assert tg_label_log_probs.is_nested and tg_label_ids.is_nested
+    label_lps = tg_label_log_probs.values().unsqueeze(0)  # (1, total_nnz, K)
+    label_ids = tg_label_ids.values().unsqueeze(0)  # (1, total_nnz, K)
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        label_lps = slice_input_tensor(label_lps, dim=1)
+        label_ids = slice_input_tensor(label_ids, dim=1)
+        # bool pads to False (zero), so SP padding positions never enter.
+        tg_token_mask = slice_input_tensor(tg_token_mask, dim=1)
+    assert label_lps.shape[:2] == label_ids.shape[:2] == student_logits.shape[:2], (
+        f"tg label/logits misalignment: labels {tuple(label_lps.shape[:2])} vs "
+        f"logits {tuple(student_logits.shape[:2])}"
+    )
+    assert tg_token_mask.shape == student_logits.shape[:2], (
+        f"tg_token_mask {tuple(tg_token_mask.shape)} vs logits {tuple(student_logits.shape[:2])}"
+    )
+
+    out = torch.zeros(student_logits.shape[:2], dtype=torch.float32, device=student_logits.device)
+    mask = tg_token_mask[0].bool()
+    if not mask.any():
+        return out
+    flat_logits = student_logits[0][mask]  # [nnz_tg, V] — keeps the autograd graph
+    flat_ids = label_ids[0][mask].to(torch.long)  # [nnz_tg, K]
+    flat_lps = label_lps[0][mask].float()  # [nnz_tg, K] renormalised label
+    loss_config: DistillationLossConfig = config.distillation_loss
+    q_lp = _chunked_topk_log_probs(
+        flat_logits.unsqueeze(0),
+        flat_ids.unsqueeze(0),
+        chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
+    )[0].float()  # [nnz_tg, K]
+    ce = (flat_lps.exp() * (flat_lps - q_lp)).sum(dim=-1)  # [nnz_tg]
+    out[0][mask] = ce
+    return out

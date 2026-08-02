@@ -128,17 +128,35 @@ def test_scorer_tg_rows_come_back_renormalised_privileged_stay_raw(scorer_ns):
     ]
     data = _score_batch(scorer_ns, extras, P=P, R=R)
     lps = [t for t in data["teacher_logprobs"].unbind()]
+    tg_lps = [t for t in data["tg_label_logprobs"].unbind()]
 
     # Row layout is (P-1) zeros | R valid | 1 dummy for scored rows.
     priv_valid = lps[0][P - 1 : P - 1 + R]
-    tg_valid = lps[1][P - 1 : P - 1 + R]
-    # privileged: raw top-K logprobs — truncated mass < 1 with K=4 < V=7.
+    tg_valid = tg_lps[1][P - 1 : P - 1 + R]
+    # privileged: raw top-K logprobs on the TEACHER channel — truncated mass
+    # < 1 with K=4 < V=7 — and a zero stub on the tg channel.
     assert (torch.logsumexp(priv_valid, dim=-1) < -1e-4).all()
-    # tg: renormalised — a proper distribution over the K buckets.
+    assert tg_lps[0].abs().sum().item() == 0.0
+    assert data["tg_label_ids"].unbind()[0].abs().sum().item() == 0.0
+    # tg: renormalised proper distribution on the TG LABEL channel — and a
+    # zero stub on the teacher channel (decoupling: the OPD formulas must
+    # never see a bare-policy distribution wearing a teacher field name).
     assert torch.logsumexp(tg_valid, dim=-1).abs().max().item() < 1e-5
-    # tg_skip: all-zero dummy rows, nothing scored.
+    assert lps[1].abs().sum().item() == 0.0
+    assert data["teacher_ids"].unbind()[1].abs().sum().item() == 0.0
+    # tg_skip: all-zero dummy rows on both channels, nothing scored.
     assert data["teacher_logprobs"].unbind()[2].abs().sum().item() == 0.0
     assert data["teacher_ids"].unbind()[2].abs().sum().item() == 0.0
+    assert tg_lps[2].abs().sum().item() == 0.0
+
+
+def test_scorer_no_tg_rows_ships_no_tg_fields(scorer_ns):
+    # tg-free batches carry zero extra fields — the tg channel exists only
+    # when a tg row exists (arm off == byte-identical transfer).
+    extras = [{"teacher_mode": "privileged", "teacher_topk": 4,
+               "teacher_prefix_ids": list(range(6))}]
+    data = _score_batch(scorer_ns, extras)
+    assert "tg_label_ids" not in data and "tg_label_logprobs" not in data
 
 
 def test_scorer_tg_contracts_fail_loud(scorer_ns):
@@ -210,7 +228,7 @@ def losses_ns():
             sys.modules[k] = v
 
 
-def _call_ppo(ns, tg_coef, agg_mode, data, losses=None):
+def _call_ppo(ns, tg_coef, agg_mode, data, losses=None, tg_losses=None):
     losses = losses if losses is not None else torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     ns["get_distillation_loss_fn"] = lambda mode: (
         lambda config, distillation_config, model_output, data: (losses, {}))
@@ -222,7 +240,11 @@ def _call_ppo(ns, tg_coef, agg_mode, data, losses=None):
         distillation_loss_coef=1.0, opd_loss_coef=1.0,
     )
     distillation_config = types.SimpleNamespace(distillation_loss=loss_cfg)
+    # Decoupled channels: the OPD matrix and the tg matrix are separate
+    # model_output entries — exactly what the logits processor now ships.
     model_output = {"distillation_losses": losses}
+    if tg_losses is not None:
+        model_output["tg_losses"] = tg_losses
     return ns["distillation_ppo_loss"](config, distillation_config, model_output, data)
 
 
@@ -243,7 +265,10 @@ def test_tg_call_site_seq_mean_uses_frequency_weighted_total(losses_ns):
     rmask = torch.tensor([[True, True], [False, False]])
     data = {"response_mask": rmask, "tg_mask": tg_mask,
             "batch_num_seqs": 5, "dp_size": 2, "batch_num_tg_seqs": 3}
-    _, metrics = _call_ppo(ns, 1.0, "seq-mean-token-mean", data)
+    opd_mat = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    tg_mat = torch.tensor([[9.0, 9.0], [0.5, 1.5]])
+    _, metrics = _call_ppo(ns, 1.0, "seq-mean-token-mean", data,
+                           losses=opd_mat, tg_losses=tg_mat)
     tg_calls = [c for c in calls if c.get("loss_mask") is not None
                 and torch.equal(c["loss_mask"], tg_mask)]
     opd_calls = [c for c in calls if c.get("loss_mask") is not None
@@ -252,6 +277,9 @@ def test_tg_call_site_seq_mean_uses_frequency_weighted_total(losses_ns):
     assert tg_calls[0]["global_batch_size"] == 8.0    # 5 lost + 3 tg
     assert opd_calls[0]["global_batch_size"] == 8.0   # same total for OPD
     assert tg_calls[0]["dp_size"] == 2.0
+    # Decoupling: each term aggregates its OWN matrix.
+    assert torch.equal(tg_calls[0]["loss_mat"], tg_mat)
+    assert torch.equal(opd_calls[0]["loss_mat"], opd_mat)
     assert "tg/loss" in metrics and "tg/rows" in metrics and "tg/tokens" in metrics
 
 
@@ -272,7 +300,8 @@ def test_tg_call_site_seq_mean_fails_loud_without_stamp(losses_ns):
             "tg_mask": torch.tensor([[False, False], [True, True]]),
             "batch_num_seqs": 5, "dp_size": 2}
     with pytest.raises(RuntimeError, match="batch_num_tg_seqs"):
-        _call_ppo(ns, 1.0, "seq-mean-token-mean", data)
+        _call_ppo(ns, 1.0, "seq-mean-token-mean", data,
+                  tg_losses=torch.tensor([[0.0, 0.0], [0.5, 1.5]]))
 
 
 def test_tg_call_site_token_mean_keeps_local_zero_safe_denominator(losses_ns):
@@ -280,7 +309,8 @@ def test_tg_call_site_token_mean_keeps_local_zero_safe_denominator(losses_ns):
     tg_mask = torch.tensor([[False, False], [True, True]])
     data = {"response_mask": torch.tensor([[True, True], [False, False]]),
             "tg_mask": tg_mask}
-    _call_ppo(ns, 1.0, "token-mean", data)
+    _call_ppo(ns, 1.0, "token-mean", data,
+              tg_losses=torch.tensor([[0.0, 0.0], [0.5, 1.5]]))
     tg_calls = [c for c in calls if c.get("loss_mask") is not None
                 and torch.equal(c["loss_mask"], tg_mask)]
     assert len(tg_calls) == 1
@@ -295,18 +325,33 @@ def test_tg_call_site_coef_zero_ships_nothing(losses_ns):
     assert all("tg" not in str(c.get("loss_mask", "")) for c in calls)
 
 
-def test_tg_losses_are_clamped_like_the_opd_branch(losses_ns):
-    # A negative per-token value (fp jitter) must be clamped to 0 before the
-    # tg aggregation — the spy receives the clamped matrix.
+def test_tg_reads_dedicated_matrix_and_clamps_min_zero(losses_ns):
+    # Decoupling: the tg term reads model_output["tg_losses"], NEVER the OPD
+    # matrix; a negative per-token value (fp jitter) is clamped to 0 before
+    # aggregation.
     ns, calls = losses_ns
     tg_mask = torch.tensor([[True, True]])
     data = {"response_mask": torch.tensor([[False, False]]),
             "tg_mask": tg_mask, "batch_num_seqs": 1, "dp_size": 1,
             "batch_num_tg_seqs": 1}
-    losses = torch.tensor([[-0.5, 2.0]])
-    _call_ppo(ns, 1.0, "seq-mean-token-mean", data, losses=losses)
+    opd_mat = torch.tensor([[9.0, 9.0]])           # poisoned OPD matrix
+    tg_mat = torch.tensor([[-0.5, 2.0]])
+    _call_ppo(ns, 1.0, "seq-mean-token-mean", data,
+              losses=opd_mat, tg_losses=tg_mat)
     tg_calls = [c for c in calls if torch.equal(c.get("loss_mask"), tg_mask)]
-    assert (tg_calls[0]["loss_mat"] >= 0).all()
+    assert torch.equal(tg_calls[0]["loss_mat"], torch.tensor([[0.0, 2.0]]))
+
+
+def test_tg_fails_loud_without_dedicated_matrix(losses_ns):
+    # tg rows in the batch but the logits processor shipped no tg_losses —
+    # a broken invariant, never a silent fallback to the OPD matrix.
+    ns, _ = losses_ns
+    data = {"response_mask": torch.tensor([[False, False]]),
+            "tg_mask": torch.tensor([[True, True]]),
+            "batch_num_seqs": 1, "dp_size": 1, "batch_num_tg_seqs": 1}
+    with pytest.raises(RuntimeError, match="tg_losses"):
+        _call_ppo(ns, 1.0, "seq-mean-token-mean", data,
+                  losses=torch.tensor([[0.0, 0.0]]))
 
 
 # ---------------------------------------------------------------------------
@@ -463,8 +508,13 @@ def test_tg_rows_in_behaviour_metrics_but_isolated_from_grpo_and_padding():
 
 
 # ---------------------------------------------------------------------------
-# 8. codex tg-review P0-2: the -10 log-prob floor made the tg "KL" genuinely
-#    negative; tg positions are exempt. Hand-computed trigger case.
+# 8. codex tg-review P0-2, made STRUCTURAL by the decoupling ruling
+#    (2026-08-02): the OPD -10 floor makes a renormalised-label "KL" genuinely
+#    negative — which is why tg no longer rides the OPD formula at all. The
+#    hand-computed trigger case now pins the CONTRAST: the pure OPD formula
+#    still floors this input negative (its own semantics, untouched), while
+#    the standalone tg soft-CE returns the true non-negative value with no
+#    clamp anywhere near it.
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def fsdp_losses_ns():
@@ -497,7 +547,7 @@ def fsdp_losses_ns():
             sys.modules[k] = v
 
 
-def _tg_clamp_case(fsdp_losses_ns, tg_mask_on):
+def _p02_trigger_inputs():
     # Renormalised label [0.99995, 2.5e-5, 2.5e-5]: tail log-prob -10.6 sits
     # BELOW the -10 floor. q from logits [30,0,0,0,0]: top ~1, tail ~9e-14
     # (log ~ -30). Unclamped soft-CE ~ +9.2e-4 > 0; with both sides floored
@@ -509,26 +559,90 @@ def _tg_clamp_case(fsdp_losses_ns, tg_mask_on):
     logits = torch.zeros(1, 1, 5)
     logits[0, 0, 0] = 30.0
     loss_cfg = types.SimpleNamespace(log_prob_min_clamp=-10.0,
-                                     use_chunked_topk=False)
+                                     use_chunked_topk=False,
+                                     chunked_topk_chunk_size=4096)
     cfg = types.SimpleNamespace(distillation_loss=loss_cfg)
-    kwargs = {}
-    if tg_mask_on:
-        kwargs["tg_token_mask"] = torch.tensor([[True]])
+    return label_nested, ids_nested, logits, cfg
+
+
+def test_forward_kl_topk_restored_to_pure_opd_form(fsdp_losses_ns):
+    import inspect
+
+    # The tg hole-punching is gone: no tg parameter, byte-comparable OPD math.
+    sig = inspect.signature(fsdp_losses_ns["compute_forward_kl_topk"])
+    assert "tg_token_mask" not in sig.parameters
+    # The trigger case still floors negative under the OPD formula — its own
+    # (OPD) semantics, untouched; exactly why tg rows must not ride it.
+    label_nested, ids_nested, logits, cfg = _p02_trigger_inputs()
     out = fsdp_losses_ns["compute_forward_kl_topk"](
         student_logits=logits, teacher_topk_log_probs=label_nested,
-        teacher_topk_ids=ids_nested, config=cfg, data_format="thd", **kwargs)
-    return out["distillation_losses"][0, 0].item()
+        teacher_topk_ids=ids_nested, config=cfg, data_format="thd")
+    assert out["distillation_losses"][0, 0].item() < -1e-5
 
 
-def test_tg_positions_exempt_from_logprob_floor(fsdp_losses_ns):
-    clamped = _tg_clamp_case(fsdp_losses_ns, tg_mask_on=False)
-    exempt = _tg_clamp_case(fsdp_losses_ns, tg_mask_on=True)
-    # Pin the defect on the legacy path: the floored "KL" is genuinely
-    # negative (not fp jitter), so clamp_min(0) would erase signal + gradient.
-    assert clamped < -1e-5
-    # The exempt path restores the true non-negative soft-CE.
-    assert exempt > 0
-    assert exempt == pytest.approx(9.2e-4, rel=0.2)
+def test_tg_soft_ce_structurally_immune_to_p02(fsdp_losses_ns):
+    # Same trigger input through the standalone formula: the true
+    # non-negative soft-CE, no floor, no max-clamp, gradient alive exactly
+    # where q parks mass outside the label support.
+    label_nested, ids_nested, logits, cfg = _p02_trigger_inputs()
+    logits = logits.clone().requires_grad_(True)
+    out = fsdp_losses_ns["compute_tg_soft_ce"](
+        student_logits=logits, tg_label_log_probs=label_nested,
+        tg_label_ids=ids_nested, tg_token_mask=torch.tensor([[True]]),
+        config=cfg)
+    val = out[0, 0].item()
+    assert val > 0 and val == pytest.approx(9.2e-4, rel=0.2)
+    out.sum().backward()
+    assert logits.grad.abs().max().item() > 0
+    # Source pin: the standalone formula never touches the OPD clamps.
+    src = (_VERL / "trainer" / "distillation" / "fsdp" / "losses.py").read_text(encoding="utf-8")
+    tg_src = src.split("def compute_tg_soft_ce")[1]
+    assert "log_prob_min_clamp" not in tg_src.split("Args:")[1]
+    assert "loss_max_clamp" not in tg_src.split("Args:")[1]
+
+
+def test_tg_soft_ce_hand_math_gradient_and_masking(fsdp_losses_ns):
+    # Full-formula pin on the standalone soft-CE: hand-computed parity on tg
+    # positions, exact zeros elsewhere, analytic gradient q - label through
+    # the chunked gather (validates the index_put autograd path).
+    torch.manual_seed(0)
+    T, V, K = 6, 50, 4
+    logits = torch.randn(1, T, V, requires_grad=True)
+    mask = torch.tensor([[True, True, True, False, False, False]])
+    ref_lp = torch.log_softmax(torch.randn(T, V), dim=-1)
+    top_lp, top_ids = torch.topk(ref_lp, k=K, dim=-1)
+    lab_lp = top_lp - torch.logsumexp(top_lp, dim=-1, keepdim=True)
+    lab_lp_full = torch.zeros(T, K)
+    lab_ids_full = torch.zeros(T, K, dtype=torch.int32)
+    lab_lp_full[:3] = lab_lp[:3]
+    lab_ids_full[:3] = top_ids[:3].to(torch.int32)
+    nt_lp = torch.nested.nested_tensor([lab_lp_full], layout=torch.jagged)
+    nt_id = torch.nested.nested_tensor([lab_ids_full], layout=torch.jagged)
+    loss_cfg = types.SimpleNamespace(chunked_topk_chunk_size=3)
+    cfg = types.SimpleNamespace(distillation_loss=loss_cfg)
+
+    out = fsdp_losses_ns["compute_tg_soft_ce"](logits, nt_lp, nt_id, mask, cfg)
+    q_lp_full = torch.log_softmax(logits[0].detach(), dim=-1)
+    for t in range(3):
+        p = lab_lp[t].exp()
+        hand = (p * (lab_lp[t] - q_lp_full[t, top_ids[t]])).sum()
+        assert out[0, t].item() == pytest.approx(hand.item(), abs=1e-5)
+    assert (out[0, 3:] == 0).all()
+
+    out.sum().backward()
+    g = logits.grad[0]
+    for t in range(3):
+        q = torch.softmax(logits[0, t].detach(), dim=-1)
+        expected = q.clone()
+        expected[top_ids[t]] -= lab_lp[t].exp()
+        assert torch.allclose(g[t], expected, atol=1e-5)
+    assert (g[3:] == 0).all()
+
+    # Empty-mask fast path: zero matrix, right shape.
+    out2 = fsdp_losses_ns["compute_tg_soft_ce"](
+        torch.randn(1, T, V), nt_lp, nt_id,
+        torch.zeros(1, T, dtype=torch.bool), cfg)
+    assert (out2 == 0).all() and out2.shape == (1, T)
 
 
 def test_tg_branch_drops_loss_max_clamp_and_reports_preclamp_min(losses_ns):
@@ -551,7 +665,9 @@ def test_tg_branch_drops_loss_max_clamp_and_reports_preclamp_min(losses_ns):
         distillation_loss_coef=1.0, opd_loss_coef=1.0)
     distillation_config = types.SimpleNamespace(distillation_loss=loss_cfg)
     _, metrics = ns["distillation_ppo_loss"](
-        config, distillation_config, {"distillation_losses": losses}, data)
+        config, distillation_config,
+        {"distillation_losses": torch.zeros_like(losses), "tg_losses": losses},
+        data)
     tg_calls = [c for c in calls if torch.equal(c.get("loss_mask"), tg_mask)]
     assert tg_calls[-1]["loss_mat"].max().item() == pytest.approx(27.0)
     assert "tg/loss_min_preclamp" in metrics and "tg/loss_max" in metrics
@@ -570,6 +686,89 @@ def test_config_rejects_tg_with_token_mean(tmp_path):
         _load(tmp_path, "tm", ["train.mix_tg_weight=1.0", "train.opd_lost_only=true",
                                "train.loss_agg_mode=token-mean"])
 
+
+
+def test_dispatch_decoupling_contracts(losses_ns):
+    """compute_topk_loss dispatch: (a) tg arm on + no tg rows in the
+    micro-batch -> a zero tg matrix ships (uniform read path downstream);
+    (b) tg rows present but the label channel missing -> fail loud;
+    (c) tg rows + labels -> the standalone formula's output ships."""
+    ns, _ = losses_ns
+    T, V = 4, 7
+    logits = torch.zeros(1, T, V)
+
+    def fake_opd(student_logits, teacher_topk_log_probs, teacher_topk_ids,
+                 config, data_format):
+        shape = student_logits.shape[:2]
+        return {"distillation_losses": torch.zeros(shape),
+                "student_mass": torch.zeros(shape),
+                "teacher_mass": torch.zeros(shape), "obs": None}
+
+    seen = {}
+
+    def fake_tg(student_logits, tg_label_log_probs, tg_label_ids,
+                tg_token_mask, config):
+        seen["mask"] = tg_token_mask.clone()
+        return torch.full(student_logits.shape[:2], 7.0)
+
+    fsdp_mod = types.ModuleType("verl.trainer.distillation.fsdp.losses")
+    fsdp_mod.compute_forward_kl_topk = fake_opd
+    fsdp_mod.compute_reverse_kl_topk = fake_opd
+    fsdp_mod.compute_tg_soft_ce = fake_tg
+    pkg_dist = types.ModuleType("verl.trainer.distillation")
+    pkg_fsdp = types.ModuleType("verl.trainer.distillation.fsdp")
+    saved = {k: sys.modules.get(k) for k in
+             ("verl.trainer.distillation", "verl.trainer.distillation.fsdp",
+              "verl.trainer.distillation.fsdp.losses")}
+    sys.modules["verl.trainer.distillation"] = pkg_dist
+    sys.modules["verl.trainer.distillation.fsdp"] = pkg_fsdp
+    sys.modules["verl.trainer.distillation.fsdp.losses"] = fsdp_mod
+    try:
+        config = types.SimpleNamespace(strategy="fsdp")
+        loss_cfg = types.SimpleNamespace(loss_mode="reverse_kl_topk",
+                                         log_prob_min_clamp=-10.0,
+                                         tg_loss_coef=1.0)
+        dcfg = types.SimpleNamespace(distillation_loss=loss_cfg)
+        prompts = torch.nested.nested_tensor(
+            [torch.zeros(1, dtype=torch.long)] * 2, layout=torch.jagged)
+        responses = torch.nested.nested_tensor(
+            [torch.zeros(1, dtype=torch.long)] * 2, layout=torch.jagged)
+
+        # (a) no tg rows -> zero matrix, formula not called
+        data = {"extra_fields": [{"sample_role": "bare"}, {"sample_role": "bare"}],
+                "prompts": prompts, "responses": responses,
+                "teacher_logprobs": None, "teacher_ids": None}
+        out = ns["compute_topk_loss"](config, dcfg, data, logits, "thd")
+        assert torch.equal(out["tg_losses"], torch.zeros(1, T)) and not seen
+
+        # (b) tg rows, label channel missing -> fail loud
+        data_tg = dict(data)
+        data_tg["extra_fields"] = [{"sample_role": "bare"}, {"sample_role": "tg"}]
+        with pytest.raises(RuntimeError, match="tg_label_ids"):
+            ns["compute_topk_loss"](config, dcfg, data_tg, logits, "thd")
+
+        # (c) tg rows + labels -> standalone output ships, mask marks row 2
+        data_tg["tg_label_ids"] = "stub"
+        data_tg["tg_label_logprobs"] = "stub"
+        out = ns["compute_topk_loss"](config, dcfg, data_tg, logits, "thd")
+        assert (out["tg_losses"] == 7.0).all()
+        assert torch.equal(seen["mask"],
+                           torch.tensor([[False, False, True, True]]))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def test_verl_config_tg_whitelist_source_pin():
+    # Decoupling ruling: the OPD loss_mode is free within the top-k family;
+    # k3/gated (teacher_topk=0 single-column) is a structural layout clash.
+    src = (_VERL / "workers" / "config" / "distillation.py").read_text(encoding="utf-8")
+    assert "loss_mode not in (" in src
+    seg = src.split("tg_loss_coef) > 0.0 and self.loss_mode not in (")[1][:400]
+    assert "forward_kl_topk" in seg and "reverse_kl_topk" in seg
 
 
 def test_tg_gradient_bounded_under_extreme_q():

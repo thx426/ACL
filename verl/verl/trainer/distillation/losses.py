@@ -145,9 +145,10 @@ def compute_topk_loss(
     - teacher_mass: (bsz, seqlen/cp_size)
     """
     loss_mode = distillation_config.distillation_loss.loss_mode
-    # codex tg-review P0-2: build the packed per-token tg flag (full P+R span
-    # per tg row) so the fsdp loss can exempt tg positions from the OPD
-    # log-prob floor. Zero-cost when no row is a tg row.
+    # trace-opd teacher grounding (decoupling ruling 2026-08-02): build the
+    # packed per-token tg flag (full P+R span per tg row) — it tells the
+    # standalone tg formula which positions belong to tg rows. Zero-cost when
+    # no row is a tg row.
     tg_token_mask = None
     extras = data.get("extra_fields", None)
     if extras is not None:
@@ -157,7 +158,7 @@ def compute_topk_loss(
             if not (getattr(prompts, "is_nested", False) and getattr(responses, "is_nested", False)):
                 raise RuntimeError(
                     "teacher-grounding rows require the nested (THD) batch layout - "
-                    "the dense path does not carry the per-row tg clamp exemption"
+                    "the dense path does not carry the per-row tg span flags"
                 )
             p_lens = prompts.offsets().diff().tolist()
             r_lens = responses.offsets().diff().tolist()
@@ -193,17 +194,41 @@ def compute_topk_loss(
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
 
-    loss_fn_kwargs = {}
-    if tg_token_mask is not None:
-        loss_fn_kwargs["tg_token_mask"] = tg_token_mask
     outputs = distillation_loss_fn(
         student_logits=student_logits,
         teacher_topk_log_probs=data["teacher_logprobs"],
         teacher_topk_ids=data["teacher_ids"],
         config=distillation_config,
         data_format=data_format,
-        **loss_fn_kwargs,
     )
+    # trace-opd teacher grounding (decoupling ruling 2026-08-02): the tg term
+    # runs its OWN per-token formula on its OWN label channel — the OPD
+    # formula above never sees a tg label, and the tg soft-CE never inherits
+    # OPD clamps. A micro-batch without tg rows still ships a zero matrix so
+    # the aggregation side keeps one uniform read path (its all-false tg_mask
+    # contributes zero tokens over the batch-global denominator).
+    tg_loss_coef = float(getattr(distillation_config.distillation_loss, "tg_loss_coef", 0.0) or 0.0)
+    if tg_loss_coef > 0.0 and config.strategy in ("fsdp", "fsdp2", "veomni"):
+        import verl.trainer.distillation.fsdp.losses as fsdp_losses
+
+        if tg_token_mask is None:
+            outputs["tg_losses"] = torch.zeros(
+                student_logits.shape[:2], dtype=torch.float32, device=student_logits.device
+            )
+        else:
+            for key in ("tg_label_ids", "tg_label_logprobs"):
+                if key not in data.keys():
+                    raise RuntimeError(
+                        f"tg rows present but '{key}' is missing — the scorer did not ship "
+                        "the decoupled tg label channel (teacher_topk_fsdp)"
+                    )
+            outputs["tg_losses"] = fsdp_losses.compute_tg_soft_ce(
+                student_logits=student_logits,
+                tg_label_log_probs=data["tg_label_logprobs"],
+                tg_label_ids=data["tg_label_ids"],
+                tg_token_mask=tg_token_mask,
+                config=distillation_config,
+            )
     obs = outputs.pop("obs", None)
     if obs is not None:
         _collect_observation_rows(
@@ -425,11 +450,12 @@ def distillation_ppo_loss(
     # trace-opd teacher grounding (docs/teacher-grounding-design.md): reverse
     # distillation over the tg rows — bare SUCCESS trajectories re-prompted
     # with the doc prefix, labelled by the bare policy's renormalised top-k.
-    # The logits processor already computed their per-token soft-CE (the
-    # forward_kl_topk formula applied to the tg label IS the tg soft-CE), so
-    # this term re-reads the SAME per-token matrix under ``tg_mask``. tg rows
-    # carry an all-zero response_mask, so every term above is blind to them
-    # and this term is a pure addition, exactly like the SFT arm.
+    # Decoupled from the OPD family end to end (user ruling 2026-08-02): the
+    # labels ride their own tg_label channel and the logits processor computed
+    # their per-token soft-CE with the standalone compute_tg_soft_ce, so this
+    # term reads ``tg_losses`` under ``tg_mask``. tg rows carry an all-zero
+    # response_mask, so every term above is blind to them and this term is a
+    # pure addition, exactly like the SFT arm.
     tg_loss_coef = float(getattr(distillation_loss_config, "tg_loss_coef", 0.0) or 0.0)
     if tg_loss_coef > 0.0:
         tg_mask = data.get("tg_mask", None)
@@ -443,19 +469,28 @@ def distillation_ppo_loss(
         if tg_mask.is_nested:
             tg_mask = tg_mask.to_padded_tensor(0)
         tg_mask = tg_mask.to(torch.bool)
-        tg_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+        # Decoupling ruling 2026-08-02: the tg term reads its OWN per-token
+        # matrix (compute_tg_soft_ce over the tg_label channel), never the OPD
+        # formula's. Absence is a broken invariant, not a fallback.
+        if "tg_losses" not in model_output:
+            raise RuntimeError(
+                "tg_loss_coef > 0 but the logits processor shipped no 'tg_losses' — "
+                "the decoupled tg formula did not run (compute_topk_loss dispatch)"
+            )
+        tg_losses = no_padding_2_padding(model_output["tg_losses"], data)
         if tg_losses.shape != tg_mask.shape:
             raise RuntimeError(
                 f"tg_mask shape {tuple(tg_mask.shape)} does not match the per-token loss "
                 f"layout {tuple(tg_losses.shape)} — a tg row is out of step with its responses"
             )
-        # codex tg-review P0-2: with tg positions exempt from the log-prob
-        # floor (fsdp loss), the soft-CE is non-negative by construction and
-        # clamp_min(0) is genuinely lossless. loss_max_clamp is deliberately
-        # NOT applied: a large tg loss is legitimate supervision (q parking
-        # its mass outside the label support) and torch.clamp would zero its
-        # gradient exactly there. Telemetry keeps the invariant observable -
-        # a materially negative pre-clamp minimum means the exemption broke.
+        # The standalone soft-CE is non-negative by construction (renormalised
+        # label, no OPD clamps anywhere near it — codex tg-review P0-2 made
+        # structural by the decoupling), so clamp_min(0) is genuinely lossless
+        # fp hygiene. loss_max_clamp is deliberately NOT applied: a large tg
+        # loss is legitimate supervision (q parking its mass outside the label
+        # support) and clamping would zero its gradient exactly there.
+        # Telemetry keeps the invariant observable - a materially negative
+        # pre-clamp minimum means the formula broke.
         with torch.no_grad():
             tg_valid_losses = tg_losses[tg_mask]
             if tg_valid_losses.numel():
@@ -949,6 +984,12 @@ def _collect_observation_rows(
             if lo >= hi:
                 continue
             extra = extras[i] if isinstance(extras[i], dict) else {}
+            if extra.get("sample_role") == "tg":
+                # trace-opd teacher grounding (decoupled channels): a tg row's
+                # teacher_* fields are zero stubs and its OPD per-token matrix
+                # is masked garbage — the microscope is an OPD instrument, so
+                # tg rows stay out of its packs entirely.
+                continue
             seg_slice = (lo - rank_lo, hi - rank_lo)
             rows.append(
                 {
