@@ -129,7 +129,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # On timeout the pending agent loops are cancelled and the prompt falls
             # into the existing failure path (asyncio.TimeoutError is builtins
             # TimeoutError on py3.11+, an Exception subclass), releasing the batch.
-            # Default 2700s >> per-task wall p100 (~12 min incl. researcher session);
+            # Default 2700s >> per-task wall p100;
             # set TRACE_AGENT_TASK_TIMEOUT_S=0 to disable.
             _timeout_s = float(os.environ.get("TRACE_AGENT_TASK_TIMEOUT_S", "2700"))
             if _timeout_s > 0:
@@ -154,14 +154,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
-        # TODO: Support output:list[AgentLoopOutput]
-        await self._compute_teacher_logprobs(
-            final_output,
-            prompt_ids=final_output.prompt_ids,
-            response_ids=final_output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
@@ -189,67 +181,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field.update(kwargs)
             # do not store raw image/video
             field.pop("multi_modal_data", None)
-            # trace-opd mixed objective (docs/mixed-objective-design.md): an
-            # expert sample — a rollout produced WITH the privileged document and
-            # replayed under the bare prompt — supervises through `sft_mask` and
-            # nothing else. Clearing its response_mask keeps it out of the
-            # on-policy terms (top-k OPD, policy gradient) AND out of every
-            # denominator derived from them (batch_num_tokens is a sum over
-            # loss_mask), so switching the SFT arm on cannot rescale the OPD loss.
-            #
-            # The agent loop stamps sample_role on EVERY row exactly when the SFT
-            # arm is on, and that stamp is the switch here: with the arm off no
-            # row carries it, no sft_mask is allocated, and nothing extra is
-            # stored or shipped. With it on every row carries the field, so the
-            # batch layout stays uniform.
-            sample_role = (field.get("extra_fields") or {}).get("sample_role")
-            if sample_role is not None:
-                response_mask = field["response_mask"]
-                if sample_role == "sft":
-                    field["sft_mask"] = response_mask
-                    field["response_mask"] = torch.zeros_like(response_mask)
-                else:
-                    field["sft_mask"] = torch.zeros_like(response_mask)
-                # trace-opd teacher grounding (docs/teacher-grounding-design.md):
-                # a tg row — a bare SUCCESS trajectory re-prompted with the doc
-                # prefix — supervises through ``tg_mask`` and nothing else.
-                # Same discipline as the SFT arm above: clearing response_mask
-                # keeps the row out of the on-policy terms AND out of every
-                # denominator derived from response_mask (batch_num_seqs counts
-                # non-empty response_mask rows, so the OPD seq-mean denominator
-                # cannot be rescaled by switching the tg arm on). A dropped-won
-                # placeholder arrives with an already-cleared mask, so its
-                # tg_mask is all-zero and the row contributes nothing anywhere.
-                if sample_role == "tg":
-                    field["tg_mask"] = field["response_mask"]
-                    field["response_mask"] = torch.zeros_like(field["response_mask"])
-                else:
-                    field["tg_mask"] = torch.zeros_like(response_mask)
-            # trace-opd self-research (docs/self-research-design.md): a research
-            # row is the researcher session itself — its researcher-generated
-            # tokens live in response_mask exactly like an executor row's
-            # assistant tokens. Same discipline as the SFT arm: the row
-            # supervises through ``research_mask`` and nothing else. Clearing
-            # its response_mask keeps the (possibly very long) research
-            # trajectory out of the OPD/RL/SFT terms AND out of every
-            # denominator derived from response_mask, so switching the research
-            # channel on cannot rescale the executor-side losses. The
-            # ``research_arm`` stamp plays the role sample_role plays above:
-            # the agent loop stamps it on EVERY row exactly when the channel is
-            # on, so the batch layout stays uniform and the off path ships
-            # nothing.
-            if (field.get("extra_fields") or {}).get("research_arm") is not None:
-                response_mask = field["response_mask"]
-                if sample_role == "research":
-                    field["research_mask"] = response_mask
-                    field["response_mask"] = torch.zeros_like(response_mask)
-                else:
-                    field["research_mask"] = torch.zeros_like(response_mask)
-                # Placeholder; the trainer's advantage stage fills the real
-                # group-relative value (see trainer_base._compute_advantage).
-                field["research_advantage"] = torch.zeros_like(
-                    field["research_mask"], dtype=torch.float32
-                )
             # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

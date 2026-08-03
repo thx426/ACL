@@ -39,7 +39,6 @@ from transfer_queue import KVBatchMeta
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
-from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -47,7 +46,6 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
-from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -70,7 +68,6 @@ from verl.trainer.ppo.utils import (
     create_rl_sampler,
     need_critic,
     need_reference_policy,
-    need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
@@ -88,7 +85,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl.workers.config import CriticConfig, DistillationConfig
+from verl.workers.config import CriticConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
@@ -151,7 +148,6 @@ class PPOTrainer(ABC):
         self.config = config
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
-        self.use_teacher_policy = need_teacher_policy(self.config)
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -190,7 +186,6 @@ class PPOTrainer(ABC):
         2. LLMServerManager: launch and manage LLM server replicas for generation.
         3. CheckpointEngineManager: sync weights between worker group and LLM server replicas.
         4. RewardLoopManager: reward workers for rule-based reward, optional LLM server for model-based reward.
-        5. [Optional] MultiTeacherModelManager: LLM teacher servers for on-policy distillation.
         """
         self._setup()
         self.on_init_end()
@@ -209,7 +204,6 @@ class PPOTrainer(ABC):
         actor_rollout_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[actor_role],
             config=self.config.actor_rollout_ref,
-            distillation_config=self.config.get("distillation"),
             role=str(actor_role),
         )
         self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
@@ -304,23 +298,6 @@ class PPOTrainer(ABC):
         )
         logger.info("reward loop manager initialized")
 
-        # 8. initialize teacher loop manager
-        if self.use_teacher_policy:
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            self.teacher_model_manager = MultiTeacherModelManager(
-                config=self.config,
-                resource_pool=teacher_resource_pool,
-            )
-        else:
-            self.teacher_model_manager = None
-        # H3 pilot: the loss side needs distillation_config whenever distillation
-        # is enabled — including self_teacher mode, which has no teacher manager.
-        self.distillation_config: DistillationConfig | None = (
-            omega_conf_to_dataclass(self.config.distillation)
-            if is_distillation_enabled(self.config.get("distillation"))
-            else None
-        )
-
         # 9. initialize agent loop manager
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
@@ -345,14 +322,6 @@ class PPOTrainer(ABC):
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
         return self.llm_server_manager.get_client()
-
-    def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
-        """Get the On-Policy Distillation teacher server clients.
-
-        Returns:
-            dict[str, LLMServerClient]: The teacher server clients.
-        """
-        return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
         """Get the handles of reward loop workers."""
@@ -743,18 +712,6 @@ class PPOTrainer(ABC):
             config.reward.reward_model.nnodes = config.trainer.nnodes
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
             self.mapping[Role.RewardModel] = "global_pool"
-
-        distillation_config = config.get("distillation")
-        # H3 pilot: self_teacher scores on the rollout engine — no teacher pool.
-        if is_distillation_enabled(distillation_config) and not distillation_config.get("self_teacher", False):
-            if distillation_config.n_gpus_per_node <= 0:
-                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
-            if distillation_config.nnodes <= 0:
-                raise ValueError("config.distillation.nnodes must be greater than 0")
-
-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-            self.mapping[Role.TeacherModel] = "teacher_pool"
 
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
@@ -1557,80 +1514,15 @@ class PPOTrainer(ABC):
 
         return batch
 
-    def _mixed_objective_enabled(self) -> bool:
-        """trace-opd: whether the RL or SFT arm of the mixed objective, the
-        self-research channel, or the teacher-grounding arm is on (all four key
-        the sample_role machinery — codex tg-review P1-3: without tg here the
-        tg GRPO isolation below is UNREACHABLE in the T1 configuration, since
-        tg is mutually exclusive with rl/sft and research defaults off)."""
-        if not is_distillation_enabled(self.config.get("distillation")):
-            return False
-        loss_cfg = self.distillation_config.distillation_loss
-        return (
-            float(getattr(loss_cfg, "rl_loss_coef", 0.0) or 0.0) > 0.0
-            or float(getattr(loss_cfg, "sft_loss_coef", 0.0) or 0.0) > 0.0
-            or float(getattr(loss_cfg, "research_loss_coef", 0.0) or 0.0) > 0.0
-            or float(getattr(loss_cfg, "tg_loss_coef", 0.0) or 0.0) > 0.0
-        )
-
-    def _research_channel_enabled(self) -> bool:
-        """trace-opd self-research: whether research rows carry a gradient at all."""
-        if not is_distillation_enabled(self.config.get("distillation")):
-            return False
-        loss_cfg = self.distillation_config.distillation_loss
-        return float(getattr(loss_cfg, "research_loss_coef", 0.0) or 0.0) > 0.0
-
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
-        # trace-opd mixed objective: sample_role decides the GRPO group (below).
-        mixed_objective = self._mixed_objective_enabled()
-        if mixed_objective:
-            fields.append("extra_fields")
-        research_enabled = self._research_channel_enabled()
-        if research_enabled:
-            fields.append("research_mask")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-        sample_roles = data.pop("extra_fields", None) if mixed_objective else None
 
         response_mask = data["response_mask"]
-        # trace-opd self-research: nested layout template for writing the
-        # research advantages back (response_mask is all-zero on those rows).
-        research_mask_nested = data["research_mask"] if research_enabled else None
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
-
-        if sample_roles is not None:
-            # Expert (SFT) samples reach ~96% success while the bare rollouts of
-            # the same task sit far lower, so leaving them in the task's GRPO
-            # group would drag the group mean up and hand the successful BARE
-            # rollouts a negative advantage. Give them their own group instead;
-            # their advantages are then masked out of the loss anyway (all-zero
-            # response_mask), the isolation is purely to keep the on-policy
-            # group statistics honest.
-            roles = sample_roles.tolist() if hasattr(sample_roles, "tolist") else list(sample_roles)
-            uids = data.non_tensor_batch["uid"]
-
-            def _grouped_uid(uid, extra):
-                role = extra.get("sample_role") if isinstance(extra, dict) else None
-                # trace-opd self-research: research rows form their own GRPO
-                # group per task. Their reward (the document's downstream
-                # success rate) lives on a different scale than the executor's
-                # binary outcome, and their advantage is recomputed below with
-                # the research formula anyway — the isolation keeps the
-                # executor groups' statistics untouched, same reason as :sft.
-                # trace-opd teacher grounding: a tg row is a WON trajectory
-                # with reward 1.0 and an all-zero response_mask; under the won
-                # split the bare rows of its task are all lost, so leaving it
-                # in the task group would hand every lost bare row a negative
-                # advantage baseline. Own group, same honesty argument.
-                return f"{uid}:{role}" if role in ("sft", "research", "tg") else uid
-
-            data.non_tensor_batch["uid"] = np.array(
-                [_grouped_uid(uid, extra) for uid, extra in zip(uids, roles)],
-                dtype=object,
-            )
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1665,47 +1557,6 @@ class PPOTrainer(ABC):
             config=self.config.algorithm,
         )
 
-        # 3b. trace-opd self-research: overwrite the research rows' advantage
-        # with the research formula — group-relative, mean-centred, NOT divided
-        # by the group std (K-rollout success rates make the std collapse on
-        # near-tied groups and dividing amplifies pure sampling noise;
-        # docs/self-research-design.md 7.2), hard-clamped to +/-adv_clip. The
-        # standard GRPO advantage these rows just received is never read (their
-        # response_mask is all zero), but the value shipped to the loss must be
-        # the research one, on its own field, nested by research_mask.
-        research_advantage_padded = None
-        if research_enabled and sample_roles is not None:
-            research_rows = [
-                i
-                for i, extra in enumerate(roles)
-                if isinstance(extra, dict) and extra.get("sample_role") == "research"
-            ]
-            if research_rows:
-                loss_cfg = self.distillation_config.distillation_loss
-                adv_clip = float(getattr(loss_cfg, "research_adv_clip", 2.0) or 2.0)
-                scores = data.batch["token_level_scores"].sum(-1)
-                group_rows: dict[str, list[int]] = {}
-                for i in research_rows:
-                    group_rows.setdefault(str(data.non_tensor_batch["uid"][i]), []).append(i)
-                row_adv = torch.zeros_like(scores)
-                mask_padded = data.batch["research_mask"]
-                # codex review P2-11 / design 7.2: a "trainable candidate" is a
-                # row whose research_mask carries tokens (degraded rows — empty
-                # or over-length sessions — keep their real reward in the group
-                # mean but cannot carry gradient). A group with fewer than two
-                # trainable candidates is skipped whole: one row against a mean
-                # of untrainable rewards is a baseline comparison, not a
-                # group-relative one.
-                trainable = mask_padded.sum(dim=-1) > 0
-                for rows in group_rows.values():
-                    idx = torch.tensor(rows, dtype=torch.long, device=scores.device)
-                    if int(trainable[idx].sum().item()) < 2:
-                        continue
-                    rewards = scores[idx]
-                    centred = rewards - rewards.mean()
-                    row_adv[idx] = centred.clamp(min=-adv_clip, max=adv_clip)
-                research_advantage_padded = row_adv.unsqueeze(-1).expand(mask_padded.shape).contiguous()
-
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
         if self.config.algorithm.use_kl_in_reward:
@@ -1718,10 +1569,6 @@ class PPOTrainer(ABC):
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
-        if research_advantage_padded is not None:
-            output["research_advantage"] = response_to_nested(
-                research_advantage_padded, research_mask_nested
-            )
         output = TensorDict(output, batch_size=len(batch))
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
@@ -1758,74 +1605,8 @@ class PPOTrainer(ABC):
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
-        distillation_use_topk = (
-            self.distillation_config.distillation_loss.loss_settings.use_topk
-            if is_distillation_enabled(self.config.get("distillation"))
-            else False
-        )
-        distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
-        if is_distillation_enabled(self.config.get("distillation")):
-            distillation_loss_cfg = self.distillation_config.distillation_loss
-            distillation_only = (
-                distillation_use_topk
-                and not distillation_loss_cfg.use_task_rewards
-                and not distillation_loss_cfg.use_policy_gradient
-                # trace-opd mixed objective: the RL and SFT terms both need the
-                # full policy-loss path (advantages / log-probs), so the
-                # memory-saving distillation-only shortcut must stay off.
-                and float(getattr(distillation_loss_cfg, "rl_loss_coef", 0.0) or 0.0) <= 0.0
-                and float(getattr(distillation_loss_cfg, "sft_loss_coef", 0.0) or 0.0) <= 0.0
-                # trace-opd self-research (codex review P0-2): the research PG
-                # term reads model_output["log_probs"] on EVERY update while its
-                # coefficient is positive (warmup exec sub-batches included —
-                # the aggregator calls research_pg_loss whenever the coef is
-                # on), so the memory-saving shortcut must stay off with it.
-                and float(getattr(distillation_loss_cfg, "research_loss_coef", 0.0) or 0.0) <= 0.0
-            )
-        # trace-opd intervention-OPD (its design 12): the verified-intervention
-        # mechanism ships fixed-shape batches where slots without an admitted
-        # sample are ZERO-MASK pad rows. A batch below the signal floor still
-        # produces loss==0, but AdamW's decoupled weight decay would move the
-        # weights anyway and the LR scheduler would tick — skip the whole
-        # update, loudly, and let the step account for itself in the metrics.
-        min_signal = 0
-        if is_distillation_enabled(self.config.get("distillation")):
-            min_signal = int(
-                getattr(self.distillation_config.distillation_loss, "min_signal_rows", 0) or 0
-            )
-        if min_signal > 0:
-            # codex tg-review P1-2: tg rows clear response_mask and carry
-            # their signal in tg_mask — counting response_mask alone would
-            # skip the whole actor update exactly when the policy is winning
-            # (few lost rows, many tg rows). Count either signal. tg_mask is
-            # only requested when the arm is on (rows carry no such field
-            # otherwise, and the fetch must not invent one).
-            tg_on = float(getattr(
-                self.distillation_config.distillation_loss, "tg_loss_coef", 0.0
-            ) or 0.0) > 0.0
-            fields = ["response_mask"] + (["tg_mask"] if tg_on else [])
-            sig_data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=fields
-            )
-            n_signal = _count_signal_rows(sig_data.pop("response_mask"))
-            if tg_on:
-                n_signal += _count_signal_rows(sig_data.pop("tg_mask"))
-            metrics["distill/signal_rows"] = float(n_signal)
-            if n_signal < min_signal:
-                metrics["distill/skipped_low_signal"] = 1.0
-                logger.error(
-                    "intervention-OPD: only %d rows carry distillation signal "
-                    "(< min_signal_rows=%d) — SKIPPING the actor update this step "
-                    "(no optimizer step, no scheduler tick)",
-                    n_signal, min_signal,
-                )
-                return batch
-            metrics["distill/skipped_low_signal"] = 0.0
-
         extra_info = {
             "calculate_entropy": calculate_entropy,
-            "distillation_use_topk": distillation_use_topk,
-            "distillation_only": distillation_only,
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
@@ -1833,102 +1614,7 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
-        # trace-opd self-research (docs/self-research-design.md 7.1): route the
-        # research rows according to research_update_mode.
-        #   warmup      research rows carry no gradient yet: they are dropped
-        #               from the update entirely (documents and teacher
-        #               selection already happened rollout-side).
-        #   joint       (default) research rows share the executor backward —
-        #               one optimizer step, every gradient at the sampling
-        #               weights. The loss keeps the terms apart via
-        #               research_mask and the batch-global research-token
-        #               denominator, so nothing here needs splitting.
-        #   separate    research rows are split out and trained in a SECOND
-        #               update within the same global step (UCOB/SEED form).
-        research_split = None
-        if self._research_channel_enabled():
-            loss_cfg = self.distillation_config.distillation_loss
-            role_data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"]
-            )
-            role_fields = role_data.pop("extra_fields")
-            is_research = np.array(
-                [
-                    isinstance(extra, dict) and extra.get("sample_role") == "research"
-                    for extra in role_fields.tolist()
-                ],
-                dtype=bool,
-            )
-            in_warmup = self.global_steps <= int(getattr(loss_cfg, "research_warmup_steps", 0) or 0)
-            mode = str(getattr(loss_cfg, "research_update_mode", "joint") or "joint")
-            if is_research.any() and (in_warmup or mode == "separate"):
-                keep = ~is_research
-
-                def _subset(mask: np.ndarray) -> KVBatchMeta:
-                    sub = KVBatchMeta(
-                        partition_id=batch.partition_id,
-                        keys=[k for k, m in zip(batch.keys, mask.tolist()) if m],
-                        tags=[t for t, m in zip(batch.tags, mask.tolist()) if m],
-                    )
-                    sub.extra_info.update(batch.extra_info)
-                    return sub
-
-                # codex review P1-5 (first-line defence): a failure prompt can
-                # ship a PARTIAL role group into the batch (replay treats
-                # failure as a samplable terminal state), which breaks the
-                # launcher's nominal divisibility maths. Splitting an empty
-                # executor side would train nothing at all — fall back to the
-                # unsplit batch (joint-style mixing: safe, never silent).
-                if not keep.any():
-                    logger.error(
-                        "self-research split found NO executor rows (%d research rows, "
-                        "likely a failure-prompt partial group) — falling back to the "
-                        "unsplit batch for this update",
-                        int(is_research.sum()),
-                    )
-                    batch_for_update = batch
-                    research_split = None
-                elif in_warmup:
-                    # Research rows sit this update out; one greppable line so a
-                    # silent warmup is never mistaken for a broken channel.
-                    logger.info(
-                        "self-research warmup: step %s <= %s, %d research rows skipped",
-                        self.global_steps,
-                        getattr(loss_cfg, "research_warmup_steps", 0),
-                        int(is_research.sum()),
-                    )
-                    batch_for_update = _subset(keep)
-                else:
-                    research_split = _subset(is_research)
-                    batch_for_update = _subset(keep)
-                    # P1-5 hardening: a partial role group (failure prompt)
-                    # can leave a row count TransferQueue cannot spread evenly
-                    # across dp ranks. Training an uneven research split risks
-                    # a short rank inside a collective; skip it loudly instead
-                    # — the executor update still runs, and one step without a
-                    # research gradient is the cheap failure mode.
-                    dp_ranks = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
-                    if dp_ranks > 0 and len(research_split.keys) % dp_ranks != 0:
-                        logger.error(
-                            "self-research split has %d rows, not divisible by %d dp ranks "
-                            "(partial role group?) — skipping the research update this step",
-                            len(research_split.keys), dp_ranks,
-                        )
-                        metrics["research_update/skipped_uneven_split"] = 1.0
-                        research_split = None
-                # A subset no longer matches the mini-batch size derived from
-                # rollout.n above — the dataloader would emit zero full
-                # mini-batches and the update would silently do nothing. The
-                # production configs run ppo_mini_batch_size == train_batch_size
-                # (one mini-batch per update), which num_mini_batch=1 preserves
-                # exactly for any subset row count.
-                extra_info = dict(extra_info)
-                extra_info["mini_batch_size"] = None
-                extra_info["num_mini_batch"] = 1
-            else:
-                batch_for_update = batch
-        else:
-            batch_for_update = batch
+        batch_for_update = batch
 
         batch_for_update.extra_info.update(extra_info)
 
@@ -1937,54 +1623,6 @@ class PPOTrainer(ABC):
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
-
-        if research_split is not None:
-            # Second update of the same global step, research rows only. The
-            # loss side sees research_only and computes nothing but the
-            # research term; num_mini_batch=1 sidesteps the mini-batch-size
-            # divisibility assert for the smaller split; the lr scheduler is
-            # NOT advanced here (train_mini_batch only steps it when the
-            # update_lr_scheduler flag is set, which we do not set).
-            # codex review P1-8: an all-zero-advantage research split would still
-            # run a full optimizer step — and Adam momentum plus weight decay
-            # move parameters even on a zero gradient, which is NOT the "natural
-            # zero gradient" the design promises. Skip the update entirely.
-            adv_data = tq.kv_batch_get(
-                keys=research_split.keys,
-                partition_id=research_split.partition_id,
-                select_fields=["research_advantage"],
-            )
-            research_adv = adv_data["research_advantage"]
-            if hasattr(research_adv, "to_padded_tensor"):
-                research_adv = research_adv.to_padded_tensor(0.0)
-            if not bool((research_adv.abs() > 1e-8).any()):
-                logger.info(
-                    "self-research separate update skipped: zero advantage signal "
-                    "(%d rows)", len(research_split.keys)
-                )
-                metrics["research_update/skipped_zero_signal"] = 1.0
-                return batch
-
-            research_extra = dict(extra_info)
-            research_extra["research_only"] = True
-            # Entropy is an executor-side curve; computing it over the research
-            # rows' long sequences buys nothing and costs a full-vocab pass.
-            research_extra["calculate_entropy"] = False
-            # codex review P1-7: the scheduler already advanced on the executor
-            # update of this global step.
-            research_extra["advance_lr_scheduler"] = False
-            # The research rows carry only dummy teacher columns (their scoring
-            # was skipped) — running the top-k logits processor over these very
-            # long sequences would burn memory for a value the loss never
-            # reads. The research term needs the plain log-probs path only.
-            research_extra["distillation_use_topk"] = False
-            research_extra["mini_batch_size"] = None
-            research_extra["num_mini_batch"] = 1
-            research_split.extra_info.update(research_extra)
-            research_output: TensorDict = self.actor_rollout_wg.update_actor(research_split)
-            research_output = rename_dict(research_output["metrics"], "research_update/")
-            research_output.pop("research_update/mfu", None)
-            metrics.update(reduce_metrics(research_output))
 
         return batch
 
@@ -2050,45 +1688,16 @@ class PPOTrainer(ABC):
             select_fields=["extra_fields"],
         )
         rollout_extra_fields = extra_data.pop("extra_fields", None)
-        # trace-opd mixed objective: expert (SFT) rows are document-guided, not
-        # on-policy — at ~96% success they would visibly lift critic/score/mean,
-        # which is the run's primary health and stopping signal. Every behaviour
-        # metric below reads on-policy rows only; the sft_* counters keep the
-        # full population because they ARE the expert-arm bookkeeping.
         on_policy_mask = non_padding_mask
         if rollout_extra_fields is not None:
-            # trace-opd: expert (SFT) rows and research rows are both excluded
-            # from the on-policy behaviour metrics — the former would inflate
-            # them (~96% success), the latter would deflate them (a research
-            # session has no task outcome; its reward is a doc success rate).
-            # tg rows are deliberately NOT excluded (codex tg-review P0-1): a
-            # tg row is a bare rollout the policy actually WON — its outcome
-            # belongs in the behaviour curves exactly like any bare row, and
-            # excluding it turns critic/score/mean into a lost-only ~0 curve
-            # (with an all-won batch snapping back to 1 through the empty-mask
-            # fallback). Its per-token tensors carry a zero response_mask, so
-            # mask-weighted training statistics ignore it either way; only the
-            # scalar behaviour metrics see it — which is the point.
-            is_expert = np.array(
-                [
-                    isinstance(extra_field, dict)
-                    and extra_field.get("sample_role") in ("sft", "research")
-                    for extra_field in rollout_extra_fields.tolist()
-                ],
-                dtype=bool,
-            )
-            if is_expert.any():
-                on_policy_mask = non_padding_mask & ~is_expert
-
+            # trace-opd: numeric scalars from the rollout side ride
+            # extra_fields["reward_extra_info"] -> rollout_extra/<key> curves.
             reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-            for keep_any, keep_on_policy, extra_field in zip(
-                non_padding_mask.tolist(), on_policy_mask.tolist(), rollout_extra_fields.tolist()
-            ):
+            for keep_any, extra_field in zip(non_padding_mask.tolist(), rollout_extra_fields.tolist()):
                 if not keep_any or not isinstance(extra_field, dict):
                     continue
                 for key, value in extra_field.get("reward_extra_info", {}).items():
-                    if key.startswith(("sft_", "research_rl_")) or keep_on_policy:
-                        reward_extra_infos_dict[key].append(value)
+                    reward_extra_infos_dict[key].append(value)
             if reward_extra_infos_dict:
                 metrics.update(compute_rollout_extra_metrics(reward_extra_infos_dict))
 

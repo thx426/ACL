@@ -18,7 +18,6 @@ from enum import Enum
 from omegaconf import DictConfig
 
 from verl.single_controller.base import Worker
-from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
 WorkerType = type[Worker]
@@ -77,22 +76,6 @@ def need_reference_policy(
 ) -> bool:
     """Given the config, do we need ref policy."""
     return config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss
-
-
-def need_teacher_policy(
-    config: DictConfig,
-) -> bool:
-    """Given the config, do we need a DEDICATED teacher policy deployment.
-
-    H3 pilot: with distillation.self_teacher=True the rollout engine itself
-    scores the teacher log-probs (current policy + privileged prefix), so no
-    teacher resource pool / server manager is allocated even though
-    distillation is enabled.
-    """
-    dist_config = config.get("distillation")
-    if not is_distillation_enabled(dist_config):
-        return False
-    return not dist_config.get("self_teacher", False)
 
 
 def need_reward_model(

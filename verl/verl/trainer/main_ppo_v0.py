@@ -21,7 +21,6 @@ import socket
 import ray
 from omegaconf import OmegaConf
 
-from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -84,17 +83,6 @@ class BaseTaskRunner:
             config.reward.reward_model.nnodes = config.trainer.nnodes
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
 
-        distillation_config = config.get("distillation")
-        # H3 pilot: self_teacher scores on the rollout engine — no teacher pool.
-        if is_distillation_enabled(distillation_config) and not distillation_config.get("self_teacher", False):
-            if distillation_config.n_gpus_per_node <= 0:
-                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
-            if distillation_config.nnodes <= 0:
-                raise ValueError("config.distillation.nnodes must be greater than 0")
-
-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -111,15 +99,6 @@ class BaseTaskRunner:
                 self.mapping[Role.RewardModel] = "reward_pool"
             else:
                 self.mapping[Role.RewardModel] = "global_pool"
-
-    def add_teacher_model_resource_pool(self, config):
-        """Add teacher model worker if enabled."""
-        from verl.trainer.ppo.ray_trainer import Role
-
-        if is_distillation_enabled(config.get("distillation")):
-            # we do not use teacher model workers, so we only register teacher model in resource pool
-            # without registering a teacher model worker in role-worker mapping
-            self.mapping[Role.TeacherModel] = "teacher_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Ref policy is fused into ActorRolloutRefWorker in the unified model engine.
@@ -173,7 +152,6 @@ class TaskRunner(BaseTaskRunner):
 
         self.add_reward_model_resource_pool(config)
 
-        self.add_teacher_model_resource_pool(config)
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)

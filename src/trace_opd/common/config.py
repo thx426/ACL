@@ -1,6 +1,6 @@
 """Configuration loading — ONE yaml file is the single source of truth for
-every tunable in the mechanism (configs/trace.yaml): research session,
-narration, role connections, environment, training launcher, evaluation.
+every tunable in the mechanism (configs/pgs.yaml): episode protocol,
+environment, training launcher, steering, evaluation.
 
 ``${VARS}`` expand from the environment at load time (empty when unset;
 clients fail loudly at connection time). Deployment facts (endpoints, data
@@ -29,148 +29,6 @@ def _expand(value: Any) -> Any:
     if isinstance(value, list):
         return [_expand(v) for v in value]
     return value
-
-
-@dataclass
-class RoleCfg:
-    """Connection parameters for an ``external`` backend role."""
-
-    endpoint: str = ""
-    model: str = ""
-    api_key: str = ""
-    max_concurrency: int = 8
-    temperature: float = 0.7
-    max_tokens: int = 1024
-    timeout_s: float = 300.0
-    extra_body: dict[str, Any] = field(default_factory=dict)
-    # Single-machine time-slicing: the trainer drives this server through the
-    # rollout sleep/wake rhythm (verl sidecar patch). Researcher role only.
-    sidecar_sleep: bool = False
-    # Depth of that sleep: 1 parks the weights in host RAM, 2 discards them.
-    sidecar_sleep_level: int = 1
-    # vLLM data-parallel size of the server. >0 turns on client-side sticky
-    # routing via the X-data-parallel-rank header (crc32(route_key) % dp_size)
-    # so multi-turn sessions hit one engine's prefix cache. 0 = no header.
-    dp_size: int = 0
-    # How this role is served, stated once instead of inferred from the
-    # combination of endpoint/sidecar_sleep/dp_size (CD-006 requirement 3-F):
-    #   local_sidecar — a server this run starts and drives through sleep/wake
-    #   external_pool — endpoints someone else runs; `endpoint` may list several
-    # The launcher and the run scripts both read this instead of each carrying
-    # their own environment switch (EXTERNAL_RESEARCHER / REMOTE_RESEARCHER).
-    # Ports are NOT a separate setting: `endpoint` is the source of truth and a
-    # script that needs the port parses it from there, or the two drift.
-    mode: str = "local_sidecar"
-
-    _KNOWN_KEYS = {
-        "endpoint", "model", "api_key_env", "max_concurrency",
-        "temperature", "max_tokens", "timeout_s", "extra_body", "sidecar_sleep",
-        "sidecar_sleep_level", "dp_size", "mode",
-    }
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "RoleCfg":
-        unknown = set(d) - RoleCfg._KNOWN_KEYS
-        if unknown:
-            raise ValueError(f"role config: unknown keys {sorted(unknown)}")
-        api_key_env = str(d.get("api_key_env", "") or "")
-        return RoleCfg(
-            endpoint=str(d.get("endpoint", "") or ""),
-            model=str(d.get("model", "") or ""),
-            api_key=os.environ.get(api_key_env, "") if api_key_env else "",
-            max_concurrency=int(d.get("max_concurrency", 8)),
-            temperature=float(d.get("temperature", 0.7)),
-            max_tokens=int(d.get("max_tokens", 1024)),
-            timeout_s=float(d.get("timeout_s", 300.0)),
-            extra_body=dict(d.get("extra_body", {}) or {}),
-            sidecar_sleep=bool(d.get("sidecar_sleep", False)),
-            sidecar_sleep_level=int(d.get("sidecar_sleep_level", 1)),
-            dp_size=int(d.get("dp_size", 0)),
-            mode=str(d.get("mode", "local_sidecar") or "local_sidecar"),
-        )
-
-
-@dataclass
-class ResearchCfg:
-    enabled: bool = True
-    backend: str = "external"        # external | engine (policy-as-researcher)
-    tool_protocol: str = "fncall"    # fncall | text
-    n_exp: int = 12
-    k_default: int = 4
-    k_max: int = 8
-    max_turns: int = 30
-    wrapup_buffer: int = 2
-    fetch_raw_limit: int = 20
-    fetch_raw_max_chars: int = 16000
-    doc_max_words: int = 1200
-    gt: str = "off"                  # off | on — GT into the researcher prompt
-    # GT-doc 消融实验(docs/gt-doc-ablation.md,ALFWorld 专属验证,非通用
-    # 机制):"gt" = 短路整个 research 会话,教师特权文档直接用任务 ground
-    # truth 参考解(walkthrough 渲染);doc 注入协议/打分/OPD 逐字节不动,
-    # 单变量只有"doc 从哪来"。默认 null = 逐字节现状。
-    static_doc_source: str | None = None
-    episode_temperature: float = 1.0
-    researcher_max_tokens: int = 4096
-    session_timeout_s: float = 3600.0  # hard wall per research session (defensive)
-
-
-@dataclass
-class ResearchRLCfg:
-    """Self-research 通道(docs/self-research-design.md):policy-as-researcher 的
-    research 能力 RL。与执行侧混合目标(train.mix_*)是两个**正交模块**——那三个
-    系数优化「任务执行更好」,这里优化「researcher 更好」;二者唯一的耦合是数据流
-    (argmax 文档拿 teacher 位),不在 loss 语义上,故本节独立于 TrainCfg。
-
-    weight=0(默认)= 通道关断:不产 research 副本、不加 loss 项、不进 fingerprint,
-    与现状逐字节一致。开启硬前提:research.backend=engine + tool_protocol=text
-    (research 轨迹必须是 policy 自己的 on-policy 采样,外部 35B 的轨迹不能拿来
-    做 policy 的 PG)。"""
-
-    weight: float = 0.0               # research_loss_coef;第二通道的整体系数
-    update_mode: str = "joint"        # joint | separate(设计 §7.1:joint=同一
-                                      # backward,完美 on-policy,默认;separate=
-                                      # 同一全局 step 的第二次 update,UCOB/SEED
-                                      # 形态,备选与消融臂)
-    n_docs: int = 8                   # N:每任务并行 research 会话数(组间对比的
-                                      # 组大小;用户裁定默认 8,快速实验可调小,>=2)
-    eval_k: int = 8                   # K:每份文档的 doc-conditioned 评测 rollout 数
-                                      # (p_i = wins/K,即 PG-7 文档质量信号)
-    adv_clip: float = 2.0             # 组间 advantage 硬 clip(UCOB 同款 ±2.0)
-    warmup_steps: int = 30            # 前多少个 global step research 行不给梯度
-                                      # (UCOB writer warmup ~30);文档生产与
-                                      # teacher 选择从第 1 步照常
-    max_sample_tokens: int = 16384    # research 会话 token 样本总长预算;超限则
-                                      # 该轨迹降级不进训练面(doc 仍用、reward 仍
-                                      # 参与组统计),防超长序列打爆显存峰值
-
-
-@dataclass
-class SftGenCfg:
-    """Researcher-SFT 离线采样 pipeline(src/trace_opd/sftgen/;用户需求
-    2026-07-28)。与训练机制共享 research/narration/roles/alfworld 各节(同构性
-    由共享配置保证——特别是 research.gt 与 research.tool_protocol 两键,SFT 采样
-    与 self-evolve 训练读同一个值);本节只放 pipeline 特有键。不影响训练路径。"""
-
-    benchmark: str = "alfworld"       # 分层函数注册键(sftgen/strata.py;新
-                                      # benchmark = 新 adapter 包 + 一个分层函数)
-    tasks: int = 512                  # 采样任务数 T(用户后续制定;从训练 parquet
-                                      # 按 seed 分层采样,与训练任务身份严格同源)
-    sessions_per_task: int = 1        # 每任务会话数 M(覆盖优先,默认 1)
-    seed: int = 20260728
-    eval_k: int = 8                   # 每份 doc 的带文档评测 rollout 数(0=关);
-                                      # 口径=机制温度下的 PG-7 信号,直接对标训练时 p_i
-    bare_k: int = 8                   # 裸对照 rollout 数(增益 = p_doc − p_bare)
-    task_parallel: int = 16           # 并发会话数
-    executor_endpoint: str = ""       # 初始 policy 的 vLLM OpenAI 端点(${VAR};
-                                      # executor episodes 与 narrator 共用此服务)
-    executor_model: str = ""          # 该服务的模型名(Qwen3-4B-Instruct-2507)
-
-
-@dataclass
-class NarrationCfg:
-    backend: str = "engine"          # engine (policy) | external | none
-    max_words: int = 600
-    temperature: float = 0.3
 
 
 @dataclass
@@ -242,38 +100,10 @@ class TrainCfg:
                                       # use_remove_padding=True + flash_attention_2
     rollout_gpu_mem: float = 0.35
     rollout_max_num_batched_tokens: int = 2048  # vLLM chunked-prefill budget; the
-                                      # transient logits tensor during self-teacher
-                                      # scoring is THIS x vocab x 2B (smoke-run OOM
-                                      # root cause at 4096; halved for coexistence)
+                                      # transient logits tensor during prompt_logprobs
+                                      # scoring (SPS verify) is THIS x vocab x 2B
+                                      # (smoke-run OOM root cause at 4096)
     rollout_temperature: float = 1.0
-    distill_topk: int = 64
-    # --- OPD 项的散度形式(docs/mixed-objective-design.md §2.7)-----------------
-    # 与 mix_opd_weight 正交:系数管强度,这里管 OPD 项内部用哪种散度。四个值:
-    #   forward_kl_topk —— 现状默认。teacher top-K 上的截断前向 KL(分布蒸馏,
-    #                      dense,K=distill_topk)。4B 主线全部结论建立于此。
-    #   reverse_kl_k3   —— 采样 token 单点反向 KL 的 k3 估计器(Schulman
-    #                      kl-approx 编号,与已移除的信号增强三件套 K1/K2/K3 无关),
-    #                      CD-003 反向 KL 消融同款 ⇒ 与 h3_2507_full_rkl3_from10
-    #                      历史曲线严格可比。teacher 打分降为单点(topk=0),
-    #                      传输/打分开销反而低于 forward。
-    #   reverse_kl_topk —— 与 forward 完全镜像的稠密反向 KL(同一份 top-K 数据
-    #                      + 尾桶),消融时**唯一变量是 KL 方向本身**;estimator
-    #                      形式一次改三个变量(方向/单点 vs 分布/估计器),回答
-    #                      不了"方向贡献几何"。
-    #   reverse_kl_gated—— SDAR/SEED 的置信门控 logp-shift(两家数学同构;
-    #                      gate=sigmoid(β·Δ) detach,梯度=−gate·∇logπ_S,
-    #                      只上拉采样 token、teacher 否决则指数衰减)。他们的
-    #                      λ 对应我们的 mix_opd_weight(SDAR 代码默认 0.1、
-    #                      论文 0.01),β 对应 opd_gate_beta。
-    # 注意:①各模式 loss 数值尺度互不可比,跨模式只比成功率等任务指标,
-    # mix_opd_weight 的"等效学习率"含义也随模式变;②CD-003 定论:单换 KL 方向
-    # 不救崩塌(方向是二阶因素,只调崩塌速度/深度)——此开关的价值是消融完备性
-    # 与"方向 × RL/SFT 臂交互"这一开放问题(SDAR/SEED 的稳定配方 = RL 锚 +
-    # 采样点 reverse surrogate,CD-003 只测过纯 OPD × reverse);③estimator 两模式
-    # 下 top-k 系观察(student/teacher_mass、overlap_ratio、teacher_topk_entropy)
-    # 数据上不存在,自动缺席;显微镜仍落 per-token loss(gated 另有 gate 列)。
-    opd_kl_mode: str = "forward_kl_topk"
-    opd_gate_beta: float = 5.0        # 仅 reverse_kl_gated 消费;SDAR/SEED 均默认 5.0
     # --- 损失的信用分配单位(verl actor.loss_agg_mode;蒸馏项与 policy 项共用)---
     # token-mean(verl 默认,4B 主线 rkl/sp2 全部历史结论建立于此):
     #   loss = Σ_token loss / batch_num_tokens —— 分母是全批 token 总数,
@@ -289,72 +119,12 @@ class TrainCfg:
     #    要复现 2026-07-29 之前的任何 run,必须在其配置里显式写回
     #    `loss_agg_mode: token-mean`(4B 主线 rkl/sp2 的全部历史结论建立于 token-mean)。
     loss_agg_mode: str = "seq-mean-token-mean"
-    # --- 混合目标(OPD × RL × SFT;docs/mixed-objective-design.md)---
-    # 总损失 = OPD + mix_rl_weight × RL + mix_sft_weight × SFT。两个权重默认 0
-    # ⇒ 与纯 OPD 逐字节一致(4B 主线无感知)。弱模型(1.7B)上 self-teacher 在
-    # student 错误前缀下失去文档语义抓地力,KL 信号起不来,故给 RL 锚(真实
-    # reward 的 GRPO)与 SFT 锚(特权文档 rollout 的成功轨迹)。三项同 token 口径,
-    # 权重可直接互比;也是正式的消融开关(A0/A1/A2/A3 臂,见设计文档 §6)。
-    mix_opd_weight: float = 1.0        # OPD 项自己的系数。**两臂全关时它就是 loss 的
-                                      # 整体缩放,也就是有效学习率的乘数**——纯 OPD 基线
-                                      # 是在 1.0 上建立的(4B step-9 起飞),改它等于改基线。
-                                      # 0 = 完全去掉 OPD 项,即"OPD 在弱模型上还有没有净
-                                      # 贡献"那个消融臂(A5)。
-    mix_rl_weight: float = 0.0
-    mix_sft_weight: float = 0.0
-    mix_sft_rollouts: int = 4         # 每任务额外的带文档 rollout 数(仅
-                                      # mix_sft_weight>0 时生效);verl 侧
-                                      # rollout.n = rollout_n + 本值,尾部这几
-                                      # 个副本走 expert 分支,不参与 OPD/RL
-    # SFT 项的前缀,决定这一项在优化谁(CD-006 requirements §3-G,用户 2026-07-26 裁定):
-    #   doc  —— 保留 expert 生成时的带文档 prompt ⇒ 优化 policy(·|裸+文档) = **OPD 的
-    #           teacher 本身**。分工是「SFT 修老师、OPD 做传导」,直击 CD-003 的病因
-    #           (teacher 在 student 错误前缀下失去抓地力)。
-    #   bare —— 重放到裸 prompt ⇒ 直接教裸 policy。与 OPD 功能重叠,且 A2 首跑实测
-    #           **23.6% 的已接受样本在教「零观察依据下断言物体位置」**——expert 带着
-    #           文档才知道东西在哪,重放到裸条件后这些断言没有依据,而 expert 轨迹里
-    #           没有一条演示「猜错了怎么回退」⇒ 学到自信断言 + 无法恢复。保留作对照臂。
-    mix_sft_prefix: str = "doc"       # doc | bare
-
-    # --- teacher grounding(教师接地,docs/teacher-grounding-design.md)---
-    # 反向蒸馏臂:bare 成功轨迹换 doc 前缀作训练前向(q),裸分布 top-64 重归一
-    # 作软标签,soft-CE 只经 teacher 前向回传——首次直接训练 q 的"教师功能"。
-    # won 分割 + 频率加权(用户裁定 2026-08-02):
-    #   L = (N_lost/N)·mean_lost[OPD] + w·(N_won/N)·mean_won[tg], N=N_lost+N_won
-    # 两项同除 batch 全局总信号行数,won 率上升 ⇒ OPD 份额真退火。
-    # 0 = 关断,逐字节现状(不做裸打分、不构造 tg 行、不传 label 字段)。
-    mix_tg_weight: float = 0.0
-    # OPD 只训失败轨迹:won=1 的 bare 行不再进 OPD(tg 开时转换为 tg 行;
-    # tg 关时以零 mask 占位行存在——T1' 归因臂形态)。False = 现状。
-    opd_lost_only: bool = False
-    # 标签健康门(设计 §动力学三防线之三,默认关):非 null 时,thought 字符/
-    # turn 超过该阈值的 won 轨迹不转换为 tg 行(以 tg_dropped_unhealthy 占位
-    # 行退出,曲线可见)。防标签质量 ratchet(病理若抢先污染 won 轨迹,tg 会
-    # 把膨胀形态固化进教师)。T1 首跑保持 null(单变量纪律),凭标签质量曲线
-    # (tg_label_thought_* 族)决定是否启用;阈值应锚定健康期(如基线 step5-7
-    # 的 ~315 字符/turn 的 2-3 倍),严禁随当前模型滚动上调。
-    mix_tg_health_gate: float | None = None
-    # --- 分布观察包(docs/microscope-design.md;显微镜工作台的数据层)--------
-    # 存"最小完备源":每训练样本每 response 位置的 teacher top-K / student top-K /
-    # student-on-teacher-support / realized 双侧 + 训练 per-token loss 真值锚。
-    # 一切指标(KL/overlap/mass/熵/rank/外流)由读取层实时派生 ⇒ 分析视角可
-    # 不断进化而数据不过时。成本 ~300-465MB/step(K=64 对称,fp16+压缩),
-    # 默认关;观察/消融 run 显式开。仅 topk 系 KL 模式有数据(estimator 模式
-    # student logits 不过 processor,自动无包)。SP>1 时按段落盘、读层重组
-    # (162 SP=2 首用时验证)。
-    microscope_distributions: bool = False
-    microscope_dist_every: int = 1    # 每 N 个 global step 存一次(1=每步)
-    distill_microscope: bool = True   # sample per-token distillation quantities
-                                      # to <run>/microscope/ for the analysis
-                                      # suite (docs/analysis-design.md; ~MBs/step)
-    distill_sample_every: int = 4     # deterministic 1/N trajectory sample rate
     # --- 从环境变量迁入(CD-006 requirement 3-F;用户 2026-07-26 裁定)---------
     # 这些原先散落在启动脚本的 export 里,而代码侧另有一套 fallback 默认值。
     # 两套真源 = 换一条启动路径就静默换一种行为:`run_a800_4b.sh` 设了
     # `TRACE_TEACHER_SCORING_BACKEND=fsdp`,而 162 主线用的 `run_experiment.sh`
     # 没设,代码 fallback 是 "vllm" ⇒ 打分会悄悄退回 R11 刚根治掉的 vLLM 路径。
     # 现在配置是唯一真源,launcher 从这里写 env,env 降级为纯进程间传递。
-    teacher_scoring_backend: str = "fsdp"   # fsdp | vllm(回退路径)
     vllm_rpc_timeout_ms: int = 300000       # EngineCore↔worker RPC 超时;默认
                                             # 10s 会在长序列下误判"引擎已死"
     agent_task_timeout_s: int = 2700        # R3 hang guard;0=禁用
@@ -393,30 +163,34 @@ class EvalCfg:
 class RunCfg:
     name: str = "trace_v1"
     runs_root: str = "runs"
-    tape: bool = True
+
+
+@dataclass
+class SteeringCfg:
+    """PGS steering 配置(规范 docs/pgs-final-spec.md)。enabled=False ⇒ 纯 bare
+    rollout,与 GRPO 底座逐字节一致。"""
+    enabled: bool = False
+    doc_table: str = ""            # task_id→doc 的 jsonl 表(静态特权文档源)
+    eta_max: float = 0.5           # 倾斜强度上限
+    c: float = 2.5                 # 截断参数(单点话语权限幅;目标语境实测标定)
+    b_max: float = 6.0             # D_∞ 逐轨迹预算(nats)
+    topk: int = 64                 # 保尾核候选集 S 的两侧 top-K
+    theta_d: float = 0.0           # D 主门冻结阈值(0=预扫描标定前的占位,启动校验拒 0)
+    epsilon: float = 0.05          # ε 探针概率
+    gate_rate_bounds: tuple = (0.02, 0.30)
+    r_max: int = 4                 # 每轮拒绝上限(行为态)
+    w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace(消融开关,规范 §2.6)
 
 
 @dataclass
 class Config:
     run: RunCfg
-    research: ResearchCfg
-    research_rl: ResearchRLCfg
-    sft_gen: SftGenCfg
-    narration: NarrationCfg
-    roles: dict[str, RoleCfg]
     episode: EpisodeCfg
     alfworld: AlfworldCfg
     train: TrainCfg
     eval: EvalCfg
+    steering: SteeringCfg
     raw: dict[str, Any]
-
-    def role(self, name: str) -> RoleCfg:
-        try:
-            return self.roles[name]
-        except KeyError as err:
-            raise KeyError(
-                f"role {name!r} not configured (roles present: {sorted(self.roles)})"
-            ) from err
 
 
 def _build(dc, d: dict[str, Any]):
@@ -428,382 +202,36 @@ def _build(dc, d: dict[str, Any]):
     return dc(**d)
 
 
-_KNOWN_SECTIONS = {"run", "research", "research_rl", "sft_gen", "narration", "roles", "episode", "alfworld", "train", "eval"}
+_KNOWN_SECTIONS = {"run", "episode", "alfworld", "train", "eval", "steering"}
 
 
 def _validate(cfg: "Config") -> None:
-    """Semantic checks — misconfigurations die at load time, not mid-training."""
-    problems: list[str] = []
-    if cfg.research.backend not in ("external", "engine"):
-        problems.append(f"research.backend={cfg.research.backend!r} (external|engine)")
-    if cfg.research.tool_protocol not in ("fncall", "text"):
-        problems.append(f"research.tool_protocol={cfg.research.tool_protocol!r} (fncall|text)")
-    if cfg.research.backend == "engine" and cfg.research.tool_protocol != "text":
-        problems.append("research.backend=engine requires tool_protocol=text")
-    if cfg.research.gt not in ("off", "on"):
-        problems.append(f"research.gt={cfg.research.gt!r} (off|on)")
-    if cfg.research.static_doc_source is not None:
-        # GT-doc 消融(docs/gt-doc-ablation.md):三条互斥/依赖。
-        if cfg.research.static_doc_source != "gt":
-            problems.append(
-                f"research.static_doc_source={cfg.research.static_doc_source!r} "
-                f"must be null or 'gt'"
+    t = cfg.train
+    if not t.model_path:
+        raise ValueError("train.model_path is required")
+    if t.rollout_n < 1:
+        raise ValueError("train.rollout_n must be >= 1")
+    st = cfg.steering
+    if st.enabled:
+        if not st.doc_table:
+            raise ValueError("steering.enabled 需要 doc_table(task_id→doc jsonl)")
+        if not (0.0 < st.eta_max < 1.0):
+            raise ValueError(f"steering.eta_max 必须在 (0,1),得到 {st.eta_max}")
+        if st.c <= 0 or st.b_max < 0:
+            raise ValueError("steering.c 必须 > 0 且 b_max >= 0")
+        if st.theta_d <= 0:
+            raise ValueError(
+                "steering.theta_d 未标定(<=0)——先用目标文档语境预扫描 D 分布定 P85"
             )
-        if not cfg.research.enabled:
-            problems.append(
-                "research.static_doc_source requires research.enabled — the static "
-                "doc rides the same injection pipeline (GUIDANCE_HEADER/teacher prefix)"
-            )
-        if cfg.research.gt == "on":
-            problems.append(
-                "research.static_doc_source is mutually exclusive with research.gt='on' "
-                "— gt='on' feeds GT to the RESEARCHER, the static source bypasses the "
-                "researcher entirely; combining them is semantically contradictory"
-            )
-        if cfg.research_rl.weight > 0:
-            problems.append(
-                "research.static_doc_source is mutually exclusive with research_rl "
-                "(no researcher runs under a static source, so there is nothing to train)"
-            )
-    if cfg.narration.backend not in ("engine", "external", "none"):
-        problems.append(f"narration.backend={cfg.narration.backend!r} (engine|external|none)")
-    if cfg.research.enabled and cfg.research.backend == "external" and "researcher" not in cfg.roles:
-        problems.append("research.backend=external but roles.researcher is missing")
-    if cfg.narration.backend == "external" and "narrator_external" not in cfg.roles:
-        problems.append("narration.backend=external but roles.narrator_external is missing")
-    if not (0 < cfg.research.k_default <= cfg.research.k_max):
-        problems.append("research: need 0 < k_default <= k_max")
-    if cfg.episode.max_env_steps < 1 or cfg.episode.max_assistant_turns <= cfg.episode.max_env_steps:
-        problems.append(
-            f"episode: max_env_steps={cfg.episode.max_env_steps} must be >=1 and "
-            f"max_assistant_turns={cfg.episode.max_assistant_turns} must exceed it "
-            "(the slack absorbs format-failure turns)"
-        )
-    if cfg.train.agent_num_workers < 1:
-        problems.append("train.agent_num_workers must be >= 1")
-    if cfg.train.rollout_tp < 1 or cfg.train.n_gpus % cfg.train.rollout_tp != 0:
-        problems.append(
-            f"train.rollout_tp={cfg.train.rollout_tp} must be >=1 and divide "
-            f"n_gpus={cfg.train.n_gpus}"
-        )
-    if cfg.train.rollout_n < 1:
-        problems.append(f"train.rollout_n={cfg.train.rollout_n} must be >= 1")
-    if cfg.train.ppo_max_token_len_per_gpu < 1 or cfg.train.log_prob_max_token_len_per_gpu < 1:
-        problems.append("train.ppo/log_prob_max_token_len_per_gpu must be >= 1")
-    if cfg.train.distill_sample_every < 1:
-        problems.append(
-            f"train.distill_sample_every={cfg.train.distill_sample_every} must be >= 1"
-        )
-    # 混合目标:负权重会翻转梯度方向而不报错,必须显式拦住
-    import math as _math
-
-    for _name, _value in (
-        ("mix_opd_weight", cfg.train.mix_opd_weight),
-        ("mix_rl_weight", cfg.train.mix_rl_weight),
-        ("mix_sft_weight", cfg.train.mix_sft_weight),
-        ("mix_tg_weight", cfg.train.mix_tg_weight),
-    ):
-        if not (_math.isfinite(_value) and _value >= 0):
-            problems.append(f"train.{_name}={_value} must be finite and >= 0 (0 disables the arm)")
-    if cfg.train.mix_sft_rollouts < 0:
-        problems.append(
-            f"train.mix_sft_rollouts={cfg.train.mix_sft_rollouts} must be >= 0"
-        )
-    # codex impl-review P1-6:tg 是完整目标项,TG-only(opd 0、tg>0)是合法消融。
-    if not (cfg.train.mix_opd_weight or cfg.train.mix_rl_weight
-            or cfg.train.mix_sft_weight or cfg.train.mix_tg_weight):
-        problems.append(
-            "train.mix_opd_weight / mix_rl_weight / mix_sft_weight / mix_tg_weight "
-            "are all 0 — there is no objective left to optimise"
-        )
-    # teacher grounding 的结构约束(docs/teacher-grounding-design.md §5):
-    if cfg.train.mix_tg_weight > 0:
-        if not cfg.train.opd_lost_only:
-            problems.append(
-                "train.mix_tg_weight>0 requires opd_lost_only=true — a won trajectory "
-                "is CONVERTED into a tg row; letting it also stay in the OPD term would "
-                "train the same tokens from both sides of the mirror at once"
-            )
-        if cfg.train.mix_rl_weight > 0 or cfg.train.mix_sft_weight > 0:
-            problems.append(
-                "train.mix_tg_weight>0 is mutually exclusive with mix_rl_weight/"
-                "mix_sft_weight in this version: removing won rows from response_mask "
-                "changes the GRPO group / SFT data semantics (composition unruled)"
-            )
-        if cfg.train.opd_kl_mode not in ("forward_kl_topk", "reverse_kl_topk"):
-            # 解耦裁定(2026-08-02)后 tg 有独立标签通道与公式,OPD 散度在
-            # top-k 族内自由;k3/gated 用 teacher_topk=0 单列打分,与 tg 的
-            # top-64 标签在同一 batch 的统一列宽下结构不兼容(非折中)。
-            problems.append(
-                f"train.mix_tg_weight>0 requires opd_kl_mode in "
-                f"('forward_kl_topk', 'reverse_kl_topk') — the k3/gated "
-                f"single-column (topk=0) scoring layout cannot share a batch "
-                f"with the tg top-k label, got {cfg.train.opd_kl_mode!r}"
-            )
-        if cfg.train.loss_agg_mode != "seq-mean-token-mean":
-            problems.append(
-                f"train.mix_tg_weight>0 requires loss_agg_mode='seq-mean-token-mean' "
-                f"(the ruled tg estimand is the per-sequence conditional mean; the "
-                f"token-mean fallback weights long responses and depends on "
-                f"micro-batch packing — a different objective), got "
-                f"{cfg.train.loss_agg_mode!r}"
-            )
-        if cfg.train.teacher_scoring_backend != "fsdp":
-            problems.append(
-                "train.mix_tg_weight>0 requires teacher_scoring_backend='fsdp' — the "
-                "vLLM prompt_logprobs path does not implement the tg (bare-prefix, "
-                "renormalised) label"
-            )
-        if not cfg.research.enabled:
-            problems.append(
-                "train.mix_tg_weight>0 requires research.enabled — a tg row needs the "
-                "task's document to build the doc-prefixed training prompt"
-            )
-    if cfg.train.mix_tg_health_gate is not None:
-        if cfg.train.mix_tg_weight <= 0:
-            problems.append(
-                "train.mix_tg_health_gate is set but mix_tg_weight is 0 — the gate "
-                "filters won->tg conversion and has no meaning without the tg arm"
-            )
-        elif not (_math.isfinite(cfg.train.mix_tg_health_gate)
-                  and cfg.train.mix_tg_health_gate > 0):
-            # codex impl-review P2-1:inf 能过 >0 却永不拦截,而 fingerprint
-            # 会记录"门已配置"——语义谎言,拒掉。
-            problems.append(
-                f"train.mix_tg_health_gate must be a finite positive char/turn "
-                f"threshold, got {cfg.train.mix_tg_health_gate!r}"
-            )
-    if cfg.train.mix_sft_prefix not in ("doc", "bare"):
-        problems.append(
-            f"train.mix_sft_prefix={cfg.train.mix_sft_prefix!r} must be 'doc' or 'bare'"
-        )
-    if cfg.train.mix_sft_weight > 0:
-        if cfg.train.mix_sft_rollouts < 1:
-            problems.append(
-                "train.mix_sft_weight>0 requires mix_sft_rollouts>=1 (no expert rollouts, "
-                "no expert samples — the SFT term would silently stay zero)"
-            )
-        if not cfg.research.enabled:
-            problems.append(
-                "train.mix_sft_weight>0 requires research.enabled (expert rollouts need a document)"
-            )
-    # --- sftgen pipeline(轻校验:默认值恒合法,绝不阻训练路径)------------
-    sgc = cfg.sft_gen
-    if sgc.tasks < 1:
-        problems.append(f"sft_gen.tasks={sgc.tasks} must be >= 1")
-    if sgc.sessions_per_task < 1:
-        problems.append(f"sft_gen.sessions_per_task={sgc.sessions_per_task} must be >= 1")
-    if sgc.eval_k < 0 or sgc.bare_k < 0:
-        problems.append("sft_gen.eval_k/bare_k must be >= 0")
-    if sgc.task_parallel < 1:
-        problems.append(f"sft_gen.task_parallel={sgc.task_parallel} must be >= 1")
-
-    # --- self-research 通道(docs/self-research-design.md §7)---------------
-    rrl = cfg.research_rl
-    if not math.isfinite(rrl.weight) or rrl.weight < 0.0:
-        problems.append(f"research_rl.weight={rrl.weight} must be finite and >= 0")
-    if rrl.update_mode not in ("joint", "separate"):
-        problems.append(f"research_rl.update_mode={rrl.update_mode!r} (joint|separate)")
-    if rrl.weight > 0.0:
-        if cfg.research.backend != "engine" or cfg.research.tool_protocol != "text":
-            problems.append(
-                "research_rl.weight>0 requires research.backend=engine and "
-                "research.tool_protocol=text — the research trajectories must be the "
-                "policy's own on-policy samples (an external researcher's tokens cannot "
-                "carry the policy's PG)"
-            )
-        if not cfg.research.enabled:
-            problems.append("research_rl.weight>0 requires research.enabled=true")
-        if rrl.n_docs < 2:
-            problems.append(
-                f"research_rl.n_docs={rrl.n_docs} must be >= 2 (the reward is a "
-                "group-relative comparison; one document has no group)"
-            )
-        if rrl.eval_k < 1:
-            problems.append(f"research_rl.eval_k={rrl.eval_k} must be >= 1")
-        if not math.isfinite(rrl.adv_clip) or rrl.adv_clip <= 0.0:
-            problems.append(f"research_rl.adv_clip={rrl.adv_clip} must be finite and > 0")
-        if rrl.warmup_steps < 0:
-            problems.append(f"research_rl.warmup_steps={rrl.warmup_steps} must be >= 0")
-        if rrl.max_sample_tokens < 1024:
-            problems.append(
-                f"research_rl.max_sample_tokens={rrl.max_sample_tokens} must be >= 1024"
-            )
-        # codex review P1-4: the R3 hang guard (agent_task_timeout_s) wraps the
-        # WHOLE prompt group — with the research arm on that group serially
-        # contains a full researcher session plus its eval rollouts, so the
-        # default 2700s guard fires BEFORE the 3600s session timeout and every
-        # in-session degradation path becomes unreachable. Require headroom.
-        if cfg.train.agent_task_timeout_s != 0 and (
-            cfg.train.agent_task_timeout_s
-            < cfg.research.session_timeout_s + 1800
-        ):
-            problems.append(
-                f"research_rl.weight>0 requires train.agent_task_timeout_s=0 or >= "
-                f"research.session_timeout_s+1800 (got {cfg.train.agent_task_timeout_s} vs "
-                f"{cfg.research.session_timeout_s}+1800): the hang guard would kill the "
-                "prompt group before the session's own timeout/degradation can run"
-            )
-        if (
-            rrl.max_sample_tokens + cfg.train.max_prompt_length
-            > cfg.train.log_prob_max_token_len_per_gpu
-        ):
-            # Soft warning, not a rejection: the packing budget clamps up to the
-            # longest sequence (c48568e), so the run survives — but the
-            # old-log-prob forward then peaks at max_sample_tokens x vocab x 4B
-            # of fp32 logits (~10 GiB at 16k x 152k), which is exactly the
-            # profile that killed earlier runs on the A800.
-            print(
-                f"[config] WARNING research_rl.max_sample_tokens={rrl.max_sample_tokens} "
-                f"exceeds log_prob_max_token_len_per_gpu="
-                f"{cfg.train.log_prob_max_token_len_per_gpu}: the log-prob packing "
-                "budget will be clamped up by the longest research row — watch the "
-                "old-log-prob peak memory on the first step"
-            )
-        if rrl.max_sample_tokens + cfg.train.max_prompt_length > cfg.train.rollout_max_model_len:
-            problems.append(
-                f"research_rl.max_sample_tokens={rrl.max_sample_tokens} + "
-                f"max_prompt_length={cfg.train.max_prompt_length} exceeds "
-                f"rollout_max_model_len={cfg.train.rollout_max_model_len}"
-            )
-
-    if cfg.train.opd_kl_mode not in (
-        "forward_kl_topk", "reverse_kl_k3", "reverse_kl_topk", "reverse_kl_gated"
-    ):
-        problems.append(
-            f"train.opd_kl_mode={cfg.train.opd_kl_mode!r} must be one of "
-            "forward_kl_topk / reverse_kl_k3 / reverse_kl_topk / reverse_kl_gated"
-        )
-    if not (128 <= cfg.episode.max_tokens_per_turn <= cfg.train.response_length):
-        # 下界:低于 ~128 连 <action> 标签都放不下,每轮必然格式失败;
-        # 上界:单轮不可能超过整条 response 的总预算,写大了是配置笔误。
-        problems.append(
-            f"episode.max_tokens_per_turn={cfg.episode.max_tokens_per_turn} must be in "
-            f"[128, train.response_length={cfg.train.response_length}]"
-        )
-    if cfg.train.loss_agg_mode not in ("token-mean", "seq-mean-token-mean"):
-        # 只放行两个经用户裁定的信用分配单位(2026-07-30 收窄,审阅 P1-2):
-        # verl 另有 seq-mean-token-sum[-norm],但 -norm 的 scale 因子取微批
-        # padded 宽度、随打包漂移,-sum 从未被裁定使用——在这里 fail-early
-        # 好过在 verl 侧以未定义口径静默跑完一个 run。
-        problems.append(
-            f"train.loss_agg_mode={cfg.train.loss_agg_mode!r} must be one of "
-            "token-mean / seq-mean-token-mean (the two ruled-on units)"
-        )
-    if not (_math.isfinite(cfg.train.opd_gate_beta) and cfg.train.opd_gate_beta > 0):
-        # β→0 把 gate 退化成平坦 0.5(半强度 logp-shift),负 β 反转到
-        # teacher 否决的 token 上——都不是任何实验想表达的意思
-        problems.append(
-            f"train.opd_gate_beta={cfg.train.opd_gate_beta} must be finite and > 0"
-        )
-    if cfg.train.teacher_scoring_backend not in ("fsdp", "vllm"):
-        problems.append(
-            f"train.teacher_scoring_backend={cfg.train.teacher_scoring_backend!r} "
-            "must be 'fsdp' or 'vllm'"
-        )
-    if (
-        cfg.train.teacher_scoring_backend == "vllm"
-        and cfg.train.rollout_max_num_batched_tokens > 2048
-    ):
-        problems.append(
-            f"train.teacher_scoring_backend=vllm with rollout_max_num_batched_tokens="
-            f"{cfg.train.rollout_max_num_batched_tokens}: scoring on the rollout engine "
-            "materialises a full-vocabulary logits buffer per prefill chunk "
-            "(chunk x vocab x 2B), which OOMed the smoke run at 4096. Either keep the "
-            "fsdp backend, or drop the budget to 2048 when falling back to vllm."
-        )
-    if cfg.train.fsdp_mode not in ("shard", "noshard"):
-        problems.append(f"train.fsdp_mode={cfg.train.fsdp_mode!r} must be 'shard' or 'noshard'")
-    if cfg.train.vllm_rpc_timeout_ms < 1000:
-        problems.append(
-            f"train.vllm_rpc_timeout_ms={cfg.train.vllm_rpc_timeout_ms} is below 1s — "
-            "a short RPC timeout makes EngineCore declare a live engine dead"
-        )
-    if cfg.train.agent_task_timeout_s < 0:
-        problems.append(f"train.agent_task_timeout_s={cfg.train.agent_task_timeout_s} must be >= 0 (0 disables)")
-    for name, role in cfg.roles.items():
-        if role.dp_size < 0:
-            problems.append(f"roles.{name}.dp_size must be >= 0 (0 disables routing)")
-        if role.mode not in ("local_sidecar", "external_pool"):
-            problems.append(
-                f"roles.{name}.mode={role.mode!r} must be 'local_sidecar' or 'external_pool'"
-            )
-        if role.mode == "external_pool":
-            # Someone else runs these endpoints: this run must not try to drive
-            # them through sleep/wake, and dp routing is a single-server notion.
-            if not role.endpoint.strip():
-                problems.append(f"roles.{name}.mode=external_pool requires a non-empty endpoint")
-            if role.sidecar_sleep:
-                problems.append(f"roles.{name}: external_pool cannot use sidecar_sleep")
-            if role.dp_size > 0:
-                problems.append(
-                    f"roles.{name}: external_pool cannot use dp_size>0 "
-                    "(independent servers, no shared scheduler)"
-                )
-    if cfg.train.train_batch_size % cfg.train.agent_num_workers != 0:
-        problems.append(
-            f"train.train_batch_size={cfg.train.train_batch_size} must be divisible "
-            f"by agent_num_workers={cfg.train.agent_num_workers}: the rollout_n "
-            "copies of a task are interleaved and chunked contiguously across "
-            "workers, and divisibility is what keeps all copies of one task in "
-            "the same worker process (research-session dedupe invariant)"
-        )
-    if cfg.train.ulysses_sp < 1 or cfg.train.n_gpus % cfg.train.ulysses_sp != 0:
-        problems.append(
-            f"train.ulysses_sp={cfg.train.ulysses_sp} must be >=1 and divide "
-            f"n_gpus={cfg.train.n_gpus}"
-        )
-    if (
-        cfg.train.max_token_len_per_gpu * cfg.train.ulysses_sp
-        < cfg.train.max_prompt_length + cfg.train.response_length
-    ):
-        problems.append(
-            f"sequence capacity max_token_len_per_gpu*ulysses_sp="
-            f"{cfg.train.max_token_len_per_gpu * cfg.train.ulysses_sp} is below "
-            f"max_prompt_length+response_length="
-            f"{cfg.train.max_prompt_length + cfg.train.response_length} — a full-length "
-            "sample could not fit one micro batch (raise max_token_len_per_gpu or "
-            "ulysses_sp; design.md §6.1)"
-        )
-    for name, role in cfg.roles.items():
-        if role.sidecar_sleep and name != "researcher":
-            problems.append(
-                f"roles.{name}.sidecar_sleep=true — only the researcher server "
-                "is driven by the trainer's sleep/wake rhythm"
-            )
-    for name, role in cfg.roles.items():
-        if "," in role.endpoint:  # endpoint pool (independent replicas)
-            if role.sidecar_sleep:
-                problems.append(
-                    f"roles.{name}: endpoint pool + sidecar_sleep=true — the "
-                    "sleep/wake rhythm drives ONE local server, not a pool "
-                    "(remote pool deployments must set sidecar_sleep: false)"
-                )
-            if role.dp_size > 0:
-                problems.append(
-                    f"roles.{name}: endpoint pool + dp_size>0 — the "
-                    "X-data-parallel-rank header targets DP ranks inside one "
-                    "server; independent replicas need dp_size: 0 (the pool "
-                    "does its own session-sticky balancing)"
-                )
-    if (
-        "researcher" in cfg.roles
-        and cfg.roles["researcher"].sidecar_sleep
-        and not (cfg.research.enabled and cfg.research.backend == "external")
-    ):
-        problems.append(
-            "roles.researcher.sidecar_sleep=true requires research.enabled "
-            "with backend=external (no external server to drive otherwise)"
-        )
-    if problems:
-        raise ValueError("invalid config:\n  - " + "\n  - ".join(problems))
+        if st.w_beh_mode not in ("per_token", "per_decision", "vtrace"):
+            raise ValueError(f"未知 w_beh_mode {st.w_beh_mode!r}")
 
 
 def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
     """Apply ``section.key=value`` overrides onto a parsed config dict.
 
     For settings that describe the EXPERIMENT rather than the machine — the
-    mixed-objective ablation weights above all. Those belong in the config file
+    steering ablation switches above all. Those belong in the config file
     (it is the single source of truth, and the launch manifest snapshots it), but
     running four ablation arms off one file needs a way to say which arm without
     editing the file for every run and remembering to edit it back.
@@ -820,7 +248,7 @@ def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any
         path, _, value = item.partition("=")
         parts = [p for p in path.strip().split(".") if p]
         if len(parts) < 2:
-            raise ValueError(f"config override {item!r} must name a section, e.g. train.mix_rl_weight=1.0")
+            raise ValueError(f"config override {item!r} must name a section, e.g. steering.eta_max=0.3")
         if parts[0] not in _KNOWN_SECTIONS:
             raise ValueError(f"config override {item!r}: unknown section {parts[0]!r}")
         # Walk the full path rather than splitting once: nested sections are
@@ -873,19 +301,6 @@ def template_drift(config_path: str | Path, template_path: str | Path) -> dict[s
     experiment = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
     template = yaml.safe_load(Path(template_path).read_text(encoding="utf-8")) or {}
     exp_keys, tpl_keys = flat(experiment), flat(template)
-    # Role names are the experiment's business (a run may serve roles the
-    # template does not list); compare the SHAPE of a role, not which roles exist.
-    def role_shape(keys: set[str]) -> set[str]:
-        out = set()
-        for key in keys:
-            parts = key.split(".")
-            if parts[0] == "roles" and len(parts) >= 3:
-                out.add("roles.*." + ".".join(parts[2:]))
-            else:
-                out.add(key)
-        return out
-
-    exp_keys, tpl_keys = role_shape(exp_keys), role_shape(tpl_keys)
     return {
         "missing": sorted(tpl_keys - exp_keys),
         "extra": sorted(exp_keys - tpl_keys),
@@ -893,62 +308,17 @@ def template_drift(config_path: str | Path, template_path: str | Path) -> dict[s
 
 
 def objective_fingerprint(cfg: "Config") -> str:
-    """Short hash of the settings that define WHAT this run optimises.
-
-    Resuming into a run directory whose fingerprint differs means continuing one
-    experiment's checkpoint under another experiment's objective — the ablation
-    arms all default to the same run name, so this is one forgotten flag away.
-    Deliberately narrow: it covers the objective and the batch composition that
-    feeds it, not the machine (resuming on different hardware is legitimate).
-    """
-    t = cfg.train
+    """定义「优化什么」的短哈希(resume 守卫;机器无关)。
+    steering 的机制参数全部参与:换 doc 表/η/c/预算/门/W 口径 = 换目标。"""
+    t, st = cfg.train, cfg.steering
     material = "|".join(
         str(x) for x in (
-            t.model_path, t.mix_opd_weight, t.mix_rl_weight, t.mix_sft_weight,
-            t.mix_sft_rollouts,
-            t.mix_sft_prefix,
-            t.rollout_n, t.train_batch_size, t.distill_topk, t.lr,
-            t.teacher_scoring_backend, cfg.research.enabled,
+            t.model_path, t.rollout_n, t.train_batch_size, t.lr,
+            t.loss_agg_mode,
+            st.enabled, st.doc_table, st.eta_max, st.c, st.b_max, st.topk,
+            st.theta_d, st.epsilon, st.r_max, st.w_beh_mode,
         )
     )
-    # KL 模式条件式追加,而非无条件进列表:加字段那一刻有三个消融臂在生产上跑
-    # (A0/A1/A2-doc,均为 forward_kl_topk),无条件追加会改变它们已写入 manifest
-    # 的指纹,让下一次 resume 被我们自己的守卫拒掉。默认值不进 hash ⇒ 旧指纹
-    # 逐字节不变;非默认模式照常拒绝跨模式 resume;β 只在 gated 模式下有语义,
-    # 也只在那时参与。
-    if t.opd_kl_mode != "forward_kl_topk":
-        material += f"|opd_kl_mode={t.opd_kl_mode}"
-        if t.opd_kl_mode == "reverse_kl_gated":
-            material += f"|opd_gate_beta={t.opd_gate_beta}"
-    # 聚合口径同一纪律,但基准取【历史隐含值 token-mean】而非当前默认
-    # (2026-07-29 起默认已是 seq-mean-token-mean):信用分配单位定义"优化什么",
-    # 跨口径 resume 必须被拒;而显式写回 token-mean 复现历史 run 时,指纹必须与
-    # 存量 manifest 逐字节一致——若以新默认为基准,复现 run 会被自家守卫拒掉。
-    if t.loss_agg_mode != "token-mean":
-        material += f"|loss_agg_mode={t.loss_agg_mode}"
-    # teacher grounding 同一纪律:默认关断不进 hash ⇒ 存量指纹逐字节不变;
-    # 开启后权重与 won 分割都定义"优化什么",跨值 resume 拒绝。opd_lost_only
-    # 单开(T1' 归因臂)同样改变 OPD 的数据分布,必须独立参与。
-    if t.mix_tg_weight > 0.0:
-        material += f"|mix_tg_weight={t.mix_tg_weight}"
-    if t.opd_lost_only:
-        material += "|opd_lost_only=1"
-    # 健康门改变 tg 的数据分布(哪些 won 行成为标签)⇒ 定义"优化什么",
-    # 条件式参与:null(默认关)不进 hash,存量指纹逐字节不变。
-    if t.mix_tg_health_gate is not None:
-        material += f"|mix_tg_health_gate={t.mix_tg_health_gate}"
-    # GT-doc 消融同一纪律:静态源直接更换教师特权信息来源——objective 语义
-    # 的改变,跨臂 resume 必须被拒;默认 null 不进 hash,存量指纹逐字节不变。
-    if cfg.research.static_doc_source is not None:
-        material += f"|static_doc_source={cfg.research.static_doc_source}"
-    # self-research 通道同一纪律:默认关断(weight=0)不进 hash ⇒ 存量 run 指纹
-    # 逐字节不变;开启后 N/K/模式/warmup 都定义"优化什么",跨值 resume 拒绝。
-    rrl = cfg.research_rl
-    if rrl.weight > 0.0:
-        material += (
-            f"|research_rl={rrl.weight},{rrl.update_mode},{rrl.n_docs},"
-            f"{rrl.eval_k},{rrl.adv_clip},{rrl.warmup_steps},{rrl.max_sample_tokens}"
-        )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
 
@@ -960,21 +330,16 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     unknown = set(data) - _KNOWN_SECTIONS
     if unknown:
         raise ValueError(f"unknown top-level config sections {sorted(unknown)}")
-    roles = {
-        name: RoleCfg.from_dict(cfg or {})
-        for name, cfg in (data.get("roles") or {}).items()
-    }
+    steering_raw = dict(data.get("steering") or {})
+    if isinstance(steering_raw.get("gate_rate_bounds"), list):
+        steering_raw["gate_rate_bounds"] = tuple(steering_raw["gate_rate_bounds"])
     cfg = Config(
         run=_build(RunCfg, data.get("run") or {}),
-        research=_build(ResearchCfg, data.get("research") or {}),
-        research_rl=_build(ResearchRLCfg, data.get("research_rl") or {}),
-        sft_gen=_build(SftGenCfg, data.get("sft_gen") or {}),
-        narration=_build(NarrationCfg, data.get("narration") or {}),
-        roles=roles,
         episode=_build(EpisodeCfg, data.get("episode") or {}),
         alfworld=_build(AlfworldCfg, data.get("alfworld") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
+        steering=_build(SteeringCfg, steering_raw),
         raw=data,
     )
     _validate(cfg)

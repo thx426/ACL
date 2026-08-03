@@ -17,7 +17,6 @@ from .actor import *  # noqa: F401
 from .checkpoint import *  # noqa: F401
 from .critic import *  # noqa: F401
 from .disaggregation import *  # noqa: F401
-from .distillation import *  # noqa: F401
 from .engine import *  # noqa: F401
 from .model import *  # noqa: F401
 from .optimizer import *  # noqa: F401
@@ -32,7 +31,6 @@ __all__ = (
     + optimizer.__all__
     + rollout.__all__
     + model.__all__
-    + distillation.__all__
     + disaggregation.__all__
     + checkpoint.__all__
 )

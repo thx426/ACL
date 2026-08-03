@@ -112,30 +112,6 @@ def construct_minimal_padding_template(
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
-    # trace-opd mixed objective: sft_mask is a per-token field like response_mask,
-    # so the template's copy of it — cloned from an arbitrary real row above, and
-    # very possibly a full-length expert mask — has to shrink with the sequence.
-    # Left alone it either blows up the SFT loss on a shape mismatch or, when the
-    # widths happen to agree, silently inflates sft/expert_tokens. Only rewritten
-    # when present: with the SFT arm off no row carries the field and the padding
-    # row must not invent one.
-    if "sft_mask" in template_sample:
-        template_sample["sft_mask"] = torch.zeros_like(response_mask)
-    # trace-opd self-research: same shape discipline as sft_mask — a padding
-    # row cloned off a research sample must not ship a full-length mask or a
-    # stale advantage into the loss.
-    if "research_mask" in template_sample:
-        template_sample["research_mask"] = torch.zeros_like(response_mask)
-    # trace-opd teacher grounding: same shape discipline — a padding row cloned
-    # off a tg sample must not ship a full-length tg label mask; the tg loss's
-    # shape assertion would kill the run on the mismatch (fail-loud by design,
-    # but a padding row is not the defect it is there to catch).
-    if "tg_mask" in template_sample:
-        template_sample["tg_mask"] = torch.zeros_like(response_mask)
-    if "research_advantage" in template_sample:
-        template_sample["research_advantage"] = torch.zeros_like(
-            response_mask, dtype=torch.float32
-        )
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

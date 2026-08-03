@@ -48,7 +48,6 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
-from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
@@ -136,14 +135,6 @@ class AgentLoopOutput(BaseModel):
             rm_scores[-1] = reward_score
             output["rm_scores"] = rm_scores
 
-        teacher_ids, teacher_logprobs = (
-            output["extra_fields"].pop("teacher_ids", None),
-            output["extra_fields"].pop("teacher_logprobs", None),
-        )
-        if teacher_ids is not None:
-            output["teacher_ids"] = teacher_ids
-        if teacher_logprobs is not None:
-            output["teacher_logprobs"] = teacher_logprobs
         return output
 
 
@@ -166,10 +157,6 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities for the response tokens."""
-    teacher_logprobs: Optional[torch.Tensor] = None
-    """Padded log probabilities from teacher model for prompt/response tokens."""
-    teacher_ids: Optional[torch.Tensor] = None
-    """Padded token ids corresponding to the teacher log probabilities."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -490,7 +477,6 @@ class AgentLoopWorker:
     Args:
         config (DictConfig): whole config for main entrypoint.
         llm_client (LLMServerClient): Client for the LLM server.
-        teacher_client (dict[str, LLMServerClient]): Client for multiple teacher servers.
         reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
     """
 
@@ -498,12 +484,10 @@ class AgentLoopWorker:
         self,
         config: DictConfig,
         llm_client: LLMServerClient,
-        teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.config = config
         self.llm_client = llm_client
-        self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
@@ -514,28 +498,6 @@ class AgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
-
-        # Online policy distillation
-        self.distillation_enabled = is_distillation_enabled(config.distillation)
-        self.self_teacher = False
-        if self.distillation_enabled:
-            self.teacher_key: str = config.distillation.teacher_key
-            # H3 pilot self-teacher mode: the rollout engine (current policy
-            # weights) scores teacher log-probs under the privileged prefix.
-            self.self_teacher = bool(config.distillation.get("self_teacher", False))
-            if self.self_teacher:
-                distillation_config = omega_conf_to_dataclass(config.distillation)
-                loss_config = distillation_config.distillation_loss
-                self.self_teacher_num_logprobs = (
-                    loss_config.topk if loss_config.loss_settings.use_topk else 0
-                )
-            else:
-                from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
-
-                self.teacher_server_manager = AsyncTeacherLLMServerManager(
-                    config=config,
-                    teacher_client=teacher_client,
-                )
 
         # Load tools once per worker; each trajectory just reuses self.tools.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -838,30 +800,6 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
-        await self._compute_teacher_logprobs(
-            output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
-        teacher_ids, teacher_logprobs = (
-            output.extra_fields.pop("teacher_ids", None),
-            output.extra_fields.pop("teacher_logprobs", None),
-        )
-        if teacher_ids is not None and teacher_logprobs is not None:
-            # TODO(wuxibin): remove padding and use tensordict.
-            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
-
-            teacher_ids, teacher_logprobs = _pad_teacher_outputs(
-                teacher_ids,
-                teacher_logprobs,
-                prompt_width=prompt_output["input_ids"].shape[1],
-                response_width=response_output["input_ids"].shape[1],
-                prompt_length=len(output.prompt_ids),
-                response_length=len(output.response_ids),
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
 
         return _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
@@ -875,8 +813,6 @@ class AgentLoopWorker:
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
-            teacher_logprobs=teacher_logprobs,
-            teacher_ids=teacher_ids,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -1023,188 +959,6 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
-    async def _compute_teacher_logprobs(
-        self,
-        output: AgentLoopOutput,
-        prompt_ids: list[int],
-        response_ids: list[int],
-        validate: bool,
-        sample_kwargs: Optional[dict[str, Any]] = None,
-    ) -> None:
-        """Compute teacher logprobs for single sample."""
-        # H3 pilot (privileged-context distillation): the agent loop may supply
-        # ``extra_fields["teacher_prompt_ids"]`` — an alternative prompt prefix
-        # (e.g. the same system prompt with a skill document appended) under
-        # which the teacher scores the SAME response tokens. The returned
-        # tensors are re-aligned to the student's (prompt + response) layout;
-        # the prompt segment is zero-filled and is excluded from the loss by
-        # response_mask.
-        # CD-006 R11a (2026-07-25): with TRACE_TEACHER_SCORING_BACKEND=fsdp the
-        # vLLM prompt_logprobs call below is skipped entirely; the privileged
-        # prefix rides to the trainer inside extra_fields (already shipped as
-        # non_tensor "tool_extra_fields" by _postprocess) and update_actor
-        # scores it on the FSDP engine with identical row semantics.
-        if (
-            os.environ.get("TRACE_TEACHER_SCORING_BACKEND", "vllm").strip().lower() == "fsdp"
-            and self.distillation_enabled
-            and getattr(self, "self_teacher", False)  # codex H4: fsdp backend is
-            # self-teacher only; an external-teacher config must keep the vLLM
-            # path (otherwise the teacher would be silently replaced by policy)
-            and not validate
-        ):
-            _tp = output.extra_fields.pop("teacher_prompt_ids", None)
-            output.extra_fields.pop("teacher_routing_key", None)
-            # codex H1: explicit provenance so a prefix lost in transit fails
-            # loud on the trainer side instead of silently degrading to bare.
-            # trace-opd mixed objective: an expert (SFT) row has no teacher at
-            # all — it is supervised by cross-entropy on its own tokens, and its
-            # response_mask is cleared, so the trainer skips the scoring forward.
-            if output.extra_fields.get("sample_role") == "sft":
-                output.extra_fields["teacher_mode"] = "sft"
-            elif output.extra_fields.get("sample_role") == "research":
-                # trace-opd self-research: a research row is the researcher
-                # session itself — it has no teacher, and scoring its (very
-                # long) trajectory would burn a full forward whose output the
-                # loss masks out. Same skip contract as the expert rows.
-                output.extra_fields["teacher_mode"] = "research"
-            elif output.extra_fields.get("sample_role") == "tg":
-                # trace-opd teacher grounding: the row's TRAINING prompt is the
-                # doc-prefixed sequence; its label is the bare policy's top-k,
-                # scored under the bare prompt that rides in teacher_prompt_ids
-                # (the exact mirror of the privileged mode). A tg row that lost
-                # its bare prefix, or a dropped-won placeholder (all-zero mask,
-                # opd_lost_only without a usable doc prefix), skips scoring the
-                # same way sft/research rows do.
-                has_signal = any(output.response_mask) if output.response_mask else False
-                output.extra_fields["teacher_mode"] = (
-                    "tg" if (_tp is not None and has_signal) else "tg_skip"
-                )
-            else:
-                output.extra_fields["teacher_mode"] = "privileged" if _tp is not None else "bare"
-            # codex M2: K rides with the sample; trainer asserts consistency.
-            output.extra_fields["teacher_topk"] = int(self.self_teacher_num_logprobs)
-            if _tp is not None:
-                output.extra_fields["teacher_prefix_ids"] = [int(x) for x in _tp]
-            if not getattr(self, "_trace_fsdp_backend_logged", False):
-                logger.info("teacher scoring backend=fsdp (rollout side): deferring "
-                            "to trainer, no vLLM prompt_logprobs call (codex M5 probe)")
-                self._trace_fsdp_backend_logged = True
-            return
-        teacher_prompt_ids = output.extra_fields.pop("teacher_prompt_ids", None)
-        # Optional sticky-routing key from the agent loop (trace-opd): scoring
-        # requests for the same task pin to the task's rollout replica, so the
-        # shared teacher prefix is prefilled once per task, not per sample.
-        # Always popped — it must never leak into the training batch.
-        teacher_routing_key = output.extra_fields.pop("teacher_routing_key", None)
-        if self.distillation_enabled and not validate:
-            # trace-opd (self-review after the codex round): expert rows are
-            # supervised by cross-entropy and research rows by their own PG —
-            # neither ever reads its teacher columns (their response_mask is
-            # cleared at TQ put time). The fsdp backend already skips them at
-            # plan time; THIS path did not, and a vLLM prompt_logprobs call on
-            # a (possibly 16k-token) research row allocates OUTSIDE the
-            # gpu_memory_utilization budget — the exact R11a OOM pattern. Ship
-            # aligned dummy columns instead (same shape the fsdp skip emits);
-            # the loss masks them out, so behaviour is identical and the
-            # forward is simply not burned.
-            if output.extra_fields.get("sample_role") == "tg":
-                # First version of teacher grounding supports the fsdp scoring
-                # backend only: the vLLM prompt_logprobs path would need the
-                # renormalisation and mirror-prefix plumbing duplicated here,
-                # and the production profile (162) runs fsdp anyway. Loud, not
-                # silent: a tg arm on the wrong backend must not degrade.
-                raise RuntimeError(
-                    "teacher-grounding (tg) rows require TRACE_TEACHER_SCORING_BACKEND=fsdp; "
-                    "the vLLM prompt_logprobs scoring path does not implement the tg label"
-                )
-            if output.extra_fields.get("sample_role") in ("sft", "research"):
-                dummy_width = max(int(getattr(self, "self_teacher_num_logprobs", 1) or 1), 1)
-                total_len = len(prompt_ids) + len(response_ids)
-                output.extra_fields["teacher_ids"] = torch.zeros(
-                    (total_len, dummy_width), dtype=torch.int32
-                )
-                output.extra_fields["teacher_logprobs"] = torch.zeros(
-                    (total_len, dummy_width), dtype=torch.float32
-                )
-                return
-            routing_key = None
-            if sample_kwargs is not None:
-                routing_value = sample_kwargs.get(self.teacher_key)
-                if routing_value is not None:
-                    # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
-                    routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            sequence_prompt_ids = list(teacher_prompt_ids) if teacher_prompt_ids is not None else prompt_ids
-            if self.self_teacher:
-                # Score with the rollout engine itself: current policy weights
-                # + the (possibly privileged) prefix. Forward pass only.
-                sequence_ids = sequence_prompt_ids + response_ids
-                teacher_output = await self.llm_client.generate(
-                    # Routing key only — LLMServerClient sends a fresh uuid to
-                    # the engine per call, so sharing the key across concurrent
-                    # scoring requests is safe.
-                    request_id=teacher_routing_key or uuid4().hex,
-                    prompt_ids=sequence_ids,
-                    sampling_params={
-                        "max_tokens": 1,
-                        "temperature": 1.0,
-                        "prompt_logprobs": self.self_teacher_num_logprobs,
-                    },
-                )
-                teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
-                teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-                assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
-            else:
-                teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                    sequence_ids=sequence_prompt_ids + response_ids,
-                    multi_modal_data=output.multi_modal_data,
-                    mm_processor_kwargs=output.mm_processor_kwargs,
-                    routing_key=routing_key,
-                )
-            if teacher_prompt_ids is not None:
-                # Row semantics (extract_prompt_logprobs): row i of the returned
-                # array is the model's distribution AT position i, i.e. the
-                # prediction for token i+1 (vLLM's None row 0 is dropped, a
-                # dummy row is appended at the end). The loss side
-                # (no_padding_2_padding) reads rows [P-1 : P+R-1] as the
-                # predictions for the R response tokens. Therefore the teacher
-                # rows that predict response tokens 0..R-1 are T-1..T+R-2 —
-                # slice from T-1 and drop the trailing dummy, then lay out as
-                # (P-1) zero rows | R valid rows | 1 dummy row so the loss
-                # window lands exactly on the valid rows. (Slicing from T
-                # instead fed the zero row to the FIRST response token — the
-                # trace-opd P0-1 fix.)
-                T = len(sequence_prompt_ids)
-                response_teacher_ids = teacher_ids[T - 1 : -1]
-                response_teacher_logprobs = teacher_logprobs[T - 1 : -1]
-                assert response_teacher_ids.shape[0] == len(response_ids), (
-                    f"teacher response segment {response_teacher_ids.shape[0]} "
-                    f"!= student response length {len(response_ids)}"
-                )
-                # Sentinel against off-by-one regressions: a real top-k
-                # distribution has strictly negative logprobs; the dummy row
-                # is all zeros. Checked across the first few rows rather than
-                # row 0 alone — in single-point mode (prompt_logprobs=0, the
-                # reverse-KL estimator family) a row holds ONE value, and a
-                # saturated glue token can round its logprob to exactly 0.0 in
-                # fp32; a run of them cannot, while a misaligned window reads
-                # the zero padding on every row and still fails here.
-                assert (response_teacher_logprobs[: min(8, len(response_ids))] < 0).any(), (
-                    "first teacher response rows look like dummy rows — "
-                    "prompt-logprob alignment is off"
-                )
-                prompt_pad_ids = torch.zeros((len(prompt_ids) - 1, teacher_ids.shape[1]), dtype=teacher_ids.dtype)
-                prompt_pad_logprobs = torch.zeros(
-                    (len(prompt_ids) - 1, teacher_logprobs.shape[1]), dtype=teacher_logprobs.dtype
-                )
-                tail_dummy_ids = torch.zeros((1, teacher_ids.shape[1]), dtype=teacher_ids.dtype)
-                tail_dummy_logprobs = torch.zeros((1, teacher_logprobs.shape[1]), dtype=teacher_logprobs.dtype)
-                teacher_ids = torch.cat([prompt_pad_ids, response_teacher_ids, tail_dummy_ids], dim=0)
-                teacher_logprobs = torch.cat(
-                    [prompt_pad_logprobs, response_teacher_logprobs, tail_dummy_logprobs], dim=0
-                )
-            output.extra_fields["teacher_ids"] = teacher_ids
-            output.extra_fields["teacher_logprobs"] = teacher_logprobs
-
     def _postprocess(
         self,
         inputs: list[_InternalAgentLoopOutput],
@@ -1224,9 +978,6 @@ class AgentLoopWorker:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
-        if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
-            optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
-            optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1327,7 +1078,6 @@ class AgentLoopManager:
     Args:
         config (DictConfig): whole config for main entrypoint.
         llm_client (LLMServerClient): Client for the LLM server.
-        teacher_client (dict[str, LLMServerClient]): Client for multiple teacher servers.
         reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
     """
 
@@ -1335,14 +1085,12 @@ class AgentLoopManager:
         self,
         config: DictConfig,
         llm_client: LLMServerClient,
-        teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
         self.model_config = config.actor_rollout_ref.model
         self.llm_client = llm_client
-        self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
         if not hasattr(self, "agent_loop_workers_class"):
@@ -1373,7 +1121,6 @@ class AgentLoopManager:
                 ).remote(
                     self.config,
                     self.llm_client,
-                    self.teacher_client,
                     self.reward_loop_worker_handles,
                 )
             )

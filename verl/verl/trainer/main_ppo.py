@@ -126,7 +126,6 @@ class TaskRunnerV1:
         self.agent_loop_manager = agent_loop_manager_cls.create(
             config=self.config,
             llm_client=self.trainer.get_llm_client(),
-            teacher_client=self.trainer.get_teacher_client(),
             reward_loop_worker_handles=self.trainer.get_reward_handles(),
         )
 

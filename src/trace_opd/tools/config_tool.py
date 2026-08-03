@@ -4,7 +4,7 @@
     python -m trace_opd.tools.config_tool diff 162-4b-a3   # compare against it
     python -m trace_opd.tools.config_tool list             # every experiment's drift
 
-Each experiment owns a COMPLETE copy of ``configs/trace.yaml`` under
+Each experiment owns a COMPLETE copy of ``configs/pgs.yaml`` under
 ``configs/experiments/``. Not a diff against it — a copy. A run's config is then
 self-contained: it can be read on its own months later, diffed against any other
 experiment, and a template edit can never retroactively change what a finished
@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-TEMPLATE = REPO / "configs" / "trace.yaml"
+TEMPLATE = REPO / "configs" / "pgs.yaml"
 EXPERIMENTS = REPO / "configs" / "experiments"
 
 sys.path.insert(0, str(REPO / "src"))

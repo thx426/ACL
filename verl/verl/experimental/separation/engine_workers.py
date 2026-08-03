@@ -23,7 +23,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
 )
-from verl.workers.engine_workers import ActorRolloutRefWorker, DistillationConfig
+from verl.workers.engine_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -42,19 +42,16 @@ class DetachActorWorker(ActorRolloutRefWorker):
     FSDP, FSDP2, VeOmni, and Megatron strategies.
     """
 
-    def __init__(
-        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
-    ):
+    def __init__(self, config: DictConfig, role: str, **kwargs):
         """
         Initialize the DetachActorWorker.
 
         Args:
             config: Configuration dictionary.
             role: The role of the worker (e.g., 'actor', 'rollout', 'ref').
-            distillation_config: Optional distillation configuration for OPD support.
             **kwargs: Additional arguments passed to ActorRolloutRefWorker.
         """
-        ActorRolloutRefWorker.__init__(self, config, role, distillation_config=distillation_config, **kwargs)
+        ActorRolloutRefWorker.__init__(self, config, role, **kwargs)
         self._strategy_handlers = None
 
     def _get_strategy_handlers(self):

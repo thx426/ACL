@@ -30,7 +30,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
@@ -45,7 +44,6 @@ from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.config import (
     ActorConfig,
-    DistillationConfig,
     HFModelConfig,
     MtpConfig,
     RolloutConfig,
@@ -458,13 +456,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     actor_worker_cls = TrainingWorker
     ref_worker_cls = TrainingWorker
 
-    def __init__(
-        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
-    ):
+    def __init__(self, config: DictConfig, role: str, **kwargs):
         Worker.__init__(self)
         self.config = config
-        self.distillation_config = distillation_config
-        self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.role = role
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
@@ -591,9 +585,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if "actor" in self.role:
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
-            distillation_config: Optional[DistillationConfig] = (
-                omega_conf_to_dataclass(self.distillation_config) if self.distillation_enabled else None
-            )
 
             # Build the inner actor profiler config via the hydra path (same as SFT), so
             # its tool_config entries are real dataclass instances the torch profiler can
@@ -634,12 +625,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
-            if self.distillation_enabled:
-                self.loss_fn = partial(
-                    distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
-                )
-            else:
-                self.loss_fn = partial(ppo_loss, config=actor_config)
+            self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
@@ -708,19 +694,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        # CD-006 R11a (2026-07-25, user-approved): self-teacher top-k scoring on
-        # the TRAINING engine instead of vLLM prompt_logprobs (vLLM issue #5907:
-        # logprobs allocations are outside the gpu_memory_utilization budget and
-        # unprotected — root cause of the rollout-tail VRAM spikes and the
-        # creeping torch-side baseline). Weights here equal what vLLM would have
-        # scored with (pre-optimizer-step). Enabled via
-        # TRACE_TEACHER_SCORING_BACKEND=fsdp; default keeps the vLLM path.
-        from verl.trainer.distillation.teacher_topk_fsdp import (
-            compute_teacher_topk_fsdp,
-            teacher_scoring_backend,
-        )
-        if teacher_scoring_backend() == "fsdp" and "teacher_logprobs" not in data.keys():
-            data = compute_teacher_topk_fsdp(data, self.actor.engine)
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 

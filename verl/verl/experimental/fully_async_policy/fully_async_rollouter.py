@@ -742,7 +742,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._init_async_objects()
         self._create_worker_classes()
         await self._create_reward_loop_manager()
-        await self._create_teacher_model_manager()
         await self._init_async_rollout_manager()
         SkipManager.init(self.config)
 
@@ -762,59 +761,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             None,
             lambda: RewardLoopManager(config=self.config, rm_resource_pool=None),
         )
-
-    async def _create_teacher_model_manager(self):
-        """Create MultiTeacherModelManager for distillation if enabled.
-
-        Allocates a big resource pool for all teachers and passes it to
-        MultiTeacherModelManager, which splits it internally per teacher.
-
-        NOTE: MultiTeacherModelManager.__init__ calls _run_all internally which uses
-        asyncio.run(), conflicting with the already-running event loop. Run in a thread executor.
-        """
-        from verl.trainer.distillation.losses import is_distillation_enabled
-        from verl.trainer.ppo.utils import Role
-
-        self.teacher_model_manager = None
-        if is_distillation_enabled(self.config.get("distillation")):
-            from verl.experimental.teacher_loop import MultiTeacherModelManager
-
-            resource_pool_spec = {}
-            mapping = {}
-            distillation_cfg = self.config.get("distillation", {})
-            n_gpus = distillation_cfg.get("n_gpus_per_node", 0)
-            nnodes = distillation_cfg.get("nnodes", 1)
-            assert n_gpus > 0, "distillation.n_gpus_per_node must be greater than 0 for TeacherModel"
-            teacher_pool = [n_gpus] * nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-            mapping[Role.TeacherModel] = "teacher_pool"
-
-            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-            resource_pool_manager.create_resource_pool()
-            teacher_resource_pool = resource_pool_manager.get_resource_pool(Role.TeacherModel)
-
-            loop = asyncio.get_running_loop()
-            self.teacher_model_manager = await loop.run_in_executor(
-                None,
-                lambda: MultiTeacherModelManager(config=self.config, resource_pool=teacher_resource_pool),
-            )
-
-    def _create_actor_rollout_classes(self):
-        # Skip rollout creation and let agentloop handle it
-        pass
-
-    def _create_reward_model_class(self):
-        # In fully async mode, RM is managed by RewardLoopManager (standalone). Skip worker group creation for RM.
-        pass
-
-    def _create_continuous_iterator(self):
-        """
-        Create a continuous data iterator across epoch
-        """
-        for epoch in range(self.config.trainer.total_epochs):
-            iterator = iter(self.train_dataloader)
-            for batch_dict in iterator:
-                yield epoch, batch_dict
 
     async def _init_async_rollout_manager(self):
         """
@@ -852,7 +798,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             config=self.config,
             llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,
-            teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
 
     # Add samples to the pending_queue
