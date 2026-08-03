@@ -186,6 +186,14 @@ class SteeringCfg:
     r_max: int = 4                 # 每轮拒绝上限(行为态)
     w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace(消融开关,规范 §2.6)
 
+    def __post_init__(self) -> None:
+        # yaml 1.1 把 1.0e9(无符号指数)解析成字符串——数值字段一律强转,
+        # 转不动就在这里死,而不是在校验/运行期比较时抛 TypeError。
+        for f in ("eta_max", "c", "b_max", "theta_d", "epsilon"):
+            setattr(self, f, float(getattr(self, f)))
+        self.topk = int(self.topk)
+        self.r_max = int(self.r_max)
+
 
 @dataclass
 class Config:
