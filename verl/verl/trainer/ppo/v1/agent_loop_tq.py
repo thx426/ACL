@@ -181,6 +181,29 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field.update(kwargs)
             # do not store raw image/video
             field.pop("multi_modal_data", None)
+            # trace-opd PGS: expand the sparse steering ledger into dense
+            # per-token behaviour-correction weights riding verl's native
+            # rollout_is_weights channel (consumed by the vanilla policy loss
+            # OUTSIDE the PPO clip). Only steered trajectories carry the
+            # ledger; everything else ships no field and trains untouched.
+            extra = field.get("extra_fields") or {}
+            if extra.get("steer_positions"):
+                if self.config.algorithm.get("rollout_correction", None) is not None:
+                    raise RuntimeError(
+                        "steering W_beh and algorithm.rollout_correction both write "
+                        "rollout_is_weights — enable at most one"
+                    )
+                from verl.trainer.ppo.steering_weights import expand_behavior_weights
+
+                dense = expand_behavior_weights(
+                    positions=extra["steer_positions"],
+                    log_pi=extra["steer_log_pi"],
+                    log_b=extra["steer_log_b"],
+                    response_len=int(field["response_mask"].shape[-1]),
+                    mode=str(extra.get("steer_w_beh_mode", "per_token")),
+                    log_ratio_cap=extra.get("steer_log_ratio_cap"),
+                )
+                field["rollout_is_weights"] = torch.from_numpy(dense)
             # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

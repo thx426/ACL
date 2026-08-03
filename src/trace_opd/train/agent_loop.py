@@ -189,6 +189,12 @@ class TraceAgentLoop(AgentLoopBase):
             state = steer_ctx.get("state")
             if state is not None:
                 steer_fields.update(state.ledger.finalize())
+                # 训练侧展开参数(verl agent_loop_tq 消费):W_beh 口径与
+                # 逐 token |log(π/b)| 的核界(2ηc)——越界即记账损坏,fail loud。
+                steer_fields["steer_w_beh_mode"] = self.cfg.steering.w_beh_mode
+                steer_fields["steer_log_ratio_cap"] = (
+                    2.0 * self.cfg.steering.eta_max * self.cfg.steering.c
+                )
                 alarm = state.gate.rate_alarm()
                 if alarm:
                     logger.warning("steering gate alarm for %s: %s", adapter.task_id, alarm)

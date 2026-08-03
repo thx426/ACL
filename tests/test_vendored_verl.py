@@ -97,6 +97,19 @@ def test_vanilla_loss_multiplies_weights_outside_the_clip():
     assert "negative_approx_kl = log_prob - old_log_prob" in body
 
 
+def test_wbeh_expansion_wired_on_the_tq_put_path():
+    # PGS W_beh:agent_loop_tq 在 TQ put 前把稀疏 steering ledger 展开成
+    # 稠密 rollout_is_weights(唯一写入点),并与原生 rollout_correction 互斥。
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert "expand_behavior_weights" in tq
+    assert 'field["rollout_is_weights"]' in tq
+    assert "rollout_correction" in tq          # 互斥检查在场
+    assert "steer_positions" in tq
+    sw = _read("trainer/ppo/steering_weights.py")
+    assert "def expand_behavior_weights" in sw
+    assert "per_decision" in sw and "vtrace" in sw
+
+
 def test_engine_workers_loss_is_plain_ppo():
     # 训练 loss 挂接点:无蒸馏分支,恒 ppo_loss。
     src = _read("workers/engine_workers.py")
