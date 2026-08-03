@@ -81,7 +81,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         ]
     return [
         sys.executable, "-m", "verl.trainer.main_ppo",
-        "algorithm.adv_estimator=grpo",
+        f"algorithm.adv_estimator={t.adv_estimator}",
         "algorithm.use_kl_in_reward=False",
         f"data.train_files=['{t.train_file}']",
         f"data.val_files={val_files}",

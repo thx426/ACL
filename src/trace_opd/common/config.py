@@ -119,6 +119,11 @@ class TrainCfg:
     #    要复现 2026-07-29 之前的任何 run,必须在其配置里显式写回
     #    `loss_agg_mode: token-mean`(4B 主线 rkl/sp2 的全部历史结论建立于 token-mean)。
     loss_agg_mode: str = "seq-mean-token-mean"
+    # --- GRPO advantage 口径 ---
+    # grpo_loo(PGS 默认,规范 §2.6 条件 iv):baseline 与 scale 均 leave-one-out
+    #   (scale 带全组 std floor,封二元 reward 下孤例 std_loo=0 的爆炸 edge);
+    # grpo:verl 原生口径(与历史 run 可比的对照臂)。
+    adv_estimator: str = "grpo_loo"
     # --- 从环境变量迁入(CD-006 requirement 3-F;用户 2026-07-26 裁定)---------
     # 这些原先散落在启动脚本的 export 里,而代码侧另有一套 fallback 默认值。
     # 两套真源 = 换一条启动路径就静默换一种行为:`run_a800_4b.sh` 设了

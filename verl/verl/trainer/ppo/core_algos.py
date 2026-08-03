@@ -636,6 +636,67 @@ def compute_rloo_outcome_advantage(
     return scores, scores
 
 
+@register_adv_est("grpo_loo")
+def compute_grpo_loo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """trace-opd PGS: GRPO with a leave-one-out baseline AND scale
+    (docs/pgs-final-spec.md §2.6, NF03 condition iv — a sample must not sit
+    inside its own baseline/scale, or the W_beh-weighted gradient picks up a
+    self-referential bias term).
+
+    Binary-reward edge (implementation ruling, spec-level note): a pure LOO
+    std explodes on the group's lone dissenter — in a 7-win/1-loss group the
+    loser's remaining 7 scores are identical, std_loo = 0, and the advantage
+    becomes -1/epsilon. The scale therefore takes max(std_loo, std_full):
+    unbiasedness lives in the BASELINE (kept strictly LOO); the scale is a
+    magnitude knob where the conservative (larger) denominator is safe.
+
+    Groups: n=1 keeps the plain-GRPO convention (mean 0 / std 1 -> raw score);
+    n=2 has no LOO std (one remaining sample) and uses std_full alone.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    norm_by_std = True
+    if config is not None:
+        norm_by_std = bool(config.get("norm_adv_by_std_in_grpo", True))
+
+    id2rows = defaultdict(list)
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2rows[index[i]].append(i)
+        out = scores.clone()
+        for rows in id2rows.values():
+            n = len(rows)
+            if n == 1:
+                continue  # plain-GRPO convention: raw score through
+            r = torch.stack([scores[i] for i in rows])
+            total = r.sum()
+            mean_loo = (total - r) / (n - 1)
+            centred = r - mean_loo
+            if norm_by_std:
+                std_full = torch.std(r)  # Bessel over the full group
+                if n >= 3:
+                    # per-sample LOO variance (Bessel over the n-1 remainder)
+                    sq = (r * r).sum()
+                    var_loo = ((sq - r * r) - (n - 1) * mean_loo * mean_loo) / (n - 2)
+                    std_loo = torch.sqrt(torch.clamp(var_loo, min=0.0))
+                    scale = torch.maximum(std_loo, std_full)
+                else:
+                    scale = std_full.expand(n)
+                centred = centred / (scale + epsilon)
+            for k, i in enumerate(rows):
+                out[i] = centred[k]
+        out = out.unsqueeze(-1) * response_mask
+
+    return out, out
+
+
 @register_adv_est(AdvantageEstimator.OPO)  # or simply: @register_adv_est("opo")
 def compute_opo_outcome_advantage(
     token_level_rewards: torch.Tensor,

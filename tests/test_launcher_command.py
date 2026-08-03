@@ -37,7 +37,8 @@ def test_default_profile_and_rollout_n(tmp_path):
     assert "+actor_rollout_ref.model.override_config.attn_implementation=sdpa" in cmd
     assert not any("ulysses_sequence_parallel_size" in c for c in cmd)
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=2" in cmd
-    assert "algorithm.adv_estimator=grpo" in cmd
+    # PGS 默认 grpo_loo(规范 §2.6 条件 iv);对照臂经 train.adv_estimator=grpo
+    assert "algorithm.adv_estimator=grpo_loo" in cmd
     # Collapse-watch entropy curve (metric only, entropy_coeff stays 0).
     assert "actor_rollout_ref.actor.calculate_entropy=True" in cmd
     # Micro-batch packing budgets decoupled from the 34816 capacity declaration

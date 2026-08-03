@@ -97,6 +97,14 @@ def test_vanilla_loss_multiplies_weights_outside_the_clip():
     assert "negative_approx_kl = log_prob - old_log_prob" in body
 
 
+def test_grpo_loo_estimator_registered():
+    # 规范 §2.6 条件 iv:baseline+scale LOO(scale 带全组 std floor,封
+    # 二元 reward 孤例 std_loo=0 的爆炸 edge)。经 registry 走 else 分支。
+    src = _read("trainer/ppo/core_algos.py")
+    assert '@register_adv_est("grpo_loo")' in src
+    assert "torch.maximum(std_loo, std_full)" in src
+
+
 def test_wbeh_expansion_wired_on_the_tq_put_path():
     # PGS W_beh:agent_loop_tq 在 TQ put 前把稀疏 steering ledger 展开成
     # 稠密 rollout_is_weights(唯一写入点),并与原生 rollout_correction 互斥。
