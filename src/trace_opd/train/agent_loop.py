@@ -67,7 +67,12 @@ from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
 from ..docstore.archive import ResearchArchive
 from ..envs.alfworld.adapter import AlfworldEnvFactory
 from ..research.prompts import build_researcher_system
-from ..research.session import ResearchSession, SessionResult, final_doc_success
+from ..research.session import (
+    ResearchSession,
+    SessionResult,
+    final_doc_success,
+    static_doc_fields,
+)
 from ..research.toolproto import make_tool_protocol
 from ..research.tools import ToolRouter
 from .backends import (
@@ -251,6 +256,16 @@ class TraceAgentLoop(AgentLoopBase):
         The WHOLE per-sample path — assembly included — degrades on failure;
         it never raises (review P0-3)."""
         rcfg = self.cfg.research
+        # GT-doc 消融实验(docs/gt-doc-ablation.md;ALFWorld 专属验证,非通用
+        # 机制,勿在此基础上扩展):静态源短路整个 research 会话——教师特权
+        # 文档直接用预抽取的 ground-truth walkthrough,doc 注入协议/打分/OPD
+        # 完全原样,单变量只有"doc 从哪来"。延迟 import:通用层不背 ALFWorld
+        # 依赖,开关关闭时零触碰。
+        if rcfg.static_doc_source == "gt":
+            from ..envs.alfworld.gt import render_gt_as_doc
+
+            doc = render_gt_as_doc(adapter.gt_text())
+            return doc, static_doc_fields(doc)
         router: ToolRouter | None = None
         session: ResearchSession | None = None
         result: SessionResult | None = None

@@ -43,6 +43,12 @@ research:
   doc_max_words: 3000       # 经验文档词数上限(超出触发一次软修订)| h1 定版;实测中位 544 词
   gt: "off"                 # on=专家参考解进 researcher prompt(仅训练集;executor 永不可见)
                             # | 冒烟阶段 on/off 各跑一组对照后定全量默认(用户裁定)
+  static_doc_source: null   # GT-doc 消融实验(docs/gt-doc-ablation.md,ALFWorld
+                            # 专属验证):"gt" = 短路 research 会话,教师特权文档
+                            # 直接用任务 ground-truth walkthrough;注入协议/打分/
+                            # OPD 逐字节不动,单变量只有"doc 从哪来"。与 gt:"on"、
+                            # research_rl 互斥;非 null 条件式进 fingerprint。
+                            # 默认 null = 逐字节现状。
   episode_temperature: 1.0  # 研究实验 episodes 采样温度 | 同构原则:= 训练 rollout 温度
   researcher_max_tokens: 8192  # researcher 单轮生成上限(27B 思考 ON 需余量)| h1 定版
   session_timeout_s: 3600   # 单会话硬超时(防单任务卡死整个 step;超时降级 doc=None)| 新防御项

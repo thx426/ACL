@@ -50,6 +50,28 @@ class SessionResult:
     completion_tokens: int = 0
 
 
+def static_doc_fields(doc: str | None) -> dict[str, Any]:
+    """GT 静态文档源(research.static_doc_source == "gt",GT-doc 消融实验
+    docs/gt-doc-ablation.md)的 research 指标占位。
+
+    键集与真实会话路径完全一致(曲线键批一致纪律,codex tg-review P0-3),
+    数值取静态语义:experiments/episodes/turns 恒 0(没有会话);
+    `research_final_success` 在静态源下**无实测语义,恒 0——判读忽略该曲线**,
+    GT 注入的真实成功率用离线 doc_lift 量。放在本模块(而非 agent_loop):
+    与 final_doc_success 同居、且不背 verl 训练栈依赖,可独立单测。
+    """
+    return {
+        "research_error": 0,
+        "research_experiments": 0,
+        "research_episodes": 0,
+        "research_turns": 0,
+        "research_final_success": 0.0,
+        "doc_words": len(doc.split()) if doc else 0,
+        "doc_missing": int(not doc),
+        "research_archive": "",
+    }
+
+
 def final_doc_success(result: "SessionResult | None") -> float:
     """PG-7 文档质量信号的正确口径(CD-006 反馈 §1,2026-08-03)。
 

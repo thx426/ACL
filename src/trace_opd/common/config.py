@@ -104,6 +104,11 @@ class ResearchCfg:
     fetch_raw_max_chars: int = 16000
     doc_max_words: int = 1200
     gt: str = "off"                  # off | on — GT into the researcher prompt
+    # GT-doc 消融实验(docs/gt-doc-ablation.md,ALFWorld 专属验证,非通用
+    # 机制):"gt" = 短路整个 research 会话,教师特权文档直接用任务 ground
+    # truth 参考解(walkthrough 渲染);doc 注入协议/打分/OPD 逐字节不动,
+    # 单变量只有"doc 从哪来"。默认 null = 逐字节现状。
+    static_doc_source: str | None = None
     episode_temperature: float = 1.0
     researcher_max_tokens: int = 4096
     session_timeout_s: float = 3600.0  # hard wall per research session (defensive)
@@ -437,6 +442,29 @@ def _validate(cfg: "Config") -> None:
         problems.append("research.backend=engine requires tool_protocol=text")
     if cfg.research.gt not in ("off", "on"):
         problems.append(f"research.gt={cfg.research.gt!r} (off|on)")
+    if cfg.research.static_doc_source is not None:
+        # GT-doc 消融(docs/gt-doc-ablation.md):三条互斥/依赖。
+        if cfg.research.static_doc_source != "gt":
+            problems.append(
+                f"research.static_doc_source={cfg.research.static_doc_source!r} "
+                f"must be null or 'gt'"
+            )
+        if not cfg.research.enabled:
+            problems.append(
+                "research.static_doc_source requires research.enabled — the static "
+                "doc rides the same injection pipeline (GUIDANCE_HEADER/teacher prefix)"
+            )
+        if cfg.research.gt == "on":
+            problems.append(
+                "research.static_doc_source is mutually exclusive with research.gt='on' "
+                "— gt='on' feeds GT to the RESEARCHER, the static source bypasses the "
+                "researcher entirely; combining them is semantically contradictory"
+            )
+        if cfg.research_rl.weight > 0:
+            problems.append(
+                "research.static_doc_source is mutually exclusive with research_rl "
+                "(no researcher runs under a static source, so there is nothing to train)"
+            )
     if cfg.narration.backend not in ("engine", "external", "none"):
         problems.append(f"narration.backend={cfg.narration.backend!r} (engine|external|none)")
     if cfg.research.enabled and cfg.research.backend == "external" and "researcher" not in cfg.roles:
@@ -909,6 +937,10 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 条件式参与:null(默认关)不进 hash,存量指纹逐字节不变。
     if t.mix_tg_health_gate is not None:
         material += f"|mix_tg_health_gate={t.mix_tg_health_gate}"
+    # GT-doc 消融同一纪律:静态源直接更换教师特权信息来源——objective 语义
+    # 的改变,跨臂 resume 必须被拒;默认 null 不进 hash,存量指纹逐字节不变。
+    if cfg.research.static_doc_source is not None:
+        material += f"|static_doc_source={cfg.research.static_doc_source}"
     # self-research 通道同一纪律:默认关断(weight=0)不进 hash ⇒ 存量 run 指纹
     # 逐字节不变;开启后 N/K/模式/warmup 都定义"优化什么",跨值 resume 拒绝。
     rrl = cfg.research_rl

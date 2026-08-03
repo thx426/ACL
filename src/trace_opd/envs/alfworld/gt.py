@@ -51,3 +51,29 @@ def render_walkthrough(plan: list[str] | None) -> str | None:
         return None
     lines = [f"{i + 1}. {cmd}" for i, cmd in enumerate(plan)]
     return "Engine walkthrough (playable commands):\n" + "\n".join(lines)
+
+
+# --- GT-doc 消融实验(docs/gt-doc-ablation.md;ALFWorld 专属验证,非通用机制)
+
+_WALKTHROUGH_HEADER = "Engine walkthrough (playable commands):"
+_DOC_HEADER = "A verified step-by-step reference solution for this task:"
+
+
+def render_gt_as_doc(gt_text: str | None) -> str | None:
+    """把预抽取的 GT 渲染成教师特权文档(research.static_doc_source == "gt")。
+
+    只认引擎 walkthrough 形态(逐字可执行、实例编号与环境一致)——
+    high_pddl 高层计划(GotoLocation(shelf) 之类,无实例编号、不可执行)
+    返回 None,让该行走既有 nodoc 降级并计数;数据层面的消灭由预检脚本
+    (scripts/gt_doc_precheck.py)负责。措辞最小化、不加执行指令,保持与
+    researcher 文档同一注入姿态(guidance 语义),不引入新的语气变量。
+    """
+    if not gt_text:
+        return None
+    text = str(gt_text).strip()
+    if not text.startswith(_WALKTHROUGH_HEADER):
+        return None
+    steps = text[len(_WALKTHROUGH_HEADER):].strip()
+    if not steps:
+        return None
+    return f"{_DOC_HEADER}\n{steps}"
