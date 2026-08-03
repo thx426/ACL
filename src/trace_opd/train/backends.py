@@ -39,6 +39,16 @@ class EngineGenerate:
         for key in ("min_global_steps", "max_global_steps"):
             if key in out_extra:
                 extra[key] = out_extra[key]
+        # PGS/SPS 数据通道(请求带 logprobs=K / prompt_logprobs=K 时才在场):
+        #   log_probs             采样 token 自身的 logprob(draft 的 log π(y))
+        #   response_topk_*       生成位置的 π top-K 明细(rank 序;S 的 π 侧)
+        #   prompt_ids/logprobs   prompt_logprobs 打分行(verify 的 p_T 侧;
+        #                         行语义:第 j 行预测位置 j+1,末行 dummy)
+        if getattr(out, "log_probs", None) is not None:
+            extra["log_probs"] = list(out.log_probs)
+        for key in ("response_topk_ids", "response_topk_logprobs", "prompt_ids", "prompt_logprobs"):
+            if key in out_extra:
+                extra[key] = out_extra[key]
         # verl aborts (e.g. weight sync preemption) return empty ids with
         # stop_reason="aborted" — the episode runner classifies that as an
         # infrastructure fault, not a task outcome.

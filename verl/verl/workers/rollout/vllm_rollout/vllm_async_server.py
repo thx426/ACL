@@ -592,7 +592,16 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        # trace-opd PGS: an int K asks for per-step top-K detail (the SPS
+        # draft's candidate window over pi); True keeps the historical meaning
+        # (0 = sampled token's own logprob only); False/None disables.
+        _logprobs_req = sampling_params.pop("logprobs", False)
+        if _logprobs_req is True:
+            sampling_params["logprobs"] = 0
+        elif _logprobs_req in (False, None):
+            sampling_params["logprobs"] = None
+        else:
+            sampling_params["logprobs"] = int(_logprobs_req)
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -669,6 +678,26 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            if sampling_params.logprobs > 0:
+                # trace-opd PGS: per-position top-K of the SAMPLING distribution
+                # (rank-ordered, same layout as extract_prompt_logprobs rows).
+                # The sampled token may sit outside the top-K (rank > K): it is
+                # NOT in these rows; its own logprob is in log_probs above.
+                k = sampling_params.logprobs
+                topk_ids, topk_logprobs = [], []
+                for logprobs_dict in final_res.outputs[0].logprobs:
+                    row_ids = [0] * k
+                    row_lps = [0.0] * k
+                    for token_id, token_logprob in logprobs_dict.items():
+                        rank = token_logprob.rank
+                        if rank > k:
+                            continue
+                        row_ids[rank - 1] = int(token_id)
+                        row_lps[rank - 1] = token_logprob.logprob
+                    topk_ids.append(row_ids)
+                    topk_logprobs.append(row_lps)
+                extra_fields["response_topk_ids"] = topk_ids
+                extra_fields["response_topk_logprobs"] = topk_logprobs
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:

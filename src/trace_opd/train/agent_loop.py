@@ -185,8 +185,14 @@ class TraceAgentLoop(AgentLoopBase):
         steer_fields: dict[str, Any] = {}
         if steer_ctx is not None:
             steer_fields["doc_missing"] = steer_ctx["doc_missing"]
-            # P2:episode 钩子产出的 SteeringLedger.finalize() 并入此处。
-            steer_fields.update(steer_ctx.get("ledger_fields", {}))
+            steer_fields["doc_overflow"] = steer_ctx.get("doc_overflow", 0)
+            state = steer_ctx.get("state")
+            if state is not None:
+                steer_fields.update(state.ledger.finalize())
+                alarm = state.gate.rate_alarm()
+                if alarm:
+                    logger.warning("steering gate alarm for %s: %s", adapter.task_id, alarm)
+                    steer_fields["steer_gate_alarm"] = 1
 
         output = AgentLoopOutput(
             prompt_ids=tokens.prompt_ids,
@@ -252,6 +258,58 @@ class TraceAgentLoop(AgentLoopBase):
 
     # ---------------------------------------------------------------- rollout
 
+    def _make_generate(self, adapter, epi_route: str, steer_ctx: dict[str, Any] | None):
+        """学生 episode 的生成通道:纯 EngineGenerate,或(有 doc 时)SPS 包装。
+
+        每次调用新建 TrajectorySteerState(轨迹级生命周期;retry 也拿新状态),
+        并把 state 挂回 steer_ctx 供 run() 取记账。
+        """
+        engine = EngineGenerate(self.server_manager, self.tokenizer, request_id=epi_route)
+        if not steer_ctx or not steer_ctx.get("doc"):
+            return engine
+        from ..core import protocol
+        from ..steering import SteeringGate, TrajectoryBudget, TurnRejectCap
+        from ..steering.hook import SpsGenerate, TrajectorySteerState
+
+        # 与 episode 内部的构造逐字节同参(episode 会断言 env 初始观察与
+        # dataset 一致,不一致早退 ENV_ERROR,不会触发生成)。
+        student_prompt_ids = render_ids(
+            self.tokenizer,
+            [
+                {"role": "system", "content": inject_guidance(adapter.executor_scaffold(), "")},
+                {"role": "user", "content": protocol.truncate_obs(adapter.initial_obs)},
+            ],
+            True,
+        )
+        teacher_prompt_ids = self._teacher_prompt_ids(
+            adapter, steer_ctx["doc"], student_prompt_ids, adapter.initial_obs
+        )
+        if teacher_prompt_ids is None:
+            steer_ctx["doc_overflow"] = 1
+            return engine  # doc 超上下文:降级纯 bare,记账可见
+        st_cfg = self.cfg.steering
+        state = TrajectorySteerState(
+            gate=SteeringGate(
+                theta_d=st_cfg.theta_d,
+                eta_max=st_cfg.eta_max,
+                epsilon=st_cfg.epsilon,
+                rate_bounds=tuple(st_cfg.gate_rate_bounds),
+            ),
+            budget=TrajectoryBudget(b_max=st_cfg.b_max, c=st_cfg.c),
+            reject_cap=TurnRejectCap(r_max=st_cfg.r_max),
+        )
+        steer_ctx["state"] = state
+        return SpsGenerate(
+            draft=engine,
+            verify=engine,           # 同引擎同路由:两个前缀的 KV 同 replica
+            teacher_prefix_ids=teacher_prompt_ids,
+            student_prompt_len=len(student_prompt_ids),
+            state=state,
+            tokenizer=self.tokenizer,
+            topk=st_cfg.topk,
+            c=st_cfg.c,
+        )
+
     async def _student_rollout(
         self,
         adapter,
@@ -260,12 +318,12 @@ class TraceAgentLoop(AgentLoopBase):
         route: str,
         steer_ctx: dict[str, Any] | None = None,
     ) -> EpisodeResult:
-        """裸 episode(steer_ctx 存在且有 doc 时,P2 起经 SPS 钩子采样)。
-        per-episode 唯一路由后缀;基建错误重试一次。"""
+        """学生 episode(steer_ctx 有 doc 时经 SPS 保尾核倾斜采样)。
+        per-episode 唯一路由后缀;基建错误重试一次(新 steering 状态)。"""
         epi_route = f"{route}:s{uuid4().hex[:6]}"
         result = await run_episode(
             adapter=adapter,
-            generate=EngineGenerate(self.server_manager, self.tokenizer, request_id=epi_route),
+            generate=self._make_generate(adapter, epi_route, steer_ctx),
             tokenizer=self.tokenizer,
             delta=self.delta,
             guidance="",
@@ -281,9 +339,7 @@ class TraceAgentLoop(AgentLoopBase):
             )
             result = await run_episode(
                 adapter=adapter,
-                generate=EngineGenerate(
-                    self.server_manager, self.tokenizer, request_id=epi_route
-                ),
+                generate=self._make_generate(adapter, epi_route, steer_ctx),
                 tokenizer=self.tokenizer,
                 delta=self.delta,
                 guidance="",
