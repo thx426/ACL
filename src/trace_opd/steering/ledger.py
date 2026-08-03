@@ -28,6 +28,13 @@ class TokenSteerRecord:
     cap_active: bool
 
 
+#: D 直方图口径:D = Var_{π|S}[ℓ̃] ∈ [0, c²];bins 覆盖 [0, D_HIST_MAX],
+#: 超界计入末桶。θ_D 标定(规范 §2.3 的 P85 预扫描)从聚合直方图取分位数,
+#: 因此常数必须跨 run 稳定 —— 改动它 = 换标定坐标系。
+D_HIST_BINS = 64
+D_HIST_MAX = 6.25  # c=2.5 的 c²;更大的 c 依赖末桶(标定分位数仍正确单调)
+
+
 @dataclass
 class SteeringLedger:
     """一条轨迹的记账。finalize() 输出进 extra_fields 的紧凑结构。"""
@@ -35,6 +42,17 @@ class SteeringLedger:
     records: list[TokenSteerRecord] = field(default_factory=list)
     budget_spent: float = 0.0
     turns_capped: int = 0
+    # D 观测直方图:每个候选位置(无论门开关)一次 observe_d —— θ_D 标定与
+    # 门率漂移监控的数据源(逐值存储在 32k 轨迹上不可承受,直方图分位数够用)。
+    d_hist: list[int] = field(default_factory=lambda: [0] * D_HIST_BINS)
+    d_count: int = 0
+    d_sum: float = 0.0
+
+    def observe_d(self, d_value: float) -> None:
+        b = int(d_value / D_HIST_MAX * D_HIST_BINS)
+        self.d_hist[min(max(b, 0), D_HIST_BINS - 1)] += 1
+        self.d_count += 1
+        self.d_sum += float(d_value)
 
     def append(self, rec: TokenSteerRecord) -> None:
         if self.records and rec.position <= self.records[-1].position:
@@ -62,4 +80,7 @@ class SteeringLedger:
             "steer_budget_spent": self.budget_spent,
             "steer_turns_capped": self.turns_capped,
             "steer_count": len(self.records),
+            "steer_d_hist": list(self.d_hist),
+            "steer_d_count": self.d_count,
+            "steer_d_mean": (self.d_sum / self.d_count) if self.d_count else 0.0,
         }

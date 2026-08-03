@@ -211,6 +211,7 @@ class SpsGenerate:
                     c=self._c,
                 )
                 d_value = candidate_d(s_log_pi, s_ell)
+                st.ledger.observe_d(d_value)
                 decision = st.gate.decide(d_value, st.rng)
                 eta = st.budget.admissible_eta(decision.eta)
                 if eta <= 0.0:

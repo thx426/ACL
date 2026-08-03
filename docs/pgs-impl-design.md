@@ -86,37 +86,63 @@ verify/scoring          extract_prompt_logprobs 已存在（:663，num_prompt_lo
 verify 的两次 scoring 与 draft 的比例：每轮 1 次 draft + R 次续段，每段 2 次
 scoring；教师侧 prompt 静态前部相同 ⇒ prefix cache 增量。
 
-## 4. 训练端改动（最小面）
+## 4. 训练端改动（落地定案，2026-08-04）
 
-- rollout 记账把 `log_b` 写入 batch（沿 extra_fields→TQ 通道，§7 修复后链路可用）
-- verl 侧 GRPO/PPO loss：advantage 乘 `W_beh`（消融开关：单点 w_t / 前缀 W_t /
-  V-trace 截断）；`r_upd = π_θ/π_old` 照旧走 clip——**分离式**（NF02）
-- GRPO 组内 baseline+scale 改 leave-one-out（NF03 条件 iv）
-- 定位：`mix_rl` 通道升级为主损失（旧 OPD 项清理后即纯 RL + W_beh）
+**零新 loss 代码**：verl 原生 `ppo_loss` → `compute_policy_loss_vanilla` 已内建
+`rollout_is_weights` 通道，权重乘在 dual-clip **之外**——恰是 NF02 分离式校正
+`W_t · min(r_t·Â, clip(r_t)·Â)` 的原生正确形态。落地：
 
-## 5. 测试计划
+- `verl/trainer/ppo/steering_weights.py`：稀疏 ledger → 稠密 per-token 权重
+  （`per_token` 默认 / `per_decision` 前缀积 / `vtrace` ρ̄=1 截断）；
+  逐 token `|log(π/b)| > 2ηc` 即记账损坏 fail-loud
+- 写入点唯一：`agent_loop_tq.py` TQ put 前展开；与 `algorithm.rollout_correction`
+  互斥检查（同字段两个写者 = 事故）
+- 通路：KVBatchMeta.fields=None ⇒ worker 全字段自动取数 ⇒ `ppo_loss` 的
+  `rollout_is_weights` 分支命中，无中间白名单
+- advantage：注册 `grpo_loo`（baseline 严格 LOO；scale=max(std_loo, std_full)
+  ——**规范级缺陷修订**：二元 reward 下孤例的 std_loo=0 会给出 −1/ε 的
+  advantage（7胜1负组是常态），full-std floor 封住；无偏性由 baseline 承担）
+- 命题 C 条件 v（单快照单步）：ppo_epochs=1（verl 默认）+ mini_batch=全批
 
-| 层 | 内容 |
-|---|---|
-| kernel 单测 | b_S 归一性；S 外恒等 π；密度比 ∈ e^{±2ηc}（含构造到界的极端例）；η=0 ⇒ b≡π |
-| sps 统计测试 | 小词表（V=50）模拟：SPS 输出经验分布 vs 解析 b_S 的 TV < 阈值（万次采样）；拒绝率 = TV(b,π) 校验 |
-| budget 单测 | 余额制扣费/耗尽/缩 η；R_max 状态机；记账 δ=2ηc |
-| gate 单测 | 可测性（η 不依赖 y_j——接口层强制）；探针 propensity 记录 |
-| ledger 单测 | 字段完整性；与 turn_spans 对齐 |
-| 集成冒烟 | mock generate 的 episode 全流程；真实引擎冒烟（162，C3 结束后） |
+## 5. 实现口径定案（引擎数据面）
 
-## 6. 分阶段
+1. **S 的两个封闭点**（S 是自选固定集，选择只影响覆盖度、不破坏命题 A）：
+   π 侧候选限 draft 的 obs_topk（=4×topk）观测窗；p_T top-K 中 π-rank 超窗的
+   token 不入 S（π 极冷 token 抬 e^{2ηc}≈e^{2.5} 倍仍可忽略，与「OPD 只能调
+   已有行为」的能力边界一致）。S 内 p_T 窗外的 token 用该位置观测 floor 代入
+   ——clip 到 −c 时零误差，未饱和时误差有界且方向保守。
+2. **logprobs 透传**：vllm_async_server 的 `logprobs` 支持 int K（top-K 明细行
+   `response_topk_ids/logprobs`，rank 序）；verify 用 `prompt_logprobs=K`
+   （行语义：第 j 行预测位置 j+1，末行 dummy——`extract_prompt_logprobs`）。
+3. **测度守卫**：draft 侧要求 T=1/top_p=1/top_k=-1（失配 fail-loud）；verify
+   请求显式同口径。`logprobs_mode` 的实际语义列 P4 首查。
+4. **θ_D 标定**：ledger 逐候选位置 observe_d → 64-bin 直方图随 dump 落盘；
+   标定 run 三件套 = theta_d=1e9 + epsilon=0 + gate_rate_bounds=[0,1]
+   （行为=纯 bare、零干预）；`scripts/calibrate_theta_d.py` 聚合出 P85。
+5. **doc 表**：`gt_docs_rl_train_v2.jsonl`（162：trace_opd-pgc/data/out/，
+   2875 条）与 `_load_doc_table` 格式零转换兼容，首实验直接复用。
+
+## 6. 进度
 
 ```
-P1  清理 commit（1.2 清单）+ steering 包核心（kernel/gate/budget/sps/ledger）+ 全部单测   ← 本轮
-P2  backends logprobs 透传 + episode_hook 集成 + agent_loop 精简改造
-P3  训练端 W_beh + LOO + 配置组 + pgs.yaml
-P4  真实引擎冒烟（162）→ 记账/数值一致性核验（draft vs verify 的 π 残差实测）
+P1   ✅ steering 包核心 + 12 单测（c623d85）
+P1.5 ✅ 旧机制全面出清：trace_opd 七包 + verl 蒸馏面根除（033c44d）
+P2   ✅ SPS 钩子全链路 + 引擎透传 + agent_loop 接线 + 7 测试（daa171a）
+P3   ✅ W_beh 展开（rollout_is_weights）+ 三口径 + grpo_loo（7646332, c84008f）
+P3.5 ✅ D 直方图标定数据面 + calibrate_theta_d.py（a9dfc9f）
+P4   ⏳ 真机冒烟 —— 162 被 C3 占（step 38/97，~08-05/06 完）；A800 sshd 两端口
+        reset 连不上（等端口恢复或 C3 结束）
 ```
 
-## 7. 风险清单
+## 7. P4 冒烟清单（上机首查，按序）
 
-1. prompt_logprobs 输出格式/键名（P2 首个验证项）；max_logprobs 启动参数
-2. scoring 调用的 KV/吞吐实测（NF09 算力账）
-3. draft 与 verify 的 π 数值残差（~1e-3 预期，smoke 必测）
-4. 清理面误伤（每步 import+测试把关）
+1. `prompt_logprobs`/`logprobs=K` 真实输出格式与 `logprobs_mode` 语义
+   （raw vs processed；T=1 全分布下应一致）
+2. **prefix cache × prompt_logprobs 冲突**：vLLM 对 cached prefix 可能不产
+   logprobs 行——若冲突，教师路由禁 prefix cache 或接受重算（实测定）
+3. max_logprobs=256（obs_topk）启动参数生效；verify 段级 prefill 的墙钟
+   （NF09 算力账：每轮 ≤(R_max+1) 次 prefill）
+4. draft/verify 的 π 数值残差（bf16 采样 vs 打分，~1e-3 预期）
+5. θ_D 标定 run（三件套配置）→ P85 → 正式 run 配置
+6. 冒烟对照：steering off vs on（θ_D 标定后）首 2 step 的 steer_count/
+   budget_spent/reject 率曲线（rollout_extra 通道）与墙钟差

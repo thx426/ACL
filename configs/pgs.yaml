@@ -114,7 +114,10 @@ steering:
   topk: 64                  # 保尾核候选集 S = 两侧 top-K 并集 | launcher 联动
                             # vLLM max_logprobs ≥ 本值(启动期参数)
   theta_d: 0.0              # D 主门冻结阈值 | 0=未标定占位,启用时启动校验拒绝;
-                            # 用目标语境预扫描 D 分布的 P85 定值(规范 §2.3)
+                            # 用目标语境预扫描 D 分布的 P85 定值(规范 §2.3):
+                            # 标定 run 配 theta_d=1e9(门恒关哨兵,行为=纯 bare)
+                            # + epsilon=0(零干预)+ gate_rate_bounds=[0,1],跑几步后
+                            # scripts/calibrate_theta_d.py 聚合 D 直方图出建议值
   epsilon: 0.05             # ε 探针翻转概率(倾向得分可辨识性)| 规范 §2.3
   gate_rate_bounds: [0.02, 0.30]  # 开门率合法带,越界报警(不自动调,冻结语义)
   r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
