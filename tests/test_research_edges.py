@@ -160,3 +160,70 @@ async def test_session_accumulates_researcher_usage():
     result = await session.run()
     assert result.error and result.prompt_tokens == 1000
     assert result.completion_tokens == 200
+
+
+# ---------------------------------------------------------------------------
+# CD-006 反馈 §1(2026-08-03):research_final_success 的正确口径
+# ---------------------------------------------------------------------------
+def _mk_result(doc, guidance_log):
+    from trace_opd.research.session import SessionResult
+
+    return SessionResult(
+        finalized=True, no_finalize=False, turns_used=5, experiments_used=len(guidance_log),
+        episodes_consumed=sum(e.get("k", 0) for e in guidance_log), doc=doc,
+        self_assessment="", flags=[], last_exp_successes=0, last_exp_attempts=4,
+        guidance_log=guidance_log,
+    )
+
+
+def test_final_doc_success_ignores_trailing_bare_probe():
+    # 反号场景(CD-006 实测:最新文档 8/8 而末次 bare 0/4):定稿文档的
+    # 实测战绩必须胜出,不被末次 bare 探针污染。
+    from trace_opd.core.types import guidance_hash
+    from trace_opd.research.session import final_doc_success
+
+    doc = "go to sidetable 1; the laptop is on the desk"
+    h = guidance_hash(doc)
+    log = [
+        {"guidance_hash": h, "successes": 8, "attempts": 8, "k": 8},
+        {"guidance_hash": "bare", "successes": 0, "attempts": 4, "k": 4},
+    ]
+    assert final_doc_success(_mk_result(doc, log)) == 1.0
+
+
+def test_final_doc_success_pools_all_experiments_of_final_doc():
+    from trace_opd.core.types import guidance_hash
+    from trace_opd.research.session import final_doc_success
+
+    doc = "open the drawer first"
+    h = guidance_hash(doc)
+    log = [
+        {"guidance_hash": h, "successes": 1, "attempts": 4, "k": 4},
+        {"guidance_hash": "bare", "successes": 2, "attempts": 4, "k": 4},
+        {"guidance_hash": h, "successes": 3, "attempts": 4, "k": 4},
+    ]
+    assert final_doc_success(_mk_result(doc, log)) == (1 + 3) / 8
+
+
+def test_final_doc_success_falls_back_to_last_doc_experiment():
+    # 定稿是新写未测的文本 ⇒ 回退最后一次文档实验;bare 条目仍被排除。
+    from trace_opd.research.session import final_doc_success
+
+    log = [
+        {"guidance_hash": "aaa", "successes": 1, "attempts": 4, "k": 4},
+        {"guidance_hash": "bbb", "successes": 3, "attempts": 4, "k": 4},
+        {"guidance_hash": "bare", "successes": 0, "attempts": 4, "k": 4},
+    ]
+    assert final_doc_success(_mk_result("unseen final text", log)) == 0.75
+
+
+def test_final_doc_success_degrades_to_zero():
+    from trace_opd.research.session import final_doc_success
+
+    assert final_doc_success(None) == 0.0
+    assert final_doc_success(_mk_result("d", [])) == 0.0
+    # 旧会话(条目无 successes/attempts 回填)自动落空,不抛错。
+    legacy = [{"guidance_hash": "ccc", "k": 4}]
+    assert final_doc_success(_mk_result("d", legacy)) == 0.0
+    only_bare = [{"guidance_hash": "bare", "successes": 3, "attempts": 4, "k": 4}]
+    assert final_doc_success(_mk_result("d", only_bare)) == 0.0

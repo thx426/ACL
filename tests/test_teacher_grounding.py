@@ -1093,6 +1093,114 @@ def test_collect_observation_tg_rows_use_their_own_pack(losses_ns):
                 sys.modules[k] = v
 
 
+class _FakeStack:
+    """NonTensorStack 形态:list() 出来是包装对象,.tolist() 才解包成 dict。"""
+
+    def __init__(self, items, decoded=True):
+        self._items = items
+        self._decoded = decoded
+
+    def tolist(self):
+        if self._decoded:
+            return self._items
+        return [object() for _ in self._items]  # 解包失败形态:非 dict
+
+    def __iter__(self):
+        # list(extras) 的旧路径拿到的是包装对象(非 dict)——正是 §7 的根因。
+        return iter(object() for _ in self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+
+def _collect_data(extras):
+    nested = lambda rows_: torch.nested.nested_tensor(rows_, layout=torch.jagged)
+    n = len(extras)
+    return {
+        "prompts": nested([torch.zeros(1, dtype=torch.long)] * n),
+        "responses": nested([torch.tensor([5, 6])] * n),
+        "old_log_probs": nested([torch.zeros(2)] * n),
+        "response_mask": nested([torch.tensor([1, 1])] * n),
+        "rm_scores": nested([torch.tensor([1.0, 0.0])] * n),
+        "extra_fields": extras,
+        "global_steps": [4] * n,
+    }
+
+
+def test_collect_decodes_nontensorstack_extras(losses_ns):
+    """CD-006 反馈 §7:extra_fields 是 NonTensorStack,collect 必须 .tolist()
+    解包——否则所有元数据静默落默认值(won=0、task 空、turn_spans 空、tg 行
+    伪装成 bare)。修复后:包装形态下元数据完整。"""
+    ns, _ = losses_ns
+    rows_seen = {}
+    stub = _obs_stub(enabled=True, spy=lambda **kw: rows_seen.update(kw))
+    ulysses = types.ModuleType("verl.utils.ulysses")
+    ulysses.get_ulysses_sequence_parallel_world_size = lambda: 1
+    ulysses.get_ulysses_sequence_parallel_rank = lambda: 0
+    saved = {k: sys.modules.get(k) for k in
+             ("verl.trainer.distillation.observation", "verl.utils.ulysses")}
+    sys.modules["verl.trainer.distillation.observation"] = stub
+    sys.modules["verl.utils.ulysses"] = ulysses
+    try:
+        T = 6  # 2 rows x (P=1 + R=2) packed
+        extras = _FakeStack([
+            {"sample_role": "bare", "won": 1, "task_id": "t-a",
+             "turn_spans": [[0, 2]]},
+            {"sample_role": "sft", "won": 1, "task_id": "t-b"},
+        ])
+        obs = {k: torch.zeros(1, T, 2) for k in
+               ("teacher_lps", "student_lps", "student_support_lps")}
+        obs["teacher_ids"] = torch.zeros(1, T, 2, dtype=torch.int32)
+        obs["student_ids"] = torch.zeros(1, T, 2, dtype=torch.int32)
+        ns["_collect_observation_rows"](
+            _collect_data(extras), obs, torch.zeros(1, T),
+            loss_mode="reverse_kl_topk", log_prob_min_clamp=-10.0)
+        rows = rows_seen["rows"]
+        # 解包生效:bare 行元数据完整;sft 行(零教师包语义)被跳过。
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == "t-a" and rows[0]["won"] == 1
+        assert rows[0]["turn_spans"] == [[0, 2]]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def test_collect_disables_loud_on_undecodable_extras(losses_ns):
+    """解包失败(全部非 dict)不再安静写默认值:raise 落入 _disable,原因
+    可读,且不落任何行。"""
+    ns, _ = losses_ns
+    disabled, collected = [], []
+    stub = _obs_stub(enabled=True, spy=lambda **kw: collected.append(kw))
+    stub._disable = lambda why: disabled.append(why)
+    ulysses = types.ModuleType("verl.utils.ulysses")
+    ulysses.get_ulysses_sequence_parallel_world_size = lambda: 1
+    ulysses.get_ulysses_sequence_parallel_rank = lambda: 0
+    saved = {k: sys.modules.get(k) for k in
+             ("verl.trainer.distillation.observation", "verl.utils.ulysses")}
+    sys.modules["verl.trainer.distillation.observation"] = stub
+    sys.modules["verl.utils.ulysses"] = ulysses
+    try:
+        extras = _FakeStack([{"sample_role": "bare"}], decoded=False)
+        obs = {k: torch.zeros(1, 2, 2) for k in
+               ("teacher_lps", "student_lps", "student_support_lps")}
+        obs["teacher_ids"] = torch.zeros(1, 2, 2, dtype=torch.int32)
+        obs["student_ids"] = torch.zeros(1, 2, 2, dtype=torch.int32)
+        ns["_collect_observation_rows"](
+            _collect_data(extras), obs, torch.zeros(1, 2),
+            loss_mode="reverse_kl_topk", log_prob_min_clamp=-10.0)
+        assert not collected
+        assert disabled and "did not decode" in disabled[0]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def test_tg_gradient_bounded_under_extreme_q():
     """User-requested extreme-case pin (2026-08-02): the tg soft-CE has NO
     1/q term — the log singularity cancels against the softmax Jacobian, so

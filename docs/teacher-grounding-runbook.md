@@ -96,8 +96,10 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 3. **打分后端**:日志有 `teacher_topk_fsdp ACTIVE` 探针;无任何
    `teacher_mode ... provenance` / `'tg' but ... missing` / `tg_label_ids
    ... missing` fail-loud 文本。
-4. **P0-2 不变量(解耦后仍监控)**:`tg/loss_min_preclamp ≥ -1e-6`(独立
-   soft-CE 数学非负;显著负值 = 公式破,停下报机制侧)。
+4. **P0-2 不变量(解耦后仍监控)**:`tg/loss_min_preclamp ≥ -1e-3`(CD-006
+   反馈 §2 修订:soft-CE 数学非负,但 top-64 fp32 求和的舍入残差本就在
+   1e-6 量级,−1e-6 会误报;判读看**量级是否随训练增长**——舍入恒 ~1e-6,
+   结构性 bug 会推到 1e-2 以上)。
 5. **标签质量曲线活着**:`tg_label_thought_cpt`/`_chars`/`_turns` 三键有值;
    **判读口径 = mean(tg_label_thought_cpt) ÷ mean(tg_role)**(标签行的逐轨迹
    均值,与离线 won_traj_evolution 同 estimand)——应落健康区(基线 step5-7
@@ -117,9 +119,12 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 - tg 专属:`tg/loss`(应下降收敛)、`tg/rows` 与 `tg_role`(随胜率上升)、
   `tg/loss_min_preclamp`(恒 ≥ -1e-6)、`tg/loss_max`(大值合法=q 支持集外
   质量,应随训练回落)、dropped 三计数。
-- **枢纽变量(标签质量)**:cpt 判读 = mean(tg_label_thought_cpt)÷mean(tg_role)
-  ——若相对健康期(284–315)持续上行 >2×,报回并附曲线,等待健康门启用裁定
-  (阈值锚健康期,严禁滚动上调)。
+- **枢纽变量(标签质量)**:cpt 判读 = mean(tg_label_thought_cpt)÷mean(tg_role)。
+  **健康区一律用本 run 自基线**(CD-006 反馈 §3/§6 实证采纳:前 5–7 步实测
+  均值即健康期;外部参考值——rkl+RL 臂 284–315、纯 rkl raw 349–418、t1_cs6
+  step-1 336.9——只作量级参照,不作告警线;沿用外部基线会晚报约八步)。
+  相对自基线持续上行 >2× ⇒ 报回并附曲线,等待健康门启用裁定(阈值锚自
+  基线,严禁滚动上调)。
 - **预注册主判据(病的终点)**:response length / p95 / resp_clip——step-9
   相变是否推迟/压平;崩塌步 > 基线×1.5 或预算内不崩 ⇒ 正向。
 - **won 分层锐判据**:`python3 scripts/won_traj_evolution.py --rollouts
@@ -137,7 +142,10 @@ L = (N_lost/N)·mean_lost[ OPD(rkl_topk) ] + w_tg·(N_tg/N)·mean_won[ tg soft-C
 
 | 信号 | 判定 | 动作 |
 |---|---|---|
-| 既有组合签名触发(长度钉顶+熵尖峰+score 归零) | 崩塌 | 停;存峰值 ckpt;对照点已达即有效读数 |
+| 既有组合签名触发(长度钉顶+熵尖峰+score 归零) | 崩塌(通胀形态) | 停;存峰值 ckpt;对照点已达即有效读数 |
+| **熵相对本 run 早期均值持续下滑**(t1_cs6 参照:0.70–0.78 → 0.556@14 已可读)| **坍缩形态前兆**(CD-006 §6:比胜率灵敏,胜率受批次构成干扰) | 报回;三信号并发即停 |
+| **逐字重复率超本 run 自基线告警线**(前 5–7 步均值+3σ;t1_cs6 例 1.6%±1.6% ⇒ 线 6.4%) | 不动点死锁前兆(无效动作率对此类完全失明) | 报回;三信号并发即停 |
+| **grad_norm 持续单调衰减**(与上两条并发) | 分布收窄进行时 | 三信号并发 = 坍缩判定,停;存 ckpt |
 | `tg/loss_min_preclamp < -0.01` 持续 | 独立公式不变量破 | 停,报机制侧 |
 | won 率 >0 而 `tg/rows` 连续多 step 为 0 | 分流断裂 | 停,查 doc 生成与 overflow 计数 |
 | `tg_dropped_unhealthy > 0`(门关着) | 配置错 | 停,查 effective_config |

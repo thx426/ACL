@@ -976,7 +976,22 @@ def _collect_observation_rows(
         mask_rows = [m.cpu().numpy() for m in data["response_mask"].unbind()]
         rewards = data["rm_scores"].to_padded_tensor(0.0).sum(-1).cpu().tolist()
         extras = data.get("extra_fields", None)
+        # CD-006 feedback §7 (2026-08-03): extra_fields is a NonTensorStack —
+        # plain list() yields WRAPPER objects, isinstance(e, dict) is False
+        # for every row, and every metadata field silently degrades to its
+        # default (empty task/won/turn_spans, tg rows masquerading as bare
+        # with a zero teacher pack that LOOKS like real data). Unpack exactly
+        # like the tg-loss path does (losses.py tg_token_mask construction),
+        # and fail loud inside the best-effort contract: a raise here lands
+        # in _disable() with this reason instead of quietly writing defaults.
+        if extras is not None and hasattr(extras, "tolist"):
+            extras = extras.tolist()
         extras = list(extras) if extras is not None else [{}] * len(resp_rows)
+        if extras and not any(isinstance(e, dict) for e in extras):
+            raise RuntimeError(
+                "extra_fields did not decode to dicts (NonTensorStack unpack "
+                "failed) — obs rows would silently carry default metadata"
+            )
 
         sp_size = get_ulysses_sequence_parallel_world_size()
         sp_rank = get_ulysses_sequence_parallel_rank() if sp_size > 1 else 0
@@ -1017,6 +1032,11 @@ def _collect_observation_rows(
             # label and nothing to observe.
             is_real_tg = extra.get("teacher_mode") == "tg"
             if extra.get("sample_role") == "tg" and not is_real_tg:
+                continue
+            if extra.get("sample_role") in ("sft", "research"):
+                # No distillation semantics on these rows — their teacher_*
+                # stubs are zeros and would render as fake data downstream
+                # (CD-006 §7: a zero pack LOOKS real in the UI).
                 continue
             if is_real_tg and (tg_token_losses is None or "tg_label_ids" not in obs):
                 continue  # tg row but no tg pack shipped — skip, never mix

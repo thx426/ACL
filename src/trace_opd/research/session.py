@@ -50,6 +50,44 @@ class SessionResult:
     completion_tokens: int = 0
 
 
+def final_doc_success(result: "SessionResult | None") -> float:
+    """PG-7 文档质量信号的正确口径(CD-006 反馈 §1,2026-08-03)。
+
+    旧口径 last_exp_successes/att 量的是「末次实验」——而末次有 ~25% 概率是
+    bare 探针,那时它量的是裸成功率,单任务可完全反号(最新文档 8/8 记成
+    bare 0/4)。新口径按代价递进:
+
+    1. 定稿文档(result.doc)的 hash 在 guidance_log 里的全部实验合计成功率
+       ——「定稿文档的实测战绩」,与 RL 路径 select_best_doc 的 best["p"]
+       语义对齐;
+    2. 定稿 hash 无实验记录(定稿是新写未测的文本)⇒ 回退最后一次**文档**
+       实验(guidance_hash != "bare")的成功率;
+    3. 无任何带战绩的文档实验 ⇒ 0.0。
+
+    依赖 tools.py 对 guidance_log 条目的 successes/attempts 回填;旧会话
+    (无回填字段)自动落入回退链,不抛错。
+    """
+    if result is None:
+        return 0.0
+    entries = [
+        e for e in (result.guidance_log or [])
+        if e.get("guidance_hash") != "bare" and e.get("attempts")
+    ]
+    if not entries:
+        return 0.0
+    if result.doc:
+        from ..core.types import guidance_hash
+
+        doc_hash = guidance_hash(result.doc)
+        doc_entries = [e for e in entries if e.get("guidance_hash") == doc_hash]
+        if doc_entries:
+            att = sum(int(e["attempts"]) for e in doc_entries)
+            suc = sum(int(e.get("successes", 0)) for e in doc_entries)
+            return suc / att if att else 0.0
+    last = entries[-1]
+    return int(last.get("successes", 0)) / int(last["attempts"])
+
+
 class ResearchSession:
     def __init__(
         self,

@@ -289,6 +289,13 @@ class ToolRouter:
         if attempts:
             st.last_exp_successes = successes
             st.last_exp_attempts = attempts
+            # CD-006 反馈 §1(2026-08-03):把本实验的战绩回填进它自己的
+            # guidance_log 条目(158 行 append 的正是本实验,期间无其他
+            # append)——这让"定稿文档的实测成功率"成为可计算量,
+            # research_final_success 不再被末次 bare 探针污染。
+            if st.guidance_log:
+                st.guidance_log[-1]["successes"] = successes
+                st.guidance_log[-1]["attempts"] = attempts
         summary = f"\nSummary: {successes}/{attempts} SUCCESS"
         if len(records) != attempts:
             summary += f" ({len(records) - attempts} episode(s) hit environment errors — not counted)"

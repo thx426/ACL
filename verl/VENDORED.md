@@ -1,6 +1,6 @@
 # Vendored verl(trace-opd 分支完整工作树)
 
-> 本目录是 verl 仓库 **trace-opd 分支 HEAD(d6ac87e)的 `git archive` 完整导出**
+> 本目录是 verl 仓库 **trace-opd 分支 HEAD(0303092)的 `git archive` 完整导出**
 > (用户要求 2026-07-23:改写适配后的完整 verl 代码随 trace_opd 一体存放/部署)。
 > 训练时 `scripts/launch_train.py` 自动把本目录前置进 PYTHONPATH——**实际
 > import 的就是这份代码**(优先于 venv 里安装的 verl),启动日志会打印
@@ -44,6 +44,7 @@
 | 0a4bb30 | trace-opd:**tg 目标与 OPD 族解耦**(用户裁定 2026-08-02)——打分器把 tg 标签发到独立 `tg_label_ids`/`tg_label_logprobs` 通道(batch 含 tg 行才存在;tg 行的 teacher_* 变零占位,与 sft 行同款,OPD 公式不再见到裸策略标签);独立公式 `compute_tg_soft_ce`(chunked gather soft-CE,结构性无任何 OPD clamp,P0-2 豁免由打洞变结构;SP 切法与 OPD 同构;无 tg 行微批发零矩阵);`compute_forward_kl_topk` 整段还原纯 OPD 形态(撤 tg_token_mask 打洞);聚合层读专属 `tg_losses` 矩阵、缺失 fail-loud;显微镜 obs 跳过 tg 行;校验白名单 {forward_kl_topk, reverse_kl_topk}——k3/gated 的 teacher_topk=0 单列打分布局与 tg 的 top-64 标签无法共存于同一 batch 宽度(结构不兼容,非折中)|
 | 189d789 | trace-opd:**codex 二轮实施审阅修复批**——P0-1 tg_token_mask 谓词改 `teacher_mode=="tg"`(与打分器 has_tg 同谓词;占位行 only 的分片不再索要不存在的标签通道→前向 RuntimeError/collective 挂死);P0-2 `_chunked_topk_log_probs` 增 out_dtype(默认 None=历史 bf16 行为),tg soft-CE 全程 fp32(bf16 回写 ~1e-3 误差把近收敛 KL(~1e-5)翻负,clamp_min(0) 恰在精修区杀掉 loss+梯度);P0-3 `Metric.aggregate_dp` 等长断言只留 SUM/MEAN,MIN/MAX 改 ragged flatten 取极值(条件发射的极值指标在动态装箱下各 rank 计数合法不同,旧断言直接崩训练);P1-1 全 tg 微批 overlap 空集不再产 NaN(缺席而非零);P1-3 观察包新增稳定 `row_uid`(微批指纹+行号,SP 组内一致;resp_hash 降级为一致性校验);P1-6 目标存在性校验纳入 tg_loss_coef(TG-only 合法);P2-2 字段注释同步解耦语义 |
 | d6ac87e | trace-opd:**tg 行分布级观察**(环1 显微,用户裁定补全)——`compute_tg_soft_ce` 增 obs_sink:观察开启时发三个 [1,T/sp,K] 数组(标签 p̄ 的 ids/lps + q 在标签支持集的 log-prob,tg 位外为零,与 OPD obs 同 SP 坐标系);collect 层真 tg 行以专属包落盘(teacher_*=标签 p̄、student_support_lps=q-on-support、token_loss=soft-CE 矩阵;student_* 本就是 q 自身 top-k),占位行(tg_skip)继续跳过——支撑 tg loss 段分解(lost 区 OPD-KL 段分解的镜像:教师被纠正的梯度花在叙述还是行动)|
+| 0303092 | trace-opd:**obs 收集处 extra_fields 解包修复**(CD-006 反馈 §7,长期缺陷)——collect 对 NonTensorStack 补 `.tolist()` 解包(与 tg 损失路径同款;旧 `list()` 得到包装对象,全部元数据静默落默认:task/won/turn_spans 空、tg 行伪装 bare、赢行零教师包在 UI 像真数据,7 月基线 run 即如此);解包失败 raise 落 `_disable`(原因可读,不再安静写默认值);sft/research 行跳过(零教师包语义,防假数据)。训练本身不受影响(损失路径读取一直正确)|
 
 | f27eb65 | trace-opd:混合目标的两处归一化定正——①`config.global_batch_info` 只由 `ppo_loss` 写入,而纯 OPD 路径从不调它 ⇒ 现行 OPD 一直是「每微批 token 平均」;开 RL 臂后该 config 跨微批存活,使 OPD 从第二个微批起静默换成全局分母(尺度跳 ~微批数×dp_size)且**只发生在开 RL 的臂** ⇒ 消融失效。现 OPD 项在 `rl_loss_coef>0` 时对清空后的快照求值,各臂钉死纯 OPD 口径。②SFT 项改为自算「每微批 expert token 平均」(clamp 分母)——同族口径使 `sft_loss_coef` 跨臂含义一致,且规避 `agg_loss` token-mean 在「该微批无 expert token」时的 0/0 → NaN |
 | c7c2194 | trace-opd:混合目标的三处收口——①`construct_minimal_padding_template` 会 clone 源行**全部**字段再覆盖一份固定清单,`sft_mask` 不在其中 ⇒ 合成的 padding 行带着**别的行的全长 mask**(很可能是真专家行的),而其 responses 已截到 1 token ⇒ SFT loss 形状崩溃,或(宽度恰好相同时)**静默虚增 `sft/expert_tokens`**——正是判定该臂是否生效的指标。现按需收缩(字段存在才改,SFT 关时不凭空造字段);`sft_ce_loss` 另加形状断言,任何未来"合成整行"的路径都会 fail loud 而非错数。②TQ 侧 mask 切分原为无条件执行,SFT 关时仍每行分配零 `sft_mask` 并入 TQ(每 step 数十 MB 纯浪费)⇒ 改由 `sample_role` 标记 gate(trace agent loop 仅在该臂开启时给所有行盖章)⇒ **关臂即零开销**。③`global_batch_info` 快照仅在 RL 臂开启时执行 |

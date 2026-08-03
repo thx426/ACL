@@ -67,7 +67,7 @@ from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
 from ..docstore.archive import ResearchArchive
 from ..envs.alfworld.adapter import AlfworldEnvFactory
 from ..research.prompts import build_researcher_system
-from ..research.session import ResearchSession, SessionResult
+from ..research.session import ResearchSession, SessionResult, final_doc_success
 from ..research.toolproto import make_tool_protocol
 from ..research.tools import ToolRouter
 from .backends import (
@@ -338,9 +338,12 @@ class TraceAgentLoop(AgentLoopBase):
             "research_experiments": result.experiments_used if result else 0,
             "research_episodes": result.episodes_consumed if result else 0,
             "research_turns": result.turns_used if result else 0,
-            "research_final_success": (
-                result.last_exp_successes / att if result is not None and att else 0.0
-            ),
+            # CD-006 反馈 §1:旧口径 last_exp_successes/att 有 ~25% 概率量到
+            # 末次 bare 探针(裸成功率,与文档质量无关,单任务可反号)。新
+            # 口径 = 定稿文档的实测战绩(final_doc_success,回退链见其
+            # docstring),与 RL 路径 select_best_doc 的 best["p"] 语义对齐
+            # ——它是 PG-7 文档质量信号与 runbook 判停哨的数据源。
+            "research_final_success": final_doc_success(result),
             "doc_words": len(doc.split()) if doc else 0,
             "doc_missing": int(not doc),
         }
