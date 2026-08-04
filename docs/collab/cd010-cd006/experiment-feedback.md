@@ -127,3 +127,40 @@ padding 放大 + 单条独占微批会把峰值推过 80G。
 前提已实测:LD_PRELOAD 后 flash-attn 2.8.3 **真实前向可用**;Qwen3-4B 32 heads / 8 kv_heads,
 4 卡与 2 均可整除。**首轮暂按 sp=1 跑(维持预注册),显存纳入监控**;
 若峰值逼近 78G 或出现 OOM,再切 sp=2 重跑。
+
+---
+
+## 2026-08-04 · [P0] SPS 真机墙钟 ~20×(而非设计预期 <2×);根因=接口层序列化,不是算力
+
+**发现**:标定 run(steering on,门恒关)rollout 落盘 **2.8 条/分钟** ⇒ 128 条约需
+46 分钟;base(steering off)整步仅 3.58 分钟。按此 s1 正式 100 步需 **77 小时**。
+
+**剖析定位(实测,非推断)**:
+```
+vLLMHttpServer.generate ×4 : CPU 85.7 / 85.6 / 85.5 / 85.2 %   ← 打满
+AgentLoopWorkerTQ       ×16: CPU 5.1 / 3.8 / 5.1 %             ← 几乎闲置
+GPU                        : 多数采样 0%,偶发 300W             ← 算力闲置
+```
+⇒ 瓶颈在 **vLLM 服务进程内 `extract_prompt_logprobs` 的 Python 对象构造**
+(单线程 GIL),不是 GPU、不是并发度。
+
+**为什么设计时没算到**:NF09 的算力账只算 FLOPs(draft 与普通 rollout 同价、
+verify 是一次增量 prefill),**没有"返回数据构造成本"这个维度**。实际每次 verify
+要为序列每个位置构造 obs_topk=256 宽的明细(约 1600 位置 × 256 = 41 万个 Python
+对象),而 SPS 只读最后 len(draft)+1 行 ⇒ **约 95% 算了、打包了、传了然后丢弃**。
+(叠加此前发现的 prefix-cache 对 prompt_logprobs 自动失效,但那一项不致命:
+1600 token prefill 对 A800 是亚秒级。)
+
+**已实施修复(实验侧,纯序列化裁剪、零语义变化)**:commit `ff817e6`
+- `extract_prompt_logprobs(..., tail=N)`:只序列化尾部 N 行(仍带 dummy 行)
+- `vllm_async_server`:从 sampling_params 取 `prompt_logprobs_tail` 透传
+- `hook._verify_rows`:请求 `tail=len(draft)+1`,行定位改为**相对返回数组长度**
+  ⇒ 全量返回与裁剪返回都正确(全量时退化为原式)
+
+**正确性守卫(同时补上审阅测试缺口 #2)**:新增位置相关 verify mock(第 r 行把
+token r%V 排 rank-1),两条测试:①裁剪 vs 全量返回必须产出逐 token 相同的执行
+序列与 D 观测;②反证 —— 人为整体挪一行必须被检出(否则①为空测)。
+
+**给 CD-010 的建议**:①规范的算力账应补"接口/序列化成本"一维;②`obs_topk=256`
+是另一层 4× 放大(S 每侧只用 topk=64),若裁剪后仍不够快可再降,代价是窗外
+代入率上升(实测现为 10.4%)。
