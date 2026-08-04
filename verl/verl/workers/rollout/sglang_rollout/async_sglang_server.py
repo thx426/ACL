@@ -73,62 +73,88 @@ def _extract_prompt_logprobs_sglang(
     trailing dummy row — identical to the vLLM extractor, so consumers (SPS verify
     hook / distillation teacher manager) treat both engines interchangeably.
 
-    Row-window semantics (trace-opd PGS, 2026-08-05):
-    - ``logprob_start_len == 0`` (full prompt): SGLang's entry 0 has
-      ``logprob=None`` (no predicting context) — skip it, matching vLLM's
-      ``prompt_logprobs[1:]``; total rows = ``sequence_length``.
-    - ``logprob_start_len > 0`` (windowed / tail-only): every returned entry has
-      full context, entry 0 is a REAL row (predicting position start_len) — do
-      NOT skip; total rows = ``sequence_length - logprob_start_len + 1``. This is
-      the off-by-one trap of the SGLang migration; both branches are asserted
-      against the actual payload below (fail loud, never misalign silently).
+    Row-window semantics (trace-opd PGS, 2026-08-05; codex review P0 fix):
+    ``x[i]``'s logprob comes from the PREVIOUS position's logits, and SGLang's
+    extend forward starting at ``start`` only produces ``logits[start:]`` — so
+    the window head ``x[start]`` is physically unscorable and SGLang returns a
+    ``None`` first entry for EVERY request (``start==0`` and ``start>0`` alike;
+    sglang 0.5.8 scheduler_output_processor builds ``[None] + rows``). Contract:
+    unconditionally drop the None head, append the trailing dummy — total rows
+    = ``sequence_length - logprob_start_len``. Callers wanting the last T rows
+    (T-1 real + dummy, = vLLM extract tail=T) must request
+    ``logprob_start_len = max(0, L - T)``. Both the None head and the row count
+    are enforced with RuntimeError (assert would vanish under ``python -O``).
     """
     input_token_logprobs = meta_info.get("input_token_logprobs") or []
     if num_prompt_logprobs > 0:
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
-    skip = 1 if logprob_start_len == 0 else 0
-    if input_token_logprobs:
-        first_lp = input_token_logprobs[0][0]
-        if skip == 1 and first_lp is not None:
-            raise RuntimeError(
-                "SGLang input_token_logprobs[0] has a real logprob under "
-                "logprob_start_len=0 — row convention drifted, refusing to skip it"
-            )
-        if skip == 0 and first_lp is None:
-            raise RuntimeError(
-                f"SGLang input_token_logprobs[0] is None under logprob_start_len="
-                f"{logprob_start_len} — windowed rows should all have context"
-            )
-    for position in range(skip, len(input_token_logprobs)):
+    if not input_token_logprobs:
+        raise RuntimeError(
+            "SGLang returned empty input_token_logprobs for a prompt_logprobs "
+            "request — logprob channel broken"
+        )
+    if input_token_logprobs[0][0] is not None:
+        raise RuntimeError(
+            f"SGLang input_token_logprobs[0] has a real logprob (start_len="
+            f"{logprob_start_len}) — the window head is physically unscorable, "
+            "row convention drifted; refusing to guess alignment"
+        )
+    for position in range(1, len(input_token_logprobs)):
         if num_prompt_logprobs == 0:
             logprob, token_id, _ = input_token_logprobs[position]
             prompt_ids_ls.append([int(token_id)])
             prompt_logprobs_ls.append([float(logprob)])
         else:
             top_entries = input_top_logprobs[position]
+            if not top_entries:
+                raise RuntimeError(
+                    f"SGLang input_top_logprobs[{position}] is empty for a "
+                    f"top-{num_prompt_logprobs} request — coverage broken"
+                )
             # SGLang returns ranked best-first; we preserve that ordering so rank
             # 0 is the top-1 token, matching the vLLM extractor's rank-1 slot.
             ids = [int(tok_id) for _, tok_id, _ in top_entries]
             logprobs = [float(logprob) for logprob, _, _ in top_entries]
-            assert len(ids) == num_prompt_logprobs, (
-                f"SGLang returned {len(ids)} top logprobs at position {position}, expected {num_prompt_logprobs}."
-            )
+            if len(ids) != num_prompt_logprobs:
+                raise RuntimeError(
+                    f"SGLang returned {len(ids)} top logprobs at position "
+                    f"{position}, expected {num_prompt_logprobs} — a short row "
+                    "would poison the steering candidate set"
+                )
             prompt_ids_ls.append(ids)
             prompt_logprobs_ls.append(logprobs)
     # Trailing dummy row so total length == len(sequence_ids), matching vLLM.
     pad_width = max(num_prompt_logprobs, 1)
     prompt_ids_ls.append([0] * pad_width)
     prompt_logprobs_ls.append([0.0] * pad_width)
-    expected_rows = sequence_length - logprob_start_len - (1 if logprob_start_len == 0 else 0) + 1
-    assert len(prompt_ids_ls) == expected_rows, (
-        f"SGLang prompt_logprobs rows ({len(prompt_ids_ls)}) != expected "
-        f"({expected_rows}) for sequence_length={sequence_length}, "
-        f"logprob_start_len={logprob_start_len}"
-    )
+    expected_rows = sequence_length - logprob_start_len
+    if len(prompt_ids_ls) != expected_rows:
+        raise RuntimeError(
+            f"SGLang prompt_logprobs rows ({len(prompt_ids_ls)}) != expected "
+            f"({expected_rows}) for sequence_length={sequence_length}, "
+            f"logprob_start_len={logprob_start_len}"
+        )
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def _normalize_finish_reason(finish_type):
+    """SGLang finish 值域(stop|length|abort)→ vLLM 适配器值域(completed|aborted)。
+
+    消费端契约(engine 无关侧,本仓 hook/episode/backends)只判 "aborted" =
+    基建故障;vllm_async_server 把 stop/length 归为 "completed"、abort 归为
+    "aborted",其余透传。SGLang 适配器必须逐字节同构,否则 "abort" 会被当
+    普通失败轨迹静默入训(codex review P0)。纯函数,零依赖,供 ast 级单测。
+    """
+    if finish_type is None:
+        return None
+    if finish_type == "abort":
+        return "aborted"
+    if finish_type in ("stop", "length"):
+        return "completed"
+    return finish_type
 
 
 def _extract_response_topk_sglang(
@@ -366,6 +392,11 @@ class SGLangHttpServer:
             "nnodes": self.nnodes,
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_running_requests": self.config.get("max_num_seqs", None),
+            # trace-opd PGS(codex review):这两项此前是 SGLang 下的"死参数"——
+            # launcher 照传但无人消费,读配置的人会以为生效。显式映射到 SGLang
+            # 的对应物:chunked-prefill 预算与模型上下文长度(与 vLLM 语义对齐)。
+            "chunked_prefill_size": self.config.get("max_num_batched_tokens", None) or None,
+            "context_length": self.config.get("max_model_len", None) or None,
             "log_level": "error",
             "mm_attention_backend": mm_attention_backend,
             "attention_backend": attention_backend,
@@ -632,6 +663,11 @@ class SGLangHttpServer:
                 f"({self.config.max_model_len})."
             )
 
+        if "max_new_tokens" in sampling_params and "max_tokens" in sampling_params:
+            # 双键并存时另一个会漏入 SamplingParams(TypeError 或静默覆盖)——拒绝
+            raise ValueError(
+                "sampling_params carries both max_new_tokens and max_tokens; pass exactly one"
+            )
         if "max_new_tokens" in sampling_params:
             max_new_tokens = sampling_params.pop("max_new_tokens")
         elif "max_tokens" in sampling_params:
@@ -669,6 +705,16 @@ class SGLangHttpServer:
         sampling_params.pop("detokenize", None)
         sampling_params.pop("flat_logprobs", None)
         _pl_tail = sampling_params.pop("prompt_logprobs_tail", None)
+        # vLLM 允许 top_k∈{0,-1} 表示禁用;SGLang 0.5.8 只接受 -1(0 被参数
+        # 校验拒绝)——归一化,避免等价请求被拒。
+        if sampling_params.get("top_k", None) == 0:
+            sampling_params["top_k"] = -1
+        # vLLM 的 seed 在 SGLang 叫 sampling_seed;full_determinism 注入逻辑
+        # 与 vllm_async_server 对齐(per-replica 确定性种子)。
+        if "seed" in sampling_params:
+            sampling_params["sampling_seed"] = sampling_params.pop("seed")
+        if self.config.full_determinism:
+            sampling_params.setdefault("sampling_seed", self.replica_rank + self.config.seed)
 
         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
         # input-token logprobs for every position (top-K when K>0, sampled-token
@@ -691,12 +737,16 @@ class SGLangHttpServer:
         if prompt_logprobs is not None:
             # trace-opd PGS tail contract (= vllm extract_prompt_logprobs):
             # tail=T ⇒ T-1 real rows + 1 dummy, real rows predict positions
-            # [L-(T-1), L). SGLang windows natively: logprob_start_len = L-(T-1)
-            # returns exactly those rows AND lets the radix cache serve the
-            # prefix KV (vLLM recomputes the full prefix) — the core win of the
-            # SGLang migration (verify cost O(prefix) → O(draft segment)).
+            # [L-(T-1), L). x[i]'s logprob needs logits[i-1], so the extend
+            # forward must START one position earlier: logprob_start_len =
+            # max(0, L - T); SGLang returns a None head at x[start] (dropped in
+            # the extractor) + exactly the T-1 real rows, while the radix cache
+            # still serves the prefix KV up to start (vLLM recomputes the full
+            # prefix) — the core win of the SGLang migration (codex review P0:
+            # the earlier L-(T-1) formula was off by one and unconditionally
+            # tripped the extractor's row check).
             if _pl_tail is not None and int(_pl_tail) >= 1:
-                logprob_start_len = max(0, len(prompt_ids) - (int(_pl_tail) - 1))
+                logprob_start_len = max(0, len(prompt_ids) - int(_pl_tail))
             request["logprob_start_len"] = logprob_start_len
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
@@ -723,22 +773,41 @@ class SGLangHttpServer:
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
+        # trace-opd PGS(codex review P0):SGLang 的 finish 值域是
+        # stop|length|abort,而消费端(hook/episode/backends)只识别 vLLM 适配器
+        # 的 completed|aborted——"abort" 直达会把基建中止静默当普通失败轨迹入训。
+        # 在 adapter 边界归一化到与 vLLM 完全一致的值域;未知类型透传(同 vLLM)。
+        finish_reason = _normalize_finish_reason(finish_reason)
         if return_logprob:
             token_ids = list(output.get("output_ids", []))
             output_token_logprobs = meta_info.get("output_token_logprobs") or []
-            if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
+            if len(output_token_logprobs) == len(token_ids):
                 log_probs = [float(log_prob) for log_prob, _, _ in output_token_logprobs]
-            else:
-                # SGLang may return mismatched lengths (e.g. max_new_tokens=0
-                # produces a phantom logprob entry with empty output_ids), or
-                # an abort may leave an empty logprob payload.
-                if len(output_token_logprobs) != len(token_ids):
-                    logger.error(
-                        f"output_token_logprobs length ({len(output_token_logprobs)}) != "
-                        f"output_ids length ({len(token_ids)}) for request {request_id}"
-                    )
+                # 逐位置 token 身份对账:tuple 里的 token id 必须与 output_ids
+                # 同位一致,错位即数据通道损坏(codex review 建议的运行时防线)。
+                for pos, (row, tok) in enumerate(zip(output_token_logprobs, token_ids)):
+                    if int(row[1]) != int(tok):
+                        raise RuntimeError(
+                            f"SGLang output_token_logprobs[{pos}] token id "
+                            f"({row[1]}) != output_ids[{pos}] ({tok}) for request "
+                            f"{request_id} — logprob rows misaligned"
+                        )
+            elif finish_reason == "aborted" or max_new_tokens == 0:
+                # 仅有的两个合法空账情形:引擎中止(消费端按基建故障处理)、
+                # prefill-only 打分(max_new_tokens=0 的 phantom 行)。
                 token_ids = []
                 log_probs = []
+            else:
+                # trace-opd PGS(codex review P1):其余任何缺失/错长都是数据
+                # 通道损坏——旧实现清空 token_ids 会把损坏伪装成正常空生成,
+                # 静默流入训练;一律 fail loud。
+                raise RuntimeError(
+                    f"SGLang output_token_logprobs length "
+                    f"({len(output_token_logprobs)}) != output_ids length "
+                    f"({len(token_ids)}) for request {request_id} "
+                    f"(finish={finish_reason!r}) — refusing to fabricate an "
+                    "empty generation from a broken logprob payload"
+                )
         else:
             token_ids = output["output_ids"]
             log_probs = None

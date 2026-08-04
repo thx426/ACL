@@ -77,6 +77,11 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
     # 是启动期参数(默认 20),必须 >= steering.topk,否则 verify 请求在运行
     # 中段被拒(P4 冒烟首查项,docs/pgs-impl-design.md)。
     steering_args = []
+    if t.rollout_backend == "sglang" and t.rollout_attention_backend:
+        steering_args.append(
+            "+actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend="
+            f"{t.rollout_attention_backend}"
+        )
     if cfg.steering.enabled and t.rollout_backend == "vllm":
         # 同源于 hook 的观测窗(steering.obs_topk):draft 的 logprobs=K 与
         # verify 的 prompt_logprobs=K 都要过 vLLM 的 max_logprobs 校验。

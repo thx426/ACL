@@ -64,7 +64,11 @@ python -c "import flashinfer" 2>&1 | tail -1              # 失败则记录,走 
 ```bash
 python -m sglang.launch_server \
   --model-path $TRACE_MODEL_PATH --port 30000 \
-  --mem-fraction-static 0.6 [--attention-backend triton]
+  --mem-fraction-static 0.6
+# ⚠ 0.5.8 的 attention backend 自动选择在 A800(sm80)上未经验证(codex 审阅
+# 提示默认可能选 fa3——那是 Hopper 专用)。起服若报 attention/kernel 相关错,
+# 依次显式重试:--attention-backend flashinfer / --attention-backend triton,
+# 把最终可用值回报 feedback(正式配置的 rollout_attention_backend 键按此填)。
 curl -s http://127.0.0.1:30000/generate -H 'Content-Type: application/json' -d '{
   "text": "The capital of France is", "sampling_params": {"max_new_tokens": 8}}'
 ```
@@ -92,21 +96,27 @@ def probe(logprob_start_len, tag):
     print(f"{tag}: rows={n_rows} top_width={width} latency={dt:.3f}s")
     return r
 
-n_prompt = None  # 先发一次全前缀拿行数 ⇒ prompt token 数
 probe(0, "full-A")            # 全前缀第 1 次(无缓存)
 probe(0, "full-B")            # 全前缀第 2 次
 r = probe(0, "full-C")
-L = len(r["meta_info"]["input_token_logprobs"])   # ≈ prompt token 数
+L = len(r["meta_info"]["input_token_logprobs"])   # = prompt token 数(首项 None 占位)
 probe(L - 8, "tail-A")        # tail-only 第 1 次(前缀应命中 radix cache)
 probe(L - 8, "tail-B")        # tail-only 第 2 次
 ```
 
-**断言**:① `top_width == 256` 且无报错/OOM(**大 K 支持度是全迁移的最大
-未知项,一票否决**);② tail 模式 `rows == 8`(行数=请求窗口,且首行 logprob
-非 null——`logprob_start_len>0` 时无 None 首项);③ **tail-A 的 latency 明显
-低于 full-C**(radix 命中 + 只 extend 尾部 = KV 复用生效的直接证据;若不低,
-说明 0.5.8 对带 logprob 请求也禁缓存 ⇒ 迁移收益不成立,立即反馈)。
-另观察:256 宽下服务显存增长是否平稳(`nvidia-smi` 前后对比)。
+**断言**(②已按 codex 审阅修正,2026-08-05):
+① `top_width == 256` 且无报错/OOM(**大 K 支持度是全迁移的最大未知项,
+一票否决**);
+② tail 模式(`logprob_start_len = L−8`)`rows == 8`,且 **首行 logprob 必须为
+null、其余 7 行全部非 null** —— x[i] 的 logprob 来自前一位置的 logits,
+extend 从 start 前向拿不到窗口头 x[start] 的分布,SGLang 对每个请求都返回
+None 首项(**若首行非 null 或全部非 null,说明行语义与适配层假设不符,
+一票否决并回报原始 payload**);
+③ **tail-A 的 latency 明显低于 full-C**(radix 命中 + 只 extend 尾部 = KV
+复用生效的直接证据;若不低,说明 0.5.8 对带 logprob 请求也禁缓存 ⇒ 迁移
+收益不成立,立即反馈)。
+另观察:256 宽下服务显存增长是否平稳(`nvidia-smi` 前后对比);top-256 行内
+token id 是否唯一、logprob 是否单调非增(抽查一行即可)。
 
 **门 4 · memory-saver 起服(verl 依赖它做训练期 sleep/wake)**
 

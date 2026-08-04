@@ -472,3 +472,36 @@ token"内;EMA 自适应会把门率收敛到 q,但**位置结构不变**(它只�
 **优先级建议**:2+3 合并做(前后端化顺带解决可达性)为主线;1 与 4 的说明性
 改进(图表注解/指标卡片/图例)可先以静态版快速迭代,界面精致化随前后端版落地。
 pgs_s1 正在产出数据(现 step≥2,全程 358 步),可作为实时开发的活数据源。
+
+## 2026-08-05 · [P1] SGLang 环境配置进展:162 走通方案 B(venv_sglang),门 1 全过;两处执行册勘误;门 2-4 待空卡
+
+**结论**:162 环境侧不占卡部分完成。**路线 = 方案 B**(独立 venv):方案 A dry-run
+判死——sglang 0.5.8 强制 torch 2.10.0→2.9.1 降级(连动 torchvision/audio、
+flashinfer 0.6.4→0.6.1),venv_train 不可动。`/data3/wushang/workspace/TRACE-OPD/
+venv_sglang`(uv 建,py3.12)已装齐。
+
+**版本四行**(uv pip list 实测):
+- sglang 0.5.8 / torch 2.9.1 / flashinfer-python 0.6.1 / sgl-kernel 0.3.21
+- flash-attn:venv_sglang 未装(推理面不需要;训练面补齐待 verl-sglang 适配联调时
+  按 torch 2.9.1 匹配重装,版本届时回报)。
+
+**门 1 逐项**:sglang import ✓ 0.5.8;flashinfer import ✓ 0.6.1(**无需 triton
+兜底**);**LD_PRELOAD 不需要**(manylinux wheel 自带 libstdc++ 兼容,与执行册
+§0.4 的预期不同——162 的 GLIBCXX 坑不迁移到 sglang 栈)。
+
+**执行册两处勘误**:
+1. `sglang[srt,openai]` 的 extras 在 0.5.8 不存在(uv warning:no extra named
+   srt/openai)——裸 `sglang==0.5.8` 已含 srt 全栈,文档命令请更新;
+2. 安装源:PyPI 官方直连在 162/A800 均为几百 KB/s(4GB 栈 >1h);TUNA 镜像
+   (`UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple`)分钟级完成。
+   执行册建议补默认镜像源。
+
+**门 2-4(起服/往返/机制三断言/memory-saver)待 1 张空 GPU**:162 四卡在
+pgs_s1、A800 八卡在 pgs_base_a800,无空窗;等 run 停点或用户裁定腾卡后立即执行,
+门 3 五个 latency + 三断言数字随后回报。
+
+**A800 前瞻(dry-run 进行中)**:结构性风险预判——sglang 依赖链是 PyPI CUDA
+二进制(torch 2.9.1/sgl-kernel/flashinfer 预编译 wheel),本机驱动 525 上
+PyPI CUDA 栈有"import 通但真实运算报驱动过旧"实测前科,且 conda-forge 无
+sglang/sgl-kernel。若 dry-run 后实装验证失败,A800 选项:①保持 vLLM 后端
+(回摆通道,base/对照臂本来不吃 verify 收益);②驱动升级(管理员级,需裁定)。

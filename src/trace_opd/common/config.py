@@ -105,6 +105,10 @@ class TrainCfg:
                                      # tail-only + radix 前缀复用,根治 verify
                                      # 平方墙钟;vllm 保留为回摆通道。执行层,
                                      # 不进 objective_fingerprint)
+    rollout_attention_backend: str = ""  # 仅 sglang 后端:attention 内核显式指定
+                                     # (空=引擎自动)。0.5.8 在 A800(sm80)上的
+                                     # 自动选择待 PoC 门 2 验证;若起服失败按
+                                     # 环境册填 flashinfer / triton / fa_x
     rollout_max_num_batched_tokens: int = 2048  # vLLM chunked-prefill budget; the
                                       # transient logits tensor during prompt_logprobs
                                       # scoring (SPS verify) is THIS x vocab x 2B
