@@ -36,8 +36,11 @@ from pathlib import Path
 
 import yaml
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "trace_opd" / "src"))
+# 自定位(实验反馈 P1:旧式 REPO/"trace_opd" 假设 worktree 目录名,部署改名
+# 会静默加载别的树的 verl/src——最坏一类故障)。ROOT = 脚本所在树的根,
+# worktree 叫什么名字都对。
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from trace_opd.common.config import (  # noqa: E402
     Config,
@@ -51,7 +54,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
     t = cfg.train
     if not t.model_path or not t.train_file or not t.val_files:
         raise SystemExit("train.model_path / train.train_file / train.val_files are required")
-    agent_cfg = REPO / "trace_opd" / "train" / "agent_loop_config.yaml"
+    agent_cfg = ROOT / "train" / "agent_loop_config.yaml"
     val_files = "[" + ",".join(f"'{v}'" for v in t.val_files) + "]"
     loggers = "[" + ",".join(f'"{x}"' for x in t.loggers) + "]"
     # Ulysses SP: sp>1 requires packed THD sequences, which in verl means
@@ -189,7 +192,7 @@ def main() -> int:
     cfg = load_config(config_path, overrides=args.overrides)
     # Each experiment owns a complete copy of the template, so a copy can fall
     # behind a mechanism change. Say so at launch.
-    template_path = REPO / "trace_opd" / "configs" / "pgs.yaml"
+    template_path = ROOT / "configs" / "pgs.yaml"
     if config_path != template_path and template_path.exists():
         drift = template_drift(config_path, template_path)
         for key in drift["missing"]:
@@ -209,7 +212,7 @@ def main() -> int:
 
     runs_root = Path(cfg.run.runs_root)
     if not runs_root.is_absolute():
-        runs_root = REPO / "trace_opd" / runs_root
+        runs_root = ROOT / runs_root
     run_dir = runs_root / cfg.run.name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -255,7 +258,7 @@ def main() -> int:
 
     # The vendored verl is prepended to PYTHONPATH so the run imports EXACTLY
     # the patched code shipped with this repo.
-    vendored_verl = REPO / "trace_opd" / "verl"
+    vendored_verl = ROOT / "verl"
     verl_path = ""
     if (vendored_verl / "verl" / "__init__.py").exists():
         verl_path = str(vendored_verl)
@@ -265,7 +268,7 @@ def main() -> int:
 
     env = dict(os.environ)
     pythonpath = ":".join(
-        p for p in (verl_path, str(REPO / "trace_opd" / "src"), env.get("PYTHONPATH", "")) if p
+        p for p in (verl_path, str(ROOT / "src"), env.get("PYTHONPATH", "")) if p
     )
     env.update(
         {
@@ -282,9 +285,9 @@ def main() -> int:
     # Settings that reach verl through the environment because verl reads them
     # there. The CONFIG is the source of truth; these are transport.
     env["TRACE_AGENT_TASK_TIMEOUT_S"] = str(cfg.train.agent_task_timeout_s)
-    # vLLM logprobs 路径的预算外大额临时分配(#5907)易碎片化;可扩展段减少
-    # 假性 OOM。constants_ppo 将其显式转发到 Ray worker。
-    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # 勿设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True:与 vLLM
+    # CuMemAllocator(sleep/wake 内存池)不兼容,worker 启动即 assert 拒绝
+    # (pytorch#147851;pgs_base 首启实测)。显存防御仅靠 rollout_gpu_mem。
     env["VLLM_RPC_TIMEOUT"] = str(cfg.train.vllm_rpc_timeout_ms)
     if cfg.train.dist_backend:
         env["VERL_DIST_BACKEND"] = cfg.train.dist_backend

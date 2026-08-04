@@ -146,3 +146,21 @@ P4   ⏳ 真机冒烟 —— 162 被 C3 占（step 38/97，~08-05/06 完）；A8
 5. θ_D 标定 run（三件套配置）→ P85 → 正式 run 配置
 6. 冒烟对照：steering off vs on（θ_D 标定后）首 2 step 的 steer_count/
    budget_spent/reject 率曲线（rollout_extra 通道）与墙钟差
+
+
+## 8. sp=2 / rmpad 路径下 W_beh 的正确性核查(2026-08-04,用户裁定 sp 配置化后)
+
+**结论:W_beh 通路与 ulysses_sp / use_remove_padding 正交,sp=2 下正确。** 链路:
+
+1. rollout 侧:`agent_loop_tq` 展开的 dense 权重是 **response 坐标**的 1D tensor
+   (逐轨迹变长),TQ 以 nested 形态存取——与训练端序列布局(padded/THD)无关;
+2. loss 层:`ppo_loss` 对 `response_mask/old_log_probs/advantages/rollout_is_weights`
+   统一 `to_padded_tensor()` 回 **padded 2D 空间**;`model_output["log_probs"]` 在
+   sp>1 时已由 engine 的 `gather_outputs_and_unpad` 归并回全长再 nested,经
+   `no_padding_2_padding` 同样落 padded 2D——vanilla loss 的逐元素乘全部发生在
+   同一 padded 坐标系,rmpad/sp 只是 forward 的内部实现;
+3. sp=2+rmpad 的 GRPO 主路径是 162 的历史成熟档(4B/SP2 主线全程),PGS 未触碰
+   该 forward 路径(蒸馏分支删除只移除了死代码)。
+
+**运行时终验**(替代无法本地复现的分布式数据流):s1 首个有 steer 的 step,
+swanlab `actor/rollout_is_weight_off1_frac` 必须 >0(run-guide 步骤⑤ 首查项)。

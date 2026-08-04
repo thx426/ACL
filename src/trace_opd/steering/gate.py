@@ -3,15 +3,19 @@
 可测性红线在**接口层**锁死：`decide()` 只接受 D 值与独立随机数——签名里
 不存在 draft token / 后缀的任何入口（NF04 的 σ(h_j, B_rem, 冻结统计, U_j)）。
 
-阈值 Θ_D：冻结校准值起步，训练步之间 robust-EMA 慢更新（分位数而非均值，
-防模板 token 主导——NF07）；触发率带预注册上下限，超限告警并降级。
-propensity 只记录、不进训练权重（NF07：RL 换测度中相消）。
+阈值 Θ_D:**率控自适应**(2026-08-04 用户裁定,推翻此前 IF-11 的 v1 冻结
+——标定实测 384 轨迹/84 万观测:D 分位跨 step 极稳但 CDF 门槛区间极陡,
+P85 与 P95 只差 0.01,固定阈值下门率不可控;控制量从「值」改为「率」):
 
+    θ_D(t+1) = (1−β)·θ_D(t) + β·P_{1−q}(第 t 步实测 D 分布)
 
-v1 冻结裁定(审阅 IF-11,spec §2.3 的实现注记):θ_D 标定一次、全程冻结;
-robust_quantile_update 是 v2 慢更新通道的预留件,生产路径不接线。门率越界
-只告警记账(rate_alarm → steer_gate_alarm 字段),不自动降级——可分析性
-优先(G0 教训:复杂自适应难归因)。
+q = gate_target_rate(默认 10%),β = gate_ema_beta(默认 0.1)。数据源 =
+上一 step 已完成轨迹的 D 直方图(滞后一步;分布 step 间稳定 ⇒ 滞后无害;
+因果性无损——判定仍不看当前 token,步内 θ 冻结)。worker 级独立追踪
+(GateThresholdTracker;每 worker 每 step 数千观测足够估分位,worker 间
+差异二阶)。标定 run 的角色从「一锤定音」降为「EMA 初值」。门率带告警
+保留为 EMA 失控的兜底。θ_D 逐轨迹值进记账(steer_theta_d)。
+propensity 只记录、不进训练权重(NF07:RL 换测度中相消)。
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["GateDecision", "SteeringGate"]
+__all__ = ["GateDecision", "GateThresholdTracker", "SteeringGate"]
 
 
 @dataclass(frozen=True)
@@ -99,3 +103,78 @@ def robust_quantile_update(current_theta: float, d_samples: np.ndarray, q: float
         return current_theta
     target = float(np.quantile(np.asarray(d_samples, dtype=np.float64), q))
     return ema * current_theta + (1.0 - ema) * target
+
+
+class GateThresholdTracker:
+    """worker 进程级的 θ_D 率控自适应追踪器(线程安全)。
+
+    生命周期:agent-loop worker 进程单例。每条轨迹结束时 ``observe()`` 并入
+    该轨迹的 D 直方图;检测到 global_step 前进时(``maybe_step_update``)
+    先用**上一 step 累积的直方图**做一次 EMA 更新、再清空累积——同一 step
+    内所有轨迹用同一个 θ_D(步内冻结,因果性;滞后一步,分布稳定则无害)。
+
+    直方图分位数:线性桶内插值;累积观测不足 ``min_obs`` 时跳过更新
+    (信号太少不动阈值,避免小样本抖动)。
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_init: float,
+        target_rate: float,
+        ema_beta: float,
+        d_hist_max: float,
+        bins: int,
+        min_obs: int = 500,
+    ) -> None:
+        import threading
+
+        if not (0.0 < target_rate < 1.0):
+            raise ValueError(f"target_rate must be in (0,1), got {target_rate}")
+        if not (0.0 < ema_beta <= 1.0):
+            raise ValueError(f"ema_beta must be in (0,1], got {ema_beta}")
+        self.theta = float(theta_init)
+        self.target_rate = float(target_rate)
+        self.ema_beta = float(ema_beta)
+        self.d_hist_max = float(d_hist_max)
+        self.bins = int(bins)
+        self.min_obs = int(min_obs)
+        self._acc = [0] * self.bins
+        self._acc_count = 0
+        self._last_step: int | None = None
+        self._lock = threading.Lock()
+
+    def observe(self, d_hist: list[int], d_count: int) -> None:
+        with self._lock:
+            for i, v in enumerate(d_hist[: self.bins]):
+                self._acc[i] += int(v)
+            self._acc_count += int(d_count)
+
+    def maybe_step_update(self, global_step: int | None) -> None:
+        """step 边界检测 + EMA 更新(worker 内每个 rollout 入口调一次)。"""
+        if global_step is None:
+            return
+        with self._lock:
+            if self._last_step is None:
+                self._last_step = int(global_step)
+                return
+            if int(global_step) == self._last_step:
+                return
+            # step 前进:用累积直方图更新 θ,再清空
+            if self._acc_count >= self.min_obs:
+                target = self._hist_quantile(1.0 - self.target_rate)
+                self.theta = (1.0 - self.ema_beta) * self.theta + self.ema_beta * target
+            self._acc = [0] * self.bins
+            self._acc_count = 0
+            self._last_step = int(global_step)
+
+    def _hist_quantile(self, q: float) -> float:
+        target = q * self._acc_count
+        acc = 0
+        for i, v in enumerate(self._acc):
+            acc += v
+            if acc >= target:
+                lo = i * self.d_hist_max / self.bins
+                frac = 1.0 - (acc - target) / v if v else 0.0
+                return lo + frac * (self.d_hist_max / self.bins)
+        return self.d_hist_max

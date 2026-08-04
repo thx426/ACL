@@ -95,9 +95,27 @@ def _shared_state(tokenizer) -> dict[str, Any]:
             config.alfworld.spawn_concurrency, workers
         )
         doc_table: dict[str, str] = {}
+        gate_tracker = None
         if config.steering.enabled:
             doc_table = _load_doc_table(config.steering.doc_table)
             logger.info("steering doc table loaded: %d tasks", len(doc_table))
+            if config.steering.gate_adaptive:
+                from ..steering.gate import GateThresholdTracker
+                from ..steering.ledger import D_HIST_BINS
+
+                gate_tracker = GateThresholdTracker(
+                    theta_init=config.steering.theta_d,
+                    target_rate=config.steering.gate_target_rate,
+                    ema_beta=config.steering.gate_ema_beta,
+                    d_hist_max=config.steering.c * config.steering.c,
+                    bins=D_HIST_BINS,
+                )
+                logger.info(
+                    "gate adaptive tracking on: q=%.2f beta=%.2f theta_init=%.4f",
+                    config.steering.gate_target_rate,
+                    config.steering.gate_ema_beta,
+                    config.steering.theta_d,
+                )
         _STATE.update(
             {
                 "config": config,
@@ -105,6 +123,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 "delta": TemplateDelta(tokenizer),
                 "factory": AlfworldEnvFactory(config.alfworld),
                 "doc_table": doc_table,
+                "gate_tracker": gate_tracker,
             }
         )
         return _STATE
@@ -119,6 +138,7 @@ class TraceAgentLoop(AgentLoopBase):
         self.delta: TemplateDelta = state["delta"]
         self.factory: AlfworldEnvFactory = state["factory"]
         self.doc_table: dict[str, str] = state["doc_table"]
+        self.gate_tracker = state["gate_tracker"]
 
     # --------------------------------------------------------------- prompts
 
@@ -171,6 +191,10 @@ class TraceAgentLoop(AgentLoopBase):
 
         steer_ctx = None
         if self.cfg.steering.enabled and not validate:
+            if self.gate_tracker is not None:
+                # 率控自适应:step 边界用上一 step 的 D 直方图 EMA 更新 θ_D
+                # (步内冻结;滞后一步)。
+                self.gate_tracker.maybe_step_update(global_step)
             doc = self.doc_table.get(adapter.task_id, "")
             steer_ctx = {"doc": doc, "doc_missing": int(not doc)}
 
@@ -203,6 +227,15 @@ class TraceAgentLoop(AgentLoopBase):
             steer_fields["steer_w_beh_mode"] = self.cfg.steering.w_beh_mode
             steer_fields["steer_log_ratio_cap"] = (
                 2.0 * self.cfg.steering.eta_max * self.cfg.steering.c
+            )
+            if state is not None and self.gate_tracker is not None:
+                # 本轨迹的 D 观测并入 worker 级追踪器(下一 step 边界生效)
+                self.gate_tracker.observe(state.ledger.d_hist, state.ledger.d_count)
+            # 本轨迹实际使用的 θ_D(自适应轨迹审计;swanlab 曲线自动收)
+            steer_fields["steer_theta_d"] = (
+                state.gate.theta_d if state is not None
+                else (self.gate_tracker.theta if self.gate_tracker is not None
+                      else self.cfg.steering.theta_d)
             )
             if state is not None:
                 alarm = state.gate.rate_alarm()
@@ -306,9 +339,12 @@ class TraceAgentLoop(AgentLoopBase):
         st_cfg = self.cfg.steering
         from ..steering import SteeringLedger
 
+        theta_now = (
+            self.gate_tracker.theta if self.gate_tracker is not None else st_cfg.theta_d
+        )
         state = TrajectorySteerState(
             gate=SteeringGate(
-                theta_d=st_cfg.theta_d,
+                theta_d=theta_now,
                 eta_max=st_cfg.eta_max,
                 epsilon=st_cfg.epsilon,
                 rate_bounds=tuple(st_cfg.gate_rate_bounds),

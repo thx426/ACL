@@ -7,10 +7,15 @@ CD-010,2026-08-04。配套阅读:`pgs-mechanism-explainer.md`(机制在干什么
 ## 0. 前提与环境(162)
 
 - 代码 = worktree `trace_opd-pgs`,分支 `pgs-sps`(**不要**用主树/其他 worktree 的代码)。
-  同步到 162:tar-over-ssh(纪律照旧),落到独立目录(建议
-  `/data3/wushang/workspace/TRACE-OPD/trace_opd-pgs/`),**勿覆盖** `trace_opd`
-  (CD-008/9)与 `trace_opd-pgc`(CD-005)。
-- venv:`venv_train`(162 训练环境,flash-attn 可用但 PGS 默认 sp=1 用不到)。
+  同步到 162:tar-over-ssh,**独立父目录**(现行部署
+  `/data3/wushang/workspace/TRACE-OPD-PGS/trace_opd/`,入口
+  `env_pgs.sh`/`run_pgs.sh`);launcher 已改**自定位**(commit 后目录任意命名
+  均正确),但沿用现行部署即可。**勿覆盖** `TRACE-OPD` 树(CD-008/9/5)。
+- **LD_PRELOAD 是 162 启动必要条件**(非可选):
+  `export LD_PRELOAD=/data3/wushang/libcxx_x/un/lib/libstdc++.so.6.0.34`
+  ——vLLM worker 无条件 import flash_attn(即使 PGS 用 sdpa),系统 libstdc++
+  只到 GLIBCXX_3.4.28 会当场 ImportError(env_pgs.sh 已含)。
+- venv:`venv_train`(162 训练环境;sp=2 档要求 flash-attn——LD_PRELOAD 后 2.8.3 实测可用)。
 - vendored verl 就在 worktree 内(`trace_opd-pgs/verl`),launcher 自动
   prepend 到 PYTHONPATH——**不需要**另装/另切 verl。
 - 环境变量(launcher 经 yaml `${VAR}` 消费):
@@ -61,7 +66,9 @@ python trace_opd/scripts/launch_train.py \
 python trace_opd/scripts/calibrate_theta_d.py --rollouts <run_dir>/rollouts
 ```
 输出两组标定量:
-- `suggested steering.theta_d`(D 分布 P85)→ 填入 s1 配置;
+- `suggested steering.theta_d`:**率控自适应下语义 = EMA 初值**(取 P(1−q),
+  q=gate_target_rate,即 `--q 0.90` 对应 q=10%)→ 填入 s1 配置;训练中 θ_D
+  每 step 自动追踪目标门率(swanlab `steer_theta_d` 曲线可审计);
 - **候选 c 饱和率表**(P(|ℓ|>c)):选 c 使饱和率落 10–25% 区间(spec c∈[2,3] 内取;
   若默认 2.5 的饱和率已在区间,不动)。若脚本 FATAL(分位落溢出桶)→ 反馈。
 
@@ -83,6 +90,9 @@ python trace_opd/scripts/launch_train.py \
   --config trace_opd/configs/experiments/162-pgs-s1.yaml --run-name pgs_r1_s1 \
   trainer.total_training_steps=100 trainer.test_freq=10 trainer.save_freq=10
 ```
+**s1 首查项(起跑后第一个有 steer 的 step)**:swanlab
+`actor/rollout_is_weight_off1_frac` 必须 >0 —— 这是 sp=2/rmpad 路径下 W_beh
+真实抵达 loss 的运行时终验(静态核查见 impl-design §8);=0 立即停查。
 长跑纪律照旧:setsid/nohup + 新连接确认进程存活;进度以文件系统产物为准。
 注:`trainer.*` 键属 verl 原生训练调度(非优化目标),launcher 的 passthrough
 守卫放行;**`algorithm.*` 等 objective 键会被 launcher 拒绝**——那类改动必须
@@ -96,7 +106,7 @@ python trace_opd/scripts/launch_train.py \
 |---|---|---|
 | `actor/rollout_is_weight_off1_frac` | s1 有 steer 的 step >0 | =0 ⇒ **W 静默丢失,立即停**反馈 |
 | 门率(`steer_n_base_open`/`steer_n_candidates`) | [5%,25%] | 滑出 ⇒ 记录,连续 10 step 出带 ⇒ 反馈 |
-| `steer_count` 均值 | ~2-4/轨迹 | 恒 0 或暴涨 ⇒ 反馈 |
+| `steer_count` 均值 | ~4-8/轨迹(B_∞=20) | 恒 0 或暴涨 ⇒ 反馈 |
 | `steer_gate_alarm` | 0 | >0 持续 ⇒ 反馈 |
 | entropy | 不持续跌破 0.2 | 触发安全门(§3) |
 | val won(seen/unseen) | 臂间对比 | 单点跌 >10pp ⇒ 安全门 |
@@ -123,10 +133,13 @@ thought 逐字重复率 >55% / entropy 持续 <0.2 / val 单点跌 >10pp / 不�
 | `doc_table` | (162 路径) | task_id→doc jsonl(GT 文档) | 换文档源时 |
 | `eta_max` | 0.5 | 单次倾斜强度上限(密度比 ≤e^{2ηc}≈12×) | 敏感性消融 |
 | `c` | 2.5 | 单 token 话语权限幅 | **标定后定**(步骤③) |
-| `b_max` | 10.0 | 每轨迹预算(=4 次整额干预) | 用户裁定;耗尽过早时上调 |
+| `b_max` | 20.0 | 每轨迹预算(≈8 次整额干预,1-2% 作用面) | 用户裁定 v2;消融 {10,20,40} |
 | `topk` | 64 | 候选集 S 两侧宽度 | 不动 |
 | `obs_topk` | 256 | 引擎观测窗(联动 vLLM max_logprobs) | 不动 |
-| `theta_d` | 0(防呆) | D 门阈值 | **标定后填**(步骤③);1e9=标定哨兵 |
+| `theta_d` | 0(防呆) | θ_D 的 **EMA 初值**(自适应关闭时即冻结阈值) | **标定后填**(步骤③);1e9=标定哨兵 |
+| `gate_adaptive` | true | 率控自适应开关(θ_D 每 step EMA 追目标门率) | 标定 run 必须 false |
+| `gate_target_rate` | 0.10 | 目标门率 q(干预密度旋钮) | 消融 {5,10,20}%(第二轮) |
+| `gate_ema_beta` | 0.1 | EMA 慢速率 β | 不动 |
 | `epsilon` | 0.05 | 探针翻转率 | 不动(0=标定模式) |
 | `gate_rate_bounds` | [0.05,0.25] | 门率告警带 | 不动([0,1]=标定豁免) |
 | `r_max` | 4 | 每轮拒绝上限 | 不动 |

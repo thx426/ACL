@@ -230,3 +230,68 @@ def test_ledger_ell_hist_and_token_pairs():
     assert out["steer_final_token"] == [202]
     assert out["steer_ell_count"] == 3
     assert len(out["steer_ell_hist"]) == ELL_HIST_BINS
+
+
+def test_adaptive_tracker_restores_target_rate_after_shift():
+    """率控验收(变更请求验收标准):D 分布平移后,门率在若干 step 内回到
+    q±2%;θ 轨迹平滑无跳变。"""
+    from trace_opd.steering.gate import GateThresholdTracker
+
+    rng = np.random.default_rng(0)
+    bins, hmax, q = 2048, 6.25, 0.10
+
+    def hist_of(samples):
+        h = [0] * bins
+        for v in samples:
+            b = int(v / hmax * bins)
+            h[min(max(b, 0), bins - 1)] += 1
+        return h
+
+    def open_rate(theta, samples):
+        return float(np.mean(samples >= theta))
+
+    tr = GateThresholdTracker(
+        theta_init=0.09, target_rate=q, ema_beta=0.3, d_hist_max=hmax, bins=bins,
+    )
+    thetas = []
+    # 阶段一:基准分布(lognormal 模拟陡 CDF),门率应稳在 q 附近
+    for step in range(1, 9):
+        samples = rng.lognormal(-3.2, 0.8, 6000)
+        tr.observe(hist_of(samples), len(samples))
+        tr.maybe_step_update(step)
+        thetas.append(tr.theta)
+    base_rate = open_rate(tr.theta, rng.lognormal(-3.2, 0.8, 40000))
+    assert abs(base_rate - q) < 0.02, f"baseline rate {base_rate:.3f}"
+    # 阶段二:分布整体平移(×2,CDF 平移远超 P85-P95 间距)⇒ 固定阈值下
+    # 门率会飙;自适应应在几步内拉回
+    for step in range(9, 25):
+        samples = rng.lognormal(-3.2 + np.log(2), 0.8, 6000)
+        tr.observe(hist_of(samples), len(samples))
+        tr.maybe_step_update(step)
+        thetas.append(tr.theta)
+    shifted_rate = open_rate(tr.theta, rng.lognormal(-3.2 + np.log(2), 0.8, 40000))
+    assert abs(shifted_rate - q) < 0.02, f"post-shift rate {shifted_rate:.3f}"
+    # θ 平滑:相邻步变化受 β 界(无跳变)
+    jumps = [abs(b - a) / max(a, 1e-9) for a, b in zip(thetas, thetas[1:])]
+    assert max(jumps) < 0.5
+
+
+def test_adaptive_tracker_step_semantics():
+    from trace_opd.steering.gate import GateThresholdTracker
+
+    tr = GateThresholdTracker(
+        theta_init=1.0, target_rate=0.1, ema_beta=0.5, d_hist_max=4.0, bins=64,
+    )
+    h = [0] * 64
+    h[8] = 1000                       # 全部质量在 ~0.53 附近
+    tr.observe(h, 1000)
+    tr.maybe_step_update(1)           # 首见 step:只登记,不更新
+    assert tr.theta == 1.0
+    tr.observe(h, 1000)
+    tr.maybe_step_update(1)           # 同 step:不更新
+    assert tr.theta == 1.0
+    tr.maybe_step_update(2)           # step 前进:EMA 更新
+    assert tr.theta < 1.0
+    t2 = tr.theta
+    tr.maybe_step_update(3)           # 无观测(不足 min_obs):跳过
+    assert tr.theta == t2

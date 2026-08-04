@@ -190,12 +190,19 @@ class SteeringCfg:
     doc_table: str = ""            # task_id→doc 的 jsonl 表(静态特权文档源)
     eta_max: float = 0.5           # 倾斜强度上限
     c: float = 2.5                 # 截断参数(单点话语权限幅;目标语境实测标定)
-    b_max: float = 10.0            # D_∞ 逐轨迹预算(nats;用户裁定 2026-08-04)
+    b_max: float = 20.0            # D_∞ 逐轨迹预算(nats;用户裁定 2026-08-04 v2:
+                                   # 10→20,≈8 次整额干预,600-900 决策位的 1-2% 作用面;
+                                   # per-token W 界 e^{±2ηc} 与本值无关)
     topk: int = 64                 # 保尾核候选集 S 的两侧 top-K
     obs_topk: int = 256            # draft/verify 的引擎观测窗(top-K 明细宽度);
                                    # launcher 联动 vLLM max_logprobs ≥ 本值(P0:两处
                                    # 必须同源,hook 请求超过 max_logprobs 会被引擎拒)
-    theta_d: float = 0.0           # D 主门冻结阈值(0=预扫描标定前的占位,启动校验拒 0)
+    theta_d: float = 0.0           # θ_D 的 EMA **初值**(标定 run P(1−q) 回填;0=未标定
+                                   # 占位,启动校验拒 0;自适应关闭时即冻结阈值)
+    gate_adaptive: bool = True     # 率控自适应开关(用户裁定 2026-08-04:θ_D 每 step
+                                   # EMA 追踪目标门率;标定 run 必须置 false 冻结哨兵)
+    gate_target_rate: float = 0.10 # 目标门率 q(用户裁定默认 10%;消融 {5,10,20}%)
+    gate_ema_beta: float = 0.1     # EMA 慢速率 β
     epsilon: float = 0.05          # ε 探针概率
     gate_rate_bounds: tuple = (0.05, 0.25)   # spec 预注册区间
     r_max: int = 4                 # 每轮拒绝上限(行为态)
@@ -204,7 +211,8 @@ class SteeringCfg:
     def __post_init__(self) -> None:
         # yaml 1.1 把 1.0e9(无符号指数)解析成字符串——数值字段一律强转,
         # 转不动就在这里死,而不是在校验/运行期比较时抛 TypeError。
-        for f in ("eta_max", "c", "b_max", "theta_d", "epsilon"):
+        for f in ("eta_max", "c", "b_max", "theta_d", "epsilon",
+                  "gate_target_rate", "gate_ema_beta"):
             setattr(self, f, float(getattr(self, f)))
         self.topk = int(self.topk)
         self.obs_topk = int(self.obs_topk)
@@ -257,6 +265,11 @@ def _validate(cfg: "Config") -> None:
             raise ValueError(f"steering.topk 必须 >= 1,得到 {st.topk}")
         if st.r_max < 1:
             raise ValueError(f"steering.r_max 必须 >= 1,得到 {st.r_max}")
+        if st.gate_adaptive:
+            if not (0.0 < st.gate_target_rate < 1.0):
+                raise ValueError(f"steering.gate_target_rate 必须在 (0,1),得到 {st.gate_target_rate}")
+            if not (0.0 < st.gate_ema_beta <= 1.0):
+                raise ValueError(f"steering.gate_ema_beta 必须在 (0,1],得到 {st.gate_ema_beta}")
         rb = st.gate_rate_bounds
         if len(rb) != 2 or not (0.0 <= float(rb[0]) < float(rb[1]) <= 1.0):
             raise ValueError(
@@ -380,6 +393,7 @@ def objective_fingerprint(cfg: "Config") -> str:
             st.enabled, st.doc_table, _doc_table_digest(st.doc_table),
             st.eta_max, st.c, st.b_max, st.topk, st.obs_topk,
             st.theta_d, st.epsilon, st.r_max, st.w_beh_mode,
+            st.gate_adaptive, st.gate_target_rate, st.gate_ema_beta,
         )
     )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
