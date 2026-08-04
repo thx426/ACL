@@ -55,7 +55,8 @@ class EpisodeCfg:
 class AlfworldCfg:
     data_root: str = ""
     worker_python: str = ""
-    spawn_concurrency: int = 24
+    spawn_concurrency: int = 128    # 全局 ALFWorld 引擎并发 boot 上限(按 worker 数折算);
+                                    # 用户裁定 2026-08-04:拉到 128 充分利用 80 核
     start_timeout_s: float = 300.0
     step_timeout_s: float = 120.0
     boot_concurrency: int = 12       # dataset-build engine boots (build_datasets)
@@ -103,6 +104,9 @@ class TrainCfg:
                                       # transient logits tensor during prompt_logprobs
                                       # scoring (SPS verify) is THIS x vocab x 2B
                                       # (smoke-run OOM root cause at 4096)
+    rollout_max_num_seqs: int = 128 # 每个 vLLM replica 的并发序列上限(单 TP 上限;
+                                    # 用户裁定 2026-08-04)。verl 默认 1024,显式钉死
+                                    # 便于与 agent 侧并发对账
     rollout_temperature: float = 1.0
     # --- 损失的信用分配单位(verl actor.loss_agg_mode;蒸馏项与 policy 项共用)---
     # token-mean(verl 默认,4B 主线 rkl/sp2 全部历史结论建立于此):
@@ -161,7 +165,8 @@ class TrainCfg:
     lr_scheduler_type: str = "constant"   # h3's ACTUAL schedule (its notes table
     lr_warmup_steps_ratio: float = 0.0    # saying cosine+0.03 was a misrecord)
     loggers: list[str] = field(default_factory=lambda: ["console", "swanlab"])
-    agent_num_workers: int = 8            # verl agent-loop actors; per-process
+    agent_num_workers: int = 16     # **必须 = train_batch_size**(用户长期裁定):
+                                    # 每 worker 恰好领一个任务的全部 rollout_n 副本
                                           # concurrency caps are divided by this
 
 

@@ -35,7 +35,7 @@ episode:
 alfworld:
   data_root: "${ALFWORLD_DATA}"              # json_2.1.1 数据根
   worker_python: "${ALFWORLD_WORKER_PYTHON}" # 引擎 venv 解释器(worker 子进程用)
-  spawn_concurrency: 64     # 全局引擎子进程并发 boot 上限(自动按 agent_num_workers 折算)
+  spawn_concurrency: 128    # 用户裁定 2026-08-04:并发拉满(80 核)
   start_timeout_s: 300      # 引擎 boot 超时 | h1 定版
   step_timeout_s: 120       # 单步执行超时 | h1 定版
   boot_concurrency: 32      # 数据构建期(build_datasets)引擎 boot 并发 | h3 定版
@@ -78,6 +78,7 @@ train:
                             # 同时决定 prompt_logprobs 打分(SPS verify)的临时 logits
                             # 显存:本值 × vocab × 2B ×2
   rollout_gpu_mem: 0.7      # vLLM 显存占比 | 独占拓扑值(共存拓扑回 0.35)
+  rollout_max_num_seqs: 128 # 每 vLLM replica 并发序列上限(单 TP 上限,用户裁定)
   rollout_temperature: 1.0
   # ---- 信用分配单位(verl actor.loss_agg_mode)----
   # seq-mean-token-mean(2026-07-29 用户裁定默认):每条轨迹先 token-mean 再等权,
@@ -99,7 +100,7 @@ train:
   val_before_train: true    # step-0 val = 训前基线(三件套之①)
   resume_mode: auto
   loggers: [console, swanlab]
-  agent_num_workers: 8      # verl agent-loop worker 进程数;全局并发按此折算
+  agent_num_workers: 16     # 必须 = train_batch_size(用户长期裁定)
 
 # ---------------------------------------------------------------------------
 # PGS steering(规范 docs/pgs-final-spec.md §2;enabled=false ⇒ 纯 GRPO 基线臂,

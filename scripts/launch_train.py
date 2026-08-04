@@ -142,6 +142,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # Chunked-prefill budget; also sizes the transient full-vocab logits
         # tensor vLLM materializes per chunk during prompt_logprobs scoring.
         f"actor_rollout_ref.rollout.max_num_batched_tokens={t.rollout_max_num_batched_tokens}",
+        f"actor_rollout_ref.rollout.max_num_seqs={t.rollout_max_num_seqs}",
         *steering_args,
         f"actor_rollout_ref.rollout.prompt_length={t.max_prompt_length}",
         f"actor_rollout_ref.rollout.response_length={t.response_length}",
