@@ -651,20 +651,8 @@ class FSDPEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
-        # trace-opd self-research: the research term normalises by the
-        # batch-GLOBAL research-token count (loss_mask excludes those rows —
-        # their response_mask was cleared at TQ put time), so its value cannot
-        # depend on how rows land in micro-batches. Computed here, next to
-        # batch_num_tokens, for exactly the same reason that one is.
-        if "research_mask" in data.keys():
-            research_num_tokens = data["research_mask"].sum().to(get_device_id())
-            torch.distributed.all_reduce(
-                research_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
-            )
-            tu.assign_non_tensor(data, research_num_tokens=research_num_tokens.item())
-
         # trace-opd seq-mean aggregation (CD-005 review 2026-07-29): the
-        # distillation term's seq-mean-* modes divide by a sequence count, and
+        # seq-mean-* loss_agg modes divide by a sequence count, and
         # like batch_num_tokens above it has to be batch-GLOBAL — the local
         # micro-batch row count is an artefact of the balanced partitioner
         # (long rows land in few-row micro-batches and would win back the very
@@ -683,24 +671,6 @@ class FSDPEngine(BaseEngine):
                 batch_num_seqs, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
             )
             tu.assign_non_tensor(data, batch_num_seqs=batch_num_seqs.item())
-
-        # trace-opd teacher grounding: the tg term's seq-mean-token-mean needs
-        # ITS OWN batch-global sequence count for exactly the reasons above —
-        # tg rows carry an all-zero response_mask, so batch_num_seqs cannot see
-        # them, and the tg denominator must not depend on micro-batch packing.
-        # Counted over non-empty tg_mask rows (dropped-won placeholders ship an
-        # all-zero tg_mask and stay out).
-        if "tg_mask" in data.keys():
-            tmask = data["tg_mask"]
-            if getattr(tmask, "is_nested", False):
-                batch_num_tg_seqs = torch.stack([seg.any() for seg in tmask.unbind()]).sum()
-            else:
-                batch_num_tg_seqs = (tmask.sum(dim=-1) > 0).sum()
-            batch_num_tg_seqs = batch_num_tg_seqs.to(get_device_id())
-            torch.distributed.all_reduce(
-                batch_num_tg_seqs, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
-            )
-            tu.assign_non_tensor(data, batch_num_tg_seqs=batch_num_tg_seqs.item())
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
@@ -1247,8 +1217,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
         calculate_sum_pi_squared = tu.get_non_tensor_data(
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
-        distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
-        distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1266,25 +1234,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             if use_fused_kernels:
                 # temperature is singleton
-                log_probs = None
-                if not distillation_only:
-                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+                log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                 entropy_rmpad = output.entropy.squeeze(0) if calculate_entropy else None  # (total_nnz,)
-
-                # When the fused kernel also computed top-K distillation
-                # (veomni's chunk_topk_distill path), extract the per-token
-                # distillation outputs and store them as nested tensors —
-                # same model_output keys as the eager logit-processor path.
-                if distillation_use_topk:
-                    aux_outputs = getattr(output, "fused_linear_aux", None)
-                    if aux_outputs is not None and aux_outputs.distillation_losses is not None:
-                        cu_seqlens = input_ids.offsets()
-                        for field_name in ("distillation_losses", "student_mass", "teacher_mass"):
-                            v = getattr(aux_outputs, field_name).squeeze(0)
-                            if self.use_ulysses_sp:
-                                pad_size = output_args["pad_size"]
-                                v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                            model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
@@ -1311,21 +1262,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             self.compute_entropy_from_logits, logits_rmpad
                         )
 
-                # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
-                if distillation_use_topk:
-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-                    cu_seqlens = input_ids.offsets()
-                    for k, v in outputs.items():
-                        v = v.squeeze(0)
-                        assert v.shape == (logits_rmpad.shape[0],), (
-                            f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
-                        )
-                        if self.use_ulysses_sp:
-                            pad_size = output_args["pad_size"]
-                            v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
-
-                if not distillation_only:
+                if True:
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -1341,7 +1278,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 pad_size = output_args["pad_size"]
 
                 # gather and unpad for the ulysses sp
-                if not distillation_only:
+                if True:
                     log_probs = gather_outputs_and_unpad(
                         log_probs,
                         gather_dim=0,
@@ -1366,8 +1303,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
-                if not distillation_only:
-                    log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
                 if calculate_entropy:
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                 if calculate_sum_pi_squared:
@@ -1385,10 +1321,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     arange = torch.arange(output.log_probs.shape[1], device=output.log_probs.device)
                     mask = arange < seq_lengths.unsqueeze(1)
 
-                    log_probs = None
-                    if not distillation_only:
-                        log_probs = output.log_probs[mask]
-                        log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                    log_probs = output.log_probs[mask]
+                    log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
 
                     if calculate_entropy:
                         entropy = output.entropy[mask]
@@ -1434,22 +1368,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # (log_probs is also not gathered) and pad_size is only
                     # populated in output_args along the use_remove_padding=True
                     # path of prepare_model_inputs.
-                    if distillation_use_topk:
-                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-                        for k, v in outputs.items():
-                            v = v.squeeze(0)
-                            assert v.shape == (logits_rmpad.shape[0],), (
-                                f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
-                            )
-                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
-
-                    log_probs = None
-                    if not distillation_only:
-                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
-                    if not distillation_only:
-                        log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                    log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
                     if calculate_entropy:
                         entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
                         entropy_rmpad = torch.cat([t for t in entropy.unbind()])
@@ -1463,8 +1385,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
-        if not distillation_only:
-            model_output["log_probs"] = log_probs
+        model_output["log_probs"] = log_probs
         if calculate_entropy:
             model_output["entropy"] = entropy
         if calculate_sum_pi_squared:

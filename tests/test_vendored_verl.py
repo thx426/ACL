@@ -179,6 +179,38 @@ def test_no_live_references_to_removed_machinery():
         assert "teacher_logprobs" not in src, rel
 
 
+def test_distillation_config_surface_is_gone():
+    # 审阅 IF-14:hydra 默认组合不得再指向已删除的 Distillation*Config;
+    # 生成配置不得继续宣称一个无法实例化的功能。
+    assert not (_VERL / "trainer" / "config" / "distillation").exists()
+    assert "distillation@distillation" not in _read("trainer/config/ppo_trainer.yaml")
+    for gen in (
+        "trainer/config/_generated_ppo_trainer.yaml",
+        "trainer/config/_generated_ppo_megatron_trainer.yaml",
+        "trainer/config/_generated_ppo_veomni_trainer.yaml",
+        "trainer/config/_generated_ppo_torchtitan_trainer.yaml",
+    ):
+        assert "\ndistillation:" not in _read(gen), gen
+
+
+def test_engine_impls_have_no_distillation_branches():
+    # 审阅 IF-14:engine 层半死分支(default=False 永不执行,但会诱导误接回
+    # 教师 loss)必须出清。
+    for rel in (
+        "workers/engine/fsdp/transformer_impl.py",
+        "workers/engine/megatron/transformer_impl.py",
+        "workers/engine/veomni/transformer_impl.py",
+    ):
+        src = _read(rel)
+        assert "distillation_use_topk" not in src, rel
+        assert "distillation_only" not in src, rel
+        assert "teacher_topk" not in src, rel
+    consts = _read("trainer/constants_ppo.py")
+    assert "TRACE_DISTILL" not in consts
+    assert "TRACE_TEACHER_SCORING_BACKEND" not in consts
+    assert "TRACE_OBS_DIR" not in consts
+
+
 def test_trainer_base_has_no_sample_role_machinery():
     # 旧 mixed-objective 的 GRPO 分组特判必须整体消失:PGS 的每个任务组
     # 全部是 bare student rollout,标准 GRPO 分组即正确语义。

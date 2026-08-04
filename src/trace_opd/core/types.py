@@ -1,14 +1,12 @@
 """Core data types shared by the whole mechanism.
 
-Design contract (docs/design.md §4-5):
+Design contract:
   - Trajectory is the structured ground truth of one executor episode,
-    produced by program code only; every downstream artifact (fact card,
-    narration input, fetch_raw view, archive record) derives from it
-    mechanically.
-  - The guidance slot is a protocol-level constant: the SAME header is used
-    for researcher guidance during research experiments, for the privileged
-    teacher prefix in OPD training, and for +doc evaluation arms —
-    byte-identical everywhere (PG-7).
+    produced by program code only; every downstream artifact (rollout dump,
+    eval record) derives from it mechanically.
+  - The guidance slot is a protocol-level constant (PG-7): the SAME header
+    ("## Task guidance") carries the privileged doc in the SPS teacher
+    prefix and in +doc evaluation arms — byte-identical everywhere.
 """
 from __future__ import annotations
 
@@ -57,25 +55,6 @@ def guidance_hash(guidance: str) -> str:
     if not guidance:
         return "bare"
     return hashlib.sha1(guidance.encode("utf-8")).hexdigest()[:12]
-
-
-_GUIDANCE_MENTIONS = ("task guidance", "the guidance", "guidance says", "guidance document")
-
-
-def mentions_guidance(text: str) -> bool:
-    """Whether a trajectory's own text refers to the guidance document.
-
-    Used to drop expert trajectories from the SFT arm: a bare policy has no
-    document, so reasoning like "following the task guidance, ..." quotes
-    something the reader cannot see, and training on it teaches that. Our own
-    heuristic, not a result borrowed from anywhere — PACT's leakage filter is
-    about not exposing future tool calls, a different problem — so the drop rate
-    is reported as a curve and belongs in the ablation. Deliberately over-broad:
-    losing one of four expert rollouts costs a sample, keeping a poisoned one
-    costs the behaviour.
-    """
-    lowered = (text or "").lower()
-    return any(marker in lowered for marker in _GUIDANCE_MENTIONS)
 
 
 # ----------------------------------------------------------------- episode

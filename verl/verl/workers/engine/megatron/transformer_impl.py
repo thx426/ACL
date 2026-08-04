@@ -533,10 +533,6 @@ class MegatronEngine(BaseEngine):
         Returns:
             grad_norm (float): The norm of the gradients before clipping or update.
         """
-        # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
-        # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
-        if getattr(self, "_distillation_use_topk_active", False):
-            get_torch_device().empty_cache()
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
         if update_successful:
@@ -669,7 +665,6 @@ class MegatronEngine(BaseEngine):
         return torch.tensor(input_ids.numel(), device=input_ids.device)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
-        self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
 
         # compute num_tokens in global batch for loss normalization
@@ -906,8 +901,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
         *,
         calculate_sum_pi_squared: bool,
         calculate_entropy: bool,
-        distillation_use_topk: bool,
-        distillation_only: bool,
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
@@ -942,11 +935,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             logits_bak = logits
 
-        # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
-        if distillation_use_topk:
-            ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
-        if not distillation_only:
-            ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
+        ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret
 
@@ -970,8 +959,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
-        distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
-        distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1062,8 +1049,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 self._lm_head_logits_processor,
                 calculate_sum_pi_squared=calculate_sum_pi_squared,
                 calculate_entropy=calculate_entropy,
-                distillation_use_topk=distillation_use_topk,
-                distillation_only=distillation_only,
                 logits_processor_func=logits_processor_func,
                 batch=batch,
                 data_format=data_format,

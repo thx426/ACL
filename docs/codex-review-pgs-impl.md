@@ -1,14 +1,14 @@
-# PGS 完整实施深度代码审阅（阶段性落盘）
+# PGS 完整实施深度代码审阅
 
-> 审阅区间：`c9d2466..c2096e3`，共 8 个 commit（`c623d85` → `c2096e3`）。  
-> 审阅对象固定为提交 `c2096e3` 的 Git 对象；审阅途中工作树出现了非本审阅产生的并发未提交修改，均不纳入判断，也未被本审阅触碰。  
-> 本文件按用户要求分阶段落盘；下列计数与核对表会在审阅完成时更新为最终值。
+> 审阅区间：`c9d2466..c2096e3`，共 8 个 commit（`c623d85` → `c2096e3`）。
+>
+> 审阅对象固定为提交 `c2096e3` 的 Git 对象；审阅途中工作树出现了非本审阅产生的并发未提交修改，均不纳入判断，也未被本审阅触碰。
 
-## 总体结论（阶段性）
+## 总体结论
 
-实现的数学纯模块整体质量较好，保尾核、残差采样和保守预算的主干已经形成；但当前 8-commit 快照存在一个会阻断正式 steering 轨迹进入 TransferQueue 的 P0 接线错误，并在 LOO scale、审计记账、配置单源与规范保护措施上存在数个实质缺口，现阶段不应直接进入 P4 正式实验。
+**一句话判断：机制的纯数学模块扎实、模块边界也基本清楚，但该 8-commit 快照尚不具备正式实验就绪性——一个 P0 会阻断所有非空 steering ledger 入队，另有行为核近似、LOO、异常样本处理和审计闭环等 P1 会影响机制结论。**
 
-当前已确认：**P0 1 条 / P1 5 条 / P2 2 条**（阶段性计数）。
+最终计数：**P0 1 条 / P1 11 条 / P2 4 条**。建议先修完全部 P0/P1，再进入限定范围的 P4 真机冒烟；当前结果不能用于宣称已忠实实现 v3.0-final 的全部命题条件。
 
 ## Findings
 
@@ -41,15 +41,15 @@ PGS 与 verl 原生 rollout correction 的互斥判断写成了
 
 在“理论正确档”中改用仅依赖其他样本的有界 scale（例如预注册常数、跨组/历史冻结尺度，或对 `std_loo=0` 采用与当前样本无关的固定 floor）；若保留 `max(std_loo,std_full)` 作为工程稳定档，应明确标为有偏实现、从命题 C 条件 iv 中移除，并单独做 scale 口径消融和偏差说明。
 
-### IF-03 — P1 — `src/trace_opd/steering/hook.py:201-230`；`src/trace_opd/steering/ledger.py:62-86`
+### IF-03 — P1 — `src/trace_opd/steering/hook.py:201-258`；`src/trace_opd/steering/ledger.py:17-86`
 
 **问题陈述**
 
-spec §4 要求逐 token 记录完整 `gate_state`、预算余额、`steer_flag` 与 `reject_count`；实际 ledger 只在执行了正 η，或“`base_open or probe_flipped` 且 η=0”时追加稀疏行。最常见的“主门关闭且探针未翻转”位置完全消失；预算耗尽或 cap-active 后直通的 token 也不记录。现有字段还缺逐位置预算余额、明确的 steer flag 和累计 reject count，而 `steer_count=len(records)` 会把零 η 的关闭/阻断行也计作 steer。
+spec §4 要求逐 token 记录完整 `gate_state`、预算余额、`steer_flag` 与 `reject_count`；实际 ledger 只在执行了正 η，或“`base_open or probe_flipped` 且 η=0”时追加稀疏行。最常见的“主门关闭且探针未翻转”位置完全消失；预算耗尽或 cap-active 后直通的 token 也不记录。更具体地，触发 R_max 的记录在 `record_reject()` 之前硬写 `cap_active=False`，而后续 cap-active token 在入口直接 `continue`，所以导出的 `steer_cap_active` 正常情况下根本记不到 1。现有字段还缺逐位置预算余额、明确的 steer flag 和累计 reject count，而 `steer_count=len(records)` 会把零 η 的关闭/阻断行也计作 steer。
 
 **失败场景**
 
-主门命中率 15%、epsilon=5% 时，大部分候选位置没有逐 token gate 记录。事后无法从 ledger 重建 probe 分配的控制总体、预算 noncompliance 或 cap-active 后的行为状态；`steer_count` 曲线也可能把“门开但被翻关/预算阻断”误报为实际干预。训练权重在这些未干预位置仍为 1，因而不一定立即数值错误，但 NF07 的可识别性修法和 spec §4 的审计红线没有落地。
+主门命中率 15%、epsilon=5% 时，大部分候选位置没有逐 token gate 记录。某一 turn 第 R_max 次拒绝后，汇总虽可能增加 `turns_capped`，逐位置数组却全是 `cap_active=0`，无法定位从哪一 token 起进入 base-only 状态。事后也无法从 ledger 重建 probe 分配的控制总体或预算 noncompliance；`steer_count` 曲线还可能把“门开但被翻关/预算阻断”误报为实际干预。训练权重在这些未干预位置仍为 1，因而不一定立即数值错误，但 NF07 的可识别性修法和 spec §4 的审计红线没有落地。
 
 **修复建议**
 
@@ -97,7 +97,7 @@ spec §2.3 要求训练中 robust-EMA 慢更新，并在触发率越界时“告
 
 先明确唯一数学对象：若坚持 spec，应增加 bare scoring、验证 q≈π_verify，并按裁定处理残差；若为了 speculative 精确性选择实际 draft q 作为 proposal/核的 π 侧，则应修改 spec、命名和记账说明，并显式记录 q-vs-bare residual。两种口径都需锁死所有 logits processor，而不能维持“文档双 verify、代码单 verify”的状态。
 
-### IF-07 — P2 — `src/trace_opd/common/config.py:332-344`
+### IF-07 — P2 — `src/trace_opd/common/config.py:323-335`
 
 **问题陈述**
 
@@ -125,7 +125,7 @@ D 直方图上限硬编码为 `6.25=c^2`（只适配 c=2.5）。配置允许其�
 
 让直方图范围随运行配置 c 写入 ledger 元数据，聚合时拒绝混合不同坐标系；目标分位落入 overflow bucket 时不要给数值建议，改为 fail-loud 或要求扩大 bins 后重跑。另校验 `q∈[0,1]` 与 `sum(hist)==d_count`。
 
-### IF-09 — P1 — `src/trace_opd/train/agent_loop.py:207,341-360`；`src/trace_opd/core/episode.py:181-187,292-295`
+### IF-09 — P1 — `src/trace_opd/train/agent_loop.py:207,340-359`；`src/trace_opd/core/episode.py:181-187,292-295`
 
 **问题陈述**
 
@@ -139,7 +139,7 @@ D 直方图上限硬编码为 `6.25=c^2`（只适配 c=2.5）。配置允许其�
 
 任何 `ENV_ERROR` 都不得成为有效 attempt。对整个 episode 使用新环境状态和新 steering state 重试一次；再次失败则抛出/由 TQ 明确标记该 rollout 失败并补样，绝不能按 `won=False` 计 0 分。增加“首轮已有 token、次轮 generate/verify/env-step 分别失败”的三组单测，并断言没有 reward 样本入队。
 
-### IF-10 — P1 — `src/trace_opd/core/episode.py:147-154`；`src/trace_opd/train/agent_loop.py:280-292`；`src/trace_opd/steering/hook.py:115-149,288-289`
+### IF-10 — P1 — `src/trace_opd/core/episode.py:147-154`；`src/trace_opd/train/agent_loop.py:280-292`；`src/trace_opd/steering/hook.py:118-148,287-288`
 
 **问题陈述**
 
@@ -181,7 +181,7 @@ P1.5 所称“旧机制全面出清”并未完成。默认 PPO Hydra defaults �
 
 若目标确为彻底根除，删除 defaults 项、distillation YAML/生成配置残段、三种 engine 的专用分支、旧 replay/API/docstring，并用覆盖 `src/`、`verl/`、configs 的允许名单式 `git grep` 守护；若这些是有意保留的 verl 原生通用能力，则恢复完整 dataclass/测试、去掉 trace-opd 旧机制耦合，并在设计文档明确其不被 PGS launcher 接线。不能维持“配置仍暴露、目标类已删除”的半死状态。
 
-### IF-13 — P1 — `src/trace_opd/steering/hook.py:20-22,73-90`；`docs/pgs-impl-design.md:109-113`
+### IF-13 — P1 — `src/trace_opd/steering/hook.py:20-22,76-93`；`docs/pgs-impl-design.md:109-113`
 
 **问题陈述**
 
@@ -208,6 +208,34 @@ P1.5 所称“旧机制全面出清”并未完成。默认 PPO Hydra defaults �
 **修复建议**
 
 把模式改名或至少在配置、实现文档和实验表中统一标为 `per_token`、`prefix_pdis`、`clipped_per_token`；若真要提供 full-trajectory 档，应把整条有效 response 的 log-ratio 和应用到所有有效 score term，并单独处理数值稳定性。只有实现完整 V-trace 递推时才使用 `vtrace` 名称。
+
+### IF-15 — P1 — `src/trace_opd/steering/hook.py:172-174,253-262`；`src/trace_opd/train/agent_loop.py:308-317`
+
+**问题陈述**
+
+hook 只用原 draft 是否提前结束来判断 EOS/stop；拒绝后从残差分布实际执行的 replacement token 没有重新做停止判断。任何 rejection 都设置 `rejected=True` 并无条件 `continue` 新一轮 draft，因此“残差恰好采到 EOS/stop”时仍会在已终止前缀后继续生成。这破坏了断点续采的停止语义，任务书点名要求的 EOS×拒绝交互没有被实现。
+
+**失败场景**
+
+draft 在普通 token `y` 上被拒绝，残差分布采出 EOS。代码先把 EOS 追加到 `executed`，然后再次调用 draft；vLLM 不会因为 prompt 尾部已有 EOS 自动把这个新请求视为上一请求已停止，于是返回 EOS 后的额外 token。最终 decode 又可能因 `skip_special_tokens=True` 隐去中间 EOS，环境收到拼接文本，ledger/W_beh 也包含本不应存在的后续位置，实际 episode 分布不再是按 b_S 逐 token 直到停止的分布。
+
+**修复建议**
+
+将本次采样配置实际生效的所有 stop token ID（至少 tokenizer EOS，以及框架配置的 stop IDs）显式传入 hook；每次 append **实际执行 token** 后立即判断停止。若 replacement 是 stop，结束本轮且不再 draft；若原 draft 的 stop token 被拒绝并替换成非 stop，则丢弃原 suffix 后从 replacement 前缀继续。增加这两个对偶分支以及 stop-string/tokenizer 多 EOS 的测试。
+
+### IF-16 — P1 — `src/trace_opd/train/agent_loop.py:187-200`；`verl/verl/trainer/ppo/v1/agent_loop_tq.py:189-211`；`verl/verl/utils/tensordict_utils.py:927-930`
+
+**问题陈述**
+
+只有 `state is not None` 的轨迹才导出 ledger，且 TQ 只有在 `extra.get("steer_positions")` 非空时才创建顶层 `rollout_is_weights`。因此同一 PGS batch 中“至少一次实际 steering”和“全程门关/缺 doc/doc overflow”的行具有不同 schema。下游 `list_of_dict_to_tensordict()` 不是做 key 并集，而是只取第一行 keys，再按这些 key 索引所有行；W_beh 字段于是具有顺序相关的静默丢失/崩溃行为。
+
+**失败场景**
+
+batch 两行 A/B：A 全程门关，B 有非零 steering。若 A 在第一行，首行 keys 不含 `rollout_is_weights`，B 已算出的权重被整个忽略，倾斜轨迹以全 1 未校正训练；若 B 在第一行，转换器会读取 A 的缺失 key 并抛 `KeyError`。doc missing/overflow、预算始终未用或短响应均可自然制造 A，因此这不是畸形输入。
+
+**修复建议**
+
+用明确的“PGS 协议在场”标志判断，而不是用非空 ledger 判断；steering-enabled 训练的每条轨迹都导出相同字段，空账展开为长度匹配的全 1 dense weight。也可在 batch 组装层对 key 并集补默认值，但必须 fail-loud 检查 schema。增加 A/B 两种顺序、缺 doc、overflow、全门关与非空 ledger 混合的 TQ 测试，并断言 steered 行的非 1 权重最终到达 actor batch。
 
 ## 忠实性核对表（待完成）
 

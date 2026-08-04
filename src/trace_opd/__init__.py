@@ -1,1 +1,1 @@
-"""TRACE-OPD — researcher-in-the-loop on-policy self-distillation."""
+"""TRACE-OPD / PGS — privileged-guidance steering for on-policy GRPO."""

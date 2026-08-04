@@ -118,12 +118,10 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
-    # trace-opd distillation microscope: workers sample per-token distillation
-    # quantities to this directory when set (see trainer/distillation/losses.py).
-    # trace-opd R11 (codex M5): the teacher-scoring backend switch and the
-    # agent-loop hang-guard timeout must reach every Ray worker explicitly —
-    # process-inheritance is not guaranteed for existing/remote clusters.
-    for key in ("TRACE_TEACHER_SCORING_BACKEND", "TRACE_AGENT_TASK_TIMEOUT_S"):
+    # trace-opd: the agent-loop hang-guard timeout must reach every Ray worker
+    # explicitly — process-inheritance is not guaranteed for existing/remote
+    # clusters.
+    for key in ("TRACE_AGENT_TASK_TIMEOUT_S",):
         if os.environ.get(key):
             runtime_env["env_vars"][key] = os.environ[key]
     # trace-opd (CD-006 2026-07-25): the caching-allocator GC threshold is a
@@ -132,14 +130,4 @@ def get_ppo_ray_runtime_env(config=None):
     # actually set it, so the upstream default stays untouched otherwise.
     if os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         runtime_env["env_vars"]["PYTORCH_CUDA_ALLOC_CONF"] = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
-    for key in ("TRACE_DISTILL_MICROSCOPE_DIR", "TRACE_DISTILL_SAMPLE_EVERY"):
-        if os.environ.get(key):
-            runtime_env["env_vars"][key] = os.environ[key]
-    # trace-opd observation packs (codex review P1-10): same explicit route —
-    # on an existing/remote Ray cluster the actor workers do NOT inherit the
-    # driver's environment, and a missing TRACE_OBS_DIR silently disables
-    # collection with zero packs and zero errors.
-    for key in ("TRACE_OBS_DIR", "TRACE_OBS_EVERY"):
-        if os.environ.get(key):
-            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env
