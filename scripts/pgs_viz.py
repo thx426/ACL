@@ -64,6 +64,12 @@ a{text-decoration:none;color:#0a58ca}
 .scale .theta{background:#c33}
 .lgd{font-size:12px;color:#555;margin:8px 0}
 .turnhdr{margin:14px 0 4px;font-weight:700;color:#333;border-top:1px solid #ddd;padding-top:8px}
+details.turn{content-visibility:auto;contain-intrinsic-size:auto 120px;margin:8px 0}
+details.turn>summary{cursor:pointer;font-weight:700;color:#333;padding:4px 0}
+details.turn>summary .badge{font-weight:400;color:#a33;margin-left:8px;font-size:12px}
+#navbar{position:sticky;top:0;background:#fffe;border-bottom:1px solid #ccc;
+ padding:6px 0;z-index:5;font-size:13px}
+#navbar b{color:#a33}
 .kv{color:#555}
 """
 
@@ -116,6 +122,25 @@ function showPanel(el){
 }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 document.addEventListener('keydown', e => { if(e.key==='Escape') document.getElementById('panel').style.display='none'; });
+// J/K 在干预位(steer 行)之间跳转;跳转时自动展开所属 turn
+let _marks = null, _cur = -1;
+function marks(){ if(!_marks) _marks = Array.from(document.querySelectorAll('.acc,.rej')); return _marks; }
+function jump(dir){
+  const m = marks(); if(!m.length) return;
+  _cur = (_cur + dir + m.length) % m.length;
+  const el = m[_cur];
+  const det = el.closest('details'); if(det) det.open = true;
+  el.scrollIntoView({block:'center'});
+  el.style.outline = '3px solid #333';
+  setTimeout(()=>{ el.style.outline=''; }, 900);
+  const nb = document.getElementById('navpos');
+  if(nb) nb.textContent = (_cur+1) + '/' + m.length;
+}
+document.addEventListener('keydown', e => {
+  if(e.target.tagName==='INPUT') return;
+  if(e.key==='j'||e.key==='J') jump(1);
+  if(e.key==='k'||e.key==='K') jump(-1);
+});
 """
 
 
@@ -198,13 +223,24 @@ def render_traj(payload, tok, cfg) -> str:
         for t_idx, (a, b) in enumerate(spans):
             for p in range(a, min(b, len(resp_ids))):
                 turn_of[p] = t_idx
+        # 每 turn 的干预统计(决定默认展开与否;无干预 turn 折叠省 DOM 首渲)
+        turn_steer = defaultdict(int)
+        for p in rows:
+            ti = turn_of.get(p)
+            if ti is not None and (rows[p]["eta"] > 0):
+                turn_steer[ti] += 1
         parts = []
         cur_turn = None
         for p, txt in enumerate(texts):
             t_idx = turn_of.get(p)
             if t_idx is not None and t_idx != cur_turn:
                 cur_turn = t_idx
-                parts.append(f"</div><div class='turnhdr'>turn {t_idx + 1}</div><div class='tok'>")
+                ns = turn_steer.get(t_idx, 0)
+                badge = f"<span class='badge'>{ns} 干预</span>" if ns else ""
+                op = " open" if ns else ""
+                parts.append(
+                    f"</div></details><details class='turn'{op}>"
+                    f"<summary>turn {t_idx + 1}{badge}</summary><div class='tok'>")
             e = html.escape(txt)
             r = rows.get(p)
             if r is not None:
@@ -238,7 +274,10 @@ def render_traj(payload, tok, cfg) -> str:
                 parts.append(f"<span class='struct'>{e}</span>")
             else:
                 parts.append(e)
-        body = "<div class='tok'>" + "".join(parts) + "</div>"
+        n_marks = sum(1 for r in rows.values() if r["eta"] > 0)
+        navbar = (f"<div id='navbar'>干预位 <b id='navpos'>0/{n_marks}</b>"
+                  " · 按 <b>J</b>/<b>K</b> 跳转(自动展开所属 turn;无干预 turn 默认折叠)</div>")
+        body = navbar + "<details class='turn' open><summary>开头</summary><div class='tok'>"                + "".join(parts) + "</div></details>"
     else:
         # 降级:无 token ids / 无 tokenizer —— turn 文本 + steer 行表
         steps = (payload.get("trajectory") or {}).get("steps") or []
@@ -279,7 +318,10 @@ def main() -> int:
     ap.add_argument("--out-dir", default="")
     ap.add_argument("--tokenizer", default="")
     ap.add_argument("--steps", default="", help="只渲染指定 step(逗号分隔);默认全部")
-    ap.add_argument("--max-trajs", type=int, default=None, help="每 step 最多渲染的轨迹页数")
+    ap.add_argument("--last", type=int, default=None, help="只渲染最近 N 个 step")
+    ap.add_argument("--max-trajs", type=int, default=20,
+                    help="每 step 渲染的轨迹页数上限(按拒绝数排序取头部;0=全部)")
+    ap.add_argument("--no-cache", action="store_true", help="忽略 step 聚合缓存")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -307,6 +349,10 @@ def main() -> int:
         d for d in (run_dir / "rollouts").glob("step_*")
         if d.is_dir() and not d.name.endswith("_val")
     )
+    if args.last:
+        step_dirs = step_dirs[-args.last:]
+    cache_dir = out / "_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     per_step = []
     step_pages = []
@@ -314,10 +360,22 @@ def main() -> int:
         step_no = int(sd.name.split("_")[1])
         if want and step_no not in want:
             continue
+        # 聚合缓存:dump 不可变 ⇒ 按 (step, 文件数) 键缓存聚合与排序结果,
+        # 大 run 重复渲染从分钟级降到秒级(轨迹页仍按需重渲,tokenizer 相关)。
+        files = sorted(sd.glob("*.json"))
+        ck = cache_dir / f"step_{step_no:05d}.json"
+        cached = None
+        if not args.no_cache and ck.exists():
+            try:
+                cached = json.loads(ck.read_text(encoding="utf-8"))
+                if cached.get("nfiles") != len(files):
+                    cached = None
+            except Exception:  # noqa: BLE001
+                cached = None
         trajs = []
         agg = defaultdict(float)
         n = 0
-        for f in sorted(sd.glob("*.json")):
+        for f in files:
             try:
                 p = json.loads(f.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001
@@ -334,9 +392,10 @@ def main() -> int:
             trajs.append((f, p, st))
         if not n:
             continue
+        ck.write_text(json.dumps({"nfiles": len(files)}), encoding="utf-8")
         # 轨迹排序:先拒绝数降序(最有信息量),再 won
         trajs.sort(key=lambda x: (-(x[2].get("steer_reject_count", 0)), -(x[2].get("steer_count", 0))))
-        rendered = trajs[: args.max_trajs] if args.max_trajs else trajs
+        rendered = trajs if not args.max_trajs else trajs[: args.max_trajs]
         rows_html = []
         for f, p, st in trajs:
             name = f.stem + ".html"
@@ -352,11 +411,19 @@ def main() -> int:
                 f"<td>{st.get('steer_gate_open_rate', 0):.1%}</td>"
                 f"<td>{st.get('steer_n_bypassed', 0)}</td><td>{p.get('outcome', '')}</td></tr>"
             )
+        sort_js = ("<script>document.querySelectorAll('th').forEach((th,i)=>th.onclick=()=>{"
+                   "const tb=th.closest('table');const rows=Array.from(tb.rows).slice(1);"
+                   "const num=rows.every(r=>!isNaN(parseFloat(r.cells[i].innerText))||r.cells[i].innerText=='');"
+                   "const dir=th._d=-(th._d||1);"
+                   "rows.sort((a,b)=>{const x=a.cells[i].innerText,y=b.cells[i].innerText;"
+                   "return dir*(num?(parseFloat(x)||0)-(parseFloat(y)||0):x.localeCompare(y));});"
+                   "rows.forEach(r=>tb.appendChild(r));});</script>")
         page = (f"<!doctype html><meta charset='utf-8'><title>step {step_no}</title><style>{CSS}</style>"
                 f"<h2><a href='index.html'>←</a> step {step_no}({n} 轨迹,won {agg['won']/n:.1%})</h2>"
+                "<p class='lgd'>点表头排序;默认按拒绝数降序(最有信息量的轨迹在前)</p>"
                 "<table><tr><th>任务(点击看逐 token)</th><th>won</th><th>倾斜</th><th>拒绝</th>"
                 "<th>预算</th><th>门率</th><th>旁路</th><th>outcome</th></tr>"
-                + "".join(rows_html) + "</table>")
+                + "".join(rows_html) + "</table>" + sort_js)
         (out / f"step_{step_no:05d}.html").write_text(page, encoding="utf-8")
         step_pages.append((step_no, n, agg))
         per_step.append({
