@@ -70,7 +70,11 @@ train:
   ppo_max_token_len_per_gpu: 8192      # actor 训练前反向微批打包预算/卡
                             # (logits 分量 = 本值 × vocab × 4B fp32;21.2GiB 事故后解耦)
   log_prob_max_token_len_per_gpu: 8192 # old_log_prob 推理打包预算/卡(同时产出熵曲线)
-  ulysses_sp: 1             # 训练侧 Ulysses SP(1=关,sdpa profile;>1 联动 rmpad+FA2,
+  ulysses_sp: 2             # 2026-08-04 OOM 实锤后切换:标定 run 第 3 步出现 32704
+                            # 打满预算轨迹,rmpad=False 下单条 fp32 logits ≈18.5G 必爆
+                            # (update_actor OOM: need 8.94G, free 1.15G)。sp=2 联动
+                            # rmpad=True+FA2(已实测可用),序列切两卡;4B/SP2 是 162
+                            # 历史成熟配置。执行档改动,不进指纹,两臂一致
                             # 需可用 flash-attn —— 仅 162 venv 有,A800-SXM 不可用)
   rollout_max_model_len: 40960   # rollout 单序列 ctx ≥ 教师前缀(scaffold+doc+obs)+ response
   rollout_max_num_batched_tokens: 8192  # vLLM chunked-prefill 预算 | 2026-07-28 用户裁定
