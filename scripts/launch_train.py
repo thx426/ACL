@@ -129,8 +129,8 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # hf_model 保存关闭(rank0 全量 gather + 单线程写 8GB 是保存耗时大头);
         # 需要 HF 格式时用 `python -m verl.model_merger` 离线转。
         'actor_rollout_ref.actor.checkpoint.save_contents=["model","optimizer","extra"]',
-        # 滚动只留最近 3 个 ckpt,峰值 ckpt 另行 pin 到不受清理的目录。
-        "trainer.max_actor_ckpt_to_keep=3",
+        # 滚动保留的 ckpt 数走配置(硬编码会在 manifest 里说谎)。
+        f"trainer.max_actor_ckpt_to_keep={t.max_ckpt_to_keep}",
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={t.rollout_tp}",

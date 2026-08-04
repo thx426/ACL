@@ -19,7 +19,7 @@
 
 run:
   name: pgs_s1              # 实验名;归档根 = runs_root/name(TRACE_RUN_DIR 由 launcher 导出)
-  runs_root: runs           # 归档根目录(相对 trace_opd/,服务器上建议配绝对路径)
+  runs_root: /data4/ws/PGS   # 用户裁定 2026-08-04:ckpt/产物落 /data4(5.6T 余量;/data3 曾写满炸掉 C3)
 
 # ---------------------------------------------------------------------------
 # Episode 协议(训练/评测同构,PG-3)
@@ -53,7 +53,7 @@ train:
   experiment_name: pgs_s1
   project_name: trace_opd
   n_gpus: 4                 # 机器相关,实验副本按实机改(162 共享期 2;A800-SXM 4)
-  rollout_tp: 2             # rollout 引擎 TP | 用户裁定:为长程任务预留 KV 余量;
+  rollout_tp: 1             # 用户裁定 2026-08-04:推理 TP=1(4 卡 ⇒ 4 个独立 replica,无跨卡通信)
                             # zkgy 混卡纪律:TP 组必须落同型号卡对
   train_batch_size: 16      # 每 step 任务数 | 用户裁定 2026-07-23
   rollout_n: 8              # 每任务独立 student rollout 数 = GRPO 组大小 | 用户裁定;
@@ -94,8 +94,9 @@ train:
   reshard_after_forward: true     # True=ZeRO-3
   dist_backend: ""                # 空=nccl;"cpu:gloo,cuda:gloo"=绕开 NCCL
   total_epochs: 2
-  test_freq: 20             # 每 20 step val(seen/unseen greedy)| 用户裁定
-  save_freq: 20             # 与 test_freq 同格:每个 val 点都有可回滚 ckpt
+  test_freq: 10             # 用户裁定:每 10 step 一个 val 点
+  save_freq: 10             # 与 test_freq 同格:每个 val 点都有可回滚 ckpt
+  max_ckpt_to_keep: 4       # 用户裁定:滚动保留 4 个 actor ckpt(单个 ≈45G)
   val_before_train: true    # step-0 val = 训前基线(三件套之①)
   resume_mode: auto
   loggers: [console, swanlab]

@@ -153,6 +153,9 @@ class TrainCfg:
     total_epochs: int = 2
     test_freq: int = 10
     save_freq: int = 10
+    max_ckpt_to_keep: int = 4       # 滚动保留的 actor ckpt 数(用户裁定 2026-08-04;
+                                    # 单 ckpt ≈45G ⇒ 峰值 ~180G。旧值 3 曾硬编码在
+                                    # launcher 里——参数真值必须在配置层可见)
     val_before_train: bool = True
     resume_mode: str = "auto"
     lr_scheduler_type: str = "constant"   # h3's ACTUAL schedule (its notes table
