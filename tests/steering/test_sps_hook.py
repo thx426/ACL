@@ -120,7 +120,7 @@ def _mk_hook(world, *, theta_d, eta_max=0.5, c=2.5, b_max=6.0, topk=8,
     hook = SpsGenerate(
         draft=draft, verify=verify,
         teacher_prefix_ids=list(teacher_prefix),
-        student_prompt_len=len(student_prompt),
+        student_prompt_ids=list(student_prompt),
         state=state, tokenizer=_Tok(), topk=topk, c=c, obs_topk=obs_topk,
     )
     return hook, state, draft, verify, list(student_prompt)
@@ -138,12 +138,13 @@ def _analytic_b(world, *, topk, obs_topk, eta, c):
     known = set(np.argsort(-pi)[:obs_topk].tolist())
     top_pt = [t for t in np.argsort(-pt)[:topk] if t in known]
     S = sorted(set(top_pi) | set(top_pt))
-    # p_T 观测窗 floor(top-obs 内最小值)
-    pt_window = np.sort(pt)[::-1][:obs_topk]
-    floor = float(np.log(pt_window[-1]))
+    # p_T 观测窗外单侧区间鲁棒代入(max-IF-13):floor 上界 + 钳非正
+    pt_window_min = np.sort(pt)[::-1][:obs_topk][-1]
+    floor = float(np.log(pt_window_min))
     b = pi.copy()
     ell = np.array([
-        np.clip((np.log(pt[t]) if pt[t] >= pt_window[-1] else floor) - np.log(pi[t]), -c, c)
+        np.clip(np.log(pt[t]) - np.log(pi[t]), -c, c) if pt[t] >= pt_window_min
+        else min(0.0, np.clip(floor - np.log(pi[t]), -c, c))
         for t in S
     ])
     piS = pi[S]
@@ -342,3 +343,26 @@ def test_cap_row_ordering_and_budget_after():
     # 计数器与稀疏行自洽
     assert state.ledger.n_candidates >= len(recs)
     assert state.ledger.n_base_open >= sum(1 for r in recs if r.base_open)
+
+
+def test_prefix_drift_fails_loud():
+    # 审阅 max-IF-10:episode 实际前缀与预构学生前缀有任何 token 漂移必须
+    # raise,不得静默错位 ledger 坐标。
+    world = _World(seed=30)
+    hook, *_ , sp = _mk_hook(world, theta_d=1e9)
+    drifted = list(sp)
+    drifted[-1] = drifted[-1] + 1
+    with pytest.raises(RuntimeError, match="prefix drift"):
+        _run(hook(drifted, {"max_tokens": 4, "temperature": 1.0}))
+
+
+def test_pt_window_miss_is_counted_and_never_lifts():
+    # π-only 冷候选(p_T 窗外):单侧鲁棒代入 ⇒ 永不抬升;计数进账。
+    # 构造:p_T 集中在少数 token(窗 = 全部质量),π 的 top-K 有窗外成员。
+    world = _World(seed=31)
+    order = np.argsort(-world.pt)
+    world.pt[order[16:]] = 1e-12          # obs_topk=16 窗外几乎零质量
+    world.pt = world.pt / world.pt.sum()
+    hook, state, *_ , sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, seed=8)
+    _run(hook(sp, {"max_tokens": 16, "temperature": 1.0}))
+    assert state.ledger.n_pt_window_miss > 0

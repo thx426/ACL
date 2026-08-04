@@ -24,11 +24,18 @@ Guarantees inherited from the sampling side (trace_opd steering package):
   * per-token |log W| <= 2*eta*c  (kernel density-ratio bound)
   * per-trajectory |sum log W| <= b_max  (D_inf budget, conservative charging)
 
-Modes (ablation switch, spec §2.6):
-  per_token     W_t = pi/b at steered positions, 1 elsewhere (default)
-  per_decision  W_t = running prefix product of pi/b up to t (trajectory IS;
-                bounded by e^{±b_max}, heavy-tailed — ablation arm only)
-  vtrace        min(1, per_token) (V-trace rho-truncation at rho_bar=1)
+Modes (ablation switch, spec §2.6; PRECISE definitions per review max-IF-14 —
+the short names are configuration labels, not literature-faithful claims):
+  per_token     W_t = pi/b at steered positions, 1 elsewhere (default).
+  per_decision  PDIS prefix product: W_t = prod_{s<=t} pi/b — the product up
+                to position t applied to position t's score term ONLY. This
+                is per-decision importance sampling, NOT full-trajectory IS
+                (that would apply the whole-trajectory ratio to every term).
+                Bounded by e^{±b_max}; heavy-tailed — ablation arm only.
+  vtrace        min(1, pi/b) per token — the rho-bar=1 pointwise truncation
+                borrowed from V-trace. NOT the full V-trace estimator (no
+                value targets, no c-bar trace recursion); do not cite
+                V-trace bias/contraction results for runs using it.
 """
 from __future__ import annotations
 

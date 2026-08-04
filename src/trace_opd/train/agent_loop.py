@@ -323,7 +323,7 @@ class TraceAgentLoop(AgentLoopBase):
             draft=engine,
             verify=engine,           # 同引擎同路由:两个前缀的 KV 同 replica
             teacher_prefix_ids=teacher_prompt_ids,
-            student_prompt_len=len(student_prompt_ids),
+            student_prompt_ids=student_prompt_ids,
             state=state,
             tokenizer=self.tokenizer,
             topk=st_cfg.topk,

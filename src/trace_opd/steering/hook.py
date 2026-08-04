@@ -25,10 +25,13 @@
   * S 的 π 侧候选取 draft 返回的 top-obs_topk;p_T top-K 中 π-rank 超出
     obs_topk 的 token 不入 S(π 极冷 token 抬 e^{2ηc}≈e^{2.5} 倍仍可忽略,
     这与「OPD 只能调已有行为」的能力边界一致)。
-  * S 内 p_T 观测窗外的 token,log p_T 用该位置观测窗的 floor(最小观测
-    logprob)代入 —— 真值必 ≤ floor,而多数情形 clip(ℓ,−c) 已饱和,floor
-    与真值给出同一个 ℓ̃=−c(无误差);未饱和时误差有界且方向保守(低估
-    压制力度)。
+  * S 内 p_T 观测窗外的 token(π-only 候选)取**单侧区间鲁棒代入**:
+    ℓ̃ = min(0, clip(log floor − log π, ±c)),floor = 该位置观测窗最小
+    logprob(真值的上界)。审阅 max-IF-13:纯 floor 代入在 floor > π(t)
+    时符号翻转(教师强烈反对的 token 被当成偏好抬升);钳到非正后,
+    floor 足够低时保留方向正确的压制(真值更负 ⇒ 实际压得比真值少,
+    保守),floor 偏高时退化为中性(不倾斜)——窗外候选永不被抬升。
+    替代发生率进记账(steer_n_pt_window_miss)。
 """
 from __future__ import annotations
 
@@ -95,9 +98,15 @@ def position_candidates(
             s_tokens.append(t)
 
     log_pi = np.array([known_pi[t] for t in s_tokens], dtype=np.float64)
-    log_pt = np.array([pt_map.get(t, pt_floor) for t in s_tokens], dtype=np.float64)
+    # p_T 窗外单侧区间鲁棒代入(见模块 docstring):floor 上界 + 钳非正
+    in_window = np.array([t in pt_map for t in s_tokens])
+    n_window_miss = int((~in_window).sum())
+    log_pt = np.array(
+        [pt_map.get(t, pt_floor) for t in s_tokens], dtype=np.float64
+    )
     ell = truncated_increment(log_pt, log_pi, c)
-    return np.array(s_tokens, dtype=np.int64), log_pi, ell, known_pi
+    ell = np.where(in_window, ell, np.minimum(0.0, ell))
+    return np.array(s_tokens, dtype=np.int64), log_pi, ell, known_pi, n_window_miss
 
 
 def candidate_d(log_pi: np.ndarray, ell: np.ndarray) -> float:
@@ -121,7 +130,7 @@ class SpsGenerate:
         draft: Callable[[list[int], dict[str, Any]], Awaitable[Any]],
         verify: Callable[[list[int], dict[str, Any]], Awaitable[Any]],
         teacher_prefix_ids: list[int],
-        student_prompt_len: int,
+        student_prompt_ids: list[int],
         state: TrajectorySteerState,
         tokenizer,
         topk: int,
@@ -132,7 +141,12 @@ class SpsGenerate:
         self._draft = draft
         self._verify = verify
         self._teacher_prefix = list(teacher_prefix_ids)
-        self._student_prompt_len = int(student_prompt_len)
+        # 审阅 max-IF-10:保存完整学生前缀并逐调校验——只存长度时,上游
+        # prompt 构造与 episode 实际前缀有任何 token 级漂移(如 initial_obs
+        # 尾随空白差异过了 strip 比较)都会静默错位 ledger 坐标与 verify
+        # 组装;fail loud 是唯一正确行为。
+        self._student_prompt = [int(t) for t in student_prompt_ids]
+        self._student_prompt_len = len(self._student_prompt)
         self._state = state
         self._tokenizer = tokenizer
         self._topk = int(topk)
@@ -159,9 +173,11 @@ class SpsGenerate:
         st.reject_cap.new_turn()
 
         stream_len = len(prompt_ids) - self._student_prompt_len
-        if stream_len < 0:
+        if stream_len < 0 or list(prompt_ids[: self._student_prompt_len]) != self._student_prompt:
             raise RuntimeError(
-                "prompt shorter than the student prompt — wrong prefix wiring"
+                "episode prompt does not start with the pre-built student prompt — "
+                "prefix drift (e.g. initial_obs whitespace) would silently misalign "
+                "ledger positions and verify assembly"
             )
 
         executed: list[int] = []
@@ -221,7 +237,7 @@ class SpsGenerate:
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
                     continue
-                s_tokens, s_log_pi, s_ell, known_pi = position_candidates(
+                s_tokens, s_log_pi, s_ell, known_pi, n_miss = position_candidates(
                     pi_ids=pi_topk_ids[g],
                     pi_logprobs=pi_topk_lps[g],
                     pt_ids=pt_rows[0][g],
@@ -229,6 +245,7 @@ class SpsGenerate:
                     topk=self._topk,
                     c=self._c,
                 )
+                st.ledger.n_pt_window_miss += n_miss
                 d_value = candidate_d(s_log_pi, s_ell)
                 st.ledger.observe_d(d_value)
                 decision = st.gate.decide(d_value, st.rng)

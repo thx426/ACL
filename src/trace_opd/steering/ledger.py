@@ -61,6 +61,7 @@ class SteeringLedger:
     n_probe_flipped: int = 0
     n_budget_blocked: int = 0         # 门开但预算不允许(η 缩到 0)
     n_bypassed: int = 0               # cap/预算耗尽后未判定直通的 token 数
+    n_pt_window_miss: int = 0         # S 内 p_T 窗外中性代入次数(max-IF-13)
 
     def observe_d(self, d_value: float) -> None:
         b = int(d_value / self.d_hist_max * D_HIST_BINS)
@@ -108,4 +109,5 @@ class SteeringLedger:
             "steer_n_probe_flipped": self.n_probe_flipped,
             "steer_n_budget_blocked": self.n_budget_blocked,
             "steer_n_bypassed": self.n_bypassed,
+            "steer_n_pt_window_miss": self.n_pt_window_miss,
         }

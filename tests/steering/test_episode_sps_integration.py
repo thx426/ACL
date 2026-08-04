@@ -111,7 +111,7 @@ def _episode_with_sps(texts):
     sps = SpsGenerate(
         draft=draft, verify=verify,
         teacher_prefix_ids=teacher_prefix,
-        student_prompt_len=len(student_prompt_ids),
+        student_prompt_ids=student_prompt_ids,
         state=state, tokenizer=TOK, topk=4, c=2.5, obs_topk=OBS_TOPK,
     )
     result = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(

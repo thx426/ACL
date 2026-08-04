@@ -2,13 +2,13 @@
 
 > 审阅区间：`c9d2466..c2096e3`，共 8 个 commit（`c623d85` → `c2096e3`）。
 >
-> 审阅对象固定为提交 `c2096e3` 的 Git 对象；审阅途中工作树出现了非本审阅产生的并发未提交修改，均不纳入判断，也未被本审阅触碰。
+> 审阅对象固定为提交 `c2096e3` 的 Git 对象。审阅途中外部并发工作将分支推进到 `6194b94` 并继续留下未提交修改；本报告后半程全部使用显式 `c2096e3:<path>` 复核，新增提交与工作树修改均不纳入判断，也未被本审阅触碰。
 
 ## 总体结论
 
-**一句话判断：机制的纯数学模块扎实、模块边界也基本清楚，但该 8-commit 快照尚不具备正式实验就绪性——一个 P0 会阻断所有非空 steering ledger 入队，另有行为核近似、LOO、异常样本处理和审计闭环等 P1 会影响机制结论。**
+**一句话判断：机制的纯数学模块扎实、模块边界也基本清楚，但该 8-commit 快照尚不具备正式实验就绪性——两个 P0 分别使 SPS 请求超过 vLLM 上限、使非空 steering ledger 无法入队，另有行为核近似、LOO、异常样本处理和审计闭环等 P1 会影响机制结论。**
 
-最终计数：**P0 1 条 / P1 11 条 / P2 4 条**。建议先修完全部 P0/P1，再进入限定范围的 P4 真机冒烟；当前结果不能用于宣称已忠实实现 v3.0-final 的全部命题条件。
+最终计数：**P0 2 条 / P1 10 条 / P2 5 条**。建议先修完全部 P0/P1，再进入限定范围的 P4 真机冒烟；当前结果不能用于宣称已忠实实现 v3.0-final 的全部命题条件。
 
 ## Findings
 
@@ -55,19 +55,19 @@ spec §4 要求逐 token 记录完整 `gate_state`、预算余额、`steer_flag`
 
 分离两种数据面：行为校正可继续使用只含非零 ratio 的稀疏表；审计 ledger 必须逐生成 token 写全 `D/base_open/assigned_open/probe/propensity/eta/delta/budget_remaining/cap_active/steer_flag/reject_count`。为计数另设 `actual_steer_count`，不要复用记录行数。
 
-### IF-04 — P1 — `src/trace_opd/train/agent_loop.py:308-317`；`src/trace_opd/common/config.py:182-185`
+### IF-04 — P0 — `scripts/launch_train.py:73-81`；`src/trace_opd/steering/hook.py:124-134,159,297`；`src/trace_opd/train/agent_loop.py:308-317`
 
 **问题陈述**
 
-配置声明 `steering.obs_topk` 是 hook 与 vLLM `max_logprobs` 的单一真源，launcher 也按该值配置引擎；但构造 `SpsGenerate` 时没有传入 `obs_topk=st_cfg.obs_topk`，hook 实际静默采用 `4 * topk` 默认值。
+`c2096e3` 没有 `SteeringCfg.obs_topk`。launcher 只把 vLLM 启动上限设为 `max(topk,20)`，而 `SpsGenerate` 在调用方未传参时静默采用 `4*topk`，并把这个更大值同时用于 draft `logprobs` 和 verify `prompt_logprobs`。所有仓库配置均为 `topk=64`，所以引擎上限是 64、hook 实际请求是 256；P4 清单所写的“max_logprobs=256”没有落进命令生成。
 
 **失败场景**
 
-合法配置 `topk=64, obs_topk=128` 会让 launcher 将 vLLM 上限设为 128，而 hook 仍请求 `logprobs=256/prompt_logprobs=256`，首个 SPS 请求在引擎侧失败。反向配置 `obs_topk=512` 则 manifest/fingerprint 声称观察 512，实际只观察 256，候选覆盖与实验定义不符。
+直接运行提供的 `162-pgs-calib.yaml` 或 `162-pgs-s1.yaml`：首个 SPS draft 发送 `logprobs=256`，vLLM 以配置上限 64 拒绝请求，episode 走基础设施失败路径；即使 draft 偶然越过校验，teacher verify 的 `prompt_logprobs=256` 仍会失败。标定和正式 S1 都无法产生机制数据，因此是独立于 IF-01 的全链阻断。
 
 **修复建议**
 
-在 `SpsGenerate(...)` 显式传 `obs_topk=st_cfg.obs_topk`；增加非默认 `obs_topk` 的 agent-loop 接线测试，并断言 launcher 上限、hook 请求宽度和 fingerprint 三者一致。
+引入显式 `steering.obs_topk`（默认 256/或由 `4*topk` 唯一派生），由同一值驱动 launcher 的 vLLM 上限与 `SpsGenerate` 两类请求，并校验 `obs_topk>=topk`；不要在 hook 内保留隐藏倍率默认。增加“真实生成命令 + 构造后的 hook 请求参数”集成断言，覆盖 calib/base/S1 三份配置。
 
 ### IF-05 — P1 — `src/trace_opd/steering/gate.py:74-95`；`src/trace_opd/train/agent_loop.py:198-201`
 
@@ -97,19 +97,19 @@ spec §2.3 要求训练中 robust-EMA 慢更新，并在触发率越界时“告
 
 先明确唯一数学对象：若坚持 spec，应增加 bare scoring、验证 q≈π_verify，并按裁定处理残差；若为了 speculative 精确性选择实际 draft q 作为 proposal/核的 π 侧，则应修改 spec、命名和记账说明，并显式记录 q-vs-bare residual。两种口径都需锁死所有 logits processor，而不能维持“文档双 verify、代码单 verify”的状态。
 
-### IF-07 — P2 — `src/trace_opd/common/config.py:323-335`
+### IF-07 — P2 — `src/trace_opd/common/config.py:323-335`；`scripts/launch_train.py:179,297-310`
 
 **问题陈述**
 
-`objective_fingerprint()` 未包含新增且直接改变梯度的 `train.adv_estimator`，也未包含 `ppo_mini_batch_size` 等命题 C 单快照/单步相关口径；`doc_table` 只哈希路径字符串，不哈希内容。
+`objective_fingerprint()` 未包含新增且直接改变梯度的 `train.adv_estimator`，也未包含 `ppo_mini_batch_size` 等命题 C 单快照/单步相关口径；`doc_table` 只哈希路径字符串，不哈希内容。launcher 还把所有未知参数原样追加到 verl 命令末尾，受保护的算法字段可在 fingerprint 计算后被 Hydra 的末项覆盖；manifest 虽记录字符串，却不参与 resume 守卫。
 
 **失败场景**
 
-同一 run 目录先用 `grpo`，再把配置改成 `grpo_loo` 并 `resume_mode=auto`，fingerprint 不变，旧 checkpoint 会在另一 advantage 定义下继续训练而不触发守卫。同路径 doc JSONL 被替换也同样不可见。
+同一 run 目录先用 `grpo`，再把配置改成 `grpo_loo` 并 `resume_mode=auto`，fingerprint 不变，旧 checkpoint 会在另一 advantage 定义下继续训练而不触发守卫。同路径 doc JSONL 被替换也同样不可见。即使日后把字段补进 Config，命令尾传 `algorithm.adv_estimator=grpo`、loss mode 或 PPO epochs 仍可让实际命令与 fingerprint 分叉。
 
 **修复建议**
 
-把所有会改变采样分布、advantage、loss 聚合或更新次数的字段纳入规范化 fingerprint；对 doc 表至少加入内容摘要（以及可选的数据版本/行数）。为每个字段增加“改单项必改 fingerprint”的参数化测试。
+把所有会改变采样分布、advantage、loss 聚合或更新次数的字段纳入规范化 fingerprint；对 doc 表至少加入内容摘要（以及可选的数据版本/行数）。对 protected Hydra keys 禁止 passthrough 覆盖，或解析最终有效命令后再做规范化摘要。为每个字段和一组尾部覆盖增加“改单项必改 fingerprint/受保护项拒绝启动”的参数化测试。
 
 ### IF-08 — P2 — `src/trace_opd/steering/ledger.py:31-55`；`scripts/calibrate_theta_d.py:61-81`
 
@@ -237,33 +237,91 @@ batch 两行 A/B：A 全程门关，B 有非零 steering。若 A 在第一行，
 
 用明确的“PGS 协议在场”标志判断，而不是用非空 ledger 判断；steering-enabled 训练的每条轨迹都导出相同字段，空账展开为长度匹配的全 1 dense weight。也可在 batch 组装层对 key 并集补默认值，但必须 fail-loud 检查 schema。增加 A/B 两种顺序、缺 doc、overflow、全门关与非空 ledger 混合的 TQ 测试，并断言 steered 行的非 1 权重最终到达 actor batch。
 
-## 忠实性核对表（待完成）
+### IF-17 — P2 — `src/trace_opd/common/config.py:221-240`；`src/trace_opd/steering/budget.py:19-45`；`src/trace_opd/steering/gate.py:39-47`
 
-| spec 条款 | 代码位置 | 阶段性判定 |
+**问题陈述**
+
+`SteeringCfg` 已解决 YAML 科学计数法字符串并做 float/int 强转，但统一 `_validate()` 没有检查数值有限性，也没有检查 `topk>=1`、`r_max>=1` 和合法的 `gate_rate_bounds`。Python 对 NaN 的大小比较为 false，导致 `c/b_max/theta_d` 的现有条件可被绕过；部分整数错误会延迟到状态构造，另一些配置会静默改变机制。
+
+**失败场景**
+
+YAML 写 `theta_d: .nan`：配置成功加载，`d_value >= theta_d` 永远为 false，正式 steering 静默退化成门恒关；`b_max: .nan` 通过 `<0` 检查，预算 `remaining=max(0,nan)` 的行为可把干预折成 0 或在一次扣费后污染状态。`topk: 0` 则直到首个候选位置才形成空 S/除零，浪费一次正式 rollout 才失败；逆序 rate bounds 只会产生无意义告警。
+
+**修复建议**
+
+在配置加载完成后集中检查所有浮点字段 `math.isfinite`，并验证 `topk>=1`、`obs_topk>=topk`、`r_max>=1`、`0<=lo<hi<=1`；底层 `TrajectoryBudget/SteeringGate/SteeringKernel` 仍保留同样的防御，以免绕过 Config 直接构造。增加 `.nan/.inf`、0/负整数和逆序 bounds 的参数化 fail-fast 测试。
+
+## 可读性与结构评价
+
+整体模块边界是本实施的强项：`kernel.py`、`sps.py`、`gate.py`、`budget.py` 都是小而纯的数学/状态模块，约束靠近数据结构，易做性质测试；`hook.py` 把教师限制在采样端，训练侧只接稀疏账本，红线在目录结构上可见。verify 行语义的注释也准确解释了 `r→r+1` 和末行 dummy，实际下标核对通过。
+
+主要结构债务集中在三处：
+
+- backend 的 logprob 明细用若干动态 `extra` key 和平行 list 隐式约定，没有 typed row/schema validator，因而宽度、rank、行数、有限性和 stop 契约分别散落在 hook/server（IF-04/11/15）。建议定义一个经过单点校验的 `ScoredTokenBlock`/协议对象。
+- agent loop 只把 `student_prompt_len` 交给 hook，而不是把经过环境 reset 的完整 prefix 作为不变量，导致字符串/模板一致性无法在边界层证明（IF-10）。prompt 构造应由同一阶段完成并传完整 token prefix。
+- `SteeringLedger` 同时承担训练稀疏 ratio 表、因果审计和曲线汇总，三种粒度互相妥协（IF-03/16）。应把 correction table 与 audit/aggregate schema 分离，并给每个字段定义是否逐 token、逐 decision 或逐 trajectory。
+
+需要纠正的文档失真包括：`SpsOutcome.log_pi`/hook 文字暗示同一 bare verify、实际取 draft q（IF-06）；prefix PDIS 和单步截断被称为 trajectory IS/V-trace（IF-14）；包级 docstring、Hydra defaults 和 engine 注释仍宣称旧 distillation/research 机制（IF-12）。关键输入契约目前还多处用可被 `python -O` 删除的 `assert`；修 IF-10/11 时应改为带请求/位置上下文的显式异常。
+
+## 忠实性核对表
+
+| spec 条款 | 代码位置（均指 `c2096e3`） | 判定 |
 |---|---|---|
-| §2.1 保尾核 | `steering/kernel.py` | 主公式、S 外恒 π、S 质量守恒与 ratio 界正确 |
-| §2.2 截断 | `kernel.py:28-36` | 正确 |
-| §2.3 D 门/探针 | `gate.py`、`hook.py` | 可测接口基本正确；慢更新、越界降级与逐 token 审计未闭合（IF-03/05） |
-| §2.4 D∞ 预算 | `budget.py`、`hook.py` | `δ=2ηc` 与余额缩 η 主路径正确；最终边界继续核查 |
-| §2.5 SPS | `sps.py`、`hook.py` | 单点恒等与拒绝续采主路径正确；双 verify 口径不忠实（IF-06），异常/EOS 路径继续核查 |
-| §2.6 训练 | `steering_weights.py`、`agent_loop_tq.py`、`core_algos.py` | clip 外乘权重的 loss 形态正确；TQ 默认配置阻断（IF-01），scale 非严格 LOO（IF-02） |
-| §3 命题 A-D | 多处 | A/B 的纯模块对象基本成立；C 的实现条件未完全满足；D 为规范数例、代码无额外外推 |
-| §4 记账 | `ledger.py`、`hook.py` | 不完整（IF-03） |
+| §2.1 固定 S 与保尾核 | `steering/hook.py:59-95`；`steering/kernel.py:40-141` | **部分通过。** S 在当前 token 判定前由两侧行分布固定；核在 S 外严格等于 proposal、S 内保持原质量且归一化正确。两个观测封闭点定义了另一合法 operational S，但不是字面理想并集；teacher floor 还可翻转方向（IF-13）。 |
+| §2.2 截断增量 | `steering/kernel.py:28-35,72-94` | **通过。** `clip(log p_T-log q,±c)`、几何倾斜和 `|log(b/q)|<=2ηc` 的实现/断言一致。这里的 π 侧实际是 draft q（见 IF-06）。 |
+| §2.3 D 门与 ε 探针 | `steering/gate.py:29-95`；`steering/hook.py:205-216` | **部分通过。** D、主门和 probe 的函数签名不接当前 proposal token，满足可测性红线；随机翻转概率也正确。训练期 robust-EMA、跨轨迹率界和越界降级未接线，审计总体不全（IF-03/05/08）。 |
+| §2.4 D∞ 预算 | `steering/budget.py:16-46`；`steering/hook.py:185,201-250` | **通过数学主路径。** 逐位置先按余额缩 η、再扣 `δ=2ηc`，恰好耗尽后转 base，不会透支；轨迹密度比界随扣费相加。耗尽/cap 尾段的逐 token 状态没有如实落账（IF-03），不影响采样界但影响可审计性。 |
+| §2.5 SPS 与 R_max | `steering/sps.py:31-78`；`steering/hook.py:155-311` | **部分通过。** 单点接受 `min(1,b/q)`、残差 `norm((b-q)_+)`、拒绝后丢后缀并从修正前缀续采、每 turn cap 主路径正确。`_verify_rows` 的 `base=T+M+E-1` 与“行 r 预测 r+1”语义对齐。缺 bare verify，残差 EOS 不终止，prompt 精确前缀、异常与 rank 契约也未闭合（IF-06/09/10/11/15）。 |
+| §2.6 W_beh 与 LOO | `steering_weights.py:42-99`；`agent_loop_tq.py:189-211`；`core_algos.py:640-699,1340-1420` | **代码形态部分通过、集成不通过。** vanilla loss 先对 `πθ/πold` clip，再在外部乘 W，位置正确；per-token 与前缀积展开/尾部延续正确。默认 Hydra 守卫会拒绝非空账（IF-01），混合账字段又会丢权重或崩溃（IF-16）；scale 不是严格 LOO（IF-02），模式命名有误（IF-14）。 |
+| §3 命题 A | `kernel.py`；`sps.py`；`hook.py` | **有条件成立。** 若 vLLM top-K 行完整，输出单点精确服从以真实 draft q 构造的 operational `b_S(q,p_T)`；相对规范所写 bare-verify π、理想 p_T 值和完整停止轨迹，现代码不能直接引用命题 A（IF-06/11/13/15）。 |
+| §3 命题 B | `kernel.py:91-94,139-141`；`budget.py:30-46` | **成立于 operational q-kernel。** S 外 ratio=1，S 内逐点界和轨迹累计界正确。它不自动证明 q≈训练端 `π_old`。 |
+| §3 命题 C | `core_algos.py:640-699,1340-1420`；`steering_weights.py` | **不满足默认实现条件。** 默认 per-token 不是整轨无裁剪换测度，q 与 `π_old` 未同对象验证，scale 包含当前 outcome；单快照/单 epoch 虽靠 verl 默认与整批 mini-batch 配置近似满足，也未被完整 fingerprint/守卫锁死。只能引用 spec 已承认的一阶有偏工程档，不能声称期望梯度等于 `∇J`。 |
+| §3 命题 D | `tests/steering/test_steering.py` | **仅窄范围通过。** 单点二元数例有对应数值测试；实现没有把它外推到 episode，这一点忠实。 |
+| §4 extra_fields | `steering/ledger.py:17-86`；`steering/hook.py:201-258` | **不通过。** 行为校正需要的稀疏 `log_q/log_b` 足够，但规范要求的逐 token gate/budget/cap/steer/reject 状态无法重建，且 `cap_active` 逐行字段事实上记不到真值（IF-03）。 |
+| “奖励只来自 verifiable outcome；loss 无教师”红线 | `train/agent_loop.py:207`；`scripts/launch_train.py:84-111`；`core_algos.py:1340-1420` | **活跃 PGS 路径通过。** reward 由 `traj.won` 产生，教师只在采样 hook；vanilla policy loss 无蒸馏项。但默认配置/engine 仍有半死 distillation/research 残留（IF-12），故“全面根除”不通过。 |
 
-## 测试缺口清单（待完成）
+### NF01–NF10 修法回归
 
-- 缺真实 Hydra 默认配置下的 TQ/W_beh 入队集成测试，因而未发现 IF-01。
-- verify mock 每行分布相同，任何行偏移一位的 bug 都会通过；需要位置相关 oracle。
-- 拒绝续采断言含宽松的 `or len(draft.calls) >= 2`，没有逐次证明“修正前缀 + 重采 token”精确一致。
-- 缺 EOS/stop token 被拒、空 draft、draft/verify aborted、畸形或不完整 top-K 行、输出超过 max_tokens 的测试。
-- 缺多轮中发生真实拒绝后的 ledger 坐标测试；现有 episode 集成只覆盖 D=0、门恒关透明路径。
-- 缺默认关闭 rollout correction 与 PGS 字段混合批次的实际 TransferQueue 测试。
-- `grpo_loo` 数值测试验证了稳定性，却没有验证 scale 对本样本 outcome 的依赖及相应偏差。
-- 已知只能真机验证的 prefix-cache×prompt_logprobs、`logprobs_mode` 与 draft/verify 数值残差仍按 P4 清单保留。
+| 前轮编号 | 本轮判定 | 落地情况 |
+|---|---|---|
+| NF01 固定行为对象 | **核心已修。** | `SteeringKernel` 明确定义固定 S 的保尾核，S 外 q 不变，接受/残差/记账共用该对象。当前对象实际是 q-kernel，floor 是额外近似；见 IF-06/13。 |
+| NF02 行为比进入 PPO clip | **公式已修、集成未通。** | `core_algos.py` 在 PPO clip 后乘 `rollout_is_weights`，不再用 W_beh 污染 update ratio；但 IF-01/16 使该字段在正式批次拒绝、丢失或崩溃。 |
+| NF03 命题 C 条件缺失 | **部分修复。** | 规范已撤回“二阶偏差”，加入分离式 W 和 `grpo_loo`；默认仍非整轨 IS、q 未与 `π_old` 同对象校验、scale 非 LOO，故条件 iii/iv 仍不满足（IF-02/06/14）。 |
+| NF04 η 可测性/R_max 行为态 | **采样层已修，审计未闭合。** | gate API 不接 proposal token，R_max 达到后 turn 尾部转 η=0；残差 EOS 仍破坏停止态，cap-active 逐 token 账为假（IF-03/15）。 |
+| NF05 ITT credit 冷启动 | **从第一版移出。** | 当前 PGS 没有在线 credit/剂量学习活路径，固定 B∞；原问题不再适用于本机制实现。 |
+| NF06 sham/跨快照 LCB | **从第一版移出。** | sham 和 LCB credit 不在当前采样/训练主链；无须在本 8-commit 实现中修补，但旧机制残留清理仍不彻底（IF-12）。 |
+| NF07 D 门/阈值/propensity | **部分修复。** | D 使用同一 operational S，P85 标定面、ε propensity 与 rate alarm 已有；robust-EMA/越界降级未接、逐 token 控制总体和 histogram 坐标仍不完整（IF-03/05/08）。 |
+| NF08 五臂 estimand/功效 | **原冲突已移出机制层。** | 当前只提供 calib/base/S1 首批配置，不再把旧 T/U/S 五臂写成一个含混 estimand；种子/功效仍需另行预注册，代码本身不能证明充分。 |
+| NF09 成本式/重复 verify/cache | **实现语义部分修复，真机未闭环。** | hook 在每次拒绝后丢 suffix 并重新 draft+teacher verify，成本应按重复次数计算；prefix-cache 可复用和实际墙钟仍只在 P4 清单，且代码没有规范所写的 bare verify。 |
+| NF10 c 与 B∞ 解释 | **核心已修。** | 实现用完整密度比界 `2ηc` 扣费，而非只把 c 当“最大抬升”；B∞=6 只提供有限界、不等于方差安全，当前规范未再作 episode 安全外推。 |
 
-## 四个实现口径定案的独立判定（待完成）
+## 测试缺口清单
 
-1. **S 的两个封闭点**：阶段性判定为“作为预先固定的自选 S，不破坏相对该 b_S 的 SPS 恒等；会降低教师冷 token 覆盖，需如实命名，不能解释为理想双 top-K 并集”。
-2. **p_T 观测窗外 floor 代入**：阶段性判定为“定义了可采样的近似核，clip 饱和时无误差；未饱和时所谓方向保守需要结合行提取/floor 完整性继续核查”。
-3. **`max(std_loo,std_full)`**：不满足严格 LOO/命题 C，但可作为明确有偏的稳定性档；见 IF-02。
-4. **借原生 `rollout_is_weights` 通道**：loss 中 clip 外乘权重的选择本身正确且改动面小；当前互斥守卫使默认配置不可运行，故落地判定暂为不通过；见 IF-01。
+按任务书口径，目标集合有 88 个 collected case（源码为 53 个测试函数，另有参数化展开）。本审阅逐文件检查了这些测试；因审阅中分支被外部推进且工作树持续有并发改动，没有在非 `c2096e3` 工作树上运行 pytest，以下判定来自静态代码/测试审阅，不把后续修复的结果冒充原快照结果。
+
+现有覆盖的强项：纯 kernel 的 S 质量/保尾/密度界、预算与 gate 单元边界；SPS 单点接受/残差恒等及约 20 万次统计等价；hook 正常路径约 3 万次统计；三种 W_beh 展开；`grpo_loo` 的 n=1/n=2/全同/孤例稳定性；D=0、门恒关的 episode×SPS 透明集成；vendored 文件的若干字符串守护。
+
+仍需补齐：
+
+1. **两个 P0 的真实配置测试**：从 `162-pgs-{calib,s1}.yaml` 构造最终命令与 hook，断言 `max_logprobs >= logprobs/prompt_logprobs`；用真实 Hydra defaults 加一条非空 ledger 走完整 TQ postprocess，证明关闭的 rollout correction 不误判。
+2. **TQ mixed schema**：全门关/缺 doc/overflow 与非空 steering 轨迹按两种顺序混合，断言字段恒齐、空账为全 1、非空权重抵达 actor；当前测试只对展开函数本身，不覆盖 `list_of_dict_to_tensordict()`（IF-16）。
+3. **verify 行 oracle**：每个位置使用不同 top-K/概率，逐项证明行 r 预测 r+1 及 `base=T+M+E-1`；现有 mock 各行相同，偏移一行也会通过。
+4. **真正的多轮拒绝路径**：第一轮拒绝后插入环境 glue，第二轮再次拒绝，核对 prompt、ledger position、turn cap 重置、budget 余额与 W 展开；当前 episode 集成只走 D=0 透明路径。
+5. **停止边界**：普通 token 被拒后 residual=EOS 应立即停；draft EOS 被拒且 replacement 非 stop 应继续；覆盖多 EOS/自定义 stop ID。再测恰好 R_max、恰好耗尽预算及下一 token 的 base-only 状态。
+6. **异常契约**：首轮/后续轮分别注入 draft aborted、verify aborted、env step exception；已有 response 的 `ENV_ERROR` 必须整轨丢弃。另覆盖空 draft、缺 logprob 明细、行数不齐、后端返回超过 remaining `max_tokens`，确保不产生 phantom ledger/budget。
+7. **prompt 精确一致性**：初始观察前后空白、Unicode 归一化、等长不同 token 和聊天模板差异；每次调用都验证完整 student prefix，而非只比较长度/尾部。
+8. **top-K 行契约**：rank=None、重复、负/零/越界、空洞、sampled token rank>K、token ID 重复和非有限 logprob；验证失败要定位 request/position，不允许 sentinel 进入核。
+9. **floor/封闭点性质**：构造 `p_T(t)<<π(t)<p_floor` 的符号反转例；统计真实模型中 teacher cold-token 排除质量、floor 替代率、`p_floor>π(t)` 率和 D/门决定变化。当前测试只证明近似核自洽，没有证明方向保守。
+10. **统计功效**：20 万次纯单点测试对常见概率差异足够，但 3 万次 hook 测试难发现低于约 1% 的稀有 residual/顺序偏差，也没有检验两位置联合分布。应预注册 TV/卡方阈值与功效，覆盖多个质量尺度、稀有拒绝和两位置 joint target，避免单 seed 偶然通过。
+11. **LOO 理论性质**：现有测试固化了 n=1/n=2/孤例“数值不爆炸”，却没有做“改变当前 reward 不得改变本样本 scale”的性质测试；理论正确档应先定义外部/frozen scale，再测该独立性。全同组应继续保持零 advantage。
+12. **配置/恢复/标定**：逐字段验证 fingerprint 改变，doc 内容同路径替换、protected passthrough、`.nan/.inf`、topk/rmax/rate bounds；标定需测混合 c 坐标、目标分位落 overflow、非法 q 及 `sum(hist)!=d_count`。
+13. **根除守护**：守护范围扩到 `src/`、`verl/`、Hydra defaults、生成 YAML 和 vendored tests；完整 collection 不应再 import 已删除的 distillation 模块。
+
+已知 P4 真机项仍包括 prefix-cache×`prompt_logprobs`、`logprobs_mode`、q（draft）对训练端 `π_old` 的数值残差、反复拒绝后的 KV/cache 墙钟与显存。**本轮新增只能真机可靠验证的项目**是：所有声明支持的 vLLM 版本是否都返回完整/唯一 rank 1..K；真实 EOS/stop 在 response token IDs 中的表现；Ray TransferQueue 混合 PGS schema；server cancel/abort 后 sticky route 与 KV 状态能否安全重用。
+
+## 四个实现口径定案的独立判定
+
+1. **S 的两个封闭点——条件通过。** S 是机制可自选的 prefix-measurable 固定集：π 侧只用已观察窗口、teacher top-K 中没有已知 q 值的冷 token 不入 S，不会破坏相对这个 operational `b_S` 的 SPS 恒等、保尾或预算界。代价不是“数值近似”而是**目标覆盖改变**：最强 teacher 建议若在 q 中很冷会被系统性忽略，不能再把 S 描述成字面 `topK(q)∪topK(p_T)`。正式实验应记录 teacher top-K 被排除数、q 质量上界与最大可提升质量；这些量足够小且预注册时，该裁定是 sound 的工程封闭。
+2. **p_T 观测窗外 floor 代入——当前论证不通过。** 它确实定义了一个可归一化、可精确采样且仍受 D∞ 预算约束的近似核；若真实与 proxy 都落在同一负侧 clip 饱和区，结果无误差。但 floor 是未观察概率的上界，不是保守点估计，未饱和时可从 `-c` 翻到正值并逆 teacher 方向（IF-13）。在真实率未量化前不能称“方向保守”；推荐取得精确值、用中性增量 0，或使用区间鲁棒规则。
+3. **`scale=max(std_loo,std_full)`——理论主档不通过，工程消融可保留。** 它解决 7胜1负和 n=2 的爆炸，但 `std_full` 包含本样本 outcome，违反命题 C 条件 iv；baseline LOO 不能单独恢复无偏性（IF-02）。主档应使用与本样本无关的 frozen/跨组尺度或 scale≡1；现实现只能标为“有偏稳定化消融”，并与 n=1 原始 score、全同组零 advantage 的边界分别说明。
+4. **借原生 `rollout_is_weights` 通道——架构选择通过，`c2096e3` 落地不通过。** vanilla loss 对该字段的消费位置正好在 PPO clip 之外，复用通道比新增第二套 loss plumbing 更小、更清晰；与原生 rollout correction 互斥也是正确约束。落地必须判断 `rollout_is/rollout_rs` 是否真正启用，而不是配置映射是否存在，并给每条 PGS 行补全同 schema 的 dense 权重（IF-01/16）；同时钉死 vanilla loss、禁止 protected passthrough 覆盖。满足这些条件后，该定案是四项中最 sound 的工程选择。
