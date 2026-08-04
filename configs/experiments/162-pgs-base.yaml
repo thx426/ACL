@@ -81,7 +81,11 @@ train:
                             # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048。
                             # 同时决定 prompt_logprobs 打分(SPS verify)的临时 logits
                             # 显存:本值 × vocab × 2B ×2
-  rollout_gpu_mem: 0.7      # vLLM 显存占比 | 独占拓扑值(共存拓扑回 0.35)
+  rollout_gpu_mem: 0.6      # 2026-08-04 防御性下调 0.7→0.6:SPS 的 logprobs/
+                            # prompt_logprobs 请求触发 vLLM 预算外分配(#5907,
+                            # 无保护;实测峰值超预算 11-22G,78/80 贴上限)。让出
+                            # 8G 结构性 headroom;代价=KV 池缩、preempt 增多
+                            # (degrade 不崩)。与 R11a 历史事故同源
   rollout_max_num_seqs: 128 # 每 vLLM replica 并发序列上限(单 TP 上限,用户裁定)
   rollout_temperature: 1.0
   # ---- 信用分配单位(verl actor.loss_agg_mode)----

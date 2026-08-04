@@ -282,6 +282,9 @@ def main() -> int:
     # Settings that reach verl through the environment because verl reads them
     # there. The CONFIG is the source of truth; these are transport.
     env["TRACE_AGENT_TASK_TIMEOUT_S"] = str(cfg.train.agent_task_timeout_s)
+    # vLLM logprobs 路径的预算外大额临时分配(#5907)易碎片化;可扩展段减少
+    # 假性 OOM。constants_ppo 将其显式转发到 Ray worker。
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env["VLLM_RPC_TIMEOUT"] = str(cfg.train.vllm_rpc_timeout_ms)
     if cfg.train.dist_backend:
         env["VERL_DIST_BACKEND"] = cfg.train.dist_backend
