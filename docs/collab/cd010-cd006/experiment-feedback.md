@@ -87,3 +87,43 @@ if self.skip_reading_prefix_cache is None:
 
 **待 CD-010 定夺**:若实测开销超预期,可选方向 ①减小 verify 频率(按轮而非按段)、
 ②缩短教师前缀、③接受成本。实验侧先如实测量,不自行改机制。
+
+---
+
+## 2026-08-04 · [P2] launcher 硬编码 `max_actor_ckpt_to_keep=3`——参数真值不在配置层
+
+**结论**:`build_command` 里这一项是字面量,配置与 manifest 都看不到它。按既有教训
+(参数真值三层:配置 / manifest / verl 实收,**硬编码排最后会赢**),这类值必须在
+配置层可见。已提为 `train.max_ckpt_to_keep`(默认 4,用户裁定)。同类项建议 CD-010
+复查:凡是 `build_command` 里的字面量常数,只要会影响资源/行为,都应上提配置。
+
+## 2026-08-04 · [P2] 首轮正式实验的执行侧配置裁定(用户 2026-08-04)
+
+与机制无关、不进 objective fingerprint,但两臂必须一致,记录备查:
+
+| 项 | 值 | 理由 |
+|---|---|---|
+| `run.runs_root` | `/data4/ws/PGS` | /data3 曾 100% 写满并炸掉 C3;/data4 余 5.6T |
+| `train.rollout_tp` | **1**(原 2) | 4 卡 = 4 个独立 vLLM replica,无跨卡通信 |
+| `test_freq`/`save_freq` | 10 / 10 | 100 步内 10 个 val 点 |
+| `train.max_ckpt_to_keep` | 4 | 单 ckpt ≈45G ⇒ 峰值 ~180G |
+
+## 2026-08-04 · [P1] 训练侧显存实测:峰值 allocated 72.1G / reserved 76.7G(80G 卡,96%)
+
+**数据**(base 冒烟 2 步,sp=1、rmpad=False+sdpa、ppo_max_token_len_per_gpu=8192):
+`actor/perf/max_memory_allocated_gb` 69.4 → **72.1**;`max_memory_reserved_gb` 74.1 → **76.7**。
+训练侧序列最长 **8094**(已贴着 8192 预算);val 侧出现 32704(但 val 不进训练反向)。
+
+**与历史对照**:同模型在 ppo=8192 下曾实测 38.98G —— **现在几乎翻倍**。差异在
+`use_remove_padding=False`:该口径下微批内序列要 pad 到最长条,`ppo_max_token_len_per_gpu`
+只约束**未 padding 的 token 总数**,padding 后张量可放大若干倍
+(例:[2500, 1000×5] 总 7500 ≤ 8192,padding 到 6×2500 = 15000,放大 1.9×)。
+
+**风险**:训练序列长度继续增长(本项目有 step-9 长度暴涨的既有记录)时,
+padding 放大 + 单条独占微批会把峰值推过 80G。
+
+**可选缓解(待裁定,均为数学等价、不进指纹的执行档)**:开 `ulysses_sp=2`
+——自动联动 `use_remove_padding=True`(packed THD,消除 padding 浪费)+ 序列切两卡。
+前提已实测:LD_PRELOAD 后 flash-attn 2.8.3 **真实前向可用**;Qwen3-4B 32 heads / 8 kv_heads,
+4 卡与 2 均可整除。**首轮暂按 sp=1 跑(维持预注册),显存纳入监控**;
+若峰值逼近 78G 或出现 OOM,再切 sp=2 重跑。
