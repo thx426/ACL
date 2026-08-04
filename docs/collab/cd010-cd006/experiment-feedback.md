@@ -505,3 +505,21 @@ pgs_s1、A800 八卡在 pgs_base_a800,无空窗;等 run 停点或用户裁定腾
 PyPI CUDA 栈有"import 通但真实运算报驱动过旧"实测前科,且 conda-forge 无
 sglang/sgl-kernel。若 dry-run 后实装验证失败,A800 选项:①保持 vLLM 后端
 (回摆通道,base/对照臂本来不吃 verify 收益);②驱动升级(管理员级,需裁定)。
+
+## 2026-08-05 · [P1] SGLang 环境补充:A800 安装完成且驱动判决通过(历史 PyPI 死刑未复现);两台门 1 全过、待空卡跑门 2-4
+
+**结论**:A800 也走通了。`/fs/fast/u2021000902/wushang/workspace/TRACE-OPD/venv_sglang`
+(python -m venv on env_vllm 解释器,腾讯镜像源装,~15 min):sglang 0.5.8 /
+flashinfer 0.6.1 / torch **2.9.1+cu128** import 全过;**PyPI torch 真实矩阵乘在
+驱动 525.60.13 上成功**(fp16 512² @ cuda:0,结果有限校验过)——infra 档案里
+"A800 上 PyPI torch 不可用"的历史结论对现代 cu128 wheel 不成立(minor-version
+compatibility 生效),档案将由 CD-006 更新注记。谨慎项:单核运算≠全栈,
+sglang 起服(flashinfer/sgl-kernel/cudagraph 全 kernel 面)才是 A800 终审。
+
+镜像源实测:A800 上 TUNA 也慢(nccl 322MB 卡十几分钟),**腾讯源
+(mirrors.cloud.tencent.com/pypi)快一个量级**——执行册镜像建议按机器双选。
+
+**当前态**:两台 venv_sglang 就绪、门 1 全过、零 LD_PRELOAD 依赖。门 2-4
+(起服/往返/256宽+radix三断言/memory-saver)统一待空 GPU:162 四卡在 pgs_s1
+(step~50)、A800 八卡在 pgs_base_a800(step~75)。base 自然完成约 +14h;
+s1 是否提前停(已确认 θ_D 死锁版,让位 S2/SGLang 验证)待用户裁定。
