@@ -108,3 +108,26 @@ def test_steering_config_rejects_nonfinite_and_bad_structure(tmp_path):
                 "gate_rate_bounds: [0.5, 0.2]", "gate_rate_bounds: [0.0, 0.3, 1.0]"):
         with pytest.raises(ValueError):
             _load(base % bad)
+
+
+def test_norm_adv_by_std_defaults_off_and_flows_through(tmp_path):
+    # 审阅 IF-04(方案 A):主档不做组内 std 归一化(scale≡1,条件 iv 严格成立)
+    cmd = _cmd(tmp_path)
+    assert "algorithm.norm_adv_by_std_in_grpo=False" in cmd
+    cmd2 = _cmd(tmp_path, ", norm_adv_by_std: true")
+    assert "algorithm.norm_adv_by_std_in_grpo=True" in cmd2
+
+
+def test_fingerprint_moves_with_objective_fields(tmp_path):
+    # 审阅 IF-10:改 adv_estimator / norm_adv_by_std / steering 参数必须换指纹
+    from trace_opd.common.config import objective_fingerprint
+
+    def _fp(train_extra=""):
+        path = tmp_path / f"fp{abs(hash(train_extra))}.yaml"
+        path.write_text(YAML % (train_extra, ""))
+        return objective_fingerprint(load_config(path))
+
+    base = _fp()
+    assert _fp(", adv_estimator: grpo") != base
+    assert _fp(", norm_adv_by_std: true") != base
+    assert _fp(", lr: 2.0e-6") != base

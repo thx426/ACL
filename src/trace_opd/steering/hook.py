@@ -12,6 +12,14 @@
              η → speculative 接受判定;拒绝 ⇒ S 上残差重采,回 1 从断点续。
   4. 每轮拒绝达 R_max ⇒ 该轮余下强制 η=0(行为态,如实记账)。
 
+理论对象口径(审阅 IF-03 定案):本机制的核构造于**引擎采样分布 q**
+(draft 路径返回的 logprobs),即 b_S = b_S(q, p_T);speculative 恒等的
+接受分母必须与真实 proposal 分布一致,故 q 是唯一自洽的 π 侧口径——命题 A
+的精确性相对 b_S(q,·) 成立。q 与训练端 π_old(FSDP bf16→fp32 重算)的
+数值残差 ~1e-3/token,与普通 GRPO 默认忽略的 vLLM-FSDP 失配同类同量级;
+不额外做 bare verify(那会让接受分母偏离真实 proposal,反而破坏恒等)。
+残差量级 P4 冒烟实测(docs/pgs-final-spec.md 实现注记)。
+
 实现口径(引擎数据面的两个封闭点,均为 S 的合法自选而非近似——命题 A 的
 精确性相对 b_S 成立,S 的选择只影响倾斜覆盖度):
   * S 的 π 侧候选取 draft 返回的 top-obs_topk;p_T top-K 中 π-rank 超出

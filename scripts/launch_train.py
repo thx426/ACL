@@ -84,6 +84,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
     return [
         sys.executable, "-m", "verl.trainer.main_ppo",
         f"algorithm.adv_estimator={t.adv_estimator}",
+        # 审阅 IF-04(方案 A):默认关组内 std 归一化(Dr.GRPO 形态,scale≡1
+        # 与样本无关,严格满足条件 iv);开=有偏稳定化消融档。
+        f"algorithm.norm_adv_by_std_in_grpo={t.norm_adv_by_std}",
         "algorithm.use_kl_in_reward=False",
         f"data.train_files=['{t.train_file}']",
         f"data.val_files={val_files}",
@@ -296,6 +299,21 @@ def main() -> int:
         print("[launch] SWANLAB_API_KEY not set — falling back to SWANLAB_MODE=offline")
         env["SWANLAB_MODE"] = "offline"
 
+    # 审阅 IF-10:passthrough 在 fingerprint 计算之后追加——改变优化目标的
+    # 键从这里溜进去会绕过 resume 守卫(同一 run 换 objective 续训)。这类
+    # 键必须走 --set(参与校验与指纹),不许走 passthrough。
+    _OBJECTIVE_PREFIXES = ("algorithm.",)
+    _OBJECTIVE_SUBSTRINGS = (
+        "loss_agg_mode", "adv_estimator", "optim.lr", "ppo_epochs",
+        "ppo_mini_batch_size", "train_files",
+    )
+    for item in passthrough:
+        key = item.split("=", 1)[0].lstrip("+")
+        if key.startswith(_OBJECTIVE_PREFIXES) or any(sub in key for sub in _OBJECTIVE_SUBSTRINGS):
+            raise SystemExit(
+                f"FATAL: passthrough override {item!r} changes the optimisation "
+                "objective but bypasses the fingerprint — use --set (config-level) instead"
+            )
     cmd = build_command(cfg, run_dir) + list(passthrough)
     if passthrough:
         print(f"[launch] WARNING: manual verl overrides appended: {passthrough}")

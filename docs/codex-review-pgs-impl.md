@@ -167,19 +167,47 @@ K=3 的一行只返回 rank 1 和 3（另有 sampled token rank 7）。代码产
 
 先收集所有 `rank<=K` 项，严格验证 ranks 恰为 `1..K`、token ID 唯一、logprob 有限，再生成稠密行；sampled token `rank>K` 可继续单独保留在 sampled logprob 通道，但绝不能用于填 top-K。验证失败应携带 request ID、token position、K 和原始 ranks fail-loud。增加 rank=None、重复、越界、空洞以及 sampled-token rank>K 的契约测试；该契约还需纳入支持的每个 vLLM 版本真机冒烟。
 
-### IF-12 — P2 — `verl/verl/trainer/config/ppo_trainer.yaml:42-43`；`verl/verl/trainer/config/distillation/distillation.yaml:1-113`；`verl/verl/workers/engine/fsdp/transformer_impl.py:654-703,1250-1467`；`src/trace_opd/core/episode.py:323-360`
+### IF-12 — P2 — `verl/verl/trainer/config/ppo_trainer.yaml:42-43`；`verl/verl/trainer/config/distillation/distillation.yaml:1-113`；`verl/verl/workers/engine/fsdp/transformer_impl.py:654-703,1250-1467`；`verl/tests/utils/test_special_megatron_kl_loss_tp.py:24-25`；`src/trace_opd/core/episode.py:323-360`
 
 **问题陈述**
 
-P1.5 所称“旧机制全面出清”并未完成。默认 PPO Hydra defaults 仍装载一整棵 distillation 配置，其 `_target_` 指向已经不存在的 `verl.workers.config.DistillationConfig`；FSDP（以及 Megatron/VeOmni）仍保留 `research_mask`、`tg_mask`、`distillation_use_topk`、`distillation_only` 活分支；trace_opd 还留有只服务旧 SFT/mixed-objective 的 `replay_bare_tokens()`，以及旧机制命名/docstring。当前主路径没有读取 `config.distillation`，所以默认关闭时不直接改变 PGS loss，但“纯 GRPO 面、无旧机制配置/代码”的守护结论不成立。
+P1.5 所称“旧机制全面出清”并未完成。默认 PPO Hydra defaults 仍装载一整棵 distillation 配置，其 `_target_` 指向已经不存在的 `verl.workers.config.DistillationConfig`；FSDP（以及 Megatron/VeOmni）仍保留 `research_mask`、`tg_mask`、`distillation_use_topk`、`distillation_only` 活分支；trace_opd 还留有只服务旧 SFT/mixed-objective 的 `replay_bare_tokens()`，以及旧机制命名/docstring。四个 vendored 测试文件也仍 import 已删除的 `verl.trainer.distillation.*` 模块。当前主路径没有读取 `config.distillation`，所以默认关闭时不直接改变 PGS loss，但“纯 GRPO 面、无旧机制配置/代码”的守护结论不成立，完整 verl test collection 也不再闭合。
 
 **失败场景**
 
-调试工具或未来公共代码尝试把默认 `config.distillation` 转成 dataclass，立即因目标类已删而 import/instantiate 失败；用户看到仍存在的 `distillation.enabled` 并尝试启用，会进入半删除状态。若旧 batch key 偶然泄漏，engine 中休眠分支还可重新改变 logprob/归一化行为，而现有字符串守护测试因检查面不全不会报警。
+调试工具或未来公共代码尝试把默认 `config.distillation` 转成 dataclass，立即因目标类已删而 import/instantiate 失败；用户看到仍存在的 `distillation.enabled` 并尝试启用，会进入半删除状态。完整收集 `verl/tests/` 会先在上述遗留测试的 import 阶段失败。若旧 batch key 偶然泄漏，engine 中休眠分支还可重新改变 logprob/归一化行为，而现有字符串守护测试因检查面不全不会报警。
 
 **修复建议**
 
 若目标确为彻底根除，删除 defaults 项、distillation YAML/生成配置残段、三种 engine 的专用分支、旧 replay/API/docstring，并用覆盖 `src/`、`verl/`、configs 的允许名单式 `git grep` 守护；若这些是有意保留的 verl 原生通用能力，则恢复完整 dataclass/测试、去掉 trace-opd 旧机制耦合，并在设计文档明确其不被 PGS launcher 接线。不能维持“配置仍暴露、目标类已删除”的半死状态。
+
+### IF-13 — P1 — `src/trace_opd/steering/hook.py:20-22,73-90`；`docs/pgs-impl-design.md:109-113`
+
+**问题陈述**
+
+对属于 π 侧 top-K、但落在 teacher top-K 窗外的 token，代码用 teacher 第 K 名 logprob（floor）代替真实 `log p_T`。真实值只知道“不大于 floor”；这个上界代入并不保证文档暗示的方向保守，甚至可把 `log p_T-log π` 的符号翻转。SPS 和预算命题仍相对这个人为定义的近似核成立，但该核不再保证沿真实 teacher 偏好倾斜，D 门也会由同一伪差异触发。
+
+**失败场景**
+
+某 π-only 候选满足 `π(t)=1e-4`、teacher 第 K 名 `p_floor=1e-3`，而真实 `p_T(t)=1e-8`，取 `c=2.5`。真实增量应为 `clip(log(1e-8/1e-4))=-2.5`，floor 代理却给出 `log(10)≈+2.30`：实现把一个 teacher 强烈反对的 token 当成偏好 token 提升。只要此类位置未达到注释所假设的“负侧 clip 已饱和且 floor 不影响”，形式上的 privileged guidance 方向就可能反转；当前 ledger 也没有统计发生率。
+
+**修复建议**
+
+不要把上界当点估计。最稳妥的是扩大/精确取得 S 内 teacher logprob；若必须 top-K 封闭，可对未知项取中性 `log p_T:=log π`（令该 token 的增量为 0），或用区间鲁棒核并把最坏方向写进规范。至少记录 floor-substitution 数、`floor>π(t)` 的符号不确定率和质量占比，先用真实模型验证“多数已饱和”的经验前提；在此之前不要称其为方向保守。
+
+### IF-14 — P2 — `verl/verl/trainer/ppo/steering_weights.py:27-31,87-96`
+
+**问题陈述**
+
+三种展开的代码行为与测试基本一致，但命名/注释夸大了两个消融：`per_decision` 实际是“截至当前位置的前缀乘积（PDIS）”，不是把完整轨迹乘积施加到所有 score term 的 trajectory IS；`vtrace` 只是逐 token 的 `min(1,π/b)`，没有 V-trace 的 value target、`c` trace 系数或时序递推。对终局 outcome reward，前缀权重尤其不能自动等同于完整轨迹换测度。
+
+**失败场景**
+
+实验表把 `w_beh_mode=per_decision` 标成“完整 trajectory IS”并据此声称满足命题 C，或把 `vtrace` 档结果解释为标准 V-trace；实际早期 token 的 loss 没有乘未来动作比，后者也只是局部截断权重。即使代码按设计运行，论文中的 estimand/偏差结论仍会被误报。
+
+**修复建议**
+
+把模式改名或至少在配置、实现文档和实验表中统一标为 `per_token`、`prefix_pdis`、`clipped_per_token`；若真要提供 full-trajectory 档，应把整条有效 response 的 log-ratio 和应用到所有有效 score term，并单独处理数值稳定性。只有实现完整 V-trace 递推时才使用 `vtrace` 名称。
 
 ## 忠实性核对表（待完成）
 

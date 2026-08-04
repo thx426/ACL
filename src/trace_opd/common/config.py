@@ -120,10 +120,14 @@ class TrainCfg:
     #    `loss_agg_mode: token-mean`(4B 主线 rkl/sp2 的全部历史结论建立于 token-mean)。
     loss_agg_mode: str = "seq-mean-token-mean"
     # --- GRPO advantage 口径 ---
-    # grpo_loo(PGS 默认,规范 §2.6 条件 iv):baseline 与 scale 均 leave-one-out
-    #   (scale 带全组 std floor,封二元 reward 下孤例 std_loo=0 的爆炸 edge);
+    # grpo_loo(PGS 默认):baseline 严格 leave-one-out。
     # grpo:verl 原生口径(与历史 run 可比的对照臂)。
     adv_estimator: str = "grpo_loo"
+    # scale 口径(审阅 IF-04 裁定,方案 A):默认 False = 不做组内 std 归一化
+    # (Dr.GRPO 形态,scale≡1 与样本无关——严格满足规范条件 iv 且零爆炸)。
+    # True 时 grpo_loo 用 max(std_loo, std_full),std_full 含当前样本,是
+    # **有偏稳定化消融档**(孤例组的 scale 依赖自身 outcome),不作主档。
+    norm_adv_by_std: bool = False
     # --- 从环境变量迁入(CD-006 requirement 3-F;用户 2026-07-26 裁定)---------
     # 这些原先散落在启动脚本的 export 里,而代码侧另有一套 fallback 默认值。
     # 两套真源 = 换一条启动路径就静默换一种行为:`run_a800_4b.sh` 设了
@@ -343,15 +347,30 @@ def template_drift(config_path: str | Path, template_path: str | Path) -> dict[s
     }
 
 
+def _doc_table_digest(path: str) -> str:
+    """doc 表**内容**摘要(审阅 IF-10:只哈希路径时同路径换内容不触发守卫)。
+    文件不在本机时(如在本地 dry-run 服务器配置)返回哨兵——真正的 resume
+    守卫发生在服务器上,那里 launcher 预检已保证文件存在。"""
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.is_file():
+        return "absent"
+    return hashlib.sha1(p.read_bytes()).hexdigest()[:12]
+
+
 def objective_fingerprint(cfg: "Config") -> str:
     """定义「优化什么」的短哈希(resume 守卫;机器无关)。
-    steering 的机制参数全部参与:换 doc 表/η/c/预算/门/W 口径 = 换目标。"""
+    steering 机制参数、advantage 口径与 doc 表内容全部参与:
+    换其中任何一个 = 换优化目标(审阅 IF-10 扩面)。"""
     t, st = cfg.train, cfg.steering
     material = "|".join(
         str(x) for x in (
             t.model_path, t.rollout_n, t.train_batch_size, t.lr,
-            t.loss_agg_mode,
-            st.enabled, st.doc_table, st.eta_max, st.c, st.b_max, st.topk, st.obs_topk,
+            t.loss_agg_mode, t.adv_estimator, t.norm_adv_by_std,
+            t.ppo_mini_batch_size,
+            st.enabled, st.doc_table, _doc_table_digest(st.doc_table),
+            st.eta_max, st.c, st.b_max, st.topk, st.obs_topk,
             st.theta_d, st.epsilon, st.r_max, st.w_beh_mode,
         )
     )

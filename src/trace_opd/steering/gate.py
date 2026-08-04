@@ -6,6 +6,12 @@
 阈值 Θ_D：冻结校准值起步，训练步之间 robust-EMA 慢更新（分位数而非均值，
 防模板 token 主导——NF07）；触发率带预注册上下限，超限告警并降级。
 propensity 只记录、不进训练权重（NF07：RL 换测度中相消）。
+
+
+v1 冻结裁定(审阅 IF-11,spec §2.3 的实现注记):θ_D 标定一次、全程冻结;
+robust_quantile_update 是 v2 慢更新通道的预留件,生产路径不接线。门率越界
+只告警记账(rate_alarm → steer_gate_alarm 字段),不自动降级——可分析性
+优先(G0 教训:复杂自适应难归因)。
 """
 
 from __future__ import annotations

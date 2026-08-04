@@ -133,3 +133,28 @@ R_max=4：达到后**该轮后续位置进入 η≡0 状态**（cap-active 计�
 - 工程实现文档：`docs/pgs-impl-design.md`（随代码演进）。
 - 实施工作区：独立 git worktree（分支 `pgs-sps`），不触碰共享工作树的
   未提交生产改造。
+
+
+---
+
+## 附:实现裁定注记(2026-08-04,codex 深度审阅后;实现 = trace_opd-pgs 树)
+
+以下五条是实现层对本规范的**约束性裁定**(审阅报告 docs/codex-review-pgs-impl-xhigh.md
+与 docs/codex-review-pgs-impl.md;规范正文与这些注记冲突时,以注记为准):
+
+1. **理论对象 q-kernel 化(IF-03)**:§2.1/§2.5 的 π 侧在实现中是**引擎采样
+   分布 q**(draft 路径),核 = b_S(q, p_T)。speculative 恒等的接受分母必须
+   等于真实 proposal 分布,故不做 bare verify;q vs π_old 残差(~1e-3/token,
+   与普通 GRPO 忽略的引擎-训练失配同类)P4 冒烟实测并作为监控项。命题 A/B
+   相对 b_S(q,·) 成立;命题 C 的"q≡π"假设改记为"q≈π_old + 残差监控"。
+2. **scale 口径(IF-04,条件 iv)**:主档 = LOO baseline + **无组内 std 归一化**
+   (Dr.GRPO 形态,scale≡1,严格满足条件 iv);"scale 也 LOO"字面条款由
+   scale≡1 极限形式满足。norm=True 的 max(std_loo, std_full) 保留为**有偏
+   稳定化消融档**,其运行不得引用条件 iv。
+3. **§4 记账的稀疏口径(IF-07)**:逐 token 行只落"门参与"位置;分布/率类
+   审计由 D 直方图(全候选位置)+ 计数器组 + 轨迹级汇总补齐,行为状态可
+   完整重建。字段面见 steering/ledger.py。
+4. **θ_D v1 冻结(IF-11)**:§2.3 的 robust-EMA 慢更新与越界降级移入 v2 留白;
+   v1 标定一次全程冻结,门率越界只告警记账。
+5. **D 直方图坐标系(IF-12)**:上界 = c²,随账落盘;标定聚合校验坐标一致,
+   目标分位落末桶时拒绝给出建议值。
