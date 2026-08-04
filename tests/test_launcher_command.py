@@ -91,3 +91,20 @@ def test_rollout_n_override_flows_through(tmp_path):
 def test_batched_tokens_override_flows_through(tmp_path):
     cmd = _cmd(tmp_path, ", rollout_max_num_batched_tokens: 4096")
     assert "actor_rollout_ref.rollout.max_num_batched_tokens=4096" in cmd
+
+
+def test_steering_config_rejects_nonfinite_and_bad_structure(tmp_path):
+    # 审阅 IF-13:NaN/inf/topk=0/坏 rate bounds 必须在启动时死,不能等到
+    # rollout 中段。
+    import pytest
+
+    def _load(steering):
+        path = tmp_path / "c.yaml"
+        path.write_text(YAML % ("", steering))
+        return load_config(path)
+
+    base = 'steering: {enabled: true, doc_table: /tmp/d.jsonl, theta_d: 0.8, %s}'
+    for bad in ("c: .inf", "eta_max: .nan", "topk: 0", "r_max: 0",
+                "gate_rate_bounds: [0.5, 0.2]", "gate_rate_bounds: [0.0, 0.3, 1.0]"):
+        with pytest.raises(ValueError):
+            _load(base % bad)

@@ -21,9 +21,9 @@ import json
 import sys
 from pathlib import Path
 
-# 与 ledger 的直方图口径一致(单一真源:steering.ledger)
+# 与 ledger 的直方图口径一致(单一真源:steering.ledger;上界随账落盘)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from trace_opd.steering.ledger import D_HIST_BINS, D_HIST_MAX  # noqa: E402
+from trace_opd.steering.ledger import D_HIST_BINS  # noqa: E402
 
 
 def main() -> int:
@@ -36,6 +36,7 @@ def main() -> int:
     n_traj = n_files = 0
     total = 0
     d_mean_sum = 0.0
+    hist_max = None
     for f in sorted(Path(args.rollouts).glob("step_*/**/*.json")):
         n_files += 1
         try:
@@ -46,6 +47,15 @@ def main() -> int:
         h = st.get("steer_d_hist")
         if not h:
             continue
+        # 审阅 IF-12:坐标系(上界=c²)随账落盘;不同坐标系的账不可混合聚合
+        hm = float(st.get("steer_d_hist_max", 6.25))
+        if hist_max is None:
+            hist_max = hm
+        elif abs(hm - hist_max) > 1e-9:
+            raise SystemExit(
+                f"FATAL: mixed histogram coordinate systems ({hist_max} vs {hm}) "
+                f"in {f} — calibrate one run at a time"
+            )
         n_traj += 1
         c = int(st.get("steer_d_count", sum(h)))
         total += c
@@ -58,27 +68,35 @@ def main() -> int:
               "is the run steering-enabled?")
         return 1
 
-    def quantile(q: float) -> float:
+    if not (0.0 < args.q < 1.0):
+        raise SystemExit(f"FATAL: --q must be in (0,1), got {args.q}")
+
+    def quantile(q: float) -> tuple[float, bool]:
+        """返回 (值, 是否落在末桶)。末桶同时含合法尾区与溢出,值不可信。"""
         target = q * total
         acc = 0
         for i, v in enumerate(hist):
             acc += v
             if acc >= target:
-                # 桶内线性插值
-                lo = i * D_HIST_MAX / D_HIST_BINS
+                lo = i * hist_max / D_HIST_BINS
                 frac = 1.0 - (acc - target) / v if v else 0.0
-                return lo + frac * (D_HIST_MAX / D_HIST_BINS)
-        return D_HIST_MAX
+                return lo + frac * (hist_max / D_HIST_BINS), i == D_HIST_BINS - 1
+        return hist_max, True
 
-    print(f"trajectories: {n_traj}   D observations: {total}")
+    print(f"trajectories: {n_traj}   D observations: {total}   hist_max: {hist_max}")
     print(f"D mean: {d_mean_sum / total:.4f}")
     for q in (0.5, 0.75, args.q, 0.95, 0.99):
-        print(f"P{int(q * 100):02d}: {quantile(q):.4f}")
-    tail = hist[-1] / total
-    if tail > 0.02:
-        print(f"WARNING: {tail:.1%} of D mass in the overflow bucket "
-              f"(> {D_HIST_MAX}) — quantiles above are floor estimates")
-    print(f"\nsuggested steering.theta_d: {quantile(args.q):.4f}")
+        val, ovf = quantile(q)
+        print(f"P{int(q * 100):02d}: {val:.4f}" + ("  (in overflow bucket — floor only)" if ovf else ""))
+    val, ovf = quantile(args.q)
+    if ovf:
+        # 审阅 IF-12:目标分位落进末桶时桶内插值没有辨识依据——拒绝给出
+        # 建议值,而不是输出一个会被误用的 floor。
+        print(f"\nFATAL: target P{int(args.q*100)} falls in the overflow bucket "
+              f"(> {hist_max * (D_HIST_BINS - 1) / D_HIST_BINS:.3f}) — no suggested "
+              "theta_d. Rerun calibration with a larger c (hist range = c^2).")
+        return 2
+    print(f"\nsuggested steering.theta_d: {val:.4f}")
     return 0
 
 

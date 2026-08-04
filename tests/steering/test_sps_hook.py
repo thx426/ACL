@@ -317,3 +317,28 @@ def test_rejected_eos_resampled_to_non_stop_continues():
         )
     else:
         pytest.skip("no rejected-then-swapped trajectory under this seed")
+
+
+def test_cap_row_ordering_and_budget_after():
+    # 审阅 IF-07:第 R_max 次拒绝那一行必须记 cap_active=True;
+    # budget_after 单调不增且与 delta 自洽。
+    def crush_top(pt_logits, pi):
+        top = int(np.argmax(pi))
+        pt_logits = pt_logits.copy()
+        pt_logits[top] = -30.0
+        return pt_logits
+
+    world = _World(seed=3, pt_shift=crush_top)
+    hook, state, *_ , sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, r_max=2, seed=11)
+    _run(hook(sp, {"max_tokens": 64, "temperature": 1.0}))
+    recs = state.ledger.records
+    rejects = [r for r in recs if r.rejected]
+    if len(rejects) >= 2:
+        assert rejects[1].cap_active, "the R_max-th reject row must carry cap_active=True"
+        assert not rejects[0].cap_active
+    # budget_after 自洽:非递增,且扣费行 delta>0 ⇒ 余额下降
+    afters = [r.budget_after for r in recs if r.budget_after >= 0]
+    assert all(b2 <= b1 + 1e-9 for b1, b2 in zip(afters, afters[1:]))
+    # 计数器与稀疏行自洽
+    assert state.ledger.n_candidates >= len(recs)
+    assert state.ledger.n_base_open >= sum(1 for r in recs if r.base_open)

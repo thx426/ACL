@@ -195,6 +195,21 @@ def test_ledger_finalize_roundtrip():
     led.budget_spent = 2.5
     out = led.finalize()
     assert out["steer_positions"] == [3, 9]
-    assert out["steer_count"] == 2 and out["steer_budget_spent"] == 2.5
+    # steer_count = 实际倾斜位置数(η>0);记录行数另走 steer_record_rows
+    assert out["steer_count"] == 1 and out["steer_record_rows"] == 2
+    assert out["steer_budget_spent"] == 2.5
     with pytest.raises(ValueError):
         led.append(TokenSteerRecord(5, 0, 0, 0, 0, 0, False, False, 0.5, False, False))
+
+
+def test_ledger_counters_and_hist_max():
+    led = SteeringLedger(d_hist_max=9.0)   # c=3 ⇒ c²=9
+    led.observe_d(8.5)                     # c=3 的合法值,不得落末桶外
+    out = led.finalize()
+    assert out["steer_d_hist_max"] == 9.0
+    assert out["steer_n_candidates"] == 1
+    # 计数器组齐全(率类审计的全量通道)
+    for key in ("steer_n_base_open", "steer_n_probe_flipped",
+                "steer_n_budget_blocked", "steer_n_bypassed",
+                "steer_reject_count", "steer_record_rows"):
+        assert key in out

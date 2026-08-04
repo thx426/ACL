@@ -659,14 +659,23 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
             prompt_ids = [None] * num_prompt_logprobs
             prompt_logprobs = [None] * num_prompt_logprobs
             # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
-            assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
+            filled = 0
             for token_id_str, token_logprob in logprobs_dict.items():
                 rank = token_logprob.rank
-                if rank > num_prompt_logprobs:
+                if rank is None or rank > num_prompt_logprobs:
                     continue  # the sampled token is not in the top-k
                 logprob = token_logprob.logprob
                 prompt_ids[rank - 1] = int(token_id_str)
                 prompt_logprobs[rank - 1] = logprob
+                filled += 1
+            # trace-opd review IF-08: incomplete rank coverage must fail loud
+            # (a None hole would crash later with no context; an assert would
+            # vanish under python -O).
+            if filled != num_prompt_logprobs:
+                raise RuntimeError(
+                    f"prompt_logprobs row {len(prompt_ids_ls)} has {filled}/"
+                    f"{num_prompt_logprobs} ranks — vLLM rank coverage is broken"
+                )
             prompt_logprobs_ls.append(prompt_logprobs)
             prompt_ids_ls.append(prompt_ids)
 

@@ -230,12 +230,26 @@ def _validate(cfg: "Config") -> None:
         raise ValueError("train.rollout_n must be >= 1")
     st = cfg.steering
     if st.enabled:
+        # 审阅 IF-13:数值面先过有限性——NaN/inf 能绕过大小比较,错误会
+        # 延迟到 rollout 中段才爆。
+        for name in ("eta_max", "c", "b_max", "theta_d", "epsilon"):
+            if not math.isfinite(getattr(st, name)):
+                raise ValueError(f"steering.{name} 必须是有限数,得到 {getattr(st, name)!r}")
         if not st.doc_table:
             raise ValueError("steering.enabled 需要 doc_table(task_id→doc jsonl)")
         if not (0.0 < st.eta_max < 1.0):
             raise ValueError(f"steering.eta_max 必须在 (0,1),得到 {st.eta_max}")
         if st.c <= 0 or st.b_max < 0:
             raise ValueError("steering.c 必须 > 0 且 b_max >= 0")
+        if st.topk < 1:
+            raise ValueError(f"steering.topk 必须 >= 1,得到 {st.topk}")
+        if st.r_max < 1:
+            raise ValueError(f"steering.r_max 必须 >= 1,得到 {st.r_max}")
+        rb = st.gate_rate_bounds
+        if len(rb) != 2 or not (0.0 <= float(rb[0]) < float(rb[1]) <= 1.0):
+            raise ValueError(
+                f"steering.gate_rate_bounds 必须是 [lo, hi] 且 0<=lo<hi<=1,得到 {rb!r}"
+            )
         if st.theta_d <= 0:
             raise ValueError(
                 "steering.theta_d 未标定(<=0)——先用目标文档语境预扫描 D 分布定 P85"

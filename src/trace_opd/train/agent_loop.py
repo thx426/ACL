@@ -148,10 +148,12 @@ class TraceAgentLoop(AgentLoopBase):
             )
             return None
         # 特权/裸前缀必须终止于同一生成上下文(逐 token 对齐的前提)。
+        # 机制红线用显式异常,不用 assert(python -O 会剥掉 assert;审阅 IF-15)。
         n = len(self.delta.gen_prefix) + 2
-        assert teacher_prompt_ids[-n:] == student_prompt_ids[-n:], (
-            "teacher/bare prompts diverge near the generation prefix"
-        )
+        if teacher_prompt_ids[-n:] != student_prompt_ids[-n:]:
+            raise RuntimeError(
+                "teacher/bare prompts diverge near the generation prefix"
+            )
         return teacher_prompt_ids
 
     # ------------------------------------------------------------------ run
@@ -193,7 +195,10 @@ class TraceAgentLoop(AgentLoopBase):
             # 字段(缺 doc/超上下文的轨迹用空账 = 全 1 权重)。TQ 的
             # list_of_dict_to_tensordict 以首行 keys 为准,混合批里 schema
             # 不齐会静默丢掉整批 rollout_is_weights——已倾斜轨迹未经校正训练。
-            ledger = state.ledger if state is not None else SteeringLedger()
+            ledger = (
+                state.ledger if state is not None
+                else SteeringLedger(d_hist_max=self.cfg.steering.c * self.cfg.steering.c)
+            )
             steer_fields.update(ledger.finalize())
             steer_fields["steer_w_beh_mode"] = self.cfg.steering.w_beh_mode
             steer_fields["steer_log_ratio_cap"] = (
@@ -299,6 +304,8 @@ class TraceAgentLoop(AgentLoopBase):
             steer_ctx["doc_overflow"] = 1
             return engine  # doc 超上下文:降级纯 bare,记账可见
         st_cfg = self.cfg.steering
+        from ..steering import SteeringLedger
+
         state = TrajectorySteerState(
             gate=SteeringGate(
                 theta_d=st_cfg.theta_d,
@@ -308,6 +315,8 @@ class TraceAgentLoop(AgentLoopBase):
             ),
             budget=TrajectoryBudget(b_max=st_cfg.b_max, c=st_cfg.c),
             reject_cap=TurnRejectCap(r_max=st_cfg.r_max),
+            # IF-12:D 直方图上界随 run 的 c 派生(=c²),坐标系随账落盘
+            ledger=SteeringLedger(d_hist_max=st_cfg.c * st_cfg.c),
         )
         steer_ctx["state"] = state
         return SpsGenerate(

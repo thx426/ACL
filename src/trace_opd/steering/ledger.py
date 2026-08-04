@@ -1,8 +1,15 @@
-"""逐 token steering 记账（规范 §4）→ rollout extra_fields。
+"""steering 记账（规范 §4 的稀疏实现口径）→ rollout extra_fields。
 
 记账自洽原则：log_b 必须是**实际行为分布**（保尾核）对最终执行 token 的
-真值——训练端 W_beh 的无偏性只建立在这一条上。未 steer 位置 log_b == log_pi
-（ratio 0），记账仍逐位置齐全（训练端不需要分支判断）。
+真值——训练端 W_beh 的无偏性只建立在这一条上。
+
+稀疏口径（审阅 IF-07/IF-15 定案，spec §4 的实现注记）：只有「门参与」的
+位置（base_open / probe_flipped / η>0）落逐 token 行；其余位置 log_b==log_pi
+（ratio 0），训练端展开为权重 1，无需行。分布/率类审计由三个全量通道补齐：
+① D 观测直方图（每个候选位置一次 observe_d）；② 计数器组（候选/开门/探针
+翻转/预算阻断/旁路）；③ 轨迹级汇总（budget_spent/remaining、turns_capped）。
+「门关且未翻转」位置的 propensity 恒为 1−ε，可由计数器重建——审计意图
+（重建行为状态与率）在此口径下完整达成，而 32k 轨迹不必携带数万行全量账。
 """
 
 from __future__ import annotations
@@ -25,14 +32,14 @@ class TokenSteerRecord:
     probe_flipped: bool
     propensity: float
     rejected: bool
-    cap_active: bool
+    cap_active: bool       # 本行写入时 cap 是否已激活(第 R_max 次拒绝行=True)
+    budget_after: float = -1.0   # 本位置结算后的预算余额(审阅 IF-07)
 
 
-#: D 直方图口径:D = Var_{π|S}[ℓ̃] ∈ [0, c²];bins 覆盖 [0, D_HIST_MAX],
-#: 超界计入末桶。θ_D 标定(规范 §2.3 的 P85 预扫描)从聚合直方图取分位数,
-#: 因此常数必须跨 run 稳定 —— 改动它 = 换标定坐标系。
+#: D 直方图口径:D = Var_{π|S}[ℓ̃] ∈ [0, c²]。bins 数固定;上界随 run 的 c
+#: 派生(d_hist_max = c²,审阅 IF-12——硬编码 6.25 会在 c>2.5 时把尾部
+#: 全压末桶还输出伪精确分位数)。上界随 finalize 落盘,标定聚合时校验一致。
 D_HIST_BINS = 64
-D_HIST_MAX = 6.25  # c=2.5 的 c²;更大的 c 依赖末桶(标定分位数仍正确单调)
 
 
 @dataclass
@@ -45,14 +52,22 @@ class SteeringLedger:
     # D 观测直方图:每个候选位置(无论门开关)一次 observe_d —— θ_D 标定与
     # 门率漂移监控的数据源(逐值存储在 32k 轨迹上不可承受,直方图分位数够用)。
     d_hist: list[int] = field(default_factory=lambda: [0] * D_HIST_BINS)
+    d_hist_max: float = 6.25          # = c²,由构造方(hook state)按 run 的 c 传入
     d_count: int = 0
     d_sum: float = 0.0
+    # 计数器组(IF-07:率类审计的全量通道;稀疏行之外的位置由此重建)
+    n_candidates: int = 0             # 进入判定的位置数(= observe_d 次数)
+    n_base_open: int = 0
+    n_probe_flipped: int = 0
+    n_budget_blocked: int = 0         # 门开但预算不允许(η 缩到 0)
+    n_bypassed: int = 0               # cap/预算耗尽后未判定直通的 token 数
 
     def observe_d(self, d_value: float) -> None:
-        b = int(d_value / D_HIST_MAX * D_HIST_BINS)
+        b = int(d_value / self.d_hist_max * D_HIST_BINS)
         self.d_hist[min(max(b, 0), D_HIST_BINS - 1)] += 1
         self.d_count += 1
         self.d_sum += float(d_value)
+        self.n_candidates += 1
 
     def append(self, rec: TokenSteerRecord) -> None:
         if self.records and rec.position <= self.records[-1].position:
@@ -79,8 +94,18 @@ class SteeringLedger:
             "steer_cap_active": [int(r.cap_active) for r in self.records],
             "steer_budget_spent": self.budget_spent,
             "steer_turns_capped": self.turns_capped,
-            "steer_count": len(self.records),
+            # steer_count = 实际倾斜位置数(η>0),不是记录行数——记录行还含
+            # 「门开但预算阻断」「探针翻转」的零 η 行(审阅 IF-07/max-IF-03)
+            "steer_count": sum(1 for r in self.records if r.eta > 0),
+            "steer_record_rows": len(self.records),
+            "steer_reject_count": sum(1 for r in self.records if r.rejected),
             "steer_d_hist": list(self.d_hist),
+            "steer_d_hist_max": self.d_hist_max,
             "steer_d_count": self.d_count,
             "steer_d_mean": (self.d_sum / self.d_count) if self.d_count else 0.0,
+            "steer_n_candidates": self.n_candidates,
+            "steer_n_base_open": self.n_base_open,
+            "steer_n_probe_flipped": self.n_probe_flipped,
+            "steer_n_budget_blocked": self.n_budget_blocked,
+            "steer_n_bypassed": self.n_bypassed,
         }

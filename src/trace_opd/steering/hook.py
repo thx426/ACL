@@ -151,7 +151,10 @@ class SpsGenerate:
         st.reject_cap.new_turn()
 
         stream_len = len(prompt_ids) - self._student_prompt_len
-        assert stream_len >= 0, "prompt shorter than the student prompt — wrong prefix wiring"
+        if stream_len < 0:
+            raise RuntimeError(
+                "prompt shorter than the student prompt — wrong prefix wiring"
+            )
 
         executed: list[int] = []
         executed_logpi: list[float] = []
@@ -190,6 +193,7 @@ class SpsGenerate:
 
             steerable = st.budget.remaining > 0 and not st.reject_cap.cap_active
             if not steerable:
+                st.ledger.n_bypassed += len(gen_ids)
                 executed += gen_ids
                 executed_logpi += [float(x) for x in pi_lp]
                 finished = draft_finished
@@ -205,6 +209,7 @@ class SpsGenerate:
                 log_pi_y = float(pi_lp[g])
                 position = stream_len + len(executed)
                 if st.budget.remaining <= 0 or st.reject_cap.cap_active:
+                    st.ledger.n_bypassed += 1
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
                     continue
@@ -219,10 +224,14 @@ class SpsGenerate:
                 d_value = candidate_d(s_log_pi, s_ell)
                 st.ledger.observe_d(d_value)
                 decision = st.gate.decide(d_value, st.rng)
+                st.ledger.n_base_open += int(decision.base_open)
+                st.ledger.n_probe_flipped += int(decision.probe_flipped)
                 eta = st.budget.admissible_eta(decision.eta)
                 if eta <= 0.0:
                     if decision.base_open or decision.probe_flipped:
                         # 门开了但预算不允许(或探针翻关):记账可见,零扣费
+                        if decision.eta > 0.0:
+                            st.ledger.n_budget_blocked += 1
                         st.ledger.append(TokenSteerRecord(
                             position=position, log_pi=log_pi_y, log_b=log_pi_y,
                             eta=0.0, delta=0.0, d_value=d_value,
@@ -230,6 +239,7 @@ class SpsGenerate:
                             probe_flipped=decision.probe_flipped,
                             propensity=decision.propensity,
                             rejected=False, cap_active=st.reject_cap.cap_active,
+                            budget_after=st.budget.remaining,
                         ))
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
@@ -243,6 +253,12 @@ class SpsGenerate:
                 )
                 delta = st.budget.charge(eta)
                 st.ledger.budget_spent = st.budget.spent
+                # 审阅 IF-07:先推进 cap 状态再落账——第 R_max 次拒绝行必须
+                # 记 cap_active=True(旧顺序恒 False,cap 尾段在账上不可见)。
+                if outcome.rejected:
+                    st.reject_cap.record_reject()
+                    if st.reject_cap.cap_active:
+                        st.ledger.turns_capped += 1
                 st.ledger.append(TokenSteerRecord(
                     position=position,
                     log_pi=outcome.log_pi,
@@ -252,14 +268,12 @@ class SpsGenerate:
                     probe_flipped=decision.probe_flipped,
                     propensity=decision.propensity,
                     rejected=outcome.rejected,
-                    cap_active=False,
+                    cap_active=st.reject_cap.cap_active,
+                    budget_after=st.budget.remaining,
                 ))
                 executed.append(int(outcome.token_id))
                 executed_logpi.append(float(outcome.log_pi))
                 if outcome.rejected:
-                    st.reject_cap.record_reject()
-                    if st.reject_cap.cap_active:
-                        st.ledger.turns_capped += 1
                     if int(outcome.token_id) in self._stop_ids:
                         finished = True  # IF-06:重采出停止 token,本轮生成结束
                     rejected = True

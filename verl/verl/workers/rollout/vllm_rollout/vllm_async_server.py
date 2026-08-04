@@ -685,15 +685,27 @@ class vLLMHttpServer:
                 # NOT in these rows; its own logprob is in log_probs above.
                 k = sampling_params.logprobs
                 topk_ids, topk_logprobs = [], []
-                for logprobs_dict in final_res.outputs[0].logprobs:
+                for pos, logprobs_dict in enumerate(final_res.outputs[0].logprobs):
                     row_ids = [0] * k
                     row_lps = [0.0] * k
+                    filled = 0
                     for token_id, token_logprob in logprobs_dict.items():
                         rank = token_logprob.rank
-                        if rank > k:
+                        if rank is None or rank > k:
                             continue
                         row_ids[rank - 1] = int(token_id)
                         row_lps[rank - 1] = token_logprob.logprob
+                        filled += 1
+                    # trace-opd 审阅 IF-08: a rank hole would leave the
+                    # legal-looking sentinel (token 0, logprob 0.0 = prob 1)
+                    # in the row and poison the steering candidate set —
+                    # fail loud with context instead.
+                    if filled != k:
+                        raise RuntimeError(
+                            f"top-K logprobs row at position {pos} has "
+                            f"{filled}/{k} ranks (request {request_id}) — "
+                            "vLLM rank coverage is broken"
+                        )
                     topk_ids.append(row_ids)
                     topk_logprobs.append(row_lps)
                 extra_fields["response_topk_ids"] = topk_ids

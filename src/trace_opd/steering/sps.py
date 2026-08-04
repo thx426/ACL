@@ -24,7 +24,7 @@ class SpsOutcome:
     token_id: int          # 最终 token（= draft token 或残差重采结果）
     rejected: bool         # 该位置是否发生了拒绝-重采
     log_b: float           # log b(最终 token) —— 训练端 W_beh 的分母记账
-    log_pi: float          # log π(最终 token) —— 同一 verify 路径的值
+    log_pi: float          # log q(最终 token) —— 引擎采样分布(draft 路径)的值
     accept_prob: float     # 本位置的接受概率（诊断）
 
 
@@ -42,7 +42,12 @@ def accept_or_resample(
         kernel: 该位置的保尾核（在看到 draft token 前构造——可测性红线由
             episode hook 层保证，本函数不接触任何后缀信息）。
         draft_token: 学生 draft 采出的 token。
-        draft_log_pi: verify 前向给出的 log π(draft_token)（数值统一路径）。
+        draft_log_pi: draft 生成时引擎返回的 log q(draft_token)。审阅 IF-03
+            口径定案：本机制的核构造于**引擎采样分布 q**（draft 路径），
+            speculative 恒等的分母必须与真实 proposal 分布一致，故 q 是
+            唯一正确的口径；q 与训练端 π_old 的数值残差（bf16 采样 vs
+            FSDP 重算，~1e-3/token）与普通 GRPO 忽略的失配同类同量级，
+            P4 冒烟实测（docs/pgs-final-spec.md 实现注记）。
         rng: 独立随机数发生器。
         log_pi_lookup: S 内 token 的 log π 查表（残差重采出的 token 需要其
             log π 才能记账 log_b；缺省时用 kernel 自带的 S 上 log_pi）。
