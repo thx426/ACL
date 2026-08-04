@@ -195,7 +195,15 @@ class SpsGenerate:
             remaining = max_tokens - len(executed)
             draft_out = await self._draft(
                 prompt_ids + executed,
-                {**params, "max_tokens": remaining, "logprobs": self._obs_topk},
+                {
+                    **params,
+                    "max_tokens": remaining,
+                    "logprobs": self._obs_topk,
+                    # 响应 text 由 verl 侧 EngineGenerate 自行 decode;vLLM 的
+                    # detokenize/对象构造对 draft 的 256 宽明细同样是纯浪费。
+                    "detokenize": False,
+                    "flat_logprobs": True,
+                },
             )
             for key in ("min_global_steps", "max_global_steps", "stop_reason"):
                 if key in draft_out.extra:
@@ -354,10 +362,17 @@ class SpsGenerate:
                 "top_p": 1.0,
                 "top_k": -1,
                 "prompt_logprobs": self._obs_topk,
-                # 只要 draft 段那几行(+末行 dummy):引擎为整段序列构造 top-K
-                # 明细是纯 Python 对象工作、单线程 GIL,实测是 SPS 的主瓶颈
-                # (server 进程 85% CPU 而 GPU 空转)。其余 ~95% 的行本就用不到。
+                # 三层裁剪(实测分层定位,缺一不可):
+                # ① tail:verl 层只序列化 draft 段行(传输面,实测 1.5×);
+                # ② detokenize=False:vLLM 会把全序列×K 的候选 token 全部
+                #    detokenize 成文本(_update_prompt_logprobs),而我们只用
+                #    id/logprob——请求级关闭,41 万次 detokenize 归零;
+                # ③ flat_logprobs=True:扁平数组替代 41 万个 Logprob 对象
+                #    (vLLM 官方:常数个对象),且索引惰性——配合 ① 前缀行
+                #    永不 Python 化。
                 "prompt_logprobs_tail": n_positions + 1,
+                "detokenize": False,
+                "flat_logprobs": True,
             },
         )
         if out.extra.get("stop_reason") == "aborted":
