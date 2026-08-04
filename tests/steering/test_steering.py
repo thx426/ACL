@@ -230,6 +230,12 @@ def test_ledger_ell_hist_and_token_pairs():
     assert out["steer_final_token"] == [202]
     assert out["steer_ell_count"] == 3
     assert len(out["steer_ell_hist"]) == ELL_HIST_BINS
+    # viz 数据面(2026-08-04 实验侧规格)
+    led.observe_d(0.5, position=7)
+    out2 = led.finalize()
+    assert out2["steer_cand_positions"] == [7] and out2["steer_d_all"] == [0.5]
+    assert 0.0 <= out2["steer_gate_open_rate"] <= 1.0
+    assert isinstance(out2["steer_pi_top16"], list)
 
 
 def test_adaptive_tracker_restores_target_rate_after_shift():

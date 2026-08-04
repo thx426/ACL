@@ -262,7 +262,7 @@ class SpsGenerate:
                 st.ledger.n_pt_window_miss += n_miss
                 st.ledger.observe_ell(raw_ell)
                 d_value = candidate_d(s_log_pi, s_ell)
-                st.ledger.observe_d(d_value)
+                st.ledger.observe_d(d_value, position=position)
                 decision = st.gate.decide(d_value, st.rng)
                 st.ledger.n_base_open += int(decision.base_open)
                 st.ledger.n_probe_flipped += int(decision.probe_flipped)
@@ -312,6 +312,15 @@ class SpsGenerate:
                     cap_active=st.reject_cap.cap_active,
                     budget_after=st.budget.remaining,
                     draft_token=y, final_token=int(outcome.token_id),
+                    # viz 下钻:两侧分布 top-16(倾斜后分布由 η/c/ℓ̃ 前端重算)
+                    pi_top16=[
+                        [int(t), round(float(lp), 4)]
+                        for t, lp in zip(pi_topk_ids[g][:16], pi_topk_lps[g][:16])
+                    ],
+                    pt_top16=[
+                        [int(t), round(float(lp), 4)]
+                        for t, lp in zip(pt_rows[0][g][:16], pt_rows[1][g][:16])
+                    ],
                 ))
                 executed.append(int(outcome.token_id))
                 executed_logpi.append(float(outcome.log_pi))

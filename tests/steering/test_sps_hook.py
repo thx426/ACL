@@ -479,3 +479,24 @@ def test_row_misalignment_is_detectable_by_the_positional_mock():
             return r
     o2, s2, _ = _run_with_verify(_Shifted(16, tp, honor_tail=True), seed=4)
     assert abs(s2.ledger.d_sum - d0) > 1e-9, "位置相关 mock 未能区分行偏移 —— 测试无效"
+
+
+def test_viz_channels_recorded():
+    # viz 数据面:候选位置 D 数组与 η>0 行的两侧 top-16
+    def crush_top(pt_logits, pi):
+        top = int(np.argmax(pi))
+        pt_logits = pt_logits.copy()
+        pt_logits[top] = -30.0
+        return pt_logits
+
+    world = _World(seed=3, pt_shift=crush_top)
+    hook, state, *_ , sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, seed=11)
+    out = _run(hook(sp, {"max_tokens": 24, "temperature": 1.0}))
+    led = state.ledger
+    assert len(led.d_all) == led.n_candidates == len(led.cand_positions)
+    assert all(p2 >= p1 for p1, p2 in zip(led.cand_positions, led.cand_positions[1:]))
+    steered = [r for r in led.records if r.eta > 0]
+    assert steered
+    for r in steered:
+        assert r.pi_top16 and r.pt_top16
+        assert len(r.pi_top16) <= 16 and len(r.pi_top16[0]) == 2

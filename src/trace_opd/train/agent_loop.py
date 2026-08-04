@@ -297,6 +297,8 @@ class TraceAgentLoop(AgentLoopBase):
                     "trajectory": traj.to_dict(),
                     "response_token_len": len(result.tokens.response_ids),
                     "response_token_hash": response_token_hash(result.tokens.response_ids),
+                    # viz token 级对齐通道(2026-08-04 实验侧规格;~10KB/轨迹)
+                    "response_token_ids": list(result.tokens.response_ids),
                     "turn_token_spans": result.tokens.turn_spans,
                     "ts": time.time(),
                 },

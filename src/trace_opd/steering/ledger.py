@@ -36,6 +36,9 @@ class TokenSteerRecord:
     budget_after: float = -1.0   # 本位置结算后的预算余额(审阅 IF-07)
     draft_token: int = -1        # draft 提案 token(观察:教师把什么改成了什么)
     final_token: int = -1        # 实际执行 token(= draft 或残差重采结果)
+    # viz 下钻数据(仅 η>0 行携带;[[token_id, logprob]×16],两侧分布对比)
+    pi_top16: list | None = None
+    pt_top16: list | None = None
 
 
 #: D 直方图口径:D = Var_{π|S}[ℓ̃] ∈ [0, c²]。bins 数固定;上界随 run 的 c
@@ -76,13 +79,20 @@ class SteeringLedger:
     # ℓ 观测直方图(c 标定 + 方向观察;窗内逐 token 等权)
     ell_hist: list[int] = field(default_factory=lambda: [0] * ELL_HIST_BINS)
     ell_count: int = 0
+    # 逐候选位置的 (position, D) 轻量全量通道(viz:「为什么没触发」可视;
+    # ~15KB/轨迹。直方图管分布,这里管逐位置定位。)
+    cand_positions: list[int] = field(default_factory=list)
+    d_all: list[float] = field(default_factory=list)
 
-    def observe_d(self, d_value: float) -> None:
+    def observe_d(self, d_value: float, position: int = -1) -> None:
         b = int(d_value / self.d_hist_max * D_HIST_BINS)
         self.d_hist[min(max(b, 0), D_HIST_BINS - 1)] += 1
         self.d_count += 1
         self.d_sum += float(d_value)
         self.n_candidates += 1
+        if position >= 0:
+            self.cand_positions.append(int(position))
+            self.d_all.append(round(float(d_value), 4))
 
     def observe_ell(self, raw_ell_values) -> None:
         """S 内 p_T 观测窗内 token 的未截断 ℓ,逐 token 等权入直方图。"""
@@ -137,4 +147,13 @@ class SteeringLedger:
             "steer_final_token": [r.final_token for r in self.records],
             "steer_ell_hist": list(self.ell_hist),
             "steer_ell_count": self.ell_count,
+            # viz 全量通道与下钻数据(2026-08-04 实验侧规格)
+            "steer_cand_positions": list(self.cand_positions),
+            "steer_d_all": list(self.d_all),
+            "steer_pi_top16": [r.pi_top16 or [] for r in self.records],
+            "steer_pt_top16": [r.pt_top16 or [] for r in self.records],
+            # 轨迹级实测门率(swanlab 单曲线;分子分母另有计数器可复核)
+            "steer_gate_open_rate": (
+                self.n_base_open / self.n_candidates if self.n_candidates else 0.0
+            ),
         }
