@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PGS 显微镜</title>
+<style>
+:root{
+  --bg:#f6f7f9; --surface:#ffffff; --border:#e6e8ec; --border2:#d5d9e0;
+  --text:#101828; --text2:#475467; --text3:#98a2b3;
+  --primary:#4f46e5; --primary-bg:#eef2ff;
+  --ok:#059669; --ok-bg:#ecfdf5; --ok-bd:#a7f3d0;
+  --bad:#e11d48; --bad-bg:#fff1f2; --bad-bd:#fecdd3;
+  --cand:#0284c7; --cand-bg:#e8f4fd; --cand-bd:#bae6fd;
+  --probe:#d97706; --probe-bg:#fffbeb;
+  --obs:#f2f4f7;
+  --mono:"SF Mono",ui-monospace,Menlo,Consolas,"JetBrains Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+  --shadow-lg:0 8px 24px rgba(16,24,40,.14);
+  --r:10px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:14px}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.55}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+button{font:inherit;cursor:pointer}
+
+/* ───── 顶栏 ───── */
+.topbar{position:sticky;top:0;z-index:40;background:rgba(255,255,255,.94);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border);padding:0 22px;height:52px;display:flex;align-items:center;gap:14px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15px;flex:none;white-space:nowrap}
+.brand .dot{width:9px;height:9px;border-radius:50%;background:var(--primary);box-shadow:0 0 0 3px var(--primary-bg)}
+.crumb{color:var(--text3);font-size:13px;display:flex;align-items:center;gap:7px;min-width:0;overflow:hidden}
+.crumb a{color:var(--text2);white-space:nowrap}
+.crumb .sep{color:var(--border2);flex:none}
+.crumb .cur{color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .right{margin-left:auto;display:flex;gap:10px;align-items:center;flex:none}
+.livebdg{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;border-radius:999px;
+  padding:3px 11px;border:1px solid var(--ok-bd);color:var(--ok);background:var(--ok-bg)}
+.livebdg .pulse{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:pu 1.6s infinite}
+@keyframes pu{0%,100%{box-shadow:0 0 0 0 rgba(5,150,105,.35)}55%{box-shadow:0 0 0 5px rgba(5,150,105,0)}}
+.livebdg.off{color:var(--text3);background:var(--bg);border-color:var(--border2)}
+.livebdg.off .pulse{background:var(--text3);animation:none}
+.runname{font-family:var(--mono);font-size:12px;color:var(--text3);white-space:nowrap}
+
+/* ───── 布局/卡片 ───── */
+.wrap{max-width:1440px;margin:0 auto;padding:22px 24px 80px}
+.grid{display:grid;gap:14px}
+.cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.charts{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow)}
+.kpi{padding:13px 15px}
+.kpi .lab{font-size:12px;color:var(--text2);display:flex;align-items:center;gap:5px}
+.kpi .val{font-size:21px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.kpi .sub{font-size:11.5px;color:var(--text3);margin-top:2px}
+.kpi.good .val{color:var(--ok)} .kpi.warn .val{color:var(--probe)} .kpi.bad .val{color:var(--bad)}
+.chart-card{padding:14px 16px 10px}
+.chart-card h4{font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px}
+.chart-card .how{font-size:11.5px;color:var(--text3);margin:2px 0 6px}
+.chart-legend{display:flex;gap:13px;font-size:11px;color:var(--text2);margin-top:2px;flex-wrap:wrap}
+.chart-legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:2px}
+
+.q{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;
+  background:var(--bg);border:1px solid var(--border2);color:var(--text3);font-size:10px;cursor:help;flex:none}
+#tip{position:fixed;z-index:100;max-width:340px;background:#1f2937;color:#f9fafb;font-size:12px;line-height:1.5;
+  padding:8px 11px;border-radius:8px;box-shadow:var(--shadow-lg);pointer-events:none;opacity:0;transition:opacity .12s}
+#tip.on{opacity:1}
+#tip .t{font-weight:600;margin-bottom:2px}
+#tip .mono{font-family:var(--mono);font-size:11px;color:#d1d5db}
+
+/* ───── 表格 ───── */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{font-size:11.5px;color:var(--text2);font-weight:600;text-align:left;
+  padding:9px 12px;border-bottom:1px solid var(--border);background:#fafbfc;white-space:nowrap}
+td{padding:8px 12px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums;white-space:nowrap}
+tbody tr{transition:background .08s}
+tbody tr:hover{background:#f8faff}
+tbody tr.click{cursor:pointer}
+.table-card{overflow:hidden}
+.table-scroll{overflow-x:auto}
+.tname{max-width:430px;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono);font-size:12px}
+.bdg{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;border-radius:999px;padding:2px 9px;border:1px solid transparent}
+.bdg.win{color:var(--ok);background:var(--ok-bg);border-color:var(--ok-bd)}
+.bdg.lose{color:var(--bad);background:var(--bad-bg);border-color:var(--bad-bd)}
+.bdg.info{color:var(--cand);background:var(--cand-bg);border-color:var(--cand-bd)}
+.bdg.dim{color:var(--text3);background:var(--bg);border-color:var(--border)}
+.chip{display:inline-block;font-size:11px;border-radius:6px;padding:1px 7px;background:var(--bg);border:1px solid var(--border);color:var(--text2)}
+
+/* ───── 过滤条 ───── */
+.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:2px 0 14px}
+.filters .seg{display:inline-flex;border:1px solid var(--border2);border-radius:8px;overflow:hidden;background:var(--surface)}
+.filters .seg button{padding:5px 13px;border:0;background:transparent;font-size:12.5px;color:var(--text2)}
+.filters .seg button.on{background:var(--primary);color:#fff;font-weight:600}
+.filters input[type=search]{padding:6px 11px;border:1px solid var(--border2);border-radius:8px;font-size:12.5px;width:230px;background:var(--surface)}
+.filters label{font-size:12.5px;color:var(--text2);display:inline-flex;gap:5px;align-items:center}
+.filters select{padding:4px 8px;border:1px solid var(--border2);border-radius:7px;background:var(--surface);font-size:12.5px}
+
+/* ───── 轨迹详情 ───── */
+.traj-head{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.traj-head h2{font-size:15px;font-family:var(--mono);font-weight:600;word-break:break-all;flex:1;min-width:280px}
+.nav-tools{display:flex;gap:8px;align-items:center;flex:none;flex-wrap:wrap}
+.btn{padding:6px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--surface);font-size:12.5px;color:var(--text2)}
+.btn:hover{border-color:var(--primary);color:var(--primary)}
+.iv-nav{display:inline-flex;align-items:center;gap:2px;border:1px solid var(--border2);border-radius:8px;background:var(--surface);overflow:hidden}
+.iv-nav button{border:0;background:transparent;padding:6px 10px;font-size:13px;color:var(--text2)}
+.iv-nav button:hover{background:var(--primary-bg);color:var(--primary)}
+.iv-nav .cnt{font-size:12px;color:var(--text2);padding:0 8px;border-left:1px solid var(--border);border-right:1px solid var(--border);font-variant-numeric:tabular-nums}
+
+/* minimap(双层 focus+context) */
+.mini-card{padding:12px 16px 9px;margin-bottom:14px}
+.mini-card h4{font-size:12.5px;font-weight:600;color:var(--text2);display:flex;gap:6px;align-items:center;margin-bottom:7px}
+svg.mini{width:100%;height:118px;display:block}
+.mini-legend{display:flex;gap:14px;font-size:11px;color:var(--text3);margin-top:6px;flex-wrap:wrap}
+.mini-legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+
+.legendbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--text2);margin-bottom:12px}
+.ctx-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px;margin-bottom:14px}
+.ctx-card{padding:13px 16px}
+.ctx-card h4{font-size:12.5px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:6px;margin-bottom:8px}
+.goal{font-size:13.5px;font-weight:600;color:var(--text);background:var(--primary-bg);border:1px solid #c7d2fe;
+  border-radius:8px;padding:8px 12px;margin-bottom:9px}
+.priv{border-left:3px solid var(--probe)}
+.priv h4{color:var(--probe)}
+.priv-doc{font-family:var(--mono);font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-word;
+  background:var(--probe-bg);border:1px solid #fde68a;border-radius:8px;padding:9px 12px;color:#78350f;
+  max-height:220px;overflow-y:auto}
+.priv-none{font-size:12.5px;color:var(--text3);background:var(--bg);border:1px dashed var(--border2);border-radius:8px;padding:10px 12px}
+.tk-demo{font-family:var(--mono);font-size:12px;padding:1px 5px;border-radius:4px}
+
+/* turn 卡 */
+.turn{margin-bottom:10px;overflow:hidden}
+.turn-h{display:flex;align-items:center;gap:9px;padding:9px 15px;cursor:pointer;user-select:none;background:#fafbfc;border-bottom:1px solid transparent}
+.turn-h:hover{background:#f4f6fa}
+.turn.open .turn-h{border-bottom-color:var(--border)}
+.turn-h .tt{font-weight:600;font-size:13px}
+.turn-h .caret{color:var(--text3);font-size:10px;transition:transform .15s}
+.turn.open .caret{transform:rotate(90deg)}
+.turn-h .spacer{flex:1}
+.turn-body{display:none;padding:13px 16px 15px}
+.turn.open .turn-body{display:block}
+.obs{background:var(--obs);border:1px dashed var(--border2);border-radius:8px;padding:8px 12px;margin:0 0 11px;
+  font-family:var(--mono);font-size:11.5px;color:var(--text2);white-space:pre-wrap;word-break:break-word;
+  max-height:66px;overflow:hidden;position:relative;cursor:pointer}
+.obs.full{max-height:none}
+.obs .obs-tag{position:absolute;top:5px;right:9px;font-size:10px;color:var(--text3);font-family:var(--sans);background:var(--obs);padding:0 4px}
+.toks{font-family:var(--mono);font-size:12.8px;line-height:2.05;white-space:pre-wrap;word-break:break-word}
+.tk{border-radius:4px;padding:1.5px 1px;cursor:pointer;transition:box-shadow .1s}
+.tk:hover{box-shadow:0 0 0 1.5px var(--primary)}
+.tk.c1{background:var(--cand-bg);border-bottom:2px solid var(--cand-bd)}
+.tk.c2{background:var(--ok-bg);border-bottom:2px solid var(--ok);font-weight:600}
+.tk.c3{background:var(--bad-bg);border-bottom:2px solid var(--bad);font-weight:600}
+.tk.c4{background:var(--probe-bg);outline:1.5px dashed var(--probe);outline-offset:-1.5px}
+.tk.sel{box-shadow:0 0 0 2px var(--primary)}
+.tk.flash{animation:fl 1.2s}
+@keyframes fl{0%,60%{box-shadow:0 0 0 3px var(--primary)}100%{box-shadow:none}}
+.draft-inline{color:var(--bad);text-decoration:line-through;opacity:.55;font-weight:400;margin-right:1px}
+.exh{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;color:var(--bad);background:var(--bad-bg);
+  border:1px solid var(--bad-bd);border-radius:5px;padding:0 6px;margin:0 3px;vertical-align:1px;font-family:var(--sans)}
+
+/* ───── 抽屉 ───── */
+#drawer{position:fixed;top:0;right:0;bottom:0;width:480px;max-width:96vw;background:var(--surface);
+  border-left:1px solid var(--border);box-shadow:var(--shadow-lg);z-index:60;transform:translateX(103%);
+  transition:transform .22s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column}
+#drawer.on{transform:none}
+.dw-h{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.dw-h .tok{font-family:var(--mono);font-size:16px;font-weight:700;background:var(--bg);border:1px solid var(--border);
+  border-radius:6px;padding:2px 9px;white-space:pre;max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.dw-h .pos{font-size:11.5px;color:var(--text3)}
+.dw-h .x{margin-left:auto;border:0;background:transparent;font-size:17px;color:var(--text3);padding:4px}
+.dw-h .x:hover{color:var(--text)}
+.dw-b{overflow-y:auto;padding:15px 18px;flex:1}
+.sec{margin-bottom:18px}
+.sec h5{font-size:11.5px;font-weight:700;color:var(--text2);letter-spacing:.03em;margin-bottom:8px;display:flex;align-items:center;gap:5px}
+.flow{display:flex;align-items:center;font-size:11px}
+.flow .nd{flex:1;text-align:center;padding:7px 2px;border:1.5px solid var(--border);border-radius:8px;color:var(--text3);background:var(--bg);min-width:0}
+.flow .nd.hit{border-color:var(--primary);color:var(--primary);background:var(--primary-bg);font-weight:600}
+.flow .nd.res-ok{border-color:var(--ok);color:var(--ok);background:var(--ok-bg);font-weight:700}
+.flow .nd.res-bad{border-color:var(--bad);color:var(--bad);background:var(--bad-bg);font-weight:700}
+.flow .ar{width:15px;text-align:center;color:var(--border2);flex:none}
+.flow .ar.hit{color:var(--primary)}
+/* D 标尺 */
+.dbar{position:relative;height:26px;background:linear-gradient(90deg,#f0fdf4,#fef2f2);border:1px solid var(--border);border-radius:6px;margin-top:14px}
+.dbar .th{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--text2)}
+.dbar .th i{position:absolute;top:-14px;font-size:10px;font-style:normal;color:var(--text2);white-space:nowrap}
+.dbar .dv{position:absolute;top:3px;bottom:3px;width:8px;border-radius:3px;background:var(--primary);box-shadow:var(--shadow)}
+.dbar .dv.hot{background:var(--bad)}
+.dbar-lab{display:flex;justify-content:space-between;gap:8px;font-size:10.5px;color:var(--text3);margin-top:4px;font-variant-numeric:tabular-nums}
+.dbar-lab .mid{color:var(--text2);font-weight:600;text-align:center;flex:1}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:7px 12px}
+.kv .it{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:7px 10px;min-width:0}
+.kv .k{font-size:10.5px;color:var(--text3);display:flex;gap:4px;align-items:center}
+.kv .v{font-size:14px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:1px}
+.bud{height:9px;background:var(--bg);border:1px solid var(--border);border-radius:999px;overflow:hidden}
+.bud i{display:block;height:100%;background:linear-gradient(90deg,var(--primary),#818cf8);border-radius:999px}
+.bud-lab{display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-top:4px;font-variant-numeric:tabular-nums}
+/* 分布对比:五列定宽网格(数值列固定,杜绝溢出) */
+.dist{font-size:11.5px}
+.dist .hd,.dist .row{display:grid;grid-template-columns:44px minmax(0,1fr) 84px minmax(0,1fr) 44px;gap:6px;align-items:center}
+.dist .hd{color:var(--text3);font-size:10.5px;text-align:center;margin-bottom:5px;font-weight:600}
+.dist .row{padding:2px 0;border-radius:5px}
+.dist .row.hl-f{background:var(--ok-bg)} .dist .row.hl-d{background:var(--bad-bg)}
+.dist .pv{font-size:10px;color:var(--text3);font-variant-numeric:tabular-nums;overflow:hidden}
+.dist .pv.l{text-align:right} .dist .pv.r{text-align:left}
+.dist .bar{position:relative;height:13px;min-width:0}
+.dist .bar i{position:absolute;top:1px;bottom:1px;border-radius:3px;opacity:.85}
+.dist .bar.l i{right:0;background:#6366f1}
+.dist .bar.r i{left:0;background:#0ea5e9}
+.dist .tk-c{position:relative;font-family:var(--mono);font-size:11px;text-align:center;overflow:hidden;text-overflow:ellipsis;
+  white-space:pre;background:var(--bg);border-radius:4px;padding:0 4px;border:1px solid var(--border)}
+.dist .row.hl-f .tk-c{border-color:var(--ok);font-weight:700}
+.dist .row.hl-d .tk-c{border-color:var(--bad);font-weight:700}
+.dist .fl{position:absolute;top:-6px;right:-4px;font-size:8.5px;font-weight:800;font-family:var(--sans);
+  border-radius:4px;padding:0 3px;line-height:1.35}
+.dist .fl.f{background:var(--ok);color:#fff} .dist .fl.d{background:var(--bad);color:#fff}
+.dist .note{font-size:10.5px;color:var(--text3);margin-top:7px;line-height:1.5}
+.df{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-family:var(--mono);font-size:13px}
+.df .a{text-decoration:line-through;color:var(--bad)}
+.df .b{font-weight:700;color:var(--ok)}
+.df .ar{color:var(--text3)}
+
+#hovercard{position:fixed;z-index:70;background:var(--surface);border:1px solid var(--border);border-radius:9px;
+  box-shadow:var(--shadow-lg);padding:9px 12px;font-size:11.5px;pointer-events:none;opacity:0;transition:opacity .1s;max-width:280px}
+#hovercard.on{opacity:1}
+#hovercard .r1{display:flex;gap:7px;align-items:center;margin-bottom:4px}
+#hovercard .minibar{height:5px;border-radius:99px;background:var(--bg);position:relative;margin-top:6px}
+#hovercard .minibar .t{position:absolute;top:-2px;bottom:-2px;width:1.5px;background:var(--text2)}
+#hovercard .minibar .d{position:absolute;top:0;bottom:0;border-radius:99px;background:var(--primary)}
+
+.howto{background:linear-gradient(135deg,#eef2ff,#f5f3ff);border:1px solid #ddd6fe;border-radius:var(--r);
+  padding:13px 17px;margin-bottom:15px;font-size:12.5px;color:#3730a3}
+.howto b{color:#312e81}
+.howto .x{float:right;border:0;background:transparent;color:#6d28d9;font-size:15px;cursor:pointer}
+.empty{padding:40px;text-align:center;color:var(--text3);font-size:13px}
+svg .axis{stroke:var(--border2);stroke-width:1}
+svg .gridl{stroke:var(--border);stroke-width:.5;stroke-dasharray:2 3}
+svg text{font-family:var(--sans);font-size:9.5px;fill:var(--text3)}
+svg .band{fill:var(--ok);opacity:.08}
+svg .tgt{stroke:var(--ok);stroke-width:1;stroke-dasharray:4 3}
+@media (max-width:760px){ #drawer{width:100vw} .tname{max-width:170px} }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="dot"></span>PGS 显微镜</div>
+  <div class="crumb" id="crumb"></div>
+  <div class="right"><span id="livebdg"></span><span class="runname" id="runname"></span></div>
+</div>
+<div class="wrap" id="view"></div>
+<div id="drawer"></div>
+<div id="tip"></div>
+<div id="hovercard"></div>
+
+<script src="data/run.js" onerror=""></script>
+<script>
+"use strict";
+/* ═══════════ 数据层:live(API)/ static(data/*.js)双模 ═══════════ */
+let R = window.PGS_RUN || {name:"—", steps:[], vals:[]};
+let LIVE = false, LAST_TS = null, POLL = null;
+window.PGS_STEP_DATA = window.PGS_STEP_DATA || {};
+const stepMeta = {};   // live 模式:dir -> {trajs:[meta]}
+const trajCache = {};  // live 模式:dir/i -> traj
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const pct = x => (100*x).toFixed(1)+"%";
+const Q_TARGET=0.10, BAND=[0.05,0.25], EXPECT_TILT=[4,8], C_CLIP=2.5, BMAX=20;
+
+async function boot(){
+  try{
+    const r = await fetch("api/run",{cache:"no-store"});
+    if(r.ok){ R = await r.json(); LIVE = true; LAST_TS = new Date(); }
+  }catch(e){}
+  renderLiveBadge();
+  if(LIVE && !POLL) POLL = setInterval(async ()=>{
+    try{
+      const r = await fetch("api/run",{cache:"no-store"});
+      if(r.ok){ R = await r.json(); LAST_TS = new Date(); renderLiveBadge();
+        if(!location.hash || location.hash==="#/" ) viewOverview(); }
+    }catch(e){ renderLiveBadge(true); }
+  }, 30000);
+  route();
+}
+function renderLiveBadge(err){
+  const t = LAST_TS ? LAST_TS.toTimeString().slice(0,8) : "";
+  $("#livebdg").innerHTML = LIVE
+    ? `<span class="livebdg ${err?"off":""}"><span class="pulse"></span>${err?"连接中断":"实时"} · ${t}</span>`
+    : `<span class="livebdg off"><span class="pulse"></span>静态快照</span>`;
+  $("#runname").textContent = R.name || "";
+}
+async function getStepList(dir){
+  if(!LIVE) return (window.PGS_STEP_DATA[dir]||{}).trajs || null;
+  if(stepMeta[dir] && !isPartial(dir)) return stepMeta[dir];
+  const r = await fetch(`api/step/${dir}`,{cache:"no-store"});
+  const j = await r.json();
+  stepMeta[dir] = j.trajs; return j.trajs;
+}
+async function getTraj(dir,i){
+  if(!LIVE) return ((window.PGS_STEP_DATA[dir]||{}).trajs||[])[i];
+  const k = dir+"/"+i;
+  if(trajCache[k]) return trajCache[k];
+  const r = await fetch(`api/traj/${dir}/${i}`,{cache:"no-store"});
+  const j = await r.json();
+  if(!j.error) trajCache[k]=j;
+  return j.error?null:j;
+}
+function isPartial(dir){ const s=R.steps.find(x=>x.dir===dir); return s&&s.partial; }
+/* 静态模式的 step js 懒加载 */
+function loadStaticStep(dir, fn){
+  if(window.PGS_STEP_DATA[dir]) return fn();
+  $("#view").innerHTML = `<div class="empty">加载 ${dir} 数据…</div>`;
+  const sc=document.createElement("script");
+  sc.src=`data/${dir}.js`; sc.onload=fn;
+  sc.onerror=()=> $("#view").innerHTML=`<div class="empty">缺少 data/${dir}.js —— 静态快照未含该 step。<br>提示:起实时后端(pgs_microscope_server.py)即可看到全部 step。</div>`;
+  document.head.appendChild(sc);
+}
+
+/* ═══════════ 术语表 / tooltip ═══════════ */
+const GLOSS = {
+  won:["成功率","该 step 训练 rollout(T=1.0 采样)的任务成功占比。逐步波动主要是任务抽样噪声,判改善以 val 曲线为准。"],
+  val:["验证成功率","274 个 val 任务的裸 policy greedy 评测(无教师、无文档)。seen=训练见过的任务类型,unseen=未见类型(泛化)。每 10 步一个点。"],
+  gate:["开门率","D 门打开的候选占比 = Σ开门/Σ候选。目标 q=10%,合法带 5–25%(绿带)。分母只含未旁路的候选位置。"],
+  theta:["θ_D 阈值","D 门阈值。自适应模式:θ(t+1)=(1−β)θ(t)+β·P(1−q)(实测 D 分布分位),每 step 更新。"],
+  tilt:["倾斜次数/轨迹","实际执行分布倾斜(η>0)的位置数。预算 B∞=20、每次扣 2ηc=2.5 ⇒ 上限 8;健康区间 4–8。"],
+  rej:["拒绝重采/轨迹","倾斜后投机判定拒绝、残差重采换 token 的次数——唯一真正改变 token 的干预形态。"],
+  spent:["预算消耗/轨迹","B∞=20 nats 的逐轨迹消耗。≈20=预算打满,之后全部旁路。"],
+  bypass:["旁路 token/轨迹","预算耗尽后不再判定、直通的 token 数(零干预、零开销)。"],
+  cand:["候选位置","进入 D 门判定的位置数(预算耗尽前);旁路位置不计入。"],
+  D:["D 值","教师-学生分歧强度 = Var_{π|S}[ℓ̃],ℓ̃=clip(ln p_T−ln π,±c)。超 θ_D 才开门。"],
+  ell:["ℓ̃(截断对数比)","ln p_T−ln π 截断到 ±2.5。正=教师想抬升,负=想压制。"],
+  eta:["η 倾斜强度","该位置实际倾斜强度(≤η_max=0.5)。"],
+  prop:["倾向得分","该位置走倾斜分支的概率记账(含 ε 探针),训练侧因果可辨识性用。"],
+  probe:["探针翻转","ε=5% 概率强制翻转门决策(可辨识性设计),虚线框标注。"],
+};
+const tipHTML = k => { const g=GLOSS[k]; return g?`<div class="t">${g[0]}</div>${g[1]}`:""; };
+const tip = $("#tip");
+document.addEventListener("mouseover", e=>{
+  const q = e.target.closest("[data-tip],[data-tipkey]");
+  if(!q){ tip.classList.remove("on"); return; }
+  tip.innerHTML = q.dataset.tipkey ? tipHTML(q.dataset.tipkey) : q.dataset.tip;
+  tip.classList.add("on");
+  const r = q.getBoundingClientRect();
+  tip.style.left = Math.max(8, Math.min(r.left, innerWidth-356))+"px";
+  tip.style.top = (r.bottom+7)+"px";
+});
+
+/* ═══════════ 路由 ═══════════ */
+window.addEventListener("hashchange", route);
+const stepById = id => R.steps.find(s=>s.id===+id);
+function route(){
+  const p = location.hash.replace(/^#\/?/,"").split("/").filter(Boolean);
+  closeDrawer();
+  if(p[0]==="step" && p[1]) return viewStep(+p[1]);
+  if(p[0]==="traj" && p[1]!=null && p[2]!=null) return viewTraj(+p[1], +p[2]);
+  viewOverview();
+}
+function crumbs(items){
+  $("#crumb").innerHTML = items.map((it,i)=> i<items.length-1
+    ? `<a href="${it[1]}">${esc(it[0])}</a><span class="sep">/</span>`
+    : `<span class="cur" title="${esc(it[0])}">${esc(it[0])}</span>`).join("");
+}
+
+/* ═══════════ Overview ═══════════ */
+function viewOverview(){
+  crumbs([["总览","#/"]]);
+  const S = R.steps||[], V = R.vals||[], L = S[S.length-1]||{};
+  const lastV = V[V.length-1];
+  const gateCls = L.gate>=BAND[0]&&L.gate<=BAND[1]?"good":"warn";
+  const howto = localStorage.msHow1?"":`
+    <div class="howto"><button class="x" onclick="this.parentNode.remove();localStorage.msHow1=1">✕</button>
+    <b>怎么读:</b>卡片=最新读数(悬浮 <b>?</b> 看定义与健康区间);曲线看趋势 ——
+    盯 <b>val 曲线</b>(效果的裁判)、<b>开门率是否收敛进绿带</b>、<b>θ_D 是否在自适应爬升</b>。
+    点 step 表任意行 → 128 条轨迹全部可逐 token 下钻。${LIVE?"<b>实时模式</b>:每 30s 自动刷新,新 step 自动出现。":"当前是静态快照;起实时后端可自动追新。"}</div>`;
+  $("#view").innerHTML = `${howto}
+  <div class="grid cards" style="margin-bottom:16px">
+    ${kpi("最新 val", lastV?pct(lastV.won):"待首个 val 点", lastV?`step ${lastV.id} · seen ${pct(lastV.seen)} / unseen ${pct(lastV.unseen)}`:"每 10 步产生", "val","")}
+    ${kpi("训练成功率", L.won!=null?pct(L.won):"—", `step ${L.id??"—"}${L.partial?` · 进行中 ${L.n}/128`:""}`, "won","")}
+    ${kpi("开门率", L.gate!=null?pct(L.gate):"—", `目标 q=${pct(Q_TARGET)} · 带 ${pct(BAND[0])}–${pct(BAND[1])}`, "gate",gateCls)}
+    ${kpi("θ_D", L.theta??"—", "自适应 EMA 追踪", "theta","")}
+    ${kpi("倾斜/轨迹", L.tilt??"—", `预期 ${EXPECT_TILT[0]}–${EXPECT_TILT[1]}`, "tilt", L.tilt>=4&&L.tilt<=8?"good":"warn")}
+    ${kpi("预算消耗", L.spent!=null?`${L.spent}/${BMAX}`:"—", L.spent>=BMAX-1?"打满 → 前端速烧":"有余量", "spent", L.spent>=BMAX-1?"warn":"")}
+  </div>
+  <div class="grid charts" style="margin-bottom:16px">
+    ${chart("val 成功率(每 10 步)","效果的最终裁判:总/seen/unseen 三线。", [
+      {label:"总",color:"#4f46e5",pts:V.map(v=>[v.id,v.won])},
+      {label:"seen",color:"#059669",pts:V.map(v=>[v.id,v.seen])},
+      {label:"unseen",color:"#d97706",pts:V.map(v=>[v.id,v.unseen])}],
+      {y0:0,y1:Math.max(.55,...V.flatMap(v=>[v.won,v.seen,v.unseen]))*1.12,fmt:pct})}
+    ${chart("开门率 gate rate","应收敛进绿带(5–25%);虚线=目标 q=10%。", [{label:"开门率",color:"#4f46e5",pts:S.map(s=>[s.id,s.gate])}],
+      {y0:0,y1:Math.max(.5,...S.map(s=>s.gate||0))*1.12,fmt:pct,band:BAND,target:Q_TARGET})}
+    ${chart("θ_D(EMA 轨迹)","自适应阈值;持平初值=EMA 尚未推进或已收敛。", [{label:"θ_D",color:"#4f46e5",pts:S.map(s=>[s.id,s.theta])}], {fmt:v=>v.toFixed(4)})}
+    ${chart("训练成功率 won%","T=1.0 采样,逐步波动大是任务抽样噪声。", [{label:"won",color:"#4f46e5",pts:S.map(s=>[s.id,s.won])}], {y0:0,y1:1,fmt:pct})}
+    ${chart("预算消耗/轨迹","贴 20=预算打满(前端速烧形态)。", [{label:"消耗",color:"#4f46e5",pts:S.map(s=>[s.id,s.spent])}], {y0:0,y1:BMAX+1,fmt:v=>v.toFixed(1)})}
+    ${chart("拒绝重采/轨迹","真正改 token 的干预密度。", [{label:"拒绝",color:"#e11d48",pts:S.map(s=>[s.id,s.rej])}], {y0:0,fmt:v=>v.toFixed(2)})}
+  </div>
+  <div class="card table-card"><div class="table-scroll"><table>
+    <thead><tr><th>step</th><th>状态</th><th>轨迹</th>
+      <th data-tipkey="won">won <span class="q">?</span></th><th data-tipkey="gate">开门率 <span class="q">?</span></th>
+      <th data-tipkey="tilt">倾斜 <span class="q">?</span></th><th data-tipkey="rej">拒绝 <span class="q">?</span></th>
+      <th data-tipkey="spent">预算 <span class="q">?</span></th><th data-tipkey="bypass">旁路 <span class="q">?</span></th>
+      <th data-tipkey="theta">θ_D <span class="q">?</span></th><th></th></tr></thead>
+    <tbody>${S.map(s=>`<tr class="click" onclick="location.hash='#/step/${s.id}'">
+      <td><b>step ${s.id}</b></td>
+      <td>${s.partial?`<span class="bdg info">进行中 ${s.n}/128</span>`:`<span class="bdg dim">完成</span>`}</td>
+      <td>${s.n}</td><td>${pct(s.won)}</td><td>${pct(s.gate)}</td>
+      <td>${s.tilt}</td><td>${s.rej}</td><td>${s.spent}</td><td>${s.bypass}</td><td>${s.theta}</td>
+      <td><a href="#/step/${s.id}">进入 →</a></td></tr>`).join("")}
+    </tbody></table></div></div>`;
+}
+function kpi(lab,val,sub,tipkey,cls){
+  return `<div class="card kpi ${cls||""}"><div class="lab">${lab}<span class="q" data-tipkey="${tipkey}">?</span></div>
+  <div class="val">${val}</div><div class="sub">${sub}</div></div>`;
+}
+/* 多序列 SVG 折线 */
+function chart(title,how,series,o={}){
+  const W=430,H=158,padL=46,padR=10,padT=10,padB=22;
+  series = series.filter(s=>s.pts&&s.pts.length);
+  if(!series.length) return `<div class="card chart-card"><h4>${title}</h4><div class="how">${how}</div><div class="empty" style="padding:24px">暂无数据</div></div>`;
+  const allX = series.flatMap(s=>s.pts.map(p=>p[0])), allY = series.flatMap(s=>s.pts.map(p=>p[1]));
+  const x0=Math.min(...allX), x1=Math.max(...allX);
+  let y0=o.y0!=null?o.y0:Math.min(...allY), y1=o.y1!=null?o.y1:Math.max(...allY);
+  if(y0===y1){ y0-=Math.abs(y0)*.05+1e-6; y1+=Math.abs(y1)*.05+1e-6; }
+  const X=v=> x1===x0? (padL+(W-padL-padR)/2) : padL+(v-x0)/(x1-x0)*(W-padL-padR);
+  const Y=v=> padT+(1-(v-y0)/(y1-y0))*(H-padT-padB);
+  const ux=[...new Set(allX.map(Math.round))].sort((a,b)=>a-b);
+  const tick=Math.max(1,Math.ceil(ux.length/8));
+  const ticksX=ux.filter((v,i)=>i%tick===0||i===ux.length-1);
+  const fmt=o.fmt||(v=>v);
+  const yt=[y0,(y0+y1)/2,y1];
+  const band=o.band?`<rect class="band" x="${padL}" y="${Y(o.band[1])}" width="${W-padL-padR}" height="${Math.max(Y(o.band[0])-Y(o.band[1]),0)}"/>`:"";
+  const tgt=o.target!=null?`<line class="tgt" x1="${padL}" x2="${W-padR}" y1="${Y(o.target)}" y2="${Y(o.target)}"/>`:"";
+  const lines=series.map(s=>{
+    const d=s.pts.map((p,i)=>`${i?"L":"M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+    const dots=s.pts.map(p=>`<circle r="2.6" cx="${X(p[0])}" cy="${Y(p[1])}" fill="${s.color}"><title>${s.label} · step ${p[0]}: ${fmt(p[1])}</title></circle>`).join("");
+    return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8"/>${dots}`;
+  }).join("");
+  const legend=series.length>1?`<div class="chart-legend">${series.map(s=>`<span><i style="background:${s.color}"></i>${s.label}</span>`).join("")}</div>`:"";
+  return `<div class="card chart-card"><h4>${title}<span class="q" data-tip="${esc(how)}">?</span></h4>
+  <div class="how">${how}</div>
+  <svg viewBox="0 0 ${W} ${H}">
+    ${band}${tgt}
+    ${yt.map(v=>`<line class="gridl" x1="${padL}" x2="${W-padR}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${padL-5}" y="${Y(v)+3}" text-anchor="end">${fmt(v)}</text>`).join("")}
+    <line class="axis" x1="${padL}" x2="${W-padR}" y1="${H-padB}" y2="${H-padB}"/>
+    ${ticksX.map(v=>`<text x="${X(v)}" y="${H-7}" text-anchor="middle">${v}</text>`).join("")}
+    ${lines}
+  </svg>${legend}</div>`;
+}
+
+/* ═══════════ Step 视图 ═══════════ */
+let F = {res:"all", rejOnly:false, q:"", sort:"rej"};
+async function viewStep(id){
+  const st = stepById(id);
+  if(!st) return viewOverview();
+  crumbs([["总览","#/"],[`step ${id}`,`#/step/${id}`]]);
+  const render = (list)=>{
+    let rows = list.map((t,i)=>({t,i}));
+    if(F.res!=="all") rows = rows.filter(r=> F.res==="win"?r.t.won:!r.t.won);
+    if(F.rejOnly) rows = rows.filter(r=>r.t.m.rej>0);
+    if(F.q) rows = rows.filter(r=>r.t.task.toLowerCase().includes(F.q.toLowerCase()));
+    const key={rej:r=>r.t.m.rej,gate:r=>r.t.m.open/Math.max(r.t.m.cand,1),len:r=>r.t.len,bypass:r=>r.t.m.bypass}[F.sort];
+    rows.sort((a,b)=>key(b)-key(a));
+    $("#view").innerHTML = `
+    <div class="filters">
+      <div class="seg">${["all","win","lose"].map(k=>`<button class="${F.res===k?"on":""}" onclick="F.res='${k}';viewStep(${id})">${{all:"全部",win:"成功",lose:"失败"}[k]}</button>`).join("")}</div>
+      <label><input type="checkbox" ${F.rejOnly?"checked":""} onchange="F.rejOnly=this.checked;viewStep(${id})"> 只看有拒绝重采</label>
+      <input type="search" placeholder="搜任务名…" value="${esc(F.q)}" onchange="F.q=this.value;viewStep(${id})">
+      <span style="flex:1"></span>
+      ${st.partial?`<span class="bdg info">进行中 ${st.n}/128</span><button class="btn" onclick="delete stepMeta['${st.dir}'];viewStep(${id})">刷新</button>`:""}
+      <label>排序 <select onchange="F.sort=this.value;viewStep(${id})">
+        ${[["rej","拒绝数"],["gate","开门率"],["bypass","旁路量"],["len","响应长度"]].map(([k,l])=>`<option value="${k}" ${F.sort===k?"selected":""}>${l}</option>`).join("")}
+      </select></label>
+      <span class="chip">${rows.length}/${list.length} 条 · 全部可点</span>
+    </div>
+    <div class="card table-card"><div class="table-scroll"><table>
+      <thead><tr><th>任务</th><th>split</th><th>结果</th>
+        <th data-tipkey="tilt">倾斜 <span class="q">?</span></th><th data-tipkey="rej">拒绝 <span class="q">?</span></th>
+        <th data-tipkey="gate">开门率 <span class="q">?</span></th><th data-tipkey="cand">候选 <span class="q">?</span></th>
+        <th data-tipkey="bypass">旁路 <span class="q">?</span></th><th>响应 tok</th><th></th></tr></thead>
+      <tbody>${rows.map(({t,i})=>`
+        <tr class="click" onclick="location.hash='#/traj/${id}/${i}'">
+          <td class="tname" title="${esc(t.task)}">${esc(t.task.replace(/^train\//,""))}</td>
+          <td><span class="chip">${esc(t.split||"train")}</span></td>
+          <td>${t.won?'<span class="bdg win">✓ 成功</span>':'<span class="bdg lose">✕ 失败</span>'}</td>
+          <td>${t.m.tilt}</td><td>${t.m.rej?`<b style="color:var(--bad)">${t.m.rej}</b>`:0}</td>
+          <td>${pct(t.m.open/Math.max(t.m.cand,1))}</td>
+          <td>${t.m.cand}</td><td>${t.m.bypass}</td><td>${t.len}</td>
+          <td><a href="#/traj/${id}/${i}">逐 token →</a></td></tr>`).join("")}
+      </tbody></table></div></div>`;
+  };
+  if(LIVE){
+    $("#view").innerHTML=`<div class="empty">加载 step ${id} 列表…</div>`;
+    render(await getStepList(st.dir)||[]);
+  } else loadStaticStep(st.dir, ()=>render(window.PGS_STEP_DATA[st.dir].trajs));
+}
+
+/* ═══════════ Trajectory 视图 ═══════════ */
+let CUR = null;
+async function viewTraj(stepId, idx){
+  const st = stepById(stepId);
+  if(!st) return viewOverview();
+  crumbs([["总览","#/"],[`step ${stepId}`,`#/step/${stepId}`],["轨迹 #"+idx,""]]);
+  const go = t => renderTraj(stepId, idx, t);
+  if(LIVE){
+    $("#view").innerHTML=`<div class="empty">加载轨迹逐 token 数据…</div>`;
+    const t = await getTraj(st.dir, idx);
+    if(!t) return $("#view").innerHTML=`<div class="empty">轨迹不存在</div>`;
+    go(t);
+  } else loadStaticStep(st.dir, ()=>{
+    const t=(window.PGS_STEP_DATA[st.dir].trajs||[])[idx];
+    t?go(t):$("#view").innerHTML=`<div class="empty">轨迹不存在</div>`;
+  });
+}
+function renderTraj(stepId, idx, t){
+  CUR = {stepId, idx, t, iv:-1};
+  crumbs([["总览","#/"],[`step ${stepId}`,`#/step/${stepId}`],[t.task.replace(/^train\//,""),""]]);
+  const gate = t.m.open/Math.max(t.m.cand,1);
+  const ivs = ivList();
+  const howto = localStorage.msHow2?"":`
+    <div class="howto"><button class="x" onclick="this.parentNode.remove();localStorage.msHow2=1">✕</button>
+    <b>怎么读:</b>响应流按轮折叠(含干预的轮已展开)。彩色 token = 机制触碰过的位置,<b>点击</b>右侧开下钻面板。
+    迷你地图分两层:上=全轨迹,下=<b>干预区放大</b>(机制活动集中在开头时看下层)。⛔ 之后是预算耗尽的直通区。快捷键 J/K 干预跳转、Esc 关面板。</div>`;
+  $("#view").innerHTML = `${howto}
+  <div class="traj-head">
+    <h2>${esc(t.task)}</h2>
+    <div class="nav-tools">
+      <div class="iv-nav"><button onclick="jumpIv(-1)" title="上一处干预(K)">‹</button>
+        <span class="cnt" id="ivcnt">干预 ${ivs.length} 处</span>
+        <button onclick="jumpIv(1)" title="下一处干预(J)">›</button></div>
+      <button class="btn" onclick="expandAll(true)">全部展开</button>
+      <button class="btn" onclick="expandAll(false)">折叠无干预轮</button>
+    </div>
+  </div>
+  <div class="grid cards" style="margin-bottom:14px">
+    ${kpi("结果", t.won?"成功":"失败", esc(t.outcome||""), "won", t.won?"good":"bad")}
+    ${kpi("倾斜次数", t.m.tilt, `预期 ${EXPECT_TILT[0]}–${EXPECT_TILT[1]}`, "tilt","")}
+    ${kpi("拒绝重采", t.m.rej, "真正改 token 的位置", "rej", t.m.rej?"bad":"")}
+    ${kpi("开门率", pct(gate), `候选 ${t.m.cand} · 开门 ${t.m.open}`, "gate","")}
+    ${kpi("预算", `${t.m.spent}/${BMAX}`, t.m.spent>=BMAX-1?"已打满 → 后续全旁路":"仍有余量", "spent", t.m.spent>=BMAX-1?"warn":"good")}
+    ${kpi("旁路 token", t.m.bypass, `占全响应 ${pct(t.m.bypass/Math.max(t.len,1))}`, "bypass","")}
+    ${kpi("θ_D", t.theta, "本轨迹判定阈值", "theta","")}
+    ${kpi("响应长度", t.len+" tok", `${t.turns.length} 轮 · env ${t.env??"—"} 步`, "cand","")}
+  </div>
+  <div class="ctx-grid">
+    <div class="card ctx-card">
+      <h4>任务信息<span class="q" data-tip="ALFWorld episode 的原始任务:目标句取自初始观测;下方灰卡是完整初始观测(房间与物品布局),点击展开/收起。右侧徽章是学生侧的 guidance 状态——bare = 学生全程无任何特权信息。">?</span>
+        <span style="margin-left:auto"></span>
+        <span class="bdg dim" title="学生 guidance 状态">学生:${esc(t.ghash||"bare")}</span>
+        <span class="chip">${esc(t.split||"train")}</span></h4>
+      ${t.goal?`<div class="goal">🎯 ${esc(t.goal)}</div>`:""}
+      ${t.iobs?`<div class="obs" onclick="this.classList.toggle('full')">${esc(t.iobs)}<span class="obs-tag">初始观测 · 点击展开</span></div>`:'<div class="priv-none">无初始观测记录</div>'}
+    </div>
+    <div class="card ctx-card priv">
+      <h4>特权文档 · 仅教师可见<span class="q" data-tip="教师 p_T 的 system prompt 注入内容(## Task guidance 段):一份该任务的分步参考解。学生完全看不到它——教师正是凭这份信息对学生的采样分布做定向倾斜,所有绿/红干预位的方向都源于此。">?</span></h4>
+      ${t.doc?`<div class="priv-doc">${esc(t.doc)}</div>`
+        :(R.hasDocs===false||t.m.cand===0)?`<div class="priv-none">对照臂(纯 GRPO):无教师、无特权文档。</div>`
+        :`<div class="priv-none">⚠ 该任务在 doc 表中无文档(doc_missing)——本轨迹教师退化为无文档教师,倾斜方向不含任务特权信息。</div>`}
+    </div>
+  </div>
+  <div class="card mini-card">
+    <h4>轨迹迷你地图<span class="q" data-tip="上层=全轨迹按 token 位置铺开(灰块=观测段,竖线=轮边界);下层=干预活动区放大。蓝点=候选(未开门),绿◆=倾斜-接受,红◆=拒绝重采,⛔=预算耗尽(其后全部直通)。点击任意位置跳到对应轮。">?</span>
+    <span class="chip" style="margin-left:auto">下层 = 前 ${focusEnd(t)} tok 放大</span></h4>
+    ${minimap(t)}
+    <div class="mini-legend">
+      <span><i style="background:var(--obs);border:1px solid var(--border2)"></i>观测段</span>
+      <span><i style="background:var(--cand)"></i>候选</span>
+      <span><i style="background:var(--ok)"></i>倾斜-接受</span>
+      <span><i style="background:var(--bad)"></i>拒绝重采</span>
+      <span style="color:var(--bad)">⛔ 预算耗尽 → 直通区</span>
+    </div>
+  </div>
+  <div class="legendbar">着色:
+    <span class="tk-demo" style="background:var(--cand-bg);border-bottom:2px solid var(--cand-bd)">候选-未开门</span>
+    <span class="tk-demo" style="background:var(--ok-bg);border-bottom:2px solid var(--ok)">开门-接受</span>
+    <span class="tk-demo" style="background:var(--bad-bg);border-bottom:2px solid var(--bad)"><s style="color:var(--bad);opacity:.6">draft</s> final</span>
+    <span class="tk-demo" style="background:var(--probe-bg);outline:1.5px dashed var(--probe)">探针</span>
+    <span style="color:var(--text3)">— 悬浮看 D 值,点击开下钻面板</span>
+  </div>
+  <div id="turns">${t.turns.map(tn=>turnCard(t,tn)).join("")}
+    ${t.tail?`<div class="card turn open"><div class="turn-body"><div class="obs full">${esc(t.tail)}<span class="obs-tag">结尾</span></div></div></div>`:""}</div>`;
+  document.onkeydown = e=>{
+    if(e.key==="Escape") closeDrawer();
+    else if(e.key==="j"||e.key==="J") jumpIv(1);
+    else if(e.key==="k"||e.key==="K") jumpIv(-1);
+  };
+}
+function focusEnd(t){
+  const lastAct = Math.max(t.exhausted>=0?t.exhausted:0, ...(t.cands.length?[t.cands[t.cands.length-1][0]]:[0]),
+    ...(t.recs.length?[t.recs[t.recs.length-1].p]:[0]));
+  return Math.max(64, Math.min(Math.ceil((lastAct+8)/32)*32, t.len));
+}
+function minimap(t){
+  const W=1000, L=Math.max(t.len,1), FE=focusEnd(t);
+  const X=p=>(p/L*W);
+  const XF=p=>(p/FE*W);
+  const laneCtx=(X_,y0,h,upTo)=>{  // 灰观测块 + 轮边界
+    let g="", prev=0;
+    for(const tn of t.turns){
+      if(tn.a>=upTo) break;
+      if(tn.a>prev) g+=`<rect x="${X_(prev).toFixed(1)}" y="${y0+3}" width="${Math.max(X_(Math.min(tn.a,upTo))-X_(prev),0.6).toFixed(1)}" height="${h-6}" rx="1.5" fill="var(--obs)" stroke="var(--border)" stroke-width=".5"/>`;
+      g+=`<line x1="${X_(tn.a).toFixed(1)}" x2="${X_(tn.a).toFixed(1)}" y1="${y0}" y2="${y0+h}" stroke="var(--border2)" stroke-width="1"/>`;
+      prev=Math.min(tn.b,upTo);
+    }
+    return g;
+  };
+  const marks=(X_,cy,upTo,click)=>{
+    let g="";
+    for(const [p] of t.cands){ if(p>=upTo) break; g+=`<circle cx="${X_(p).toFixed(1)}" cy="${cy}" r="2.4" fill="var(--cand)" opacity=".8"/>`; }
+    t.recs.forEach((r,i)=>{
+      if(!(r.eta>0||r.rej)||r.p>=upTo) return;
+      const c=r.rej?"var(--bad)":"var(--ok)";
+      g+=`<path d="M ${X_(r.p).toFixed(1)} ${cy-9} l 5.5 9 l -5.5 9 l -5.5 -9 z" fill="${c}" style="cursor:pointer" onclick="event.stopPropagation();gotoRec(${i})"><title>pos ${r.p} · ${r.rej?"拒绝重采":"倾斜-接受"} · D=${r.d}</title></path>`;
+    });
+    if(t.exhausted>=0&&t.exhausted<upTo)
+      g+=`<line x1="${X_(t.exhausted).toFixed(1)}" x2="${X_(t.exhausted).toFixed(1)}" y1="${cy-13}" y2="${cy+13}" stroke="var(--bad)" stroke-width="1.8"/><text x="${(X_(t.exhausted)+5).toFixed(1)}" y="${cy-4}" fill="var(--bad)" font-size="10.5" font-weight="600">⛔ 预算耗尽</text>`;
+    return g;
+  };
+  const fw = X(FE);
+  return `<svg class="mini" viewBox="0 0 ${W} 118" preserveAspectRatio="none">
+    <g onclick="miniJump(event,${L},0,28)" style="cursor:crosshair">
+      <text x="0" y="9" font-size="9.5">全轨迹 · ${L} tok</text>
+      <rect x="0" y="12" width="${W}" height="28" fill="var(--surface)" stroke="var(--border)" rx="4"/>
+      ${laneCtx(X,12,28,L)}${marks(X,26,L)}
+      <rect x="0" y="12" width="${fw.toFixed(1)}" height="28" fill="var(--primary)" opacity=".07" stroke="var(--primary)" stroke-width="1" rx="4"/>
+    </g>
+    <path d="M 0 40 L 0 68 M ${fw.toFixed(1)} 40 L ${W} 68" stroke="var(--border2)" stroke-width="1" stroke-dasharray="3 3" fill="none"/>
+    <g onclick="miniJump(event,${FE},68,42)" style="cursor:crosshair">
+      <text x="0" y="64" font-size="9.5">干预区放大 · 前 ${FE} tok</text>
+      <rect x="0" y="68" width="${W}" height="42" fill="var(--surface)" stroke="var(--border)" rx="4"/>
+      ${laneCtx(XF,68,42,FE)}${marks(XF,89,FE)}
+    </g>
+  </svg>`;
+}
+function miniJump(e,L,y0,h){
+  const svg=e.currentTarget.closest("svg");
+  const r=svg.getBoundingClientRect();
+  const pos=Math.round((e.clientX-r.left)/r.width*L);
+  const t=CUR.t;
+  const tn = t.turns.find(x=>pos<x.b) || t.turns[t.turns.length-1];
+  if(!tn) return;
+  const el=document.getElementById(`turn-${tn.i}`);
+  if(el){ el.classList.add("open"); el.scrollIntoView({behavior:"smooth",block:"center"}); }
+}
+function turnCard(t,tn){
+  const open = tn.iv>0 || tn.i===0;
+  const hasRej = t.recs.some(r=>r.rej&&r.p>=tn.a&&r.p<tn.b);
+  const chips = tn.iv?`<span class="bdg ${hasRej?"lose":"win"}">${tn.iv} 处干预${hasRej?" · 含拒绝":""}</span>`:`<span class="bdg dim">无干预</span>`;
+  const inRange = t.exhausted>=tn.a && t.exhausted<tn.b;
+  return `<div class="card turn ${open?"open":""}" id="turn-${tn.i}">
+    <div class="turn-h" onclick="this.parentNode.classList.toggle('open')">
+      <span class="caret">▶</span><span class="tt">Turn ${tn.i+1}</span>${chips}
+      ${inRange?'<span class="exh">⛔ 本轮内预算耗尽</span>':""}
+      <span class="spacer"></span><span class="chip">${tn.b-tn.a} tok</span>
+    </div>
+    <div class="turn-body">
+      ${tn.obs?`<div class="obs" onclick="this.classList.toggle('full')">${esc(tn.obs)}<span class="obs-tag">环境观测 · 点击展开</span></div>`:""}
+      <div class="toks">${tn.segs.map(sg=>seg(t,sg)).join("")}</div>
+    </div>
+  </div>`;
+}
+function seg(t,[txt,cls,ref]){
+  if(cls===0) return esc(txt);
+  if(cls===1)
+    return `<span class="tk c1" onmouseenter="hcCand(event,${ref})" onmouseleave="hcOff()" onclick="openCand(${ref})">${esc(txt)}</span>`;
+  const r = t.recs[ref];
+  const cn = cls===3?"c3":cls===2?"c2":"c4";
+  const draft = cls===3&&r.draft?`<span class="draft-inline" title="学生原提案(被拒绝)">${esc(r.draft)}</span>`:"";
+  const exh = (t.exhausted===r.p+1 && ref===t.recs.length-1)?`<span class="exh" data-tip="此位置后预算不足一次整额扣费,余下 ${t.m.bypass} 个 token 直通(不再判定/干预)">⛔</span>`:"";
+  return `${draft}<span class="tk ${cn}" id="rec-${ref}" onmouseenter="hcRec(event,${ref})" onmouseleave="hcOff()" onclick="openRec(${ref})">${esc(txt)}</span>${exh}`;
+}
+/* hover 浮层 */
+const hc = $("#hovercard");
+function hcShow(e,html){
+  hc.innerHTML=html; hc.classList.add("on");
+  hc.style.left=Math.min(e.clientX+14, innerWidth-300)+"px";
+  hc.style.top =Math.min(e.clientY+14, innerHeight-130)+"px";
+}
+function hcOff(){ hc.classList.remove("on"); }
+function minibar(d,theta){
+  const mx=Math.max(theta*2.5, d*1.25, .01);
+  return `<div class="minibar"><div class="d" style="width:${Math.min(d/mx*100,100).toFixed(1)}%"></div><div class="t" style="left:${Math.min(theta/mx*100,99).toFixed(1)}%"></div></div>`;
+}
+function hcCand(e,ref){
+  const [p,d]=CUR.t.cands[ref], th=CUR.t.theta;
+  hcShow(e,`<div class="r1"><span class="bdg info">候选-未开门</span><span style="color:var(--text3)">pos ${p}</span></div>
+    D=${d} ≤ θ_D=${th} → 门关,原样直通${minibar(d,th)}`);
+}
+function hcRec(e,ref){
+  const r=CUR.t.recs[ref], th=CUR.t.theta;
+  const lab = r.rej?'<span class="bdg lose">拒绝重采</span>':r.eta>0?'<span class="bdg win">倾斜-接受</span>':'<span class="bdg dim">探针</span>';
+  hcShow(e,`<div class="r1">${lab}<span style="color:var(--text3)">pos ${r.p}</span></div>
+    D=${r.d}${r.d>th?" &gt; ":" ≤ "}θ=${th} · η=${r.eta} · 扣费 ${r.delta}${minibar(r.d,th)}
+    <div style="margin-top:4px;color:var(--text3)">点击看完整决策链 →</div>`);
+}
+/* ═══ 抽屉 ═══ */
+const drawer = $("#drawer");
+function closeDrawer(){ drawer.classList.remove("on"); document.querySelectorAll(".tk.sel").forEach(x=>x.classList.remove("sel")); }
+function openCand(ref){
+  const t=CUR.t, [p,d]=t.cands[ref], th=t.theta;
+  drawer.innerHTML = dwShell(`<span class="bdg info">候选-未开门</span>`, tokAt(t,p), p, `
+    ${secFlow({open:false})}
+    ${secD(d,th)}
+    <div class="sec"><h5>发生了什么</h5><div style="font-size:12.5px;color:var(--text2)">
+      该位置进入 D 门判定,但分歧强度 D=${d} 未超过阈值 θ_D=${th},门保持关闭 ——
+      学生按自身分布正常采样,机制零介入、训练权重 W=1。</div></div>`);
+  drawer.classList.add("on");
+}
+function openRec(ref){
+  const t=CUR.t, r=t.recs[ref], th=t.theta;
+  CUR.iv = ref;
+  document.querySelectorAll(".tk.sel").forEach(x=>x.classList.remove("sel"));
+  const tkEl=document.getElementById(`rec-${ref}`); if(tkEl) tkEl.classList.add("sel");
+  const state = r.rej?["拒绝重采","lose"]:r.eta>0?["倾斜-接受","win"]:["探针翻转","dim"];
+  drawer.innerHTML = dwShell(
+    `<span class="bdg ${state[1]}">${state[0]}</span>${r.probe?`<span class="bdg dim" data-tipkey="probe">ε 探针</span>`:""}`,
+    r.final||tokAt(t,r.p), r.p, `
+    ${secFlow(r)}
+    ${secD(r.d,th)}
+    <div class="sec"><h5>本位置读数</h5><div class="kv">
+      ${kv("η 倾斜强度","eta",r.eta)}${kv("扣费 δ","D",r.delta)}
+      ${kv("ln π(draft)","D",r.lp)}${kv("ln b(draft)","ell",r.lb)}
+      ${kv("倾向得分","prop",r.prop)}${kv("ℓ̃ = ln b−ln π","ell",(r.lb-r.lp).toFixed(3))}
+    </div></div>
+    <div class="sec"><h5>预算</h5>
+      <div class="bud"><i style="width:${Math.min((BMAX-r.after)/BMAX*100,100).toFixed(1)}%"></i></div>
+      <div class="bud-lab"><span>本位置结算后已用 ${(BMAX-r.after).toFixed(2)}</span><span>余 ${r.after} / ${BMAX}</span></div>
+    </div>
+    ${r.rej?`<div class="sec"><h5>token 变更</h5>
+      <div class="df"><span class="a">${esc(r.draft)}</span><span class="ar">→</span><span class="b">${esc(r.final)}</span></div>
+      <div class="dist"><div class="note">学生 draft 提案被投机判定拒绝,从残差分布重采得到最终 token。</div></div></div>`:""}
+    ${secDist(r)}`);
+  drawer.classList.add("on");
+  const cnt=$("#ivcnt");
+  if(cnt){ const ivs=ivList(); const at=ivs.findIndex(x=>x.i===ref); if(at>=0) cnt.textContent=`干预 ${at+1}/${ivs.length}`; }
+}
+function tokAt(t,p){
+  for(const tn of t.turns) for(const [txt,cls,ref] of tn.segs){
+    if(cls===1 && t.cands[ref] && t.cands[ref][0]===p) return txt;
+    if(cls>=2 && t.recs[ref] && t.recs[ref].p===p) return txt;
+  } return "·";
+}
+function dwShell(badges,tok,pos,body){
+  return `<div class="dw-h">${badges}<span class="tok" title="${esc(tok)}">${esc(tok)}</span><span class="pos">pos ${pos}</span>
+    <button class="x" onclick="closeDrawer()">✕</button></div><div class="dw-b">${body}</div>`;
+}
+function kv(k,tipkey,v){ return `<div class="it"><div class="k">${k}<span class="q" data-tipkey="${tipkey}">?</span></div><div class="v">${v}</div></div>`; }
+function secFlow(r){
+  const opened = r.open!==undefined?(!!r.open||!!r.rej||r.eta>0):false;
+  const tilted = (r.eta||0)>0;
+  const rej = !!r.rej;
+  return `<div class="sec"><h5>决策链路<span class="q" data-tip="draft:学生自由采样提案 → D 门:分歧超阈才继续 → 倾斜:按教师方向重加权分布 → 投机判定:draft 在新分布下按接受率保留或拒绝重采。高亮=本位置实际走过的路径。">?</span></h5>
+  <div class="flow">
+    <div class="nd hit">学生 draft</div><div class="ar hit">→</div>
+    <div class="nd ${opened?"hit":""}">${opened?"D 门开":"D 门关"}</div><div class="ar ${tilted?"hit":""}">→</div>
+    <div class="nd ${tilted?"hit":""}">倾斜分布</div><div class="ar ${tilted?"hit":""}">→</div>
+    <div class="nd ${!opened?"":rej?"res-bad":"res-ok"}">${!opened?"直通":rej?"拒绝→重采":"接受"}</div>
+  </div></div>`;
+}
+function secD(d,th){
+  const mx=Math.max(th*2.5, d*1.25, .01);
+  const thPct=Math.max(4, Math.min(th/mx*100, 92));       // θ 标签防溢出
+  const dPct=Math.min(d/mx*100, 98);
+  const labelSide = thPct<28 ? "left:3px" : "right:3px";  // θ 靠左时标签放右侧
+  return `<div class="sec"><h5>D 门判定<span class="q" data-tipkey="D">?</span></h5>
+  <div class="dbar">
+    <div class="th" style="left:${thPct.toFixed(1)}%"><i style="${thPct<28?"left:5px":"right:5px"}">θ_D=${th}</i></div>
+    <div class="dv ${d>th?"hot":""}" style="left:calc(${dPct.toFixed(1)}% - 4px)"></div>
+  </div>
+  <div class="dbar-lab"><span>0</span><span class="mid">D=${d} ${d>th?"→ 超阈,开门":"→ 未超阈"}</span><span>${mx.toFixed(3)}</span></div></div>`;
+}
+function secDist(r){
+  const P=new Map(), T=new Map();
+  (r.pi||[]).forEach(([t,l])=>P.set(t,Math.exp(l)));
+  (r.pt||[]).forEach(([t,l])=>T.set(t,Math.exp(l)));
+  if(!P.size&&!T.size) return "";
+  const toks=[...new Set([...P.keys(),...T.keys()])];
+  toks.sort((a,b)=> Math.max(T.get(b)||0,P.get(b)||0)-Math.max(T.get(a)||0,P.get(a)||0));
+  const top=toks.slice(0,14);
+  const mx=Math.max(...top.map(t=>Math.max(P.get(t)||0,T.get(t)||0)),1e-9);
+  const fmtp=v=> v>=0.1?(v*100).toFixed(0)+"%":(v*100).toFixed(1)+"%";
+  const rows=top.map(tk=>{
+    const p=P.get(tk), q=T.get(tk);
+    const isF = tk===r.final, isD = tk===r.draft && r.rej && r.draft!==r.final;
+    const hl = isF?"hl-f":isD?"hl-d":"";
+    const flag = isF?`<span class="fl f">final</span>`:isD?`<span class="fl d">draft</span>`:"";
+    return `<div class="row ${hl}">
+      <div class="pv l">${p!=null?fmtp(p):"—"}</div>
+      <div class="bar l">${p!=null?`<i style="width:${(p/mx*100).toFixed(1)}%"></i>`:""}</div>
+      <div class="tk-c" title="${esc(tk)}">${esc(tk)}${flag}</div>
+      <div class="bar r">${q!=null?`<i style="width:${(q/mx*100).toFixed(1)}%"></i>`:""}</div>
+      <div class="pv r">${q!=null?fmtp(q):"窗外"}</div>
+    </div>`;}).join("");
+  return `<div class="sec"><h5>学生 π vs 教师 p_T(top-16 并集)<span class="q" data-tip="左紫条=学生分布,右蓝条=教师分布(两侧 top-16 并集,按较大概率排序)。'窗外'/'—'=不在对方观测窗内。教师明显高于学生的 token 即倾斜想抬升的方向。绿标=最终 token,红标=被拒绝的 draft。">?</span></h5>
+  <div class="dist">
+    <div class="hd"><span></span><span>← 学生 π</span><span>token</span><span>教师 p_T →</span><span></span></div>
+    ${rows}
+    <div class="note">百分数为观测窗内概率;倾斜分布 b ∝ π·e^{η·clip(ln p_T−ln π, ±${C_CLIP})},在候选核 S 内归一(面板不落盘、由左右两列确定性重算)。</div>
+  </div></div>`;
+}
+/* 干预跳转 */
+function ivList(){ return CUR.t.recs.map((r,i)=>({r,i})).filter(x=>x.r.eta>0||x.r.rej); }
+function jumpIv(dir){
+  const ivs=ivList(); if(!ivs.length) return;
+  let at = ivs.findIndex(x=>x.i===CUR.iv);
+  at = at<0 ? (dir>0?0:ivs.length-1) : (at+dir+ivs.length)%ivs.length;
+  gotoRec(ivs[at].i);
+}
+function gotoRec(i){
+  const t=CUR.t, r=t.recs[i];
+  const tn=t.turns.find(x=>r.p>=x.a&&r.p<x.b);
+  if(tn){ const card=document.getElementById(`turn-${tn.i}`); if(card) card.classList.add("open"); }
+  const el=document.getElementById(`rec-${i}`);
+  if(el){ el.scrollIntoView({behavior:"smooth",block:"center"}); el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash"); }
+  openRec(i);
+}
+function expandAll(v){
+  document.querySelectorAll(".turn").forEach(el=>{
+    if(v) el.classList.add("open");
+    else { const iv=el.querySelector(".bdg.win,.bdg.lose"); if(!iv) el.classList.remove("open"); }
+  });
+}
+boot();
+</script>
+</body>
+</html>

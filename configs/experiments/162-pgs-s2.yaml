@@ -1,0 +1,157 @@
+# ═══ PGS steering 臂 S2(162)═══
+# 用户裁定 2026-08-05:s1 首查暴露 θ_D 自适应死锁(worker 分片欠观测,gate.py
+# 已修)+ 干预 98.7% 坍缩在 turn 0 前 0.4%(预算头部耗尽)。S2 = 修复后重起臂:
+# B_∞ 20→40(用户裁定 v3);预算均衡化(pacing)方案待裁定后在此加键。
+# 相对 s1 的差异仅 steering 段(b_max/theta_d 注释),train 段与 base/s1 零漂移。
+# =============================================================================
+# PGS 配置模板 —— 机制全部超参数、推荐默认值与依据(规范 docs/pgs-final-spec.md)。
+#
+# 【这是模板,不是任何一次实验的配置。】不要直接拿它跑实验:
+#     python -m trace_opd.tools.config_tool new a800-pgs-s0   # 完整复制一份
+#     # 编辑 configs/experiments/a800-pgs-s0.yaml,那份就是该实验的全部定义
+#
+# 为什么"完整复制"而非"只写差异":一次实验的配置应当自足——半年后单独打开就能读懂,
+# 能与任何另一个实验直接 diff,且模板日后怎么改都不会追溯性改变已完成实验的含义。
+#
+# 损失面(规范 §2.6):纯 verl 原生 GRPO(ppo_loss)。不存在蒸馏配置——教师只经
+# 采样端 SPS 保尾核进入;行为校正 W_beh 走 batch 的 rollout_is_weights 通道。
+#
+# ${VAR} 在加载时从环境变量展开(部署事实进 env,不进本文件)。
+# 每项注释:含义 | 依据(h1/h3 pilot、4B/A800 主线与 162 主线的实测定版)。
+# =============================================================================
+
+run:
+  name: pgs_s2              # 实验名;归档根 = runs_root/name(TRACE_RUN_DIR 由 launcher 导出)
+  runs_root: /data4/ws/PGS   # 用户裁定 2026-08-04:ckpt/产物落 /data4(5.6T 余量;/data3 曾写满炸掉 C3)
+
+# ---------------------------------------------------------------------------
+# Episode 协议(训练/评测同构,PG-3)
+# ---------------------------------------------------------------------------
+episode:
+  max_env_steps: 30         # 每 episode 环境步预算 | 用户裁定 2026-07-23(原 50):
+                            # cap=30 保住 h3 训后 94.2% 的成功(中位 11 步),
+                            # 失败 episode 不再烧满预算
+  max_assistant_turns: 40   # 会话轮上限 = 步预算 + 格式失败余量(加载强校验 turns > steps)
+  max_tokens_per_turn: 2048 # 单轮生成上限(reasoning+action)| 2026-07-30 用户裁定改配置项;
+                            # 打满该上限的轮 won 率只剩 10.5%(CD-008 实测)。
+                            # 不进 objective_fingerprint(采样协议非优化目标)
+
+alfworld:
+  data_root: "${ALFWORLD_DATA}"              # json_2.1.1 数据根
+  worker_python: "${ALFWORLD_WORKER_PYTHON}" # 引擎 venv 解释器(worker 子进程用)
+  spawn_concurrency: 128    # 用户裁定 2026-08-04:并发拉满(80 核)
+  start_timeout_s: 300      # 引擎 boot 超时 | h1 定版
+  step_timeout_s: 120       # 单步执行超时 | h1 定版
+  boot_concurrency: 32      # 数据构建期(build_datasets)引擎 boot 并发 | h3 定版
+
+# ---------------------------------------------------------------------------
+# 训练:verl GRPO —— launcher 由此生成完整命令行
+# ---------------------------------------------------------------------------
+train:
+  model_path: "${TRACE_MODEL_PATH}"    # 基座:Qwen3-4B-Instruct-2507(PG-2)
+  train_file: "${TRACE_TRAIN_FILE}"    # build_datasets 产出的 train parquet
+  val_files:                            # 训练内 val = test 两 split 裸 greedy
+    - "${TRACE_VAL_SEEN_FILE}"
+    - "${TRACE_VAL_UNSEEN_FILE}"
+  experiment_name: pgs_s2
+  project_name: trace_opd
+  n_gpus: 4                 # 机器相关,实验副本按实机改(162 共享期 2;A800-SXM 4)
+  rollout_tp: 1             # 用户裁定 2026-08-04:推理 TP=1(4 卡 ⇒ 4 个独立 replica,无跨卡通信)
+                            # zkgy 混卡纪律:TP 组必须落同型号卡对
+  train_batch_size: 16      # 每 step 任务数 | 用户裁定 2026-07-23
+  rollout_n: 8              # 每任务独立 student rollout 数 = GRPO 组大小 | 用户裁定;
+                            # 约束:train_batch_size % agent_num_workers == 0
+  ppo_mini_batch_size: 16   # 单位=任务数,verl 内部自动 ×rollout_n ⇒ 每 step 1 次全批更新
+  lr: 1.0e-6                # | h3 定版
+  lr_scheduler_type: constant   # h3 的实际调度,显式钉死保可比
+  lr_warmup_steps_ratio: 0.0
+  # ---- 序列容量参数(容量声明,非机制上限;包络变大按打包预算/SP/多机伸缩)----
+  response_length: 32768    # episode 响应流预算(=评测预算,训评同构)| 用户裁定:
+                            # 永不因输出长就不训练
+  max_prompt_length: 2048   # 首轮 prompt 上限,超长 fail-loud(truncation=error)
+  max_token_len_per_gpu: 34816   # 单序列容量声明:本值 × ulysses_sp ≥ prompt+response
+  ppo_max_token_len_per_gpu: 8192      # actor 训练前反向微批打包预算/卡
+                            # (logits 分量 = 本值 × vocab × 4B fp32;21.2GiB 事故后解耦)
+  log_prob_max_token_len_per_gpu: 8192 # old_log_prob 推理打包预算/卡(同时产出熵曲线)
+  ulysses_sp: 2             # 2026-08-04 OOM 实锤后切换:标定 run 第 3 步出现 32704
+                            # 打满预算轨迹,rmpad=False 下单条 fp32 logits ≈18.5G 必爆
+                            # (update_actor OOM: need 8.94G, free 1.15G)。sp=2 联动
+                            # rmpad=True+FA2(已实测可用),序列切两卡;4B/SP2 是 162
+                            # 历史成熟配置。执行档改动,不进指纹,两臂一致
+                            # 需可用 flash-attn —— 仅 162 venv 有,A800-SXM 不可用)
+  rollout_max_model_len: 40960   # rollout 单序列 ctx ≥ 教师前缀(scaffold+doc+obs)+ response
+  rollout_max_num_batched_tokens: 8192  # vLLM chunked-prefill 预算 | 2026-07-28 用户裁定
+                            # 模板级 8192(step-17 illegal-access 绕过 + 独占拓扑显存账);
+                            # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048。
+                            # 同时决定 prompt_logprobs 打分(SPS verify)的临时 logits
+                            # 显存:本值 × vocab × 2B ×2
+  rollout_gpu_mem: 0.6      # 2026-08-04 防御性下调 0.7→0.6:SPS 的 logprobs/
+                            # prompt_logprobs 请求触发 vLLM 预算外分配(#5907,
+                            # 无保护;实测峰值超预算 11-22G,78/80 贴上限)。让出
+                            # 8G 结构性 headroom;代价=KV 池缩、preempt 增多
+                            # (degrade 不崩)。与 R11a 历史事故同源
+  rollout_max_num_seqs: 128 # 每 vLLM replica 并发序列上限(单 TP 上限,用户裁定)
+  rollout_temperature: 1.0
+  # ---- 信用分配单位(verl actor.loss_agg_mode)----
+  # seq-mean-token-mean(2026-07-29 用户裁定默认):每条轨迹先 token-mean 再等权,
+  # 长尾失败轨迹不再按长度拿投票权(CD-008:token-mean 下 85.5% token 来自失败轨迹)。
+  loss_agg_mode: seq-mean-token-mean
+  # ---- 稳定性/传输(均有事故背书,见注释)----
+  vllm_rpc_timeout_ms: 300000     # EngineCore↔worker RPC 超时(默认 10s 长序列误判引擎死)
+  agent_task_timeout_s: 2700      # R3 hang guard:单 prompt 墙钟上限;0=禁用
+  fsdp_mode: shard                # shard | noshard(NO_SHARD≈DDP,卡间通信不可靠机器保留)
+  fsdp_strategy: fsdp2            # fsdp2 | fsdp(NO_SHARD 逃生通道要 fsdp1)
+  fsdp_size: 0                    # 0=全分片
+  param_offload: true             # 关掉训练后显存高水位不归还,vLLM wake_up 拿不到物理页
+  reshard_after_forward: true     # True=ZeRO-3
+  dist_backend: ""                # 空=nccl;"cpu:gloo,cuda:gloo"=绕开 NCCL
+  total_epochs: 2
+  test_freq: 10             # 用户裁定:每 10 step 一个 val 点
+  save_freq: 10             # 与 test_freq 同格:每个 val 点都有可回滚 ckpt
+  max_ckpt_to_keep: 4       # 用户裁定:滚动保留 4 个 actor ckpt(单个 ≈45G)
+  val_before_train: true    # step-0 val = 训前基线(三件套之①)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16     # 必须 = train_batch_size(用户长期裁定)
+
+# ---------------------------------------------------------------------------
+# PGS steering(规范 docs/pgs-final-spec.md §2;enabled=false ⇒ 纯 GRPO 基线臂,
+# 与底座逐字节一致)
+# ---------------------------------------------------------------------------
+steering:
+  enabled: true
+  doc_table: "/data3/wushang/workspace/TRACE-OPD/trace_opd-pgc/data/out/gt_docs_rl_train_v2.jsonl"             # task_id→doc 的 jsonl(静态特权文档源;离线制备)
+  eta_max: 0.5              # 倾斜强度上限 η_max | 规范 §2.2;全词表密度比 ≤ e^{2ηc}
+  c: 2.5                    # 截断参数(单点话语权限幅)| 规范 §2.1:上线前必须用
+                            # 目标文档语境实测 ℓ 分布标定(G0 的 GT 语境分布不可迁移)
+  b_max: 40.0               # D_∞ 逐轨迹预算(nats)| 用户裁定 2026-08-05 v3(20→40):
+                            # s1 首查实测换 token 仅 ~0.56 次/轨迹且总量对 η 一阶
+                            # 不敏感(次数=B/2ηc 与拒绝率∝η 相消),B 是总量主旋钮。
+                            # δ=2ηc=2.5 保守扣费 ⇒ 16 次整额等价干预/轨迹;训练端
+                            # per-token W 界 e^{±2ηc} 与本值无关,轨迹级界只影响
+                            # per_decision 消融档;消融矩阵 {10,20,40}(第二轮预注册)
+  topk: 64                  # 保尾核候选集 S = 两侧 top-K 并集
+  obs_topk: 256             # draft/verify 引擎观测窗(top-K 明细宽度)| launcher
+                            # 联动 vLLM max_logprobs ≥ 本值(启动期参数;codex
+                            # 审阅 P0:hook 与 launcher 必须同源于此键)
+  theta_d: 0.0338 # θ_D(0) 初值 = 2048 桶标定 P90(pgs_calib,2026-08-04;q=10% 目标
+                            # 门率对应)。自适应 EMA 会自校(gate.py 分片死锁已修,
+                            # 2026-08-05):s1 实测 verify 窗口口径的均衡 θ 显著更高
+                            # (开门位置 D med 0.112),修复后 EMA 约 β_eff≈0.34/次
+                            # (worker 每 ~4 step 攒够 min_obs 更新一次)自动爬升;
+                            # 若预算均衡化(pacing)落地则窗口≈全轨迹口径,本初值近均衡。
+                            # 全量分位:P50 .0027/P85 .0203/P90 .0338/P95 .0721/P99 .3033
+  gate_adaptive: true   # 率控自适应(用户裁定 2026-08-04):θ_D 每 step
+                            # EMA 追踪目标门率;标定 run 必须 false(冻结哨兵)
+  gate_target_rate: 0.10    # 目标门率 q(用户裁定默认 10%;消融 {5,10,20}%)
+  gate_ema_beta: 0.1        # EMA 慢速率 β;θ_D 语义 = EMA 初值(标定回填)
+  epsilon: 0.05             # ε 探针翻转概率(倾向得分可辨识性)| 规范 §2.3
+  gate_rate_bounds: [0.05, 0.25]  # 开门率合法带(spec 预注册区间;P85 标定的
+                            # 设计触发率 15% 居中),越界告警不自动调(冻结语义)
+  r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
+  w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
+                            # (消融开关,规范 §2.6)
+
+eval:
+  response_budget: 32768    # 评测侧 episode token 预算 | h3 定版
+  temperature: 0.0          # greedy | 评测口径(与 pilot 可比)

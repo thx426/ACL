@@ -282,6 +282,39 @@ def test_adaptive_tracker_restores_target_rate_after_shift():
     assert max(jumps) < 0.5
 
 
+def test_adaptive_tracker_sharded_worker_accumulates():
+    """回归(2026-08-05 s1 事故):verl 16-worker 拓扑下每进程每 step 只见
+    全批 1/16(~160 obs)< min_obs=500,旧实现 step 前进无条件清空累积 ⇒
+    永远攒不够 ⇒ θ_D 全程冻结在初值(s1 实测 17 step 门率恒 ~40%)。
+    修复后:欠观测跨 step 续攒,攒够才更新,β 按经过步数复利折算。"""
+    from trace_opd.steering.gate import GateThresholdTracker
+
+    rng = np.random.default_rng(7)
+    bins, hmax, q = 2048, 6.25, 0.10
+
+    def hist_of(samples):
+        h = [0] * bins
+        for v in samples:
+            h[min(int(v / hmax * bins), bins - 1)] += 1
+        return h
+
+    tr = GateThresholdTracker(
+        theta_init=0.0338, target_rate=q, ema_beta=0.1, d_hist_max=hmax, bins=bins,
+    )
+    dist = lambda n: rng.lognormal(-2.0, 1.0, n)  # 均衡 θ(~P90≈0.49)远高于初值
+    thetas = []
+    for step in range(1, 61):
+        tr.observe(hist_of(dist(160)), 160)  # 每 step 仅一个分片的观测量
+        tr.maybe_step_update(step)
+        thetas.append(tr.theta)
+    assert thetas[-1] > 0.2, "θ 未脱离初值 —— 分片欠观测死锁回归"
+    rate = float(np.mean(dist(40000) >= tr.theta))
+    assert abs(rate - q) < 0.03, f"converged rate {rate:.3f}"
+    # 更新只应发生在攒够 min_obs 的 step 边界(160/step ⇒ 每 4 step 一次)
+    changes = sum(1 for a, b in zip(thetas, thetas[1:]) if a != b)
+    assert 10 <= changes <= 20, f"update count {changes}"
+
+
 def test_adaptive_tracker_step_semantics():
     from trace_opd.steering.gate import GateThresholdTracker
 

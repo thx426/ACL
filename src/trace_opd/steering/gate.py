@@ -112,11 +112,14 @@ class GateThresholdTracker:
 
     生命周期:agent-loop worker 进程单例。每条轨迹结束时 ``observe()`` 并入
     该轨迹的 D 直方图;检测到 global_step 前进时(``maybe_step_update``)
-    先用**上一 step 累积的直方图**做一次 EMA 更新、再清空累积——同一 step
-    内所有轨迹用同一个 θ_D(步内冻结,因果性;滞后一步,分布稳定则无害)。
+    用**累积直方图**做一次 EMA 更新——同一 step 内所有轨迹用同一个 θ_D
+    (步内冻结,因果性;滞后一步,分布稳定则无害)。
 
-    直方图分位数:线性桶内插值;累积观测不足 ``min_obs`` 时跳过更新
-    (信号太少不动阈值,避免小样本抖动)。
+    直方图分位数:线性桶内插值。累积观测不足 ``min_obs`` 时**保留累积、
+    继续跨 step 攒**,攒够才更新并清空——verl 多 worker 拓扑下每个进程
+    只见全批的 1/N(162 s1 实测 16 worker × ~160 obs/step),逐 step 清空
+    会让阈值永久冻结在初值(2026-08-05 s1 事故);跨 k 步合并更新时 β 按
+    ``1-(1-β)^k`` 复利折算,时间常数与逐步更新等价。
     """
 
     def __init__(
@@ -144,6 +147,7 @@ class GateThresholdTracker:
         self._acc = [0] * self.bins
         self._acc_count = 0
         self._last_step: int | None = None
+        self._last_update_step: int | None = None
         self._lock = threading.Lock()
 
     def observe(self, d_hist: list[int], d_count: int) -> None:
@@ -159,16 +163,22 @@ class GateThresholdTracker:
         with self._lock:
             if self._last_step is None:
                 self._last_step = int(global_step)
+                self._last_update_step = int(global_step)
                 return
             if int(global_step) == self._last_step:
                 return
-            # step 前进:用累积直方图更新 θ,再清空
-            if self._acc_count >= self.min_obs:
-                target = self._hist_quantile(1.0 - self.target_rate)
-                self.theta = (1.0 - self.ema_beta) * self.theta + self.ema_beta * target
+            self._last_step = int(global_step)
+            # step 前进:累积够 min_obs 才更新并清空;不够则保留继续攒
+            # (多 worker 分片下单 step 观测不足,逐 step 清空会永久冻结)。
+            if self._acc_count < self.min_obs:
+                return
+            k = self._last_step - (self._last_update_step or self._last_step)
+            beta_eff = 1.0 - (1.0 - self.ema_beta) ** max(k, 1)
+            target = self._hist_quantile(1.0 - self.target_rate)
+            self.theta = (1.0 - beta_eff) * self.theta + beta_eff * target
             self._acc = [0] * self.bins
             self._acc_count = 0
-            self._last_step = int(global_step)
+            self._last_update_step = self._last_step
 
     def _hist_quantile(self, q: float) -> float:
         target = q * self._acc_count
