@@ -41,7 +41,7 @@ def main() -> int:
     ap.add_argument("--q", type=float, default=0.85, help="目标分位数(规范 P85)")
     args = ap.parse_args()
 
-    hist = [0] * D_HIST_BINS
+    hist = None            # 桶数以数据为准(len(h)),代码常数只是新数据的默认
     ell_hist = [0] * ELL_HIST_BINS
     ell_total = 0
     n_traj = n_files = 0
@@ -58,20 +58,26 @@ def main() -> int:
         h = st.get("steer_d_hist")
         if not h:
             continue
-        # 审阅 IF-12:坐标系(上界=c²)随账落盘;不同坐标系的账不可混合聚合
+        # 审阅 IF-12 + 桶数 schema(2026-08-04 读数事故):坐标系 = (上界, 桶数)
+        # 都以数据为准;跨轨迹不一致 = 混了不同版本的 run,拒绝聚合。
+        # 事故:代码桶数 64→256 后用新常数解释旧 64 桶数据,分位数缩小 4 倍。
         hm = float(st.get("steer_d_hist_max", 6.25))
-        if hist_max is None:
+        nb = int(st.get("steer_d_hist_bins", len(h)))
+        if len(h) != nb:
+            raise SystemExit(f"FATAL: {f} hist len {len(h)} != declared bins {nb}")
+        if hist is None:
+            hist = [0] * nb
             hist_max = hm
-        elif abs(hm - hist_max) > 1e-9:
+        elif abs(hm - hist_max) > 1e-9 or nb != len(hist):
             raise SystemExit(
-                f"FATAL: mixed histogram coordinate systems ({hist_max} vs {hm}) "
+                f"FATAL: mixed histogram schemas (({hist_max},{len(hist)}) vs ({hm},{nb})) "
                 f"in {f} — calibrate one run at a time"
             )
         n_traj += 1
         c = int(st.get("steer_d_count", sum(h)))
         total += c
         d_mean_sum += float(st.get("steer_d_mean", 0.0)) * c
-        for i, v in enumerate(h[:D_HIST_BINS]):
+        for i, v in enumerate(h):
             hist[i] += int(v)
         eh = st.get("steer_ell_hist")
         if eh:
@@ -94,9 +100,9 @@ def main() -> int:
         for i, v in enumerate(hist):
             acc += v
             if acc >= target:
-                lo = i * hist_max / D_HIST_BINS
+                lo = i * hist_max / len(hist)
                 frac = 1.0 - (acc - target) / v if v else 0.0
-                return lo + frac * (hist_max / D_HIST_BINS), i == D_HIST_BINS - 1
+                return lo + frac * (hist_max / len(hist)), i == len(hist) - 1
         return hist_max, True
 
     print(f"trajectories: {n_traj}   D observations: {total}   hist_max: {hist_max}")
@@ -109,7 +115,7 @@ def main() -> int:
         # 审阅 IF-12:目标分位落进末桶时桶内插值没有辨识依据——拒绝给出
         # 建议值,而不是输出一个会被误用的 floor。
         print(f"\nFATAL: target P{int(args.q*100)} falls in the overflow bucket "
-              f"(> {hist_max * (D_HIST_BINS - 1) / D_HIST_BINS:.3f}) — no suggested "
+              f"(> {hist_max * (len(hist) - 1) / len(hist):.3f}) — no suggested "
               "theta_d. Rerun calibration with a larger c (hist range = c^2).")
         return 2
     print(f"\nsuggested steering.theta_d: {val:.4f}")

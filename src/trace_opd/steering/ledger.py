@@ -124,6 +124,7 @@ class SteeringLedger:
             "steer_reject_count": sum(1 for r in self.records if r.rejected),
             "steer_d_hist": list(self.d_hist),
             "steer_d_hist_max": self.d_hist_max,
+            "steer_d_hist_bins": len(self.d_hist),
             "steer_d_count": self.d_count,
             "steer_d_mean": (self.d_sum / self.d_count) if self.d_count else 0.0,
             "steer_n_candidates": self.n_candidates,
