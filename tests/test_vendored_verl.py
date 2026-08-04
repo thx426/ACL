@@ -85,6 +85,14 @@ def test_ppo_loss_carries_rollout_is_weights_channel():
     assert "rollout_is_weights=rollout_is_weights" in src
 
 
+def test_ppo_loss_reports_wbeh_consumption():
+    # 运行时对账通道:rollout 侧有 steer 的 step,训练端 off1_frac 必须 >0;
+    # 该指标缺席 = W_beh 静默丢失类故障(IF-09)无法在线暴露。
+    src = _read("workers/utils/losses.py")
+    assert "actor/rollout_is_weight_mean" in src
+    assert "actor/rollout_is_weight_off1_frac" in src
+
+
 def test_vanilla_loss_multiplies_weights_outside_the_clip():
     # NF02 分离式校正的实现事实:W 乘在 dual-clip 之后的 pg_losses 上,
     # 绝不能折进 ratio 再被 clip(那会在最需要校正处零梯度)。

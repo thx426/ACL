@@ -182,14 +182,14 @@ class SteeringCfg:
     doc_table: str = ""            # task_id→doc 的 jsonl 表(静态特权文档源)
     eta_max: float = 0.5           # 倾斜强度上限
     c: float = 2.5                 # 截断参数(单点话语权限幅;目标语境实测标定)
-    b_max: float = 6.0             # D_∞ 逐轨迹预算(nats)
+    b_max: float = 10.0            # D_∞ 逐轨迹预算(nats;用户裁定 2026-08-04)
     topk: int = 64                 # 保尾核候选集 S 的两侧 top-K
     obs_topk: int = 256            # draft/verify 的引擎观测窗(top-K 明细宽度);
                                    # launcher 联动 vLLM max_logprobs ≥ 本值(P0:两处
                                    # 必须同源,hook 请求超过 max_logprobs 会被引擎拒)
     theta_d: float = 0.0           # D 主门冻结阈值(0=预扫描标定前的占位,启动校验拒 0)
     epsilon: float = 0.05          # ε 探针概率
-    gate_rate_bounds: tuple = (0.02, 0.30)
+    gate_rate_bounds: tuple = (0.05, 0.25)   # spec 预注册区间
     r_max: int = 4                 # 每轮拒绝上限(行为态)
     w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace(消融开关,规范 §2.6)
 

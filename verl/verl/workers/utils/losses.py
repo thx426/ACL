@@ -111,6 +111,21 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         rollout_is_weights=rollout_is_weights,
     )
 
+    # trace-opd PGS runtime reconciliation: prove the behaviour-correction
+    # weights actually reached the loss. A rollout step with steer_count > 0
+    # must show off1_frac > 0 here — silence means the channel silently
+    # dropped the weights (the IF-09 failure class, verified at runtime).
+    if rollout_is_weights is not None:
+        with torch.no_grad():
+            mask_f = response_mask.float()
+            denom = mask_f.sum().clamp(min=1.0)
+            pg_metrics["actor/rollout_is_weight_mean"] = (
+                (rollout_is_weights * mask_f).sum() / denom
+            )
+            pg_metrics["actor/rollout_is_weight_off1_frac"] = (
+                (((rollout_is_weights - 1.0).abs() > 1e-6).float() * mask_f).sum() / denom
+            )
+
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
     pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)

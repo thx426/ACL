@@ -366,3 +366,26 @@ def test_pt_window_miss_is_counted_and_never_lifts():
     hook, state, *_ , sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, seed=8)
     _run(hook(sp, {"max_tokens": 16, "temperature": 1.0}))
     assert state.ledger.n_pt_window_miss > 0
+
+
+def test_ledger_records_token_pairs_and_ell_observations():
+    def crush_top(pt_logits, pi):
+        top = int(np.argmax(pi))
+        pt_logits = pt_logits.copy()
+        pt_logits[top] = -30.0
+        return pt_logits
+
+    world = _World(seed=3, pt_shift=crush_top)
+    hook, state, *_ , sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, seed=11)
+    out = _run(hook(sp, {"max_tokens": 32, "temperature": 1.0}))
+    recs = state.ledger.records
+    assert recs and all(r.draft_token >= 0 and r.final_token >= 0 for r in recs)
+    # 被拒行:final ≠ draft 且 final 与输出坐标一致;接受行:final == draft
+    for r in recs:
+        if r.position < len(out.token_ids):
+            assert out.token_ids[r.position] == r.final_token
+        if not r.rejected:
+            assert r.final_token == r.draft_token
+    # ℓ 观测:每个候选位置贡献窗内 token 数条
+    assert state.ledger.ell_count > 0
+    assert sum(state.ledger.ell_hist) == state.ledger.ell_count

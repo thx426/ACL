@@ -104,9 +104,15 @@ def position_candidates(
     log_pt = np.array(
         [pt_map.get(t, pt_floor) for t in s_tokens], dtype=np.float64
     )
+    raw_ell = log_pt - log_pi
     ell = truncated_increment(log_pt, log_pi, c)
     ell = np.where(in_window, ell, np.minimum(0.0, ell))
-    return np.array(s_tokens, dtype=np.int64), log_pi, ell, known_pi, n_window_miss
+    # 窗内的未截断 ℓ 是纯观测量(无代入污染)——c 标定与方向观察的数据面
+    raw_ell_observed = raw_ell[in_window]
+    return (
+        np.array(s_tokens, dtype=np.int64), log_pi, ell, known_pi,
+        n_window_miss, raw_ell_observed,
+    )
 
 
 def candidate_d(log_pi: np.ndarray, ell: np.ndarray) -> float:
@@ -237,7 +243,7 @@ class SpsGenerate:
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
                     continue
-                s_tokens, s_log_pi, s_ell, known_pi, n_miss = position_candidates(
+                s_tokens, s_log_pi, s_ell, known_pi, n_miss, raw_ell = position_candidates(
                     pi_ids=pi_topk_ids[g],
                     pi_logprobs=pi_topk_lps[g],
                     pt_ids=pt_rows[0][g],
@@ -246,6 +252,7 @@ class SpsGenerate:
                     c=self._c,
                 )
                 st.ledger.n_pt_window_miss += n_miss
+                st.ledger.observe_ell(raw_ell)
                 d_value = candidate_d(s_log_pi, s_ell)
                 st.ledger.observe_d(d_value)
                 decision = st.gate.decide(d_value, st.rng)
@@ -265,6 +272,7 @@ class SpsGenerate:
                             propensity=decision.propensity,
                             rejected=False, cap_active=st.reject_cap.cap_active,
                             budget_after=st.budget.remaining,
+                            draft_token=y, final_token=y,
                         ))
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
@@ -295,6 +303,7 @@ class SpsGenerate:
                     rejected=outcome.rejected,
                     cap_active=st.reject_cap.cap_active,
                     budget_after=st.budget.remaining,
+                    draft_token=y, final_token=int(outcome.token_id),
                 ))
                 executed.append(int(outcome.token_id))
                 executed_logpi.append(float(outcome.log_pi))

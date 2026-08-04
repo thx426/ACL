@@ -34,12 +34,20 @@ class TokenSteerRecord:
     rejected: bool
     cap_active: bool       # 本行写入时 cap 是否已激活(第 R_max 次拒绝行=True)
     budget_after: float = -1.0   # 本位置结算后的预算余额(审阅 IF-07)
+    draft_token: int = -1        # draft 提案 token(观察:教师把什么改成了什么)
+    final_token: int = -1        # 实际执行 token(= draft 或残差重采结果)
 
 
 #: D 直方图口径:D = Var_{π|S}[ℓ̃] ∈ [0, c²]。bins 数固定;上界随 run 的 c
 #: 派生(d_hist_max = c²,审阅 IF-12——硬编码 6.25 会在 c>2.5 时把尾部
 #: 全压末桶还输出伪精确分位数)。上界随 finalize 落盘,标定聚合时校验一致。
 D_HIST_BINS = 64
+
+#: ℓ 观测直方图(未截断的 log p_T − log π,S 内 p_T 观测窗内逐 token 等权):
+#: c 的目标语境标定数据面(候选 c 的截断饱和率 P(|ℓ|>c) 直接可读)+ 教师
+#: 异议方向观察(正半区=抬升/负半区=压制)。固定对称范围,双侧溢出计入端桶。
+ELL_HIST_BINS = 96
+ELL_HIST_RANGE = 12.0   # 覆盖 [-12, 12];分辨率 0.25/桶,c∈[2,3] 标定绰绰有余
 
 
 @dataclass
@@ -61,7 +69,10 @@ class SteeringLedger:
     n_probe_flipped: int = 0
     n_budget_blocked: int = 0         # 门开但预算不允许(η 缩到 0)
     n_bypassed: int = 0               # cap/预算耗尽后未判定直通的 token 数
-    n_pt_window_miss: int = 0         # S 内 p_T 窗外中性代入次数(max-IF-13)
+    n_pt_window_miss: int = 0         # S 内 p_T 窗外单侧鲁棒代入次数(max-IF-13)
+    # ℓ 观测直方图(c 标定 + 方向观察;窗内逐 token 等权)
+    ell_hist: list[int] = field(default_factory=lambda: [0] * ELL_HIST_BINS)
+    ell_count: int = 0
 
     def observe_d(self, d_value: float) -> None:
         b = int(d_value / self.d_hist_max * D_HIST_BINS)
@@ -69,6 +80,14 @@ class SteeringLedger:
         self.d_count += 1
         self.d_sum += float(d_value)
         self.n_candidates += 1
+
+    def observe_ell(self, raw_ell_values) -> None:
+        """S 内 p_T 观测窗内 token 的未截断 ℓ,逐 token 等权入直方图。"""
+        half = ELL_HIST_BINS / 2.0
+        for v in raw_ell_values:
+            b = int(half + float(v) / ELL_HIST_RANGE * half)
+            self.ell_hist[min(max(b, 0), ELL_HIST_BINS - 1)] += 1
+            self.ell_count += 1
 
     def append(self, rec: TokenSteerRecord) -> None:
         if self.records and rec.position <= self.records[-1].position:
@@ -110,4 +129,8 @@ class SteeringLedger:
             "steer_n_budget_blocked": self.n_budget_blocked,
             "steer_n_bypassed": self.n_bypassed,
             "steer_n_pt_window_miss": self.n_pt_window_miss,
+            "steer_draft_token": [r.draft_token for r in self.records],
+            "steer_final_token": [r.final_token for r in self.records],
+            "steer_ell_hist": list(self.ell_hist),
+            "steer_ell_count": self.ell_count,
         }

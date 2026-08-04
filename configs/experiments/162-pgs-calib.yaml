@@ -113,8 +113,10 @@ steering:
   eta_max: 0.5              # 倾斜强度上限 η_max | 规范 §2.2;全词表密度比 ≤ e^{2ηc}
   c: 2.5                    # 截断参数(单点话语权限幅)| 规范 §2.1:上线前必须用
                             # 目标文档语境实测 ℓ 分布标定(G0 的 GT 语境分布不可迁移)
-  b_max: 6.0                # D_∞ 逐轨迹预算(nats)| δ=2ηc 保守扣费 ⇒
-                            # 每轨迹 steer 位置数 ≤ b_max/(2·η·c)
+  b_max: 10.0               # D_∞ 逐轨迹预算(nats)| 用户裁定 2026-08-04(6→10,
+                            # 首轮看效果调大):δ=2ηc 保守扣费,η_max=0.5/c=2.5 下
+                            # = 4 次整额等价干预/轨迹;per_token 主档逐 token 权重
+                            # 仍被 e^{±2ηc} 钳制,轨迹级界只影响 per_decision 消融档
   topk: 64                  # 保尾核候选集 S = 两侧 top-K 并集
   obs_topk: 256             # draft/verify 引擎观测窗(top-K 明细宽度)| launcher
                             # 联动 vLLM max_logprobs ≥ 本值(启动期参数;codex

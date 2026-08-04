@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""θ_D 标定 —— 聚合标定 run 的 D 观测直方图,输出分位数与建议 theta_d。
+"""θ_D 与 c 的目标语境标定 —— 聚合标定 run 的 D / ℓ 观测直方图。
+
+输出两组标定量:
+  * θ_D:D 分布分位数(默认 P85)→ steering.theta_d
+  * c:未截断 ℓ 分布的分位数 + 各候选 c 的截断饱和率 P(|ℓ|>c) 表
+    (spec:c∈[2,3] 须目标文档语境实测,禁沿用 G0 GT 语境的分布)
 
 标定运行形态(规范 §2.3 的目标语境预扫描):
   steering.enabled=true + steering.theta_d=1e9(门恒关哨兵)
@@ -23,7 +28,11 @@ from pathlib import Path
 
 # 与 ledger 的直方图口径一致(单一真源:steering.ledger;上界随账落盘)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from trace_opd.steering.ledger import D_HIST_BINS  # noqa: E402
+from trace_opd.steering.ledger import (  # noqa: E402
+    D_HIST_BINS,
+    ELL_HIST_BINS,
+    ELL_HIST_RANGE,
+)
 
 
 def main() -> int:
@@ -33,6 +42,8 @@ def main() -> int:
     args = ap.parse_args()
 
     hist = [0] * D_HIST_BINS
+    ell_hist = [0] * ELL_HIST_BINS
+    ell_total = 0
     n_traj = n_files = 0
     total = 0
     d_mean_sum = 0.0
@@ -62,6 +73,11 @@ def main() -> int:
         d_mean_sum += float(st.get("steer_d_mean", 0.0)) * c
         for i, v in enumerate(h[:D_HIST_BINS]):
             hist[i] += int(v)
+        eh = st.get("steer_ell_hist")
+        if eh:
+            for i, v in enumerate(eh[:ELL_HIST_BINS]):
+                ell_hist[i] += int(v)
+            ell_total += int(st.get("steer_ell_count", sum(eh)))
 
     if total == 0:
         print(f"no D observations in {args.rollouts} ({n_files} files scanned) — "
@@ -97,6 +113,31 @@ def main() -> int:
               "theta_d. Rerun calibration with a larger c (hist range = c^2).")
         return 2
     print(f"\nsuggested steering.theta_d: {val:.4f}")
+
+    # ── c 标定面(ℓ 分布) ─────────────────────────────────────────────
+    if ell_total > 0:
+        half = ELL_HIST_BINS / 2.0
+        centers = [
+            (i + 0.5 - half) / half * ELL_HIST_RANGE for i in range(ELL_HIST_BINS)
+        ]
+        print(f"\nell observations: {ell_total} (range ±{ELL_HIST_RANGE})")
+        # 双侧分位数(|ℓ| 的)与方向占比
+        abs_mass = {}
+        pos_mass = sum(v for cgt, v in zip(centers, ell_hist) if cgt > 0)
+        print(f"direction: lift(ℓ>0) {pos_mass / ell_total:.1%}  "
+              f"suppress(ℓ<0) {1 - pos_mass / ell_total:.1%}")
+        print("candidate-c saturation table  P(|ℓ|>c):")
+        for c_cand in (1.5, 2.0, 2.25, 2.5, 2.75, 3.0, 4.0):
+            sat = sum(
+                v for cgt, v in zip(centers, ell_hist) if abs(cgt) > c_cand
+            ) / ell_total
+            print(f"  c={c_cand:<5} saturation={sat:.1%}")
+        tail_ends = (ell_hist[0] + ell_hist[-1]) / ell_total
+        if tail_ends > 0.05:
+            print(f"WARNING: {tail_ends:.1%} of ℓ mass in the ±{ELL_HIST_RANGE} "
+                  "end buckets — saturation rates above are floor estimates")
+    else:
+        print("\n(no ℓ observations — run predates the ell-hist ledger channel)")
     return 0
 
 

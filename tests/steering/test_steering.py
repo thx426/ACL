@@ -213,3 +213,20 @@ def test_ledger_counters_and_hist_max():
                 "steer_n_budget_blocked", "steer_n_bypassed",
                 "steer_reject_count", "steer_record_rows"):
         assert key in out
+
+
+def test_ledger_ell_hist_and_token_pairs():
+    from trace_opd.steering.ledger import ELL_HIST_BINS
+
+    led = SteeringLedger()
+    led.observe_ell([-3.0, 0.5, 15.0])       # 含一个超范围值(入端桶)
+    assert led.ell_count == 3
+    assert sum(led.ell_hist) == 3
+    assert led.ell_hist[-1] == 1              # +15 → 末桶
+    led.append(TokenSteerRecord(2, -1.0, -1.5, 0.5, 2.5, 0.9, True, False, 0.95,
+                                True, False, 7.5, 101, 202))
+    out = led.finalize()
+    assert out["steer_draft_token"] == [101]
+    assert out["steer_final_token"] == [202]
+    assert out["steer_ell_count"] == 3
+    assert len(out["steer_ell_hist"]) == ELL_HIST_BINS
