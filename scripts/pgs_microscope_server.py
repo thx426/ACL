@@ -133,7 +133,11 @@ def api_run() -> dict:
     full = max((s["n"] for s in steps), default=0)
     for s in steps:
         s["partial"] = bool(full and s["n"] < full)
-    return dict(name=RUN.name, live=True, hasDocs=bool(DOCS), ts=time.time(), steps=steps, vals=sorted(vals, key=lambda v: v["id"]))
+    vals = sorted(vals, key=lambda v: v["id"])
+    vfull = max((v["n"] for v in vals), default=0)
+    for v in vals:
+        v["partial"] = bool(vfull and v["n"] < vfull)
+    return dict(name=RUN.name, live=True, hasDocs=bool(DOCS), ts=time.time(), steps=steps, vals=vals)
 
 
 def api_step(dirname: str) -> dict:

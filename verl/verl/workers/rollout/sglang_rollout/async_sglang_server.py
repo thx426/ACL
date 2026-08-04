@@ -65,24 +65,43 @@ def _extract_prompt_logprobs_sglang(
     num_prompt_logprobs: int,
     sequence_length: int,
     result_dict: dict[str, list],
+    logprob_start_len: int = 0,
 ) -> None:
     """Shape SGLang input-logprobs into the vLLM ``extract_prompt_logprobs`` contract.
-    Populates ``result_dict`` with two ``[sequence_length, max(num_prompt_logprobs, 1)]``
-    lists — ``prompt_ids`` and ``prompt_logprobs`` — so the distillation teacher
-    consumer in ``teacher_manager.AsyncTeacherLLMServerManager`` can treat vLLM and
-    SGLang teachers interchangeably.
-    SGLang returns input logprobs with length ``S == len(input_ids)`` whose first
-    entry has ``logprob=None`` (no predicting context). That matches the vLLM
-    convention, so we skip entry 0 and append a trailing dummy row to keep the
-    total length equal to the consumer's ``len(sequence_ids)`` assertion.
+    Populates ``result_dict`` with ``prompt_ids`` and ``prompt_logprobs`` row lists
+    (width ``max(num_prompt_logprobs, 1)``), rank-ordered best-first, ending with a
+    trailing dummy row — identical to the vLLM extractor, so consumers (SPS verify
+    hook / distillation teacher manager) treat both engines interchangeably.
+
+    Row-window semantics (trace-opd PGS, 2026-08-05):
+    - ``logprob_start_len == 0`` (full prompt): SGLang's entry 0 has
+      ``logprob=None`` (no predicting context) — skip it, matching vLLM's
+      ``prompt_logprobs[1:]``; total rows = ``sequence_length``.
+    - ``logprob_start_len > 0`` (windowed / tail-only): every returned entry has
+      full context, entry 0 is a REAL row (predicting position start_len) — do
+      NOT skip; total rows = ``sequence_length - logprob_start_len + 1``. This is
+      the off-by-one trap of the SGLang migration; both branches are asserted
+      against the actual payload below (fail loud, never misalign silently).
     """
     input_token_logprobs = meta_info.get("input_token_logprobs") or []
     if num_prompt_logprobs > 0:
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
-    # Entry 0 has logprob=None (no predicting context); skip it, matching vLLM.
-    for position in range(1, len(input_token_logprobs)):
+    skip = 1 if logprob_start_len == 0 else 0
+    if input_token_logprobs:
+        first_lp = input_token_logprobs[0][0]
+        if skip == 1 and first_lp is not None:
+            raise RuntimeError(
+                "SGLang input_token_logprobs[0] has a real logprob under "
+                "logprob_start_len=0 — row convention drifted, refusing to skip it"
+            )
+        if skip == 0 and first_lp is None:
+            raise RuntimeError(
+                f"SGLang input_token_logprobs[0] is None under logprob_start_len="
+                f"{logprob_start_len} — windowed rows should all have context"
+            )
+    for position in range(skip, len(input_token_logprobs)):
         if num_prompt_logprobs == 0:
             logprob, token_id, _ = input_token_logprobs[position]
             prompt_ids_ls.append([int(token_id)])
@@ -102,12 +121,51 @@ def _extract_prompt_logprobs_sglang(
     pad_width = max(num_prompt_logprobs, 1)
     prompt_ids_ls.append([0] * pad_width)
     prompt_logprobs_ls.append([0.0] * pad_width)
-    assert len(prompt_ids_ls) == sequence_length, (
-        f"SGLang prompt_logprobs length ({len(prompt_ids_ls)}) does not match "
-        f"sequence length ({sequence_length}); check logprob_start_len=0 invariant."
+    expected_rows = sequence_length - logprob_start_len - (1 if logprob_start_len == 0 else 0) + 1
+    assert len(prompt_ids_ls) == expected_rows, (
+        f"SGLang prompt_logprobs rows ({len(prompt_ids_ls)}) != expected "
+        f"({expected_rows}) for sequence_length={sequence_length}, "
+        f"logprob_start_len={logprob_start_len}"
     )
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def _extract_response_topk_sglang(
+    meta_info: dict,
+    k: int,
+    n_tokens: int,
+    request_id: str,
+    result_dict: dict[str, list],
+) -> None:
+    """Shape SGLang ``output_top_logprobs`` into the vllm_async_server
+    ``response_topk_ids``/``response_topk_logprobs`` contract: one row per
+    generated token, exactly K wide, rank-ordered best-first (SGLang already
+    returns ranked entries).
+
+    trace-opd 审阅 IF-08 同源: a short row would leave legal-looking gaps that
+    poison the SPS steering candidate set — fail loud with context instead.
+    """
+    rows = meta_info.get("output_top_logprobs") or []
+    if len(rows) != n_tokens:
+        raise RuntimeError(
+            f"SGLang output_top_logprobs rows ({len(rows)}) != generated token "
+            f"count ({n_tokens}) for request {request_id}"
+        )
+    topk_ids: list[list[int]] = []
+    topk_logprobs: list[list[float]] = []
+    for pos, entries in enumerate(rows):
+        ids = [int(token_id) for _, token_id, _ in entries]
+        logprobs = [float(logprob) for logprob, _, _ in entries]
+        if len(ids) != k:
+            raise RuntimeError(
+                f"SGLang top-K logprobs row at position {pos} has {len(ids)}/{k} "
+                f"entries (request {request_id}) — top_logprobs_num coverage broken"
+            )
+        topk_ids.append(ids)
+        topk_logprobs.append(logprobs)
+    result_dict["response_topk_ids"] = topk_ids
+    result_dict["response_topk_logprobs"] = topk_logprobs
 
 
 class SGLangHttpServer:
@@ -594,6 +652,23 @@ class SGLangHttpServer:
         )
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
+        # trace-opd PGS: vLLM-style int K asks for per-position top-K detail on
+        # the RESPONSE (the SPS draft's candidate window over pi); True keeps the
+        # historical meaning (sampled token's own logprob only); False/None
+        # disables. Mirrors vllm_async_server's logprobs passthrough.
+        response_topk: int | None = None
+        if return_logprob is None:
+            return_logprob = False
+        elif not isinstance(return_logprob, bool):
+            response_topk = int(return_logprob)
+            return_logprob = True
+        # trace-opd PGS: SGLang needs neither knob — token-in-token-out is native
+        # (skip_tokenizer_init) and input-logprob rows are already windowed by
+        # logprob_start_len; consume both as no-ops so SamplingParams never sees
+        # unknown keys.
+        sampling_params.pop("detokenize", None)
+        sampling_params.pop("flat_logprobs", None)
+        _pl_tail = sampling_params.pop("prompt_logprobs_tail", None)
 
         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
         # input-token logprobs for every position (top-K when K>0, sampled-token
@@ -612,10 +687,21 @@ class SGLangHttpServer:
             # video_data=video_data,
         }
 
+        logprob_start_len = 0
         if prompt_logprobs is not None:
-            request["logprob_start_len"] = 0
+            # trace-opd PGS tail contract (= vllm extract_prompt_logprobs):
+            # tail=T ⇒ T-1 real rows + 1 dummy, real rows predict positions
+            # [L-(T-1), L). SGLang windows natively: logprob_start_len = L-(T-1)
+            # returns exactly those rows AND lets the radix cache serve the
+            # prefix KV (vLLM recomputes the full prefix) — the core win of the
+            # SGLang migration (verify cost O(prefix) → O(draft segment)).
+            if _pl_tail is not None and int(_pl_tail) >= 1:
+                logprob_start_len = max(0, len(prompt_ids) - (int(_pl_tail) - 1))
+            request["logprob_start_len"] = logprob_start_len
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
+        elif response_topk is not None and response_topk > 0:
+            request["top_logprobs_num"] = response_topk
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -681,6 +767,15 @@ class SGLangHttpServer:
                 meta_info=meta_info,
                 num_prompt_logprobs=prompt_logprobs,
                 sequence_length=len(prompt_ids),
+                result_dict=extra_fields,
+                logprob_start_len=logprob_start_len,
+            )
+        if response_topk is not None and response_topk > 0 and token_ids:
+            _extract_response_topk_sglang(
+                meta_info=meta_info,
+                k=response_topk,
+                n_tokens=len(token_ids),
+                request_id=request_id,
                 result_dict=extra_fields,
             )
 

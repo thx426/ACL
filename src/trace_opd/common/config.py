@@ -100,6 +100,11 @@ class TrainCfg:
                                       # (design §6.1). >1 makes the launcher flip
                                       # use_remove_padding=True + flash_attention_2
     rollout_gpu_mem: float = 0.35
+    rollout_backend: str = "vllm"    # rollout 引擎:vllm | sglang(2026-08-05 用户
+                                     # 裁定切换 SGLang:原生 logprob_start_len
+                                     # tail-only + radix 前缀复用,根治 verify
+                                     # 平方墙钟;vllm 保留为回摆通道。执行层,
+                                     # 不进 objective_fingerprint)
     rollout_max_num_batched_tokens: int = 2048  # vLLM chunked-prefill budget; the
                                       # transient logits tensor during prompt_logprobs
                                       # scoring (SPS verify) is THIS x vocab x 2B
@@ -253,6 +258,8 @@ def _validate(cfg: "Config") -> None:
     t = cfg.train
     if not t.model_path:
         raise ValueError("train.model_path is required")
+    if t.rollout_backend not in ("vllm", "sglang"):
+        raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")
     if t.rollout_n < 1:
         raise ValueError("train.rollout_n must be >= 1")
     st = cfg.steering

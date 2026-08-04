@@ -364,7 +364,8 @@ function crumbs(items){
 /* ═══════════ Overview ═══════════ */
 function viewOverview(){
   crumbs([["总览","#/"]]);
-  const S = R.steps||[], V = R.vals||[], L = S[S.length-1]||{};
+  const S = R.steps||[], Vall = R.vals||[], V = Vall.filter(v=>!v.partial), L = S[S.length-1]||{};
+  const Vp = Vall.find(v=>v.partial);
   const lastV = V[V.length-1];
   const gateCls = L.gate>=BAND[0]&&L.gate<=BAND[1]?"good":"warn";
   const howto = localStorage.msHow1?"":`
@@ -374,7 +375,7 @@ function viewOverview(){
     点 step 表任意行 → 128 条轨迹全部可逐 token 下钻。${LIVE?"<b>实时模式</b>:每 30s 自动刷新,新 step 自动出现。":"当前是静态快照;起实时后端可自动追新。"}</div>`;
   $("#view").innerHTML = `${howto}
   <div class="grid cards" style="margin-bottom:16px">
-    ${kpi("最新 val", lastV?pct(lastV.won):"待首个 val 点", lastV?`step ${lastV.id} · seen ${pct(lastV.seen)} / unseen ${pct(lastV.unseen)}`:"每 10 步产生", "val","")}
+    ${kpi("最新 val", lastV?pct(lastV.won):"待首个 val 点", (lastV?`step ${lastV.id} · seen ${pct(lastV.seen)} / unseen ${pct(lastV.unseen)}`:"每 10 步产生")+(Vp?` · step ${Vp.id} 评测中 ${Vp.n}/274(未计入)`:""), "val","")}
     ${kpi("训练成功率", L.won!=null?pct(L.won):"—", `step ${L.id??"—"}${L.partial?` · 进行中 ${L.n}/128`:""}`, "won","")}
     ${kpi("开门率", L.gate!=null?pct(L.gate):"—", `目标 q=${pct(Q_TARGET)} · 带 ${pct(BAND[0])}–${pct(BAND[1])}`, "gate",gateCls)}
     ${kpi("θ_D", L.theta??"—", "自适应 EMA 追踪", "theta","")}
@@ -382,7 +383,7 @@ function viewOverview(){
     ${kpi("预算消耗", L.spent!=null?`${L.spent}/${BMAX}`:"—", L.spent>=BMAX-1?"打满 → 前端速烧":"有余量", "spent", L.spent>=BMAX-1?"warn":"")}
   </div>
   <div class="grid charts" style="margin-bottom:16px">
-    ${chart("val 成功率(每 10 步)","效果的最终裁判:总/seen/unseen 三线。", [
+    ${chart("val 成功率(每 10 步)","效果的最终裁判:总/seen/unseen 三线;进行中的 val 点不画(部分读数有偏)。", [
       {label:"总",color:"#4f46e5",pts:V.map(v=>[v.id,v.won])},
       {label:"seen",color:"#059669",pts:V.map(v=>[v.id,v.seen])},
       {label:"unseen",color:"#d97706",pts:V.map(v=>[v.id,v.unseen])}],

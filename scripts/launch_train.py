@@ -77,9 +77,10 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
     # 是启动期参数(默认 20),必须 >= steering.topk,否则 verify 请求在运行
     # 中段被拒(P4 冒烟首查项,docs/pgs-impl-design.md)。
     steering_args = []
-    if cfg.steering.enabled:
+    if cfg.steering.enabled and t.rollout_backend == "vllm":
         # 同源于 hook 的观测窗(steering.obs_topk):draft 的 logprobs=K 与
         # verify 的 prompt_logprobs=K 都要过 vLLM 的 max_logprobs 校验。
+        # SGLang 无此启动参数(top_logprobs_num 逐请求),后端为 sglang 时跳过。
         max_logprobs = max(int(cfg.steering.obs_topk), 20)
         steering_args = [
             f"+actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs={max_logprobs}",
@@ -134,7 +135,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         'actor_rollout_ref.actor.checkpoint.save_contents=["model","optimizer","extra"]',
         # 滚动保留的 ckpt 数走配置(硬编码会在 manifest 里说谎)。
         f"trainer.max_actor_ckpt_to_keep={t.max_ckpt_to_keep}",
-        "actor_rollout_ref.rollout.name=vllm",
+        # rollout 引擎按配置选(vllm | sglang;sglang 侧 verl 自动映射
+        # mem_fraction_static←gpu_memory_utilization、max_running_requests←max_num_seqs)
+        f"actor_rollout_ref.rollout.name={t.rollout_backend}",
         "actor_rollout_ref.rollout.mode=async",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={t.rollout_tp}",
         f"actor_rollout_ref.rollout.gpu_memory_utilization={t.rollout_gpu_mem}",
