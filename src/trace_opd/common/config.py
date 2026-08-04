@@ -180,6 +180,9 @@ class SteeringCfg:
     c: float = 2.5                 # 截断参数(单点话语权限幅;目标语境实测标定)
     b_max: float = 6.0             # D_∞ 逐轨迹预算(nats)
     topk: int = 64                 # 保尾核候选集 S 的两侧 top-K
+    obs_topk: int = 256            # draft/verify 的引擎观测窗(top-K 明细宽度);
+                                   # launcher 联动 vLLM max_logprobs ≥ 本值(P0:两处
+                                   # 必须同源,hook 请求超过 max_logprobs 会被引擎拒)
     theta_d: float = 0.0           # D 主门冻结阈值(0=预扫描标定前的占位,启动校验拒 0)
     epsilon: float = 0.05          # ε 探针概率
     gate_rate_bounds: tuple = (0.02, 0.30)
@@ -192,6 +195,7 @@ class SteeringCfg:
         for f in ("eta_max", "c", "b_max", "theta_d", "epsilon"):
             setattr(self, f, float(getattr(self, f)))
         self.topk = int(self.topk)
+        self.obs_topk = int(self.obs_topk)
         self.r_max = int(self.r_max)
 
 
@@ -238,6 +242,11 @@ def _validate(cfg: "Config") -> None:
             )
         if st.w_beh_mode not in ("per_token", "per_decision", "vtrace"):
             raise ValueError(f"未知 w_beh_mode {st.w_beh_mode!r}")
+        if st.obs_topk < st.topk:
+            raise ValueError(
+                f"steering.obs_topk({st.obs_topk}) 必须 >= topk({st.topk})——"
+                "观测窗小于 S 的 K 会让候选集静默缩水"
+            )
 
 
 def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
@@ -328,7 +337,7 @@ def objective_fingerprint(cfg: "Config") -> str:
         str(x) for x in (
             t.model_path, t.rollout_n, t.train_batch_size, t.lr,
             t.loss_agg_mode,
-            st.enabled, st.doc_table, st.eta_max, st.c, st.b_max, st.topk,
+            st.enabled, st.doc_table, st.eta_max, st.c, st.b_max, st.topk, st.obs_topk,
             st.theta_d, st.epsilon, st.r_max, st.w_beh_mode,
         )
     )

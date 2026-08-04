@@ -314,6 +314,7 @@ class TraceAgentLoop(AgentLoopBase):
             tokenizer=self.tokenizer,
             topk=st_cfg.topk,
             c=st_cfg.c,
+            obs_topk=st_cfg.obs_topk,
         )
 
     async def _student_rollout(

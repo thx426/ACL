@@ -115,8 +115,10 @@ steering:
                             # 目标文档语境实测 ℓ 分布标定(G0 的 GT 语境分布不可迁移)
   b_max: 6.0                # D_∞ 逐轨迹预算(nats)| δ=2ηc 保守扣费 ⇒
                             # 每轨迹 steer 位置数 ≤ b_max/(2·η·c)
-  topk: 64                  # 保尾核候选集 S = 两侧 top-K 并集 | launcher 联动
-                            # vLLM max_logprobs ≥ 本值(启动期参数)
+  topk: 64                  # 保尾核候选集 S = 两侧 top-K 并集
+  obs_topk: 256             # draft/verify 引擎观测窗(top-K 明细宽度)| launcher
+                            # 联动 vLLM max_logprobs ≥ 本值(启动期参数;codex
+                            # 审阅 P0:hook 与 launcher 必须同源于此键)
   theta_d: 1.0e+9  # 标定哨兵:门恒关(yaml 科学计数法必须带 +,否则解析成字符串)              # D 主门冻结阈值 | 0=未标定占位,启用时启动校验拒绝;
                             # 用目标语境预扫描 D 分布的 P85 定值(规范 §2.3):
                             # 标定 run 配 theta_d=1e9(门恒关哨兵,行为=纯 bare)

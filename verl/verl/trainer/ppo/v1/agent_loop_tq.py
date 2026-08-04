@@ -188,7 +188,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # ledger; everything else ships no field and trains untouched.
             extra = field.get("extra_fields") or {}
             if extra.get("steer_positions"):
-                if self.config.algorithm.get("rollout_correction", None) is not None:
+                # Hydra ALWAYS materialises algorithm.rollout_correction as a
+                # mapping (sub-keys default to null) — `is not None` would trip
+                # on every default config. The native feature only writes
+                # rollout_is_weights when rollout_is/rollout_rs are set
+                # (rollout_corr_helper contract), so that is the exclusivity
+                # test.
+                corr = self.config.algorithm.get("rollout_correction", None)
+                if corr is not None and (
+                    corr.get("rollout_is") or corr.get("rollout_rs")
+                ):
                     raise RuntimeError(
                         "steering W_beh and algorithm.rollout_correction both write "
                         "rollout_is_weights — enable at most one"

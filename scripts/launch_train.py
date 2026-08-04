@@ -75,7 +75,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
     # 中段被拒(P4 冒烟首查项,docs/pgs-impl-design.md)。
     steering_args = []
     if cfg.steering.enabled:
-        max_logprobs = max(int(cfg.steering.topk), 20)
+        # 同源于 hook 的观测窗(steering.obs_topk):draft 的 logprobs=K 与
+        # verify 的 prompt_logprobs=K 都要过 vLLM 的 max_logprobs 校验。
+        max_logprobs = max(int(cfg.steering.obs_topk), 20)
         steering_args = [
             f"+actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs={max_logprobs}",
         ]

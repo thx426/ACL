@@ -40,9 +40,6 @@ logger = logging.getLogger(__file__)
 
 __all__ = ["SpsGenerate", "TrajectorySteerState", "position_candidates", "candidate_d"]
 
-# draft/verify 的引擎观测窗(top-K 明细宽度)。上限受 vLLM --max-logprobs
-# (launcher 联动);比 S 的 K 大一档,让「p_T 候选拿不到 π 值」成为罕见事件。
-OBS_TOPK_FACTOR = 4
 
 
 @dataclass
@@ -121,7 +118,7 @@ class SpsGenerate:
         tokenizer,
         topk: int,
         c: float,
-        obs_topk: int | None = None,
+        obs_topk: int,
     ) -> None:
         self._draft = draft
         self._verify = verify
@@ -131,7 +128,11 @@ class SpsGenerate:
         self._tokenizer = tokenizer
         self._topk = int(topk)
         self._c = float(c)
-        self._obs_topk = int(obs_topk or OBS_TOPK_FACTOR * topk)
+        # 观测窗必须与 launcher 配置的 vLLM max_logprobs 同源
+        # (config.steering.obs_topk;超过 max_logprobs 的请求会被引擎拒)。
+        if int(obs_topk) < int(topk):
+            raise ValueError(f"obs_topk({obs_topk}) must be >= topk({topk})")
+        self._obs_topk = int(obs_topk)
 
     # ------------------------------------------------------------------ call
 

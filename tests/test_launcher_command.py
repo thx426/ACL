@@ -64,7 +64,9 @@ def test_steering_lifts_vllm_max_logprobs(tmp_path):
             "steering: {enabled: true, doc_table: /tmp/d.jsonl, theta_d: 0.8, topk: 64}"
         ),
     )
-    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs=64" in cmd
+    # 联动源是 obs_topk(观测窗)而非 topk —— hook 的 draft logprobs=obs_topk
+    # 与 verify prompt_logprobs=obs_topk 都要过 vLLM 校验(codex 审阅 P0)。
+    assert "+actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs=256" in cmd
     # off by default: no max_logprobs key at all
     cmd0 = _cmd(tmp_path)
     assert not any("max_logprobs" in c for c in cmd0)

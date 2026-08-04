@@ -111,7 +111,9 @@ def test_wbeh_expansion_wired_on_the_tq_put_path():
     tq = _read("trainer/ppo/v1/agent_loop_tq.py")
     assert "expand_behavior_weights" in tq
     assert 'field["rollout_is_weights"]' in tq
-    assert "rollout_correction" in tq          # 互斥检查在场
+    # 互斥判定必须是「真开启」口径:hydra 默认把 rollout_correction 物化成
+    # 全 null 子键的 mapping,`is not None` 会误伤一切默认配置(codex 审阅 P0)。
+    assert 'corr.get("rollout_is") or corr.get("rollout_rs")' in tq
     assert "steer_positions" in tq
     sw = _read("trainer/ppo/steering_weights.py")
     assert "def expand_behavior_weights" in sw
