@@ -125,6 +125,62 @@ D 直方图上限硬编码为 `6.25=c^2`（只适配 c=2.5）。配置允许其�
 
 让直方图范围随运行配置 c 写入 ledger 元数据，聚合时拒绝混合不同坐标系；目标分位落入 overflow bucket 时不要给数值建议，改为 fail-loud 或要求扩大 bins 后重跑。另校验 `q∈[0,1]` 与 `sum(hist)==d_count`。
 
+### IF-09 — P1 — `src/trace_opd/train/agent_loop.py:207,341-360`；`src/trace_opd/core/episode.py:181-187,292-295`
+
+**问题陈述**
+
+基础设施错误只在“尚无任何 response token”时重试并最终抛出；一旦错误发生在多轮 episode 的第二轮或更晚，已有的前轮 token 使两个 `and not result.tokens.response_ids` 条件都为假，`ENV_ERROR` 结果直接返回。随后输出层以 `traj.won` 计算奖励，基础设施错误因此被编码为 0 分样本，而不是从训练批次剔除。
+
+**失败场景**
+
+第一轮执行成功并产生 40 个 token；第二轮 vLLM verify 超时、环境 step 抛异常或 async server abort。`run_episode` 返回 `outcome=ENV_ERROR` 且保留前 40 个 token，`_student_rollout()` 不重试、不抛错，最终把一个本来未知的任务结果作为失败轨迹送进 GRPO。若某类长轨迹更易遇到超时，这会形成与长度/状态相关的系统性负奖励偏差。
+
+**修复建议**
+
+任何 `ENV_ERROR` 都不得成为有效 attempt。对整个 episode 使用新环境状态和新 steering state 重试一次；再次失败则抛出/由 TQ 明确标记该 rollout 失败并补样，绝不能按 `won=False` 计 0 分。增加“首轮已有 token、次轮 generate/verify/env-step 分别失败”的三组单测，并断言没有 reward 样本入队。
+
+### IF-10 — P1 — `src/trace_opd/core/episode.py:147-154`；`src/trace_opd/train/agent_loop.py:280-292`；`src/trace_opd/steering/hook.py:115-149,288-289`
+
+**问题陈述**
+
+episode 对数据集初始观察与环境实际观察只比较 `strip()` 后文本；SPS 却预先用 `adapter.initial_obs` 构造 student/teacher prompt，并只保存 `student_prompt_len`。生成时既不保存也不校验实际 student prompt token 前缀是否逐 token 相同，随后按预计算长度切 `response_stream`。这与注释声称的“逐字节同参”不符，也没有实现审阅要求中的 teacher/student prompt 一致性断言。
+
+**失败场景**
+
+数据集观察为 `"state"`，环境返回 `"state\n"`：一致性检查放行，但聊天模板可能多出一个 token。首次 generate 时 `stream_len` 已为 1，ledger position 从 1 开始；teacher verify 的 `response_stream` 还夹入 student prompt 尾 token。若长度恰好不变但 token ID 改变，则断言也不会触发，却在与实际 student prefix 不同的 teacher prefix 上计分，导致 b、位置记账和行为权重全部错位。
+
+**修复建议**
+
+要么 steering 路径要求原始初始观察精确相等并在差异时降级/报错，要么等环境 reset 得到真实观察后再构造两套 prompt。`SpsGenerate` 应保存完整 `student_prefix_ids`，每次调用先断言 `prompt_ids[:len(prefix)] == prefix`，并据此切 response；同时对 teacher prefix 做完整、而非仅生成尾部的可验证对齐。补空白、Unicode 归一化和“等长不同 token”测试。
+
+### IF-11 — P1 — `verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py:684-696`；`verl/verl/workers/rollout/vllm_rollout/utils.py:659-671`
+
+**问题陈述**
+
+response top-K 行先以 `token_id=0, logp=0.0` 填充，再按 `rank-1` 覆盖；prompt top-K 则以 `None` 填充。两条路径都只跳过 sampled-token 的 `rank>K`，没有验证 rank 非空、位于 `[1,K]`、互异且最终无空洞。只要 vLLM 版本/API、logits processor 或返回异常造成 rank 缺失，response 路径就会把“概率 1 的 token 0”伪装成真实候选，prompt 路径则把 `None` 留到更下游才失败。
+
+**失败场景**
+
+K=3 的一行只返回 rank 1 和 3（另有 sampled token rank 7）。代码产生 `ids=[t1,0,t3]`、`logps=[lp1,0,lp3]`；核把 token 0 当成 π 概率 1 的候选，可能因 S 质量超过 1 直接 abort，也可能在 ID 重复/后续字典覆盖时静默构造错误 b。相同空洞发生在 prompt scoring 时会以 `float(None)`/索引错误迟发失败，错误位置和请求上下文已经丢失。
+
+**修复建议**
+
+先收集所有 `rank<=K` 项，严格验证 ranks 恰为 `1..K`、token ID 唯一、logprob 有限，再生成稠密行；sampled token `rank>K` 可继续单独保留在 sampled logprob 通道，但绝不能用于填 top-K。验证失败应携带 request ID、token position、K 和原始 ranks fail-loud。增加 rank=None、重复、越界、空洞以及 sampled-token rank>K 的契约测试；该契约还需纳入支持的每个 vLLM 版本真机冒烟。
+
+### IF-12 — P2 — `verl/verl/trainer/config/ppo_trainer.yaml:42-43`；`verl/verl/trainer/config/distillation/distillation.yaml:1-113`；`verl/verl/workers/engine/fsdp/transformer_impl.py:654-703,1250-1467`；`src/trace_opd/core/episode.py:323-360`
+
+**问题陈述**
+
+P1.5 所称“旧机制全面出清”并未完成。默认 PPO Hydra defaults 仍装载一整棵 distillation 配置，其 `_target_` 指向已经不存在的 `verl.workers.config.DistillationConfig`；FSDP（以及 Megatron/VeOmni）仍保留 `research_mask`、`tg_mask`、`distillation_use_topk`、`distillation_only` 活分支；trace_opd 还留有只服务旧 SFT/mixed-objective 的 `replay_bare_tokens()`，以及旧机制命名/docstring。当前主路径没有读取 `config.distillation`，所以默认关闭时不直接改变 PGS loss，但“纯 GRPO 面、无旧机制配置/代码”的守护结论不成立。
+
+**失败场景**
+
+调试工具或未来公共代码尝试把默认 `config.distillation` 转成 dataclass，立即因目标类已删而 import/instantiate 失败；用户看到仍存在的 `distillation.enabled` 并尝试启用，会进入半删除状态。若旧 batch key 偶然泄漏，engine 中休眠分支还可重新改变 logprob/归一化行为，而现有字符串守护测试因检查面不全不会报警。
+
+**修复建议**
+
+若目标确为彻底根除，删除 defaults 项、distillation YAML/生成配置残段、三种 engine 的专用分支、旧 replay/API/docstring，并用覆盖 `src/`、`verl/`、configs 的允许名单式 `git grep` 守护；若这些是有意保留的 verl 原生通用能力，则恢复完整 dataclass/测试、去掉 trace-opd 旧机制耦合，并在设计文档明确其不被 PGS launcher 接线。不能维持“配置仍暴露、目标类已删除”的半死状态。
+
 ## 忠实性核对表（待完成）
 
 | spec 条款 | 代码位置 | 阶段性判定 |
@@ -155,4 +211,3 @@ D 直方图上限硬编码为 `6.25=c^2`（只适配 c=2.5）。配置允许其�
 2. **p_T 观测窗外 floor 代入**：阶段性判定为“定义了可采样的近似核，clip 饱和时无误差；未饱和时所谓方向保守需要结合行提取/floor 完整性继续核查”。
 3. **`max(std_loo,std_full)`**：不满足严格 LOO/命题 C，但可作为明确有偏的稳定性档；见 IF-02。
 4. **借原生 `rollout_is_weights` 通道**：loss 中 clip 外乘权重的选择本身正确且改动面小；当前互斥守卫使默认配置不可运行，故落地判定暂为不通过；见 IF-01。
-

@@ -187,7 +187,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # OUTSIDE the PPO clip). Only steered trajectories carry the
             # ledger; everything else ships no field and trains untouched.
             extra = field.get("extra_fields") or {}
-            if extra.get("steer_positions"):
+            # 审阅 IF-09:判定用「PGS 协议在场」(steer_count 恒由 rollout 侧
+            # finalize 写入,空账也在),而非「本轨迹有 steer 记录」——批内
+            # schema 必须恒一致,空账展开为全 1 权重。
+            if "steer_count" in extra:
                 # Hydra ALWAYS materialises algorithm.rollout_correction as a
                 # mapping (sub-keys default to null) — `is not None` would trip
                 # on every default config. The native feature only writes
@@ -205,9 +208,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 from verl.trainer.ppo.steering_weights import expand_behavior_weights
 
                 dense = expand_behavior_weights(
-                    positions=extra["steer_positions"],
-                    log_pi=extra["steer_log_pi"],
-                    log_b=extra["steer_log_b"],
+                    positions=extra.get("steer_positions") or [],
+                    log_pi=extra.get("steer_log_pi") or [],
+                    log_b=extra.get("steer_log_b") or [],
                     response_len=int(field["response_mask"].shape[-1]),
                     mode=str(extra.get("steer_w_beh_mode", "per_token")),
                     log_ratio_cap=extra.get("steer_log_ratio_cap"),

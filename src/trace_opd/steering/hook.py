@@ -119,6 +119,7 @@ class SpsGenerate:
         topk: int,
         c: float,
         obs_topk: int,
+        stop_token_ids: set[int] | frozenset[int] = frozenset(),
     ) -> None:
         self._draft = draft
         self._verify = verify
@@ -133,6 +134,10 @@ class SpsGenerate:
         if int(obs_topk) < int(topk):
             raise ValueError(f"obs_topk({obs_topk}) must be >= topk({topk})")
         self._obs_topk = int(obs_topk)
+        # 审阅 IF-06:残差重采可能采出 EOS/停止 token;引擎的停止判定只作用
+        # 于 draft 段,replacement 后必须由钩子自己重判,否则会在「已结束」的
+        # 前缀后继续 draft,产出停止符之后的 token。
+        self._stop_ids = frozenset(int(t) for t in stop_token_ids)
 
     # ------------------------------------------------------------------ call
 
@@ -255,11 +260,15 @@ class SpsGenerate:
                     st.reject_cap.record_reject()
                     if st.reject_cap.cap_active:
                         st.ledger.turns_capped += 1
+                    if int(outcome.token_id) in self._stop_ids:
+                        finished = True  # IF-06:重采出停止 token,本轮生成结束
                     rejected = True
                     break
 
             if rejected:
-                continue  # 从断点(含重采 token)续 draft
+                if finished:
+                    break
+                continue  # 从断点(含重采 token)续 draft(原 EOS 被拒重采成非停止符同样续)
             finished = draft_finished
 
         token_ids = executed[:max_tokens]

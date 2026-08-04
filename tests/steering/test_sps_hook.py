@@ -259,3 +259,61 @@ def test_verify_scores_teacher_prefix_plus_full_response():
     # teacher_prefix + (prompt − 学生前缀) + draft 段
     assert seq[: len(tp)] == tp
     assert seq[len(tp): len(tp) + 2] == stream
+
+
+def test_resampled_stop_token_ends_the_turn():
+    # 审阅 IF-06:残差重采出停止 token 时,本轮必须终止,不得续 draft。
+    # 构造:π 集中于 token A(高概率),p_T 压 A 抬 EOS ⇒ 拒 A 后残差大概率采出 EOS。
+    def crush_top_lift_eos(pt_logits, pi):
+        top = int(np.argmax(pi))
+        pt_logits = pt_logits.copy()
+        pt_logits[top] = -30.0
+        pt_logits[EOS] = 8.0
+        return pt_logits
+
+    world = _World(seed=21, pt_shift=crush_top_lift_eos)
+    hook, state, draft, verify, sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, seed=5)
+    hook._stop_ids = frozenset({EOS})
+    out = _run(hook(sp, {"max_tokens": 64, "temperature": 1.0}))
+    eos_rejects = [
+        r for r in state.ledger.records
+        if r.rejected and r.position < len(out.token_ids)
+        and out.token_ids[r.position] == EOS
+    ]
+    if eos_rejects:  # 命中重采出 EOS 的跑道(高概率;未命中则本例不判)
+        first = eos_rejects[0]
+        # EOS 必须是输出的最后一个 token:其后没有任何续 draft 产物
+        assert out.token_ids[first.position] == EOS
+        assert len(out.token_ids) == first.position + 1
+    else:
+        pytest.skip("no EOS-resample trajectory under this seed")
+
+
+def test_rejected_eos_resampled_to_non_stop_continues():
+    # 原 draft 末 token 是 EOS 且被拒、重采成非停止符 ⇒ 必须继续 draft。
+    # 构造:π 抬 EOS(draft 常以 EOS 收尾),p_T 强压 EOS ⇒ EOS 高概率被拒。
+    def lift_eos_pi_crush_pt(pt_logits, pi):
+        pt_logits = pt_logits.copy()
+        pt_logits[EOS] = -30.0
+        return pt_logits
+
+    world = _World(seed=22, pt_shift=lift_eos_pi_crush_pt)
+    world.pi[EOS] = world.pi.max() * 3
+    world.pi = world.pi / world.pi.sum()
+    hook, state, draft, verify, sp = _mk_hook(world, theta_d=1e-9, b_max=100.0, seed=6)
+    hook._stop_ids = frozenset({EOS})
+    out = _run(hook(sp, {"max_tokens": 48, "temperature": 1.0}))
+    swapped = [
+        r for r in state.ledger.records
+        if r.rejected and r.position < len(out.token_ids)
+        and out.token_ids[r.position] != EOS
+    ]
+    if swapped and len(draft.calls) >= 2:
+        # 有「拒后换成非停止符」的位置且发生了续 draft:检查续采前缀包含重采 token
+        r0 = swapped[0]
+        follow = [c for c in draft.calls if len(c) > len(sp) + r0.position]
+        assert any(
+            c[len(sp) + r0.position] == out.token_ids[r0.position] for c in follow
+        )
+    else:
+        pytest.skip("no rejected-then-swapped trajectory under this seed")

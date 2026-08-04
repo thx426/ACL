@@ -184,17 +184,22 @@ class TraceAgentLoop(AgentLoopBase):
 
         steer_fields: dict[str, Any] = {}
         if steer_ctx is not None:
+            from ..steering.ledger import SteeringLedger
+
             steer_fields["doc_missing"] = steer_ctx["doc_missing"]
             steer_fields["doc_overflow"] = steer_ctx.get("doc_overflow", 0)
             state = steer_ctx.get("state")
+            # 审阅 IF-09:steering run 的每条训练轨迹都必须携带同一套 steer
+            # 字段(缺 doc/超上下文的轨迹用空账 = 全 1 权重)。TQ 的
+            # list_of_dict_to_tensordict 以首行 keys 为准,混合批里 schema
+            # 不齐会静默丢掉整批 rollout_is_weights——已倾斜轨迹未经校正训练。
+            ledger = state.ledger if state is not None else SteeringLedger()
+            steer_fields.update(ledger.finalize())
+            steer_fields["steer_w_beh_mode"] = self.cfg.steering.w_beh_mode
+            steer_fields["steer_log_ratio_cap"] = (
+                2.0 * self.cfg.steering.eta_max * self.cfg.steering.c
+            )
             if state is not None:
-                steer_fields.update(state.ledger.finalize())
-                # 训练侧展开参数(verl agent_loop_tq 消费):W_beh 口径与
-                # 逐 token |log(π/b)| 的核界(2ηc)——越界即记账损坏,fail loud。
-                steer_fields["steer_w_beh_mode"] = self.cfg.steering.w_beh_mode
-                steer_fields["steer_log_ratio_cap"] = (
-                    2.0 * self.cfg.steering.eta_max * self.cfg.steering.c
-                )
                 alarm = state.gate.rate_alarm()
                 if alarm:
                     logger.warning("steering gate alarm for %s: %s", adapter.task_id, alarm)
@@ -315,6 +320,11 @@ class TraceAgentLoop(AgentLoopBase):
             topk=st_cfg.topk,
             c=st_cfg.c,
             obs_topk=st_cfg.obs_topk,
+            # IF-06:引擎的自然停止口径(qwen 系 eos = <|im_end|>);重采出
+            # 停止符时钩子按同一口径终止本轮。
+            stop_token_ids=frozenset(
+                t for t in (self.tokenizer.eos_token_id,) if t is not None
+            ),
         )
 
     async def _student_rollout(
@@ -338,15 +348,22 @@ class TraceAgentLoop(AgentLoopBase):
             response_budget=response_length,
             sampling_params=sampling_params,
         )
-        if result.trajectory.outcome == OUTCOME_ENV_ERROR and not result.tokens.response_ids:
+        # 审阅 IF-05:基础设施故障(ENV_ERROR)一律整 episode 作废——包括已有
+        # 部分响应的情形。旧行为只在响应为空时重试,残缺轨迹会以 reward 0 进
+        # GRPO,把基建故障当环境失败学习。重试拿全新路由与全新 steering 状态
+        # (_make_generate 每次重建并覆盖 steer_ctx["state"],残账不外泄)。
+        if result.trajectory.outcome == OUTCOME_ENV_ERROR:
             logger.warning(
-                "student episode infra error for %s (%s); retrying once",
+                "student episode infra error for %s (%s; %d response tokens discarded); "
+                "retrying once with fresh state",
                 adapter.task_id,
                 result.trajectory.error,
+                len(result.tokens.response_ids),
             )
+            retry_route = f"{route}:r{uuid4().hex[:6]}"
             result = await run_episode(
                 adapter=adapter,
-                generate=self._make_generate(adapter, epi_route, steer_ctx),
+                generate=self._make_generate(adapter, retry_route, steer_ctx),
                 tokenizer=self.tokenizer,
                 delta=self.delta,
                 guidance="",
@@ -354,7 +371,9 @@ class TraceAgentLoop(AgentLoopBase):
                 response_budget=response_length,
                 sampling_params=sampling_params,
             )
-        if result.trajectory.outcome == OUTCOME_ENV_ERROR and not result.tokens.response_ids:
+        if result.trajectory.outcome == OUTCOME_ENV_ERROR:
+            # 二次仍是基建故障:显式丢弃(verl 的 prompt failure path 接手),
+            # 绝不给残缺轨迹赋 0 reward 入训。
             raise RuntimeError(
                 f"student episode failed on infrastructure twice for {adapter.task_id}: "
                 f"{result.trajectory.error}"
