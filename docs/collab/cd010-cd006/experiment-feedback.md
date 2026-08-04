@@ -43,3 +43,47 @@ global_step_68**(最后一个完整 ckpt,PGC 线续跑/评测的唯一凭据)。
 **对 PGS 的影响与纪律**:PGS 侧 `max_actor_ckpt_to_keep=3` 且无 critic
 (单 ckpt ≈45G vs C3 的 90G),100 step / save_freq=10 下峰值约 135G,余量够。
 但 533G 不宽裕 —— 长跑期间需盯磁盘(建议纳入监控项:`df /data3` <100G 即告警)。
+
+---
+
+## 2026-08-04 · [P1] 162 部署硬前提:必须 `LD_PRELOAD` GCC15 的 libstdc++,否则 vLLM EngineCore 起不来
+
+**结论**:首次冒烟在 vLLM 引擎初始化即崩:
+`ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version 'GLIBCXX_3.4.29' not found
+(required by venv_train/.../flash_attn_2_cuda.cpython-312-*.so)`。
+venv_train 的 flash-attn 来自 conda-forge 预编译包,需 GLIBCXX_3.4.29 / CXXABI_1.3.15,
+162 系统库只到 3.4.28。**PGS 自身走 sdpa 用不到 flash-attn,但 vLLM worker 会导入它**,
+所以"PGS 不用 flash-attn"并不能免疫。
+
+**处置**:env 脚本加
+`export LD_PRELOAD=/data3/wushang/libcxx_x/un/lib/libstdc++.so.6.0.34`
+(PGC 线 `run_experiment_1p7b.sh` 的成熟绕法,库已在机)。重启后恢复正常。
+
+**建议**:run-guide §0 环境清单补这一条 —— 它是 162 上的**启动必要条件**,
+不是可选优化;新人按现文档照做必踩。
+
+---
+
+## 2026-08-04 · [P1] P4 头号风险有定论:vLLM 0.17.1 对 `prompt_logprobs` 请求**自动禁用 prefix-cache 读**
+
+**结论(源码级)**:`vllm/sampling_params.py:414-418`
+```python
+if self.skip_reading_prefix_cache is None:
+    # If prefix caching is enabled, the output of prompt logprobs may less
+    # than n_prompt_tokens, we need to skip reading cache at this request.
+    self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+```
+即引擎自己认识到"prefix cache 会让 prompt_logprobs 行数少于 prompt token 数",
+并对这类请求跳过读缓存。
+
+**两个后果,一好一坏**:
+- ✓ **正确性风险消除**:SPS verify 的 `prompt_logprobs` 行永远完整,不会出现
+  缓存命中导致的空行/缺行 —— 原预案(教师路由禁 prefix cache)**不需要了**。
+- ⚠ **NF09 算力账的前提失效**:spec §2.5 假设"文档在 system prompt 静态最前部
+  ⇒ 教师侧 KV 跨轮可复用"。在本 vLLM 版本下,**verify 请求永远不读缓存**,
+  每次都全量重算 prefill(教师前缀 + 已生成响应流 + draft 段),开销随轮次增长
+  (对 30 轮 episode 近似二次)。run-guide 步骤② 第 5 项(墙钟 <2×)的实测
+  由此成为**关键读数**,而非例行检查。
+
+**待 CD-010 定夺**:若实测开销超预期,可选方向 ①减小 verify 频率(按轮而非按段)、
+②缩短教师前缀、③接受成本。实验侧先如实测量,不自行改机制。
