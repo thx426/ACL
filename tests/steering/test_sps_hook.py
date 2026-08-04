@@ -389,3 +389,93 @@ def test_ledger_records_token_pairs_and_ell_observations():
     # ℓ 观测:每个候选位置贡献窗内 token 数条
     assert state.ledger.ell_count > 0
     assert sum(state.ledger.ell_hist) == state.ledger.ell_count
+
+
+# ---------------------------------------------- 尾部裁剪 × 位置相关行对齐
+
+class _PositionalVerify:
+    """位置相关的 p_T 行 + 尾部裁剪(prompt_logprobs_tail)。
+
+    第 r 行把 token (r % VOCAB) 排在 rank-1 —— 任何行偏移都会让 hook 读到
+    不同的 token,被下面的断言抓住。这补上了「每行相同的 mock 掩盖行偏移」
+    的测试缺口(codex 审阅测试缺口 #2),同时验证性能修法的裁剪路径。
+    """
+
+    def __init__(self, obs_topk, teacher_prefix, honor_tail=True):
+        self.obs_topk = obs_topk
+        self.teacher_prefix = list(teacher_prefix)
+        self.honor_tail = honor_tail
+        self.calls = []
+        self.tails = []
+
+    async def __call__(self, seq, params):
+        self.calls.append(list(seq))
+        tail = params.get("prompt_logprobs_tail")
+        self.tails.append(tail)
+        n_full = len(seq)                      # len-1 真实行 + 1 dummy
+        ids, lps = [], []
+        for r in range(n_full - 1):            # 真实行
+            head = r % VOCAB                   # 该行的 rank-1 token = 行号指纹
+            row = [head] + [(head + k) % VOCAB for k in range(1, self.obs_topk)]
+            ids.append(row)
+            lps.append([-1.0 - 0.01 * k for k in range(self.obs_topk)])
+        ids.append([0] * self.obs_topk)        # dummy
+        lps.append([0.0] * self.obs_topk)
+        if self.honor_tail and tail:
+            ids, lps = ids[-tail:], lps[-tail:]
+        return _GenResult([1], {"prompt_ids": ids, "prompt_logprobs": lps})
+
+
+def _run_with_verify(verify, draft_texts_len=6, seed=0, teacher_prefix=(101, 102, 103),
+                     student_prompt=(7, 8, 9), obs_topk=16):
+    world = _World(seed=seed)
+    state = TrajectorySteerState(
+        gate=SteeringGate(theta_d=1e9, eta_max=0.5, epsilon=0.0),   # 门恒关:只验行对齐
+        budget=TrajectoryBudget(b_max=10.0, c=2.5),
+        reject_cap=TurnRejectCap(r_max=4),
+        rng=np.random.default_rng(seed),
+    )
+    draft = _MockDraft(world, obs_topk, np.random.default_rng(seed + 1))
+    hook = SpsGenerate(
+        draft=draft, verify=verify,
+        teacher_prefix_ids=list(teacher_prefix),
+        student_prompt_ids=list(student_prompt),
+        state=state, tokenizer=_Tok(), topk=4, c=2.5, obs_topk=obs_topk,
+    )
+    out = _run(hook(list(student_prompt), {"max_tokens": draft_texts_len, "temperature": 1.0}))
+    return out, state, draft
+
+
+def test_verify_tail_trimming_keeps_row_alignment():
+    """裁剪返回 vs 全量返回必须读到**同一批** p_T 行(性能修法的正确性守卫)。"""
+    tp = (101, 102, 103)
+    trimmed = _PositionalVerify(16, tp, honor_tail=True)
+    full = _PositionalVerify(16, tp, honor_tail=False)
+    o1, s1, d1 = _run_with_verify(trimmed, seed=4)
+    o2, s2, d2 = _run_with_verify(full, seed=4)
+    # 同 seed ⇒ draft 相同;两种返回形态下执行序列必须逐 token 一致
+    assert o1.token_ids == o2.token_ids
+    # 裁剪确实生效:请求带了 tail,且返回行数远小于完整序列
+    assert trimmed.tails and all(t is not None for t in trimmed.tails)
+    seq_len = len(trimmed.calls[0])
+    assert trimmed.tails[0] < seq_len, "tail 必须小于完整序列长度才有意义"
+    # D 观测逐位置一致(行对齐相同 ⇒ 同样的 ℓ̃ ⇒ 同样的 D)
+    assert s1.ledger.d_count == s2.ledger.d_count > 0
+    assert abs(s1.ledger.d_sum - s2.ledger.d_sum) < 1e-9
+
+
+def test_row_misalignment_is_detectable_by_the_positional_mock():
+    """反证:位置相关 mock 能抓住行偏移(否则上一条测试是空的)。"""
+    tp = (101, 102, 103)
+    v = _PositionalVerify(16, tp, honor_tail=True)
+    o, s, d = _run_with_verify(v, seed=4)
+    d0 = s.ledger.d_sum
+    # 人为把返回行整体挪一位 ⇒ D 观测必须变化
+    class _Shifted(_PositionalVerify):
+        async def __call__(self, seq, params):
+            r = await _PositionalVerify.__call__(self, seq, params)
+            r.extra["prompt_ids"] = r.extra["prompt_ids"][1:] + [r.extra["prompt_ids"][-1]]
+            r.extra["prompt_logprobs"] = r.extra["prompt_logprobs"][1:] + [r.extra["prompt_logprobs"][-1]]
+            return r
+    o2, s2, _ = _run_with_verify(_Shifted(16, tp, honor_tail=True), seed=4)
+    assert abs(s2.ledger.d_sum - d0) > 1e-9, "位置相关 mock 未能区分行偏移 —— 测试无效"

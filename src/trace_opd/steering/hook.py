@@ -339,8 +339,9 @@ class SpsGenerate:
         """教师前缀下对 draft 段逐位置打分,返回 (ids_rows, logprob_rows)。
 
         行语义(extract_prompt_logprobs):数组第 r 行是预测位置 r+1 的分布,
-        末行 dummy。draft 段第 g 个 token 的全局位置 = T+M+E+g,其分布行
-        下标 = T+M+E+g-1(T=教师前缀长,M=已有响应流长,E=本轮已执行长)。
+        末行 dummy。本函数请求尾部裁剪(prompt_logprobs_tail),引擎只返回
+        draft 段所需的行 + 末行 dummy;定位一律相对返回数组长度做,故对
+        全量返回与裁剪返回都成立。
         """
         response_stream = prompt_ids[self._student_prompt_len:]
         teacher_seq = self._teacher_prefix + list(response_stream) + list(executed) + list(gen_ids)
@@ -353,6 +354,10 @@ class SpsGenerate:
                 "top_p": 1.0,
                 "top_k": -1,
                 "prompt_logprobs": self._obs_topk,
+                # 只要 draft 段那几行(+末行 dummy):引擎为整段序列构造 top-K
+                # 明细是纯 Python 对象工作、单线程 GIL,实测是 SPS 的主瓶颈
+                # (server 进程 85% CPU 而 GPU 空转)。其余 ~95% 的行本就用不到。
+                "prompt_logprobs_tail": n_positions + 1,
             },
         )
         if out.extra.get("stop_reason") == "aborted":
@@ -363,7 +368,14 @@ class SpsGenerate:
             raise RuntimeError(
                 "steering verify returned no prompt_logprobs — engine passthrough missing"
             )
-        base = len(teacher_seq) - len(gen_ids) - 1
+        # 相对**返回数组长度**定位——全量与尾部裁剪两种返回都正确
+        # (全量时 len(rows_ids) == len(teacher_seq),表达式退化为原式)。
+        base = len(rows_ids) - len(gen_ids) - 1
+        if base < 0:
+            raise RuntimeError(
+                f"verify returned {len(rows_ids)} rows, need at least "
+                f"{len(gen_ids) + 1} for the draft segment"
+            )
         ids = [rows_ids[base + g] for g in range(n_positions)]
         lps = [rows_lps[base + g] for g in range(n_positions)]
         return ids, lps

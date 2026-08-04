@@ -642,14 +642,34 @@ def build_mtp_speculative_config(
     }
 
 
-def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
-    """Extract prompt log probabilities from generation output."""
+def extract_prompt_logprobs(
+    output: RequestOutput,
+    num_prompt_logprobs: Optional[int],
+    result_dict: dict[str, list],
+    tail: Optional[int] = None,
+):
+    """Extract prompt log probabilities from generation output.
+
+    trace-opd PGS perf fix (2026-08-04, measured): building the full per-position
+    top-K detail is pure Python object construction inside the vLLM server
+    process — single-threaded under the GIL and, at 256 x n_prompt_tokens
+    entries per request, the dominant cost of SPS verify calls (server procs
+    measured at 85% CPU while the GPUs idled). The steering hook only reads the
+    LAST len(draft)+1 rows; `tail` lets the caller ask for exactly those, so the
+    other ~95% is never materialised. Row semantics are unchanged: the returned
+    array still ends with the dummy row, so callers index relative to
+    len(rows) — the same expression works for full and trimmed arrays.
+    """
     if num_prompt_logprobs is None:
         return
 
+    rows_in = output.prompt_logprobs[1:]
+    # tail=T ⇒ keep the last T rows overall (T-1 real rows + 1 dummy appended below)
+    start = max(0, len(rows_in) - (tail - 1)) if tail is not None and tail >= 1 else 0
+
     prompt_logprobs_ls, prompt_ids_ls = [], []
     # NOTE: logprob of first prompt token is None.
-    for logprobs_dict in output.prompt_logprobs[1:]:
+    for logprobs_dict in rows_in[start:]:
         if num_prompt_logprobs == 0:
             token_id_str = list(logprobs_dict.keys())[0]
             logprob = logprobs_dict[token_id_str].logprob

@@ -595,6 +595,8 @@ class vLLMHttpServer:
         # trace-opd PGS: an int K asks for per-step top-K detail (the SPS
         # draft's candidate window over pi); True keeps the historical meaning
         # (0 = sampled token's own logprob only); False/None disables.
+        # trace-opd PGS: 只序列化尾部 N 行 prompt_logprobs(见 utils.extract_prompt_logprobs)
+        _pl_tail = sampling_params.pop("prompt_logprobs_tail", None)
         _logprobs_req = sampling_params.pop("logprobs", False)
         if _logprobs_req is True:
             sampling_params["logprobs"] = 0
@@ -673,6 +675,7 @@ class vLLMHttpServer:
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
+            tail=_pl_tail,
         )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
