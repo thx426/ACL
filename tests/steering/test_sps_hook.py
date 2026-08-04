@@ -108,10 +108,12 @@ class _Tok:
 
 def _mk_hook(world, *, theta_d, eta_max=0.5, c=2.5, b_max=6.0, topk=8,
              obs_topk=16, epsilon=0.0, r_max=4, seed=0,
-             teacher_prefix=(101, 102, 103), student_prompt=(7, 8, 9)):
+             teacher_prefix=(101, 102, 103), student_prompt=(7, 8, 9),
+             pacing=False, u0=0.0, profile_power=2.0, t_max=1):
     state = TrajectorySteerState(
         gate=SteeringGate(theta_d=theta_d, eta_max=eta_max, epsilon=epsilon),
-        budget=TrajectoryBudget(b_max=b_max, c=c),
+        budget=TrajectoryBudget(b_max=b_max, c=c, pacing=pacing, u0=u0,
+                                profile_power=profile_power, t_max=t_max),
         reject_cap=TurnRejectCap(r_max=r_max),
         rng=np.random.default_rng(seed),
     )
@@ -500,3 +502,38 @@ def test_viz_channels_recorded():
     for r in steered:
         assert r.pi_top16 and r.pt_top16
         assert len(r.pi_top16) <= 16 and len(r.pi_top16[0]) == 2
+
+
+def test_pacing_spreads_spend_and_counts_wait():
+    """坍缩回归(2026-08-05,docs/pgs-budget-pacing-design.md):s1 实测头部高
+    异议 + 贪心花费 ⇒ 98.7% 干预堆 turn 0。pacing 下花费必须跨 turn 摊开、
+    未解锁等待与总额耗尽分账;pacing off 保持旧行为(首 turn 花光)。"""
+    def crush_top(pt_logits, pi):
+        top = int(np.argmax(pi))
+        pt_logits = pt_logits.copy()
+        pt_logits[top] = -30.0
+        return pt_logits
+
+    world = _World(seed=3, pt_shift=crush_top)
+    # U0=一次整额;T_max=4 turn 全解锁;每 turn 8 token 的候选流,门恒开
+    hook, state, draft, verify, sp = _mk_hook(
+        world, theta_d=1e-9, b_max=10.0, seed=11,
+        pacing=True, u0=2.5, profile_power=2.0, t_max=4)
+    prompt = list(sp)
+    spents = []
+    for _ in range(5):  # 5 个 assistant turn
+        out = _run(hook(prompt, {"max_tokens": 8, "temperature": 1.0}))
+        prompt = prompt + list(out.token_ids)
+        spents.append(state.budget.spent)
+    assert state.budget.turn == 5                       # 每次调用推进一个 turn
+    assert spents[0] <= 2.5 + 1e-9                      # 首 turn 至多花 U0
+    assert spents[-1] > spents[0] + 1e-9                # 后续 turn 持续获得新额度
+    assert state.ledger.n_pacing_wait > 0               # 未解锁等待被记账
+    assert state.budget.spent <= 10.0 + 1e-9
+    for r in state.ledger.records:                      # 解锁曲线随行落账
+        assert r.unlocked_at >= 0.0
+    # 对照:pacing off ⇒ 首 turn 8 个开门位置 × δ=2.5 花光 b_max(旧行为)
+    hook2, st2, _d2, _v2, sp2 = _mk_hook(world, theta_d=1e-9, b_max=10.0, seed=11)
+    _run(hook2(list(sp2), {"max_tokens": 8, "temperature": 1.0}))
+    assert st2.budget.remaining < 1e-6
+    assert st2.ledger.n_pacing_wait == 0

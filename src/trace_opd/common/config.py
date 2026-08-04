@@ -207,12 +207,19 @@ class SteeringCfg:
     gate_rate_bounds: tuple = (0.05, 0.25)   # spec 预注册区间
     r_max: int = 4                 # 每轮拒绝上限(行为态)
     w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace(消融开关,规范 §2.6)
+    budget_pacing: bool = False    # 预算解锁曲线(2026-08-05 用户裁定,修 s1 头部坍缩;
+                                   # docs/pgs-budget-pacing-design.md):false=旧行为
+                                   # (t=0 全解锁)。S2 起 true
+    budget_u0: float = 5.0         # pacing 初始拨付(nats;=2×δ_full,保头部纠错)
+    budget_profile_power: float = 2.0  # 解锁曲线族 p:1=匀速,2=速率线性衰减(默认,
+                                   # 用户提议档:预算重心前移但全程非零)
 
     def __post_init__(self) -> None:
         # yaml 1.1 把 1.0e9(无符号指数)解析成字符串——数值字段一律强转,
         # 转不动就在这里死,而不是在校验/运行期比较时抛 TypeError。
         for f in ("eta_max", "c", "b_max", "theta_d", "epsilon",
-                  "gate_target_rate", "gate_ema_beta"):
+                  "gate_target_rate", "gate_ema_beta",
+                  "budget_u0", "budget_profile_power"):
             setattr(self, f, float(getattr(self, f)))
         self.topk = int(self.topk)
         self.obs_topk = int(self.obs_topk)
@@ -265,6 +272,13 @@ def _validate(cfg: "Config") -> None:
             raise ValueError(f"steering.topk 必须 >= 1,得到 {st.topk}")
         if st.r_max < 1:
             raise ValueError(f"steering.r_max 必须 >= 1,得到 {st.r_max}")
+        if st.budget_pacing:
+            if st.budget_profile_power <= 0:
+                raise ValueError(
+                    f"steering.budget_profile_power 必须 > 0,得到 {st.budget_profile_power}")
+            if not (0.0 <= st.budget_u0 <= st.b_max):
+                raise ValueError(
+                    f"steering.budget_u0 必须在 [0, b_max],得到 {st.budget_u0}")
         if st.gate_adaptive:
             if not (0.0 < st.gate_target_rate < 1.0):
                 raise ValueError(f"steering.gate_target_rate 必须在 (0,1),得到 {st.gate_target_rate}")
@@ -394,6 +408,7 @@ def objective_fingerprint(cfg: "Config") -> str:
             st.eta_max, st.c, st.b_max, st.topk, st.obs_topk,
             st.theta_d, st.epsilon, st.r_max, st.w_beh_mode,
             st.gate_adaptive, st.gate_target_rate, st.gate_ema_beta,
+            st.budget_pacing, st.budget_u0, st.budget_profile_power,
         )
     )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]

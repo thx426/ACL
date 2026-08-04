@@ -91,7 +91,9 @@ function showPanel(el){
     h += '<div class="kv">' + (d.rejected ? '拒绝重采: <b>' + esc(d.draft_s) + '</b> → <b>' + esc(d.final_s) + '</b>'
                                           : '接受: <b>' + esc(d.final_s) + '</b>') + '</div>';
     h += '<div class="kv">η=' + d.eta.toFixed(3) + '  W=π/b=' + d.W.toFixed(3) +
-         '  预算余额=' + (d.budget===null?'?':d.budget.toFixed(2)) + (d.probe?'  <b>[探针翻转]</b>':'') + '</div>';
+         '  预算余额=' + (d.budget===null?'?':d.budget.toFixed(2)) +
+         (d.unlocked!==null && d.unlocked!==undefined && d.unlocked>=0 ? '  已解锁=' + d.unlocked.toFixed(2) : '') +
+         (d.probe?'  <b>[探针翻转]</b>':'') + '</div>';
   }
   if(d.top && d.top.length){
     h += '<h4>π / p_T / 倾斜后 b(top-16)</h4>';
@@ -197,7 +199,8 @@ def render_traj(payload, tok, cfg) -> str:
             "rejected": bool(g("steer_rejected", 0)), "probe": bool(g("steer_probe", 0)),
             "open": bool(g("steer_base_open", 0)),
             "log_pi": g("steer_log_pi", 0.0), "log_b": g("steer_log_b", 0.0),
-            "budget": g("steer_budget_after"), "draft": g("steer_draft_token", -1),
+            "budget": g("steer_budget_after"), "unlocked": g("steer_unlocked_at"),
+            "draft": g("steer_draft_token", -1),
             "final": g("steer_final_token", -1),
             "pi16": g("steer_pi_top16") or [], "pt16": g("steer_pt_top16") or [],
         }

@@ -351,7 +351,14 @@ class TraceAgentLoop(AgentLoopBase):
                 epsilon=st_cfg.epsilon,
                 rate_bounds=tuple(st_cfg.gate_rate_bounds),
             ),
-            budget=TrajectoryBudget(b_max=st_cfg.b_max, c=st_cfg.c),
+            budget=TrajectoryBudget(
+                b_max=st_cfg.b_max, c=st_cfg.c,
+                pacing=st_cfg.budget_pacing,
+                u0=st_cfg.budget_u0,
+                profile_power=st_cfg.budget_profile_power,
+                # T_max = 环境硬配置的会话轮上限(零任务先验,通用)
+                t_max=self.cfg.episode.max_assistant_turns,
+            ),
             reject_cap=TurnRejectCap(r_max=st_cfg.r_max),
             # IF-12:D 直方图上界随 run 的 c 派生(=c²),坐标系随账落盘
             ledger=SteeringLedger(d_hist_max=st_cfg.c * st_cfg.c),

@@ -174,6 +174,52 @@ def test_budget_charges_and_exhausts():
         b.charge(0.5)
 
 
+def test_budget_pacing_unlock_curve():
+    """解锁曲线族 unlocked(t)=U0+(B−U0)·[1−(1−t/T)^p] 逐点断言
+    (docs/pgs-budget-pacing-design.md;修 s1 头部坍缩)。"""
+    b = TrajectoryBudget(b_max=40.0, c=2.5, pacing=True, u0=5.0,
+                         profile_power=2.0, t_max=40)
+    assert b.unlocked == 5.0 and b.available == 5.0      # turn 0:只有 U0
+    assert b.remaining == 40.0                            # 总余额是另一口径
+    for _ in range(10):
+        b.advance_turn()
+    assert abs(b.unlocked - (5.0 + 35.0 * 0.4375)) < 1e-9  # φ(0.25)=1−0.75²
+    for _ in range(30):
+        b.advance_turn()
+    assert b.unlocked == 40.0                             # t=T_max 全解锁
+    b.advance_turn()
+    assert b.unlocked == 40.0                             # 超界钳制
+    # p=1 匀速
+    m = TrajectoryBudget(b_max=40.0, c=2.5, pacing=True, u0=5.0,
+                         profile_power=1.0, t_max=40)
+    m.advance_turn()
+    m.advance_turn()
+    assert abs(m.unlocked - (5.0 + 35.0 * 2.0 / 40.0)) < 1e-9
+    # pacing off ⇒ 旧行为(t=0 全解锁),available 与 remaining 同值
+    off = TrajectoryBudget(b_max=40.0, c=2.5)
+    assert off.unlocked == 40.0 and off.available == off.remaining == 40.0
+
+
+def test_budget_pacing_available_gates_spend():
+    """花费判据用 available:未解锁 ≠ 耗尽;跨 turn 攒额与缩水干预。"""
+    b = TrajectoryBudget(b_max=10.0, c=2.5, pacing=True, u0=2.5,
+                         profile_power=2.0, t_max=8)
+    assert b.admissible_eta(0.5) == 0.5
+    b.charge(0.5)                              # δ=2.5 花光 U0
+    assert b.available == 0.0 and b.remaining == 7.5   # 等解锁,总额未尽
+    assert b.admissible_eta(0.5) == 0.0
+    with pytest.raises(RuntimeError):
+        b.charge(0.5)                          # 超解锁额度必须炸
+    b.advance_turn()                           # turn 1 解锁 7.5×(1−(7/8)²)≈1.76
+    assert b.available > 0
+    eta = b.admissible_eta(0.5)
+    assert 0.0 < eta < 0.5                     # 不足整额 ⇒ 缩水干预
+    b.charge(eta)
+    assert b.available < 1e-9                  # 解锁额再度花尽
+    b.advance_turn()                           # 继续攒
+    assert b.available > 0
+
+
 def test_reject_cap_state_machine():
     cap = TurnRejectCap(r_max=2)
     cap.record_reject()
@@ -223,8 +269,10 @@ def test_ledger_ell_hist_and_token_pairs():
     assert led.ell_count == 3
     assert sum(led.ell_hist) == 3
     assert led.ell_hist[-1] == 1              # +15 → 末桶
-    led.append(TokenSteerRecord(2, -1.0, -1.5, 0.5, 2.5, 0.9, True, False, 0.95,
-                                True, False, 7.5, 101, 202))
+    led.append(TokenSteerRecord(
+        position=2, log_pi=-1.0, log_b=-1.5, eta=0.5, delta=2.5, d_value=0.9,
+        base_open=True, probe_flipped=False, propensity=0.95, rejected=True,
+        cap_active=False, budget_after=7.5, draft_token=101, final_token=202))
     out = led.finalize()
     assert out["steer_draft_token"] == [101]
     assert out["steer_final_token"] == [202]

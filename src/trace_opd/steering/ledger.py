@@ -34,6 +34,7 @@ class TokenSteerRecord:
     rejected: bool
     cap_active: bool       # 本行写入时 cap 是否已激活(第 R_max 次拒绝行=True)
     budget_after: float = -1.0   # 本位置结算后的预算余额(审阅 IF-07)
+    unlocked_at: float = -1.0    # 本位置时刻的累计解锁额度(pacing 审计曲线)
     draft_token: int = -1        # draft 提案 token(观察:教师把什么改成了什么)
     final_token: int = -1        # 实际执行 token(= draft 或残差重采结果)
     # viz 下钻数据(仅 η>0 行携带;[[token_id, logprob]×16],两侧分布对比)
@@ -75,6 +76,7 @@ class SteeringLedger:
     n_probe_flipped: int = 0
     n_budget_blocked: int = 0         # 门开但预算不允许(η 缩到 0)
     n_bypassed: int = 0               # cap/预算耗尽后未判定直通的 token 数
+    n_pacing_wait: int = 0            # pacing 额度暂未解锁而直通的 token 数(非耗尽)
     n_pt_window_miss: int = 0         # S 内 p_T 窗外单侧鲁棒代入次数(max-IF-13)
     # ℓ 观测直方图(c 标定 + 方向观察;窗内逐 token 等权)
     ell_hist: list[int] = field(default_factory=lambda: [0] * ELL_HIST_BINS)
@@ -126,6 +128,7 @@ class SteeringLedger:
             "steer_rejected": [int(r.rejected) for r in self.records],
             "steer_cap_active": [int(r.cap_active) for r in self.records],
             "steer_budget_after": [round(r.budget_after, 4) for r in self.records],
+            "steer_unlocked_at": [round(r.unlocked_at, 4) for r in self.records],
             "steer_budget_spent": self.budget_spent,
             "steer_turns_capped": self.turns_capped,
             # steer_count = 实际倾斜位置数(η>0),不是记录行数——记录行还含
@@ -143,6 +146,7 @@ class SteeringLedger:
             "steer_n_probe_flipped": self.n_probe_flipped,
             "steer_n_budget_blocked": self.n_budget_blocked,
             "steer_n_bypassed": self.n_bypassed,
+            "steer_n_pacing_wait": self.n_pacing_wait,
             "steer_n_pt_window_miss": self.n_pt_window_miss,
             "steer_draft_token": [r.draft_token for r in self.records],
             "steer_final_token": [r.final_token for r in self.records],

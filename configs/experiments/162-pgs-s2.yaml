@@ -124,12 +124,19 @@ steering:
   eta_max: 0.5              # 倾斜强度上限 η_max | 规范 §2.2;全词表密度比 ≤ e^{2ηc}
   c: 2.5                    # 截断参数(单点话语权限幅)| 规范 §2.1:上线前必须用
                             # 目标文档语境实测 ℓ 分布标定(G0 的 GT 语境分布不可迁移)
-  b_max: 40.0               # D_∞ 逐轨迹预算(nats)| 用户裁定 2026-08-05 v3(20→40):
-                            # s1 首查实测换 token 仅 ~0.56 次/轨迹且总量对 η 一阶
-                            # 不敏感(次数=B/2ηc 与拒绝率∝η 相消),B 是总量主旋钮。
-                            # δ=2ηc=2.5 保守扣费 ⇒ 16 次整额等价干预/轨迹;训练端
-                            # per-token W 界 e^{±2ηc} 与本值无关,轨迹级界只影响
-                            # per_decision 消融档;消融矩阵 {10,20,40}(第二轮预注册)
+  b_max: 400.0              # D_∞ 逐轨迹预算(nats)| 用户裁定 2026-08-05 v4(20→400,
+                            # 探索档"先试一试"):s1 实测换 token 仅 ~0.56 次/轨迹,
+                            # 对多轮长轨迹要显著提升;且总量对 η 一阶不敏感(次数=
+                            # B/2ηc 与拒绝率∝η 相消),B 是总量主旋钮。δ=2.5 保守
+                            # 扣费 ⇒ 160 次整额等价/轨迹 ≈ 全轨迹候选(标定口径
+                            # ~2160)的 7.4%,与 q=10% 门率接近匹配(预算从硬瓶颈
+                            # 转为轻约束)。per-token W 界 e^{±2ηc} 与本值无关。
+                            # ⚠ 墙钟预警:verify 覆盖面随之扩到近全轨迹,教师
+                            # prefill 无 KV 复用(vLLM prompt_logprobs 禁 prefix-
+                            # cache)⇒ 预计 2-4× base,s2 首 step 实测定夺。
+                            # 后续方向(用户 2026-08-05 记账,暂不实施):B 自适应
+                            # (跨 benchmark 免先验)+ B 训练期衰减调度(类 lr
+                            # cosine,随成功率退火趋纯 on-policy)
   topk: 64                  # 保尾核候选集 S = 两侧 top-K 并集
   obs_topk: 256             # draft/verify 引擎观测窗(top-K 明细宽度)| launcher
                             # 联动 vLLM max_logprobs ≥ 本值(启动期参数;codex
@@ -151,6 +158,14 @@ steering:
   r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
   w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
                             # (消融开关,规范 §2.6)
+  # ---- 预算解锁曲线(pacing;2026-08-05 用户裁定,修 s1 头部坍缩:98.7% 干预
+  # 堆 turn 0 前 0.4%。docs/pgs-budget-pacing-design.md)----
+  budget_pacing: true       # unlocked(t)=U0+(B−U0)·[1−(1−t/T_max)^p];花费只动已
+                            # 解锁额度(token-bucket 攒额);T_max=episode.
+                            # max_assistant_turns(环境硬配置,零任务先验)
+  budget_u0: 5.0            # 初始拨付(=2×δ_full,头部 2 次整额保任务理解期纠错)
+  budget_profile_power: 2.0 # 曲线族 p:1=匀速;2=解锁速率随轮次线性衰减(用户提议
+                            # 档,预算重心前移但全程非零);消融 p∈{1,2}(第二轮)
 
 eval:
   response_budget: 32768    # 评测侧 episode token 预算 | h3 定版

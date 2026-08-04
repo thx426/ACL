@@ -141,6 +141,14 @@ steering:
                             # 设计触发率 15% 居中),越界告警不自动调(冻结语义)
   r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
   w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
+  # ---- 预算解锁曲线(pacing;2026-08-05 用户裁定,修 s1 头部坍缩。
+  # docs/pgs-budget-pacing-design.md;三键均进 objective_fingerprint)----
+  budget_pacing: false      # true: unlocked(t)=U0+(B−U0)·[1−(1−t/T_max)^p],花费只动
+                            # 已解锁额度(token-bucket 攒额);false=旧行为(t=0 全解锁)。
+                            # T_max=episode.max_assistant_turns(环境硬配置,零任务先验)
+  budget_u0: 5.0            # 初始拨付(nats;=2×δ_full,头部 2 次整额保任务理解期纠错)
+  budget_profile_power: 2.0 # 曲线族 p:1=匀速;2=解锁速率随轮次线性衰减(默认档,
+                            # 预算重心前移但全程非零);消融 p∈{1,2}
                             # (消融开关,规范 §2.6)
 
 eval:

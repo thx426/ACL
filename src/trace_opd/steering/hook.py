@@ -229,9 +229,13 @@ class SpsGenerate:
                     "missing (vllm_async_server logprobs=K path)"
                 )
 
-            steerable = st.budget.remaining > 0 and not st.reject_cap.cap_active
+            steerable = st.budget.available > 0 and not st.reject_cap.cap_active
             if not steerable:
-                st.ledger.n_bypassed += len(gen_ids)
+                if st.reject_cap.cap_active or st.budget.remaining <= 0:
+                    st.ledger.n_bypassed += len(gen_ids)
+                else:
+                    # pacing:总额未尽但本 turn 额度未解锁(与耗尽区分)
+                    st.ledger.n_pacing_wait += len(gen_ids)
                 executed += gen_ids
                 executed_logpi += [float(x) for x in pi_lp]
                 finished = draft_finished
@@ -246,8 +250,11 @@ class SpsGenerate:
                 y = int(y)
                 log_pi_y = float(pi_lp[g])
                 position = stream_len + len(executed)
-                if st.budget.remaining <= 0 or st.reject_cap.cap_active:
-                    st.ledger.n_bypassed += 1
+                if st.budget.available <= 0 or st.reject_cap.cap_active:
+                    if st.reject_cap.cap_active or st.budget.remaining <= 0:
+                        st.ledger.n_bypassed += 1
+                    else:
+                        st.ledger.n_pacing_wait += 1
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
                     continue
@@ -280,6 +287,7 @@ class SpsGenerate:
                             propensity=decision.propensity,
                             rejected=False, cap_active=st.reject_cap.cap_active,
                             budget_after=st.budget.remaining,
+                            unlocked_at=st.budget.unlocked,
                             draft_token=y, final_token=y,
                         ))
                     executed.append(y)
@@ -311,6 +319,7 @@ class SpsGenerate:
                     rejected=outcome.rejected,
                     cap_active=st.reject_cap.cap_active,
                     budget_after=st.budget.remaining,
+                    unlocked_at=st.budget.unlocked,
                     draft_token=y, final_token=int(outcome.token_id),
                     # viz 下钻:两侧分布 top-16(倾斜后分布由 η/c/ℓ̃ 前端重算)
                     pi_top16=[
@@ -336,6 +345,7 @@ class SpsGenerate:
                 continue  # 从断点(含重采 token)续 draft(原 EOS 被拒重采成非停止符同样续)
             finished = draft_finished
 
+        st.budget.advance_turn()  # pacing:一个 assistant turn 结束,推进解锁曲线
         token_ids = executed[:max_tokens]
         return GenResult(
             token_ids=token_ids,
