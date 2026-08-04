@@ -238,3 +238,23 @@ q = 目标门率(如 10%),β = 慢速率(如 0.1)
 另:SPS 性能三层修复(prompt_logprobs_tail / detokenize=False / flat_logprobs=True,
 commit ff817e6 + 76a9a6f)已使 SPS 墙钟 ≈1.0× base(修复前 20×),建议机制侧
 将「接口/序列化成本」补入 NF09 算力账一维。
+
+---
+
+## 2026-08-04 · [P1] rollout 期显存实测:SPS 打分请求触发 vLLM 预算外分配(#5907),峰值超预算 11-22G
+
+**实测**(标定 v2,TP=1,gpu_mem=0.7):vLLM worker 67↔78G 动态起伏(预算 56G),
+FSDP 侧 rollout 期仅 0.8G(offload 生效)。超额部分 = logprobs/prompt_logprobs
+路径的 fp32 log-softmax 全词表副本(~5G/份)× 并发 prefill 叠加 + topk 工作区
+—— vLLM issue #5907 的已知无保护路径,**与 R11a 历史事故同源**(旧机制 self-teacher
+打分被同一机理炸掉,当年的解法是挪去 FSDP;PGS 的在线判定不能挪,只能留 headroom)。
+
+**长序列研判**:单条长序列不线性爆(chunked prefill 常数化 chunk logits;
+prompt_logprobs 输出累积 ~100MB/34k 请求);风险 = 并发尖峰时序。
+
+**已实施防御**(实验侧配置,已入模板):`rollout_gpu_mem` 0.7→**0.6**(结构性
+让 8G headroom,KV 池缩、preempt 增,degrade 不崩)+
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(减碎片假性 OOM)。
+
+**给 CD-010**:NF09 算力账之外,规范的资源账应加「logprobs 请求的预算外显存」
+一维;若未来 vLLM 版本支持 logprobs 预算化(#5907 跟进),0.6 可回调。
