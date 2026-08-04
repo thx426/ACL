@@ -119,7 +119,18 @@ python trace_opd/scripts/pgs_report.py --run-dir <run> --tokenizer $TRACE_MODEL_
 看:红绿灯全绿、重采对表语义(教师改的 token 合不合理——最直觉的机制检查)、
 thought 重复率(>55% 警戒)、预算耗尽位置(全堆前 20% = 早花晚饿,反馈)。
 
-**个案抽查(异常时)**:`pgs_traj.py <dump.json> --tokenizer ...`。
+**逐 token 可视化(s1 期间的主力观察面)**:
+```bash
+python trace_opd/scripts/pgs_viz.py --run-dir <run> --tokenizer $TRACE_MODEL_PATH \
+  [--steps 1,5,10] [--max-trajs 20]
+# 产物 <run>/viz/index.html —— scp 回本机浏览器打开
+```
+三级导航:index(机制曲线+step 表)→ step 页(轨迹表,按拒绝数排序)→
+轨迹页(逐 token 三态着色:蓝=候选未开门/绿=倾斜接受/红=拒绝重采并内联
+draft→final;点击 token 下钻 D vs θ_D 标尺、两侧 top-16 分布对比与倾斜后
+重算、W/预算余额;Esc 关闭)。旧 schema dump 自动降级 turn 表格模式。
+
+**个案抽查(轻量单条)**:`pgs_traj.py <dump.json> --tokenizer ...`。
 
 ## 3. 安全门(预注册,任一触发 ⇒ 停机保 ckpt + 反馈)
 

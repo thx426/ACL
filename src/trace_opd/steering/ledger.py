@@ -125,6 +125,7 @@ class SteeringLedger:
             "steer_propensity": [r.propensity for r in self.records],
             "steer_rejected": [int(r.rejected) for r in self.records],
             "steer_cap_active": [int(r.cap_active) for r in self.records],
+            "steer_budget_after": [round(r.budget_after, 4) for r in self.records],
             "steer_budget_spent": self.budget_spent,
             "steer_turns_capped": self.turns_capped,
             # steer_count = 实际倾斜位置数(η>0),不是记录行数——记录行还含
