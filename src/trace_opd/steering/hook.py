@@ -324,6 +324,30 @@ class SpsGenerate:
                     st.reject_cap.record_reject()
                     if st.reject_cap.cap_active:
                         st.ledger.turns_capped += 1
+                # 观察明细分层(v3.2 定案,防 maxopen 全开时 dump 膨胀):
+                # top-16 分布对比只随**拒绝位**携带(物理改写点=最高语义价值;
+                # 全位置携带在 always_on 下达 ~1.5MB/轨迹)。接受位仍有完整
+                # 训练账(log_pi/log_b)与 D/η 标量;viz 对无明细行自动降级。
+                if outcome.rejected:
+                    pi_top16 = [
+                        [int(t), round(float(lp), 4)]
+                        for t, lp in zip(pi_topk_ids[g][:16], pi_topk_lps[g][:16])
+                    ]
+                    pt_top16 = [
+                        [int(t), round(float(lp), 4)]
+                        for t, lp in zip(pt_rows[0][g][:16], pt_rows[1][g][:16])
+                    ]
+                    # 冷起能力边界观察:重采进来的 token 在 π 的 rank——
+                    # rank 贴近观测窗尾(obs_topk)说明教师在踩「保尾核只能
+                    # 倾斜 π top-K 内 token」的边界(OPD 只能调已有行为的
+                    # PGS 版判据)。
+                    try:
+                        final_rank = list(pi_topk_ids[g]).index(int(outcome.token_id))
+                    except ValueError:
+                        final_rank = -1  # p_T 侧候选恰在 π 明细窗外(known_pi 兜底)
+                else:
+                    pi_top16 = pt_top16 = None
+                    final_rank = -1
                 st.ledger.append(TokenSteerRecord(
                     position=position,
                     log_pi=outcome.log_pi,
@@ -337,15 +361,9 @@ class SpsGenerate:
                     budget_after=st.budget.remaining,
                     unlocked_at=st.budget.unlocked,
                     draft_token=y, final_token=int(outcome.token_id),
-                    # viz 下钻:两侧分布 top-16(倾斜后分布由 η/c/ℓ̃ 前端重算)
-                    pi_top16=[
-                        [int(t), round(float(lp), 4)]
-                        for t, lp in zip(pi_topk_ids[g][:16], pi_topk_lps[g][:16])
-                    ],
-                    pt_top16=[
-                        [int(t), round(float(lp), 4)]
-                        for t, lp in zip(pt_rows[0][g][:16], pt_rows[1][g][:16])
-                    ],
+                    final_token_pi_rank=final_rank,
+                    pi_top16=pi_top16,
+                    pt_top16=pt_top16,
                 ))
                 executed.append(int(outcome.token_id))
                 executed_logpi.append(float(outcome.log_pi))

@@ -43,6 +43,14 @@ class TrajectoryBudget:
             raise ValueError(f"invalid budget b_max={b_max}, c={c}")
         if profile_power <= 0 or u0 < 0:
             raise ValueError(f"invalid pacing u0={u0}, profile_power={profile_power}")
+        # b_max=inf(maxopen 档,机制 v3.2):无限预算是一等公民——available
+        # 恒 inf、admissible_eta 不缩、charge 永不透支、spent 照实累计(观察量)。
+        # 但解锁曲线在 B=inf 下无定义((B−U0)·φ 在 t=0 出 inf·0=NaN),
+        # 组合必须在此 fail loud(config 校验之外的第二道防线)。
+        import math
+
+        if pacing and math.isinf(b_max):
+            raise ValueError("budget_pacing is undefined with b_max=inf — disable pacing")
         self.b_max = float(b_max)
         self.c = float(c)
         self.spent = 0.0

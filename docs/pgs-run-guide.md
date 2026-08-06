@@ -173,6 +173,15 @@ thought 逐字重复率 >55% / entropy 持续 <0.2 / val 单点跌 >10pp / 不�
 | `r_max` | 4 | 每轮拒绝上限 | 不动 |
 | `w_beh_mode` | per_token | 训练纠偏口径 | 消融时(per_decision/vtrace) |
 | `steered_fraction` | 0.5(v3.1 主线) | 分臂:steered 臂占比,其余纯 π bare 臂同组进 GRPO | 1.0=历史全臂;**进指纹,改动=新 run_dir** |
+| `gate_mode` | always_on(v3.2 默认档) | always_on=无门恒 η_max(须显式 epsilon:0 + gate_adaptive:false,θ 免标定);adaptive=历史 D 门档 | **进指纹**;adaptive 保留为对照/回摆 |
+| `b_max: .inf` | v3.2 默认档 | 无预算约束(spent 降为观察量);须显式 budget_pacing:false | inf 进指纹(值本就在指纹) |
+
+⚠ maxopen(v3.2)监控口径变化:`steer_gate_open_rate` 恒 1、`steer_theta_d`
+恒 0(哨兵)、`steer_count`≈`steer_n_candidates`(全开)、
+`actor/rollout_is_weight_off1_frac` 显著升高(全位置 W≠1)但 weight_mean
+仍≈1;`steer_budget_spent` 是无上界观察量(增长正常)。top-16 下钻明细
+仅拒绝位携带(viz 对接受位自动降级);拒绝位新增 `steer_final_pi_rank`
+(重采 token 的 π rank,冷起边界判据:分布贴近 obs_topk=教师在踩保尾核边界)。
 
 train 段关键:`adv_estimator: grpo_loo` + `norm_adv_by_std: false`(Dr.GRPO,
 审阅裁定主档,**两臂一致勿动**);其余训练键与 4B 主线同源,注释在模板。

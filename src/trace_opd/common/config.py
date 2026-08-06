@@ -276,6 +276,12 @@ class SteeringCfg:
     enabled: bool = False
     # 缺省 static 保持历史配置/指纹语义；researcher 每 step 在线产文档。
     doc_source: str = "static"       # static | researcher
+    gate_mode: str = "adaptive"    # 门控模式(机制 v3.2,用户裁定 2026-08-06):
+                                   # adaptive = D 门 + ε 探针 + θ_D 率控自适应(历史行为);
+                                   # always_on = 无门判定,每个候选位置恒 η=η_max
+                                   # (maxopen 档:outcome reward + bare 臂锚的语境下
+                                   # 允许最大程度干预;θ 标定/探针/率告警整体退役)。
+                                   # 进 objective_fingerprint(改变行为分布 b)
     doc_table: str = ""            # static:task_id→doc 的 jsonl 表；researcher 可空
     eta_max: float = 0.5           # 倾斜强度上限
     c: float = 2.5                 # 截断参数(单点话语权限幅;目标语境实测标定)
@@ -372,10 +378,33 @@ def _validate(cfg: "Config") -> None:
         )
     if st.enabled:
         # 审阅 IF-13:数值面先过有限性——NaN/inf 能绕过大小比较,错误会
-        # 延迟到 rollout 中段才爆。
-        for name in ("eta_max", "c", "b_max", "theta_d", "epsilon"):
+        # 延迟到 rollout 中段才爆。b_max 例外:+inf 是 maxopen 档的一等语义
+        # (无限预算,v3.2),仍拒 NaN/−inf。
+        for name in ("eta_max", "c", "theta_d", "epsilon"):
             if not math.isfinite(getattr(st, name)):
                 raise ValueError(f"steering.{name} 必须是有限数,得到 {getattr(st, name)!r}")
+        if math.isnan(st.b_max) or st.b_max == -math.inf:
+            raise ValueError(f"steering.b_max 必须是非负数或 +inf,得到 {st.b_max!r}")
+        if math.isinf(st.b_max) and st.budget_pacing:
+            raise ValueError(
+                "steering.b_max=inf 与 budget_pacing=true 不相容(解锁曲线无定义)"
+                "——maxopen 档请显式 budget_pacing: false"
+            )
+        if st.gate_mode not in ("adaptive", "always_on"):
+            raise ValueError(
+                f"steering.gate_mode 必须是 adaptive|always_on,得到 {st.gate_mode!r}"
+            )
+        if st.gate_mode == "always_on":
+            # maxopen 档参数纪律(参数真值必须显式可见,不做静默忽略):
+            # 门语义整体退役 ⇒ 探针/率控自适应必须显式关闭,θ_D 免标定。
+            if st.epsilon != 0.0:
+                raise ValueError(
+                    "gate_mode=always_on 时无门决定可翻转,须显式 epsilon: 0"
+                )
+            if st.gate_adaptive:
+                raise ValueError(
+                    "gate_mode=always_on 时 θ_D 无语义,须显式 gate_adaptive: false"
+                )
         if st.doc_source == "static" and not st.doc_table:
             raise ValueError(
                 "steering.enabled 且 doc_source=static 需要 doc_table(task_id→doc jsonl)"
@@ -405,9 +434,10 @@ def _validate(cfg: "Config") -> None:
             raise ValueError(
                 f"steering.gate_rate_bounds 必须是 [lo, hi] 且 0<=lo<hi<=1,得到 {rb!r}"
             )
-        if st.theta_d <= 0:
+        if st.gate_mode == "adaptive" and st.theta_d <= 0:
             raise ValueError(
                 "steering.theta_d 未标定(<=0)——先用目标文档语境预扫描 D 分布定 P85"
+                "(gate_mode=always_on 免标定)"
             )
         if st.w_beh_mode not in ("per_token", "per_decision", "vtrace"):
             raise ValueError(f"未知 w_beh_mode {st.w_beh_mode!r}")
@@ -624,6 +654,10 @@ def objective_fingerprint(cfg: "Config") -> str:
     # (researcher source 哨兵同款先例)。
     if st.enabled and st.steered_fraction < 1.0:
         material += f"|steered_fraction={st.steered_fraction}"
+    # maxopen 门控模式(v3.2)改变行为分布 b(处处倾斜),必须进指纹;
+    # 条件追加:adaptive(历史行为)不改 material。
+    if st.enabled and st.gate_mode != "adaptive":
+        material += f"|gate_mode={st.gate_mode}"
     if st.doc_source == "researcher":
         rcfg, ncfg, role = cfg.research, cfg.narration, cfg.role("researcher")
         research_material = {

@@ -503,11 +503,15 @@ class TraceAgentLoop(AgentLoopBase):
             if state is not None and self.gate_tracker is not None:
                 # 本轨迹的 D 观测并入 worker 级追踪器(下一 step 边界生效)
                 self.gate_tracker.observe(state.ledger.d_hist, state.ledger.d_count)
-            # 本轨迹实际使用的 θ_D(自适应轨迹审计;swanlab 曲线自动收)
-            steer_fields["steer_theta_d"] = (
+            # 本轨迹实际使用的 θ_D(自适应轨迹审计;swanlab 曲线自动收)。
+            # always_on 档 θ=−inf 无语义,写 0.0 哨兵防 inf 污染数值曲线。
+            theta_used = (
                 state.gate.theta_d if state is not None
                 else (self.gate_tracker.theta if self.gate_tracker is not None
                       else self.cfg.steering.theta_d)
+            )
+            steer_fields["steer_theta_d"] = (
+                theta_used if math.isfinite(theta_used) else 0.0
             )
             if state is not None:
                 alarm = state.gate.rate_alarm()
@@ -619,15 +623,24 @@ class TraceAgentLoop(AgentLoopBase):
         st_cfg = self.cfg.steering
         from ..steering import SteeringLedger
 
-        theta_now = (
-            self.gate_tracker.theta if self.gate_tracker is not None else st_cfg.theta_d
-        )
+        if st_cfg.gate_mode == "always_on":
+            # maxopen 档(v3.2):无门判定——θ_D=−inf 使 decide 恒 base_open,
+            # 探针已被校验强制 ε=0,率告警带置 (0,1) 关闭语义。gate 代码零改动,
+            # θ 标定/率控自适应子系统对该档整体退役(tracker 经 gate_adaptive=
+            # false 已不构造)。
+            theta_now = float("-inf")
+            rate_bounds = (0.0, 1.0)
+        else:
+            theta_now = (
+                self.gate_tracker.theta if self.gate_tracker is not None else st_cfg.theta_d
+            )
+            rate_bounds = tuple(st_cfg.gate_rate_bounds)
         state = TrajectorySteerState(
             gate=SteeringGate(
                 theta_d=theta_now,
                 eta_max=st_cfg.eta_max,
                 epsilon=st_cfg.epsilon,
-                rate_bounds=tuple(st_cfg.gate_rate_bounds),
+                rate_bounds=rate_bounds,
             ),
             budget=TrajectoryBudget(
                 b_max=st_cfg.b_max, c=st_cfg.c,

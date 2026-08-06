@@ -200,3 +200,31 @@ swanlab `actor/rollout_is_weight_off1_frac` 必须 >0(run-guide 步骤⑤ 首查
 只作 baseline,W_beh 全免)/δ 驱动 fraction 退火。**θ_D 自适应只吃
 steered 臂的 D 观测**:每 worker 每 step 观测量减半,min_obs=500 下更新
 周期约 4→7 step(预期内,changelog 已告知实验侧)。
+
+## 10. maxopen 档(机制 v3.2;用户裁定 2026-08-06,规范附注第 9 条)
+
+`gate_mode: always_on` + `b_max: .inf`,后续默认档;`adaptive` 完整保留。
+
+**实现链**(全部有单测,tests/steering/test_maxopen.py):
+
+1. 配置:`SteeringCfg.gate_mode`(adaptive|always_on,进指纹、adaptive
+   不改 material);always_on 参数纪律=显式 `epsilon: 0` +
+   `gate_adaptive: false`(校验拒绝缺省,不做静默忽略),θ_D 免标定;
+   `b_max: .inf` 合法(仍拒 NaN/−inf),与 `budget_pacing: true` 组合
+   校验拒绝(解锁曲线在 B=∞ 无定义;budget.py 有第二道防线)。
+2. 门:agent_loop 构造分支——always_on 用 θ_D=−inf 的 SteeringGate
+   (decide 恒 base_open、ε=0 无翻转、propensity≡1),rate_bounds=(0,1)
+   关闭告警语义;**gate.py 零改动**。tracker 经 gate_adaptive=false 天然
+   不建;steer_theta_d 曲线写 0.0 哨兵防 −inf 污染。
+3. 预算:TrajectoryBudget(b_max=inf) 的 available/remaining≡inf、
+   admissible_eta 不缩、charge 永不透支、spent 照实累计(观察量);
+   ledger finalize 对 budget_after/unlocked_at 的 inf 写 −1 哨兵
+   (JSON/曲线安全)。
+4. 观察分层(防全开 dump 膨胀,~1.5MB→~200KB/轨迹):pi/pt_top16
+   仅**拒绝位**携带(所有模式统一;viz 对无明细行自动降级);拒绝位
+   新增 `final_token_pi_rank` → finalize `steer_final_pi_rank`(重采
+   token 的 π rank;冷起实验判据:分布贴 obs_topk=教师踩保尾核
+   「只倾斜 π top-K 内」边界=PGS 版「只能调已有行为」)。
+5. 全开下的量级参考:倾斜位≈候选数(门率恒 1)、替换仍集中高 D 位
+   (替换数=ΣTV 不随门率线性放大)、失配增量有限(重尾 D 下门开位
+   本已占 ΣD 大头);r_max 每轮拒绝上限保留(行为态,盯 turns_capped)。

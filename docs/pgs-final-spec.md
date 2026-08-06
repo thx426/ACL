@@ -194,7 +194,22 @@ R_max=4：达到后**该轮后续位置进入 η≡0 状态**（cap-active 计�
    advantage 恒非负,不复现 mixed-objective 时代的负 advantage 事故)。
    消融留白:口径 B(两臂独立分组)、口径 C(steered 只作 baseline 不进
    梯度,W_beh 全免)、δ 驱动的 fraction 退火。
-   **v3.2 候选(用户裁定 2026-08-06,待命)**:λ± outcome 块级校正
+9. **maxopen 档(机制 v3.2,用户裁定 2026-08-06;后续默认档)**:
+   `gate_mode: always_on` + `b_max: .inf`——无门判定(每个候选位置恒
+   η=η_max)、无预算约束(spent 降为观察量),允许对 steered 臂最大程度
+   干预。裁定依据:§2.3/§2.4 的门与预算设计于**无 bare 锚、预算稀缺**的
+   v3.0 语境;v3.1 分臂(bare 臂锚 on-policy 信号)+ 环境 outcome reward
+   (最终裁决)之后,干预位置过滤的必要性大降。定量支撑:D 分布重尾
+   (P50=.0027/P99=.3033)⇒ 门开位置本已占 ΣD(∝失配)的大头,全开的
+   失配增量有限(≈+30-50% 非 ~7×);verify 本就全序列打分,全开不增
+   GPU 成本。随门退役:ε 探针(因果读数由分臂 δ 对照承担)、θ_D 标定
+   与率控自适应子系统、率告警、pacing(B=∞ 下无定义)。`adaptive` 档
+   完整保留(历史行为,指纹不变,可回摆/对照)。观察分层配套:top-16
+   分布明细仅拒绝位携带(防全开 dump 膨胀),拒绝位新增
+   `final_token_pi_rank`(重采 token 的 π rank——保尾核「只能倾斜
+   π top-K 内 token」边界的直接观察,冷起实验的关键判据)。
+   `gate_mode` 进 objective_fingerprint(adaptive 不改 material)。
+   **v3.3 候选(原 v3.2 候选顺延,用户裁定 2026-08-06,待命)**:λ± outcome 块级校正
    (`w_beh_mode: outcome_block`)——steered 成功轨迹整条乘
    λ̂+=p̂/q̂(组内 bare/steered 成功率之比,替换 per_token W 非叠乘;
    E_b[W_seq|结局] 恒等式,块级期望精确)。触发判据:δ 持续大且

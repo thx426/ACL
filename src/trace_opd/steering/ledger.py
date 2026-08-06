@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,7 +38,10 @@ class TokenSteerRecord:
     unlocked_at: float = -1.0    # 本位置时刻的累计解锁额度(pacing 审计曲线)
     draft_token: int = -1        # draft 提案 token(观察:教师把什么改成了什么)
     final_token: int = -1        # 实际执行 token(= draft 或残差重采结果)
-    # viz 下钻数据(仅 η>0 行携带;[[token_id, logprob]×16],两侧分布对比)
+    final_token_pi_rank: int = -1  # 重采 token 在 π 观测窗内的 rank(仅拒绝位;
+                                 # 冷起边界观察:贴近 obs_topk = 教师踩保尾核边界)
+    # viz 下钻数据(v3.2 起仅**拒绝位**携带,防 always_on 全开 dump 膨胀;
+    # [[token_id, logprob]×16],两侧分布对比)
     pi_top16: list | None = None
     pt_top16: list | None = None
 
@@ -127,8 +131,16 @@ class SteeringLedger:
             "steer_propensity": [r.propensity for r in self.records],
             "steer_rejected": [int(r.rejected) for r in self.records],
             "steer_cap_active": [int(r.cap_active) for r in self.records],
-            "steer_budget_after": [round(r.budget_after, 4) for r in self.records],
-            "steer_unlocked_at": [round(r.unlocked_at, 4) for r in self.records],
+            # b_max=inf(maxopen)下余额/解锁额无语义,写 −1 哨兵防 Infinity
+            # 进 JSON/曲线(math.isfinite 判空,inf 与 −1 缺省同归)。
+            "steer_budget_after": [
+                round(r.budget_after, 4) if math.isfinite(r.budget_after) else -1.0
+                for r in self.records
+            ],
+            "steer_unlocked_at": [
+                round(r.unlocked_at, 4) if math.isfinite(r.unlocked_at) else -1.0
+                for r in self.records
+            ],
             "steer_budget_spent": self.budget_spent,
             "steer_turns_capped": self.turns_capped,
             # steer_count = 实际倾斜位置数(η>0),不是记录行数——记录行还含
@@ -150,6 +162,7 @@ class SteeringLedger:
             "steer_n_pt_window_miss": self.n_pt_window_miss,
             "steer_draft_token": [r.draft_token for r in self.records],
             "steer_final_token": [r.final_token for r in self.records],
+            "steer_final_pi_rank": [r.final_token_pi_rank for r in self.records],
             "steer_ell_hist": list(self.ell_hist),
             "steer_ell_count": self.ell_count,
             # viz 全量通道与下钻数据(2026-08-04 实验侧规格)
