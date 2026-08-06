@@ -85,7 +85,8 @@ class ResearchCfg:
     enabled: bool = False
     backend: str = "external"
     tool_protocol: str = "fncall"
-    n_exp: int = 12
+    n_exp: int = 16                # 每会话实验预算(用户裁定 2026-08-06:默认
+                                   # 对齐生产配置 16;历史默认 12)
     k_default: int = 4
     k_max: int = 8
     max_turns: int = 30
@@ -97,6 +98,42 @@ class ResearchCfg:
     episode_temperature: float = 1.0
     researcher_max_tokens: int = 8192
     session_timeout_s: float = 3600.0
+
+
+@dataclass
+class ResearchRLCfg:
+    """机制 v4.0(用户裁定 2026-08-06,docs/pgs-self-researcher-design.md):
+    自体研究员双目标 RL——policy 本体扮演 researcher,每任务 research_n 个
+    独立会话产 doc,以「教师在 bare 轨迹前缀上续写的成功比例」为 reward
+    (前缀续写 = 在学生状态分布上评教师价值,DAgger 式评估分布),
+    独立 GRPO 组 joint 反传。enabled=false ⇒ v3.2 现状逐字节不变。"""
+
+    enabled: bool = False
+    research_n: int = 8            # 每任务研究会话数 = research GRPO 组大小
+    prefix_quantiles: list[float] = field(
+        default_factory=lambda: [0.05, 0.15, 0.30, 0.50, 0.75]
+    )                              # policy 生成 token(mask=1)累计比例分位;
+                                   # 不对齐 turn 边界(半轮承接是特性)
+    continuation_samples: int = 4  # 每 (doc, prefix) 续写次数 K_c(用户裁定默认 4)
+    continuation_temperature: float = 1.0   # 续写采样温度(纯 p_T,无 SPS)
+    researcher_temperature: float = 1.0     # 自体 researcher chat 温度(用户裁定
+                                   # 默认 1.0;external 35B 模式仍用
+                                   # roles.researcher.temperature)
+    research_rl_weight: float = 0.1  # λ_r:research 行 advantage 标量乘(seq-mean
+                                   # 行等权口径下即角色间权重比,无需分角色分母)
+    research_warmup_steps: int = 0   # 该步数内 research 行 advantage 置 0(不反传)
+    research_max_sample_tokens: int = 24576  # research 行超长阈:超过 ⇒ mask 全 0
+                                   # (零梯度,r 留组内 baseline,doc 照用)
+
+    def __post_init__(self) -> None:
+        for f in ("continuation_temperature", "researcher_temperature",
+                  "research_rl_weight"):
+            setattr(self, f, float(getattr(self, f)))
+        self.research_n = int(self.research_n)
+        self.continuation_samples = int(self.continuation_samples)
+        self.research_warmup_steps = int(self.research_warmup_steps)
+        self.research_max_sample_tokens = int(self.research_max_sample_tokens)
+        self.prefix_quantiles = [float(q) for q in self.prefix_quantiles]
 
 
 @dataclass
@@ -333,6 +370,7 @@ class SteeringCfg:
 class Config:
     run: RunCfg
     research: ResearchCfg
+    research_rl: ResearchRLCfg
     narration: NarrationCfg
     roles: dict[str, RoleCfg]
     episode: EpisodeCfg
@@ -361,7 +399,8 @@ def _build(dc, d: dict[str, Any]):
 
 
 _KNOWN_SECTIONS = {
-    "run", "research", "narration", "roles", "episode", "alfworld", "train", "eval", "steering"
+    "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
+    "train", "eval", "steering"
 }
 
 
@@ -407,6 +446,7 @@ def _validate(cfg: "Config") -> None:
                 raise ValueError(
                     "gate_mode=always_on 时 θ_D 无语义,须显式 gate_adaptive: false"
                 )
+
         if st.doc_source == "static" and not st.doc_table:
             raise ValueError(
                 "steering.enabled 且 doc_source=static 需要 doc_table(task_id→doc jsonl)"
@@ -539,6 +579,41 @@ def _validate(cfg: "Config") -> None:
             if problems:
                 raise ValueError("invalid researcher doc source:\n  - " + "\n  - ".join(problems))
 
+    rrl = cfg.research_rl
+    if rrl.enabled:
+        # v4 自体研究员依赖 researcher 文档基建与 steering 教师面
+        # (docs/pgs-self-researcher-design.md §5)。
+        if not (st.enabled and st.doc_source == "researcher" and cfg.research.enabled):
+            raise ValueError(
+                "research_rl.enabled 要求 steering.enabled + doc_source=researcher "
+                "+ research.enabled(自体研究员复用 researcher 会话基建)"
+            )
+        if rrl.research_n < 2:
+            raise ValueError(
+                f"research_rl.research_n 必须 >= 2(组间对比),得到 {rrl.research_n}"
+            )
+        qs = rrl.prefix_quantiles
+        if not qs or any(not (0.0 < q < 1.0) for q in qs) or sorted(qs) != qs:
+            raise ValueError(
+                f"research_rl.prefix_quantiles 必须是 (0,1) 内升序非空列表,得到 {qs!r}"
+            )
+        if rrl.continuation_samples < 1:
+            raise ValueError(
+                f"research_rl.continuation_samples 必须 >= 1,得到 {rrl.continuation_samples}"
+            )
+        for name in ("continuation_temperature", "researcher_temperature"):
+            v = getattr(rrl, name)
+            if not (math.isfinite(v) and v > 0):
+                raise ValueError(f"research_rl.{name} 必须是有限正数,得到 {v!r}")
+        if not (math.isfinite(rrl.research_rl_weight) and rrl.research_rl_weight >= 0):
+            raise ValueError(
+                f"research_rl.research_rl_weight 必须是非负有限数,得到 {rrl.research_rl_weight!r}"
+            )
+        if rrl.research_warmup_steps < 0 or rrl.research_max_sample_tokens < 1:
+            raise ValueError(
+                "research_rl.research_warmup_steps 须 >=0 且 research_max_sample_tokens 须 >=1"
+            )
+
 
 def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
     """Apply ``section.key=value`` overrides onto a parsed config dict.
@@ -660,6 +735,18 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 条件追加:adaptive(历史行为)不改 material。
     if st.enabled and st.gate_mode != "adaptive":
         material += f"|gate_mode={st.gate_mode}"
+    # v4 自体研究员(research_rl)改变优化目标(双 RL 目标 + 教师文档来源
+    # 从共享单会话换为组内 argmax),全套进指纹;条件追加保历史指纹。
+    rrl = cfg.research_rl
+    if rrl.enabled:
+        material += "|" + "|".join(
+            str(x) for x in (
+                "research_rl", rrl.research_n, rrl.prefix_quantiles,
+                rrl.continuation_samples, rrl.continuation_temperature,
+                rrl.researcher_temperature, rrl.research_rl_weight,
+                rrl.research_warmup_steps, rrl.research_max_sample_tokens,
+            )
+        )
     if st.doc_source == "researcher":
         rcfg, ncfg, role = cfg.research, cfg.narration, cfg.role("researcher")
         research_material = {
@@ -722,6 +809,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     cfg = Config(
         run=_build(RunCfg, data.get("run") or {}),
         research=_build(ResearchCfg, data.get("research") or {}),
+        research_rl=_build(ResearchRLCfg, data.get("research_rl") or {}),
         narration=_build(NarrationCfg, data.get("narration") or {}),
         roles=roles,
         episode=_build(EpisodeCfg, data.get("episode") or {}),

@@ -20,7 +20,48 @@ session_id 允许缺失(兼容 V0 等不传 session_id 的调用路径)。
 """
 from __future__ import annotations
 
-__all__ = ["steered_arm_count", "is_steered_arm"]
+__all__ = ["steered_arm_count", "is_steered_arm", "role_of"]
+
+#: v4 行角色常量(docs/pgs-self-researcher-design.md §0)
+ROLE_BARE = "bare"
+ROLE_STEERED = "steered"
+ROLE_RESEARCH = "research"
+
+
+def role_of(
+    session_id: int | None,
+    rollout_n: int,
+    steered_fraction: float,
+    research_n: int = 0,
+) -> str:
+    """v4 三段行布局:[0, bare) bare | [bare, rollout_n) steered |
+    [rollout_n, rollout_n+research_n) research。
+
+    research_n=0 时退化为 v3.1 两段(is_steered_arm 语义);research_n>0
+    时缺 session_id / 越界一律 fail loud(行角色错配 = 训练数据静默错账)。
+    """
+    if research_n < 0:
+        raise ValueError(f"research_n must be >= 0, got {research_n}")
+    total = rollout_n + research_n
+    if research_n == 0 and steered_fraction >= 1.0:
+        return ROLE_STEERED if is_steered_arm(session_id, rollout_n, steered_fraction) else ROLE_BARE
+    if session_id is None:
+        raise RuntimeError(
+            "multi-role rollout requires a session_id per replica — the caller "
+            "did not forward it"
+        )
+    sid = int(session_id)
+    if not (0 <= sid < total):
+        raise RuntimeError(
+            f"session_id {session_id} out of range [0, {total}) — role assignment undefined"
+        )
+    if sid >= rollout_n:
+        return ROLE_RESEARCH
+    return (
+        ROLE_STEERED
+        if is_steered_arm(sid, rollout_n, steered_fraction)
+        else ROLE_BARE
+    )
 
 
 def steered_arm_count(rollout_n: int, steered_fraction: float) -> int:
