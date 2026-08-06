@@ -18,6 +18,46 @@
 run:
   name: pgs_v1              # 实验名;归档根 = runs_root/name(TRACE_RUN_DIR 由 launcher 导出)
   runs_root: /data4/ws/PGS   # 用户裁定 2026-08-04:ckpt/产物落 /data4(5.6T 余量;/data3 曾写满炸掉 C3)
+  tape: true                 # 外部 researcher 全量交互磁带；每 worker 独立 jsonl
+
+# 在线文档 producer 合同；steering.doc_source=static 时整节不参与旧指纹。
+research:
+  enabled: false             # researcher 源必须 true；static 源保持 false
+  backend: external          # PGS 只允许 external researcher
+  tool_protocol: fncall      # 强模型的 OpenAI function calling
+  n_exp: 12
+  k_default: 4
+  k_max: 8
+  max_turns: 30
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"                 # 动态源强制 off，特权 GT 不得进入 producer
+  episode_temperature: 1.0   # research 实验仍由当前 step 冻结 policy 采样
+  researcher_max_tokens: 8192
+  session_timeout_s: 3600
+
+narration:
+  backend: engine            # 复用当前 SGLang rollout engine，不依赖 vLLM 私有面
+  max_words: 1000
+  temperature: 0.3
+
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY  # 仅变量名入配置/manifest，secret 不落盘
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64       # 全局上限；16 workers 时每 worker=4
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
 
 # ---------------------------------------------------------------------------
 # Episode 协议(训练/评测同构,PG-3)
@@ -115,7 +155,8 @@ train:
 # ---------------------------------------------------------------------------
 steering:
   enabled: false
-  doc_table: ""             # task_id→doc 的 jsonl(静态特权文档源;离线制备)
+  doc_source: static         # static|researcher；缺省 static 保持既有配置/指纹兼容
+  doc_table: ""             # static 必需；researcher 允许空
   eta_max: 0.5              # 倾斜强度上限 η_max | 规范 §2.2;全词表密度比 ≤ e^{2ηc}
   c: 2.5                    # 截断参数(单点话语权限幅)| 规范 §2.1:上线前必须用
                             # 目标文档语境实测 ℓ 分布标定(G0 的 GT 语境分布不可迁移)
@@ -141,6 +182,15 @@ steering:
                             # 设计触发率 15% 居中),越界告警不自动调(冻结语义)
   r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
   w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
+  # ---- 分臂采样(机制 v3.1;用户裁定 2026-08-06,进 objective_fingerprint)----
+  # 每任务 n 个 rollout 的 steered 臂占比:round(n×fraction) 个副本走 SPS
+  # 倾斜采样,其余为纯 π 的 bare 臂(空账 W≡1),同组进 GRPO。动机:全臂
+  # 干预 (a) 污染训练读数(score=E_b[R]) (b) 组内方差坍缩+负样本稀疏化
+  # (c) per-token W 的状态分布偏差随 B_∞ 放大。bare 臂恢复逐步真实读数与
+  # 原生负梯度;混合组 baseline 把"教师能成/policy 失败"转成对比信号。
+  # 曲线:rollout_extra/{won_bare_rate,won_steered_rate,steer_arm_gap}/mean。
+  # 1.0=历史全臂(不进指纹,既有 run 可续);gap→0 是文档退场信号(退火二版)。
+  steered_fraction: 0.5
   # ---- 预算解锁曲线(pacing;2026-08-05 用户裁定,修 s1 头部坍缩。
   # docs/pgs-budget-pacing-design.md;三键均进 objective_fingerprint)----
   budget_pacing: false      # true: unlocked(t)=U0+(B−U0)·[1−(1−t/T_max)^p],花费只动

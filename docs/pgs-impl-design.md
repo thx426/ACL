@@ -164,3 +164,39 @@ P4   ⏳ 真机冒烟 —— 162 被 C3 占（step 38/97，~08-05/06 完）；A8
 
 **运行时终验**(替代无法本地复现的分布式数据流):s1 首个有 steer 的 step,
 swanlab `actor/rollout_is_weight_off1_frac` 必须 >0(run-guide 步骤⑤ 首查项)。
+
+## 9. 分臂采样(机制 v3.1;用户裁定 2026-08-06,规范附注第 8 条)
+
+**动机**:全臂干预的三重问题——训练 score 测 E_b[R] 污染逐步能力读数;
+组内成功率被抬升 ⇒ GRPO 组内方差坍缩 + policy 自然失败样本稀疏化(负梯度
+从高频低幅劣化为低频高幅);per-token W_beh 不校正前缀测度,命题 C 一阶
+偏差项随 B_∞ 线性放大(400 vs 20 ⇒ 20×)。分臂恢复 bare 读数与原生负
+梯度,混合组 baseline 把"教师能成/policy 失败"转成对比信号;等价于
+**轨迹级 50% 探针**(token 级 ε 探针保留在 steered 臂内)。
+
+**实现链**(全部有单测):
+
+1. `steering/arms.py`:`steered_arm_count = round(n×fraction)`;
+   `is_steered_arm(session_id, n, fraction)` 前缀切分。fraction<1 时
+   session_id 缺失/越界 **fail loud**(静默回退=整组变回全 steered,
+   正是分臂要修的污染);fraction=1.0 恒 True 且容忍 None(历史路径)。
+2. `session_id` 来源:verl TQ 层 `agent_loop_tq._run_prompt` 逐副本
+   `session_id=i` → 基类 `_run_agent_loop` 的 `**kwargs` 透传 →
+   `TraceAgentLoop.run()`(vendored 断言锁链:test_vendored_verl)。
+3. `agent_loop.run()`:bare 臂 `steer_ctx["doc"]=""` ⇒ `_make_generate`
+   走纯 EngineGenerate(零 verify/零倾斜/空账 W≡1)——复用 IF-09 的
+   "空账=全 1、schema 恒齐"路径,TQ/loss 层零改动。`doc_missing` 保持
+   任务级语义(两臂同值);臂身份独立字段 `steer_arm`(账+dump+曲线)。
+   researcher 文档仍按 (step,task) 生产一次;bare 臂 await 同一共享任务
+   只为携带同一份 research_fields(schema 恒齐),文档不注入。
+4. 曲线:`metric_utils.compute_rollout_extra_metrics` 产
+   `won_bare_rate`(去混杂能力读数)/`won_steered_rate`/`steer_arm_gap`
+   (δ=q−p,教师在线增益;空臂批跳过不发 NaN)。
+5. 指纹:fraction=1.0 不进 material(既有 run 指纹逐字节不变可续);
+   <1.0 追加 ⇒ 换指纹换 run_dir。
+
+**已知次级效应与留白**(规范附注第 8 条):steered 正信号放大/bare 珍贵
+成功稀释(观察不预修);消融留白 = 口径 B(两臂独立组)/口径 C(steered
+只作 baseline,W_beh 全免)/δ 驱动 fraction 退火。**θ_D 自适应只吃
+steered 臂的 D 观测**:每 worker 每 step 观测量减半,min_obs=500 下更新
+周期约 4→7 step(预期内,changelog 已告知实验侧)。

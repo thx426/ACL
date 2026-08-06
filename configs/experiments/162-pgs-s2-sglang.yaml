@@ -167,6 +167,15 @@ steering:
   r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
   w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
                             # (消融开关,规范 §2.6)
+  # ---- 分臂采样(机制 v3.1;用户裁定 2026-08-06,进 objective_fingerprint)----
+  # 每任务 n 个 rollout 的 steered 臂占比:round(n×fraction) 个副本走 SPS
+  # 倾斜采样,其余为纯 π 的 bare 臂(空账 W≡1),同组进 GRPO。动机:全臂
+  # 干预 (a) 污染训练读数(score=E_b[R]) (b) 组内方差坍缩+负样本稀疏化
+  # (c) per-token W 的状态分布偏差随 B_∞ 放大。bare 臂恢复逐步真实读数与
+  # 原生负梯度;混合组 baseline 把"教师能成/policy 失败"转成对比信号。
+  # 曲线:rollout_extra/{won_bare_rate,won_steered_rate,steer_arm_gap}/mean。
+  # 1.0=历史全臂(不进指纹,既有 run 可续);gap→0 是文档退场信号(退火二版)。
+  steered_fraction: 0.5
   # ---- 预算解锁曲线(pacing;2026-08-05 用户裁定,修 s1 头部坍缩:98.7% 干预
   # 堆 turn 0 前 0.4%。docs/pgs-budget-pacing-design.md)----
   budget_pacing: true       # unlocked(t)=U0+(B−U0)·[1−(1−t/T_max)^p];花费只动已

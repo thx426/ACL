@@ -32,6 +32,83 @@ def _expand(value: Any) -> Any:
 
 
 @dataclass
+class RoleCfg:
+    """外部模型角色的连接配置；密钥只由环境变量在运行期解析。"""
+
+    endpoint: str = ""
+    model: str = ""
+    api_key: str = ""
+    api_key_env: str = ""
+    max_concurrency: int = 8
+    temperature: float = 0.7
+    max_tokens: int = 1024
+    timeout_s: float = 300.0
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    sidecar_sleep: bool = False
+    sidecar_sleep_level: int = 1
+    dp_size: int = 0
+    mode: str = "local_sidecar"
+
+    _KNOWN_KEYS = {
+        "endpoint", "model", "api_key_env", "max_concurrency",
+        "temperature", "max_tokens", "timeout_s", "extra_body", "sidecar_sleep",
+        "sidecar_sleep_level", "dp_size", "mode",
+    }
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "RoleCfg":
+        unknown = set(d) - RoleCfg._KNOWN_KEYS
+        if unknown:
+            raise ValueError(f"role config: unknown keys {sorted(unknown)}")
+        api_key_env = str(d.get("api_key_env", "") or "")
+        return RoleCfg(
+            endpoint=str(d.get("endpoint", "") or ""),
+            model=str(d.get("model", "") or ""),
+            api_key=os.environ.get(api_key_env, "") if api_key_env else "",
+            api_key_env=api_key_env,
+            max_concurrency=int(d.get("max_concurrency", 8)),
+            temperature=float(d.get("temperature", 0.7)),
+            max_tokens=int(d.get("max_tokens", 1024)),
+            timeout_s=float(d.get("timeout_s", 300.0)),
+            extra_body=dict(d.get("extra_body", {}) or {}),
+            sidecar_sleep=bool(d.get("sidecar_sleep", False)),
+            sidecar_sleep_level=int(d.get("sidecar_sleep_level", 1)),
+            dp_size=int(d.get("dp_size", 0)),
+            mode=str(d.get("mode", "local_sidecar") or "local_sidecar"),
+        )
+
+
+@dataclass
+class ResearchCfg:
+    """每个(step, task)一次的在线文档生产合同。"""
+
+    enabled: bool = False
+    backend: str = "external"
+    tool_protocol: str = "fncall"
+    n_exp: int = 12
+    k_default: int = 4
+    k_max: int = 8
+    max_turns: int = 30
+    wrapup_buffer: int = 2
+    fetch_raw_limit: int = 20
+    fetch_raw_max_chars: int = 16000
+    doc_max_words: int = 3000
+    gt: str = "off"
+    episode_temperature: float = 1.0
+    researcher_max_tokens: int = 8192
+    session_timeout_s: float = 3600.0
+
+
+@dataclass
+class NarrationCfg:
+    """research 实验轨迹的叙述后端；engine 复用当前 SGLang rollout。"""
+
+    backend: str = "engine"
+    max_words: int = 1000
+    temperature: float = 0.3
+
+
+@dataclass
 class EpisodeCfg:
     """Episode protocol caps (train/research/eval isomorphic, PG-3). Entry
     points push these into core.protocol via configure_episode_caps()."""
@@ -189,6 +266,7 @@ class EvalCfg:
 class RunCfg:
     name: str = "trace_v1"
     runs_root: str = "runs"
+    tape: bool = True
 
 
 @dataclass
@@ -196,7 +274,9 @@ class SteeringCfg:
     """PGS steering 配置(规范 docs/pgs-final-spec.md)。enabled=False ⇒ 纯 bare
     rollout,与 GRPO 底座逐字节一致。"""
     enabled: bool = False
-    doc_table: str = ""            # task_id→doc 的 jsonl 表(静态特权文档源)
+    # 缺省 static 保持历史配置/指纹语义；researcher 每 step 在线产文档。
+    doc_source: str = "static"       # static | researcher
+    doc_table: str = ""            # static:task_id→doc 的 jsonl 表；researcher 可空
     eta_max: float = 0.5           # 倾斜强度上限
     c: float = 2.5                 # 截断参数(单点话语权限幅;目标语境实测标定)
     b_max: float = 20.0            # D_∞ 逐轨迹预算(nats;用户裁定 2026-08-04 v2:
@@ -222,13 +302,19 @@ class SteeringCfg:
     budget_u0: float = 5.0         # pacing 初始拨付(nats;=2×δ_full,保头部纠错)
     budget_profile_power: float = 2.0  # 解锁曲线族 p:1=匀速,2=速率线性衰减(默认,
                                    # 用户提议档:预算重心前移但全程非零)
+    steered_fraction: float = 1.0  # 分臂采样(机制 v3.1,用户裁定 2026-08-06):
+                                   # 每任务 n 个 rollout 中 steered 臂占比,其余
+                                   # 副本为纯 π 的 bare 臂(空账 W≡1),同组进
+                                   # GRPO。1.0=历史全臂行为(不进指纹);<1 时
+                                   # round(n×fraction) 为 steered 数,按
+                                   # session_id 确定性分配(steering/arms.py)
 
     def __post_init__(self) -> None:
         # yaml 1.1 把 1.0e9(无符号指数)解析成字符串——数值字段一律强转,
         # 转不动就在这里死,而不是在校验/运行期比较时抛 TypeError。
         for f in ("eta_max", "c", "b_max", "theta_d", "epsilon",
                   "gate_target_rate", "gate_ema_beta",
-                  "budget_u0", "budget_profile_power"):
+                  "budget_u0", "budget_profile_power", "steered_fraction"):
             setattr(self, f, float(getattr(self, f)))
         self.topk = int(self.topk)
         self.obs_topk = int(self.obs_topk)
@@ -238,12 +324,23 @@ class SteeringCfg:
 @dataclass
 class Config:
     run: RunCfg
+    research: ResearchCfg
+    narration: NarrationCfg
+    roles: dict[str, RoleCfg]
     episode: EpisodeCfg
     alfworld: AlfworldCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
     raw: dict[str, Any]
+
+    def role(self, name: str) -> RoleCfg:
+        try:
+            return self.roles[name]
+        except KeyError as err:
+            raise KeyError(
+                f"role {name!r} not configured (roles present: {sorted(self.roles)})"
+            ) from err
 
 
 def _build(dc, d: dict[str, Any]):
@@ -255,7 +352,9 @@ def _build(dc, d: dict[str, Any]):
     return dc(**d)
 
 
-_KNOWN_SECTIONS = {"run", "episode", "alfworld", "train", "eval", "steering"}
+_KNOWN_SECTIONS = {
+    "run", "research", "narration", "roles", "episode", "alfworld", "train", "eval", "steering"
+}
 
 
 def _validate(cfg: "Config") -> None:
@@ -267,14 +366,20 @@ def _validate(cfg: "Config") -> None:
     if t.rollout_n < 1:
         raise ValueError("train.rollout_n must be >= 1")
     st = cfg.steering
+    if st.doc_source not in ("static", "researcher"):
+        raise ValueError(
+            f"steering.doc_source 必须是 static|researcher,得到 {st.doc_source!r}"
+        )
     if st.enabled:
         # 审阅 IF-13:数值面先过有限性——NaN/inf 能绕过大小比较,错误会
         # 延迟到 rollout 中段才爆。
         for name in ("eta_max", "c", "b_max", "theta_d", "epsilon"):
             if not math.isfinite(getattr(st, name)):
                 raise ValueError(f"steering.{name} 必须是有限数,得到 {getattr(st, name)!r}")
-        if not st.doc_table:
-            raise ValueError("steering.enabled 需要 doc_table(task_id→doc jsonl)")
+        if st.doc_source == "static" and not st.doc_table:
+            raise ValueError(
+                "steering.enabled 且 doc_source=static 需要 doc_table(task_id→doc jsonl)"
+            )
         if not (0.0 < st.eta_max < 1.0):
             raise ValueError(f"steering.eta_max 必须在 (0,1),得到 {st.eta_max}")
         if st.c <= 0 or st.b_max < 0:
@@ -306,11 +411,101 @@ def _validate(cfg: "Config") -> None:
             )
         if st.w_beh_mode not in ("per_token", "per_decision", "vtrace"):
             raise ValueError(f"未知 w_beh_mode {st.w_beh_mode!r}")
+        # 分臂采样(v3.1):fraction ∈ (0,1];取整后 steered 臂至少 1 个副本
+        # (=0 等价关 steering,应直接用 base 配置,拒绝歧义形态)。
+        if not (0.0 < st.steered_fraction <= 1.0):
+            raise ValueError(
+                f"steering.steered_fraction 必须在 (0,1],得到 {st.steered_fraction}"
+            )
+        if st.steered_fraction < 1.0:
+            from ..steering.arms import steered_arm_count
+
+            k = steered_arm_count(t.rollout_n, st.steered_fraction)
+            if k < 1:
+                raise ValueError(
+                    f"steering.steered_fraction={st.steered_fraction} 在 "
+                    f"rollout_n={t.rollout_n} 下取整得 0 个 steered 副本——"
+                    "全 bare 请直接用 steering.enabled=false 的 base 配置"
+                )
+            if k >= t.rollout_n:
+                raise ValueError(
+                    f"steering.steered_fraction={st.steered_fraction} 在 "
+                    f"rollout_n={t.rollout_n} 下取整得整组 steered——"
+                    "全臂请显式写 steered_fraction: 1.0"
+                )
         if st.obs_topk < st.topk:
             raise ValueError(
                 f"steering.obs_topk({st.obs_topk}) 必须 >= topk({st.topk})——"
                 "观测窗小于 S 的 K 会让候选集静默缩水"
             )
+
+        if st.doc_source == "researcher":
+            rcfg = cfg.research
+            role = cfg.roles.get("researcher")
+            problems: list[str] = []
+            if not rcfg.enabled:
+                problems.append("research.enabled 必须为 true")
+            if rcfg.backend != "external":
+                problems.append("research.backend 必须为 external")
+            if rcfg.tool_protocol != "fncall":
+                problems.append("research.tool_protocol 必须为 fncall")
+            if rcfg.gt != "off":
+                problems.append("research.gt 必须为 off")
+            if cfg.narration.backend != "engine":
+                problems.append("narration.backend 必须为 engine")
+            if t.train_batch_size != t.agent_num_workers:
+                problems.append(
+                    "train.train_batch_size 必须等于 agent_num_workers，保证同任务副本同 worker"
+                )
+            if t.agent_task_timeout_s and t.agent_task_timeout_s <= rcfg.session_timeout_s:
+                problems.append(
+                    "train.agent_task_timeout_s 必须为 0 或显著大于 research.session_timeout_s"
+                )
+            if not (0 < rcfg.k_default <= rcfg.k_max):
+                problems.append("research 需要 0 < k_default <= k_max")
+            if rcfg.max_turns < 1 or rcfg.wrapup_buffer < 0:
+                problems.append("research.max_turns>=1 且 wrapup_buffer>=0")
+            if rcfg.n_exp < 1 or rcfg.fetch_raw_limit < 0:
+                problems.append("research.n_exp>=1 且 fetch_raw_limit>=0")
+            if rcfg.fetch_raw_max_chars < 1 or rcfg.doc_max_words < 1:
+                problems.append("research.fetch_raw_max_chars/doc_max_words 必须 >=1")
+            if rcfg.researcher_max_tokens < 1:
+                problems.append("research.researcher_max_tokens 必须 >=1")
+            if not math.isfinite(rcfg.session_timeout_s) or rcfg.session_timeout_s <= 0:
+                problems.append("research.session_timeout_s 必须是有限正数")
+            if role is None:
+                problems.append("roles.researcher 缺失")
+            else:
+                if role.mode != "external_pool":
+                    problems.append("roles.researcher.mode 必须为 external_pool")
+                if role.sidecar_sleep:
+                    problems.append("roles.researcher.sidecar_sleep 必须为 false")
+                if role.dp_size != 0:
+                    problems.append("roles.researcher.dp_size 必须为 0")
+                if not role.endpoint.strip():
+                    problems.append("roles.researcher.endpoint 不能为空")
+                if not role.model.strip():
+                    problems.append("roles.researcher.model 不能为空")
+                if not role.api_key_env.strip():
+                    problems.append("roles.researcher.api_key_env 变量名不能为空")
+                if not role.api_key:
+                    problems.append(
+                        f"roles.researcher.api_key_env={role.api_key_env!r} 未设置或为空"
+                    )
+                if role.max_concurrency < 1:
+                    problems.append("roles.researcher.max_concurrency 必须 >=1")
+                if role.max_tokens < 1 or role.timeout_s <= 0 or not math.isfinite(role.timeout_s):
+                    problems.append("roles.researcher.max_tokens/timeout_s 必须为正")
+                thinking = (
+                    role.extra_body.get("chat_template_kwargs", {})
+                    .get("enable_thinking")
+                )
+                if thinking is not False:
+                    problems.append(
+                        "roles.researcher.extra_body.chat_template_kwargs.enable_thinking 必须为 false"
+                    )
+            if problems:
+                raise ValueError("invalid researcher doc source:\n  - " + "\n  - ".join(problems))
 
 
 def apply_overrides(data: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
@@ -410,6 +605,8 @@ def objective_fingerprint(cfg: "Config") -> str:
     steering 机制参数、advantage 口径与 doc 表内容全部参与:
     换其中任何一个 = 换优化目标(审阅 IF-10 扩面)。"""
     t, st = cfg.train, cfg.steering
+    # static 路径必须逐字节保持 fa11dc8 的旧材料，既有 checkpoint 才能续跑；
+    # researcher 另加 source 哨兵与非 secret 科学合同。
     material = "|".join(
         str(x) for x in (
             t.model_path, t.rollout_n, t.train_batch_size, t.lr,
@@ -422,6 +619,52 @@ def objective_fingerprint(cfg: "Config") -> str:
             st.budget_pacing, st.budget_u0, st.budget_profile_power,
         )
     )
+    # 分臂采样(v3.1)改变优化目标(组内一半样本换回 π 采样),必须进指纹;
+    # 条件追加:fraction=1.0(历史全臂)不改 material,既有 run 指纹逐字节不变
+    # (researcher source 哨兵同款先例)。
+    if st.enabled and st.steered_fraction < 1.0:
+        material += f"|steered_fraction={st.steered_fraction}"
+    if st.doc_source == "researcher":
+        rcfg, ncfg, role = cfg.research, cfg.narration, cfg.role("researcher")
+        research_material = {
+            "source": "researcher",
+            "research": {
+                "enabled": rcfg.enabled,
+                "backend": rcfg.backend,
+                "tool_protocol": rcfg.tool_protocol,
+                "n_exp": rcfg.n_exp,
+                "k_default": rcfg.k_default,
+                "k_max": rcfg.k_max,
+                "max_turns": rcfg.max_turns,
+                "wrapup_buffer": rcfg.wrapup_buffer,
+                "fetch_raw_limit": rcfg.fetch_raw_limit,
+                "fetch_raw_max_chars": rcfg.fetch_raw_max_chars,
+                "doc_max_words": rcfg.doc_max_words,
+                "gt": rcfg.gt,
+                "episode_temperature": rcfg.episode_temperature,
+                "researcher_max_tokens": rcfg.researcher_max_tokens,
+                "session_timeout_s": rcfg.session_timeout_s,
+            },
+            "narration": {
+                "backend": ncfg.backend,
+                "max_words": ncfg.max_words,
+                "temperature": ncfg.temperature,
+            },
+            "role": {
+                "model": role.model,
+                "temperature": role.temperature,
+                "max_tokens": role.max_tokens,
+                "extra_body": role.extra_body,
+                "mode": role.mode,
+                "sidecar_sleep": role.sidecar_sleep,
+                "dp_size": role.dp_size,
+            },
+        }
+        import json
+
+        material += "|" + json.dumps(
+            research_material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
 
@@ -433,11 +676,18 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     unknown = set(data) - _KNOWN_SECTIONS
     if unknown:
         raise ValueError(f"unknown top-level config sections {sorted(unknown)}")
+    roles = {
+        name: RoleCfg.from_dict(role_cfg or {})
+        for name, role_cfg in (data.get("roles") or {}).items()
+    }
     steering_raw = dict(data.get("steering") or {})
     if isinstance(steering_raw.get("gate_rate_bounds"), list):
         steering_raw["gate_rate_bounds"] = tuple(steering_raw["gate_rate_bounds"])
     cfg = Config(
         run=_build(RunCfg, data.get("run") or {}),
+        research=_build(ResearchCfg, data.get("research") or {}),
+        narration=_build(NarrationCfg, data.get("narration") or {}),
+        roles=roles,
         episode=_build(EpisodeCfg, data.get("episode") or {}),
         alfworld=_build(AlfworldCfg, data.get("alfworld") or {}),
         train=_build(TrainCfg, data.get("train") or {}),

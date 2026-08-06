@@ -6,8 +6,9 @@
   2. 记账:逐 token steering ledger 随 extra_fields 进训练端(W_beh 数据源)。
   3. 观察:每样本 dump 完整轨迹到 <run_dir>/rollouts/step_<N>[_val]/。
 
-特权文档来源 = 静态 doc 表(steering.doc_table:task_id→doc 的 jsonl;
-离线制备,无在线 researcher)。缺 doc 的任务自然退化为纯 bare(记账可见)。
+特权文档来源由 steering.doc_source 选择:static 读取 doc_table；researcher
+则每个(global_step,task_id)冻结当前 policy 跑一次在线研究，n=8 共享同一文档。
+逐任务失败降级为空文档；系统配置错误在启动前 fail-loud。
 
 环境变量(launcher 注入):
   TRACE_CONFIG          configs/*.yaml 路径(必需)
@@ -33,13 +34,26 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
 )
 
+from ..common.aio import shared_task
 from ..common.config import Config, load_config
 from ..common.hashing import response_token_hash
+from ..common.llm import make_client
+from ..common.tape import TapeWriter
 from ..core.episode import EpisodeResult, run_episode
 from ..core.template_delta import TemplateDelta, render_ids
 from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
+from ..docstore.archive import ResearchArchive
 from ..envs.alfworld.adapter import AlfworldEnvFactory
-from .backends import EngineGenerate
+from ..research.prompts import build_researcher_system
+from ..research.session import ResearchSession, SessionResult
+from ..research.toolproto import make_tool_protocol
+from ..research.tools import ToolRouter
+from ..research.versioning import (
+    assert_rollout_policy_version,
+    research_policy_version,
+)
+from ..steering.arms import is_steered_arm
+from .backends import EngineGenerate, engine_narrate_fn
 
 logger = logging.getLogger(__file__)
 
@@ -59,6 +73,25 @@ def _as_int(value: Any) -> int | None:
 def _per_worker(cap: int, workers: int) -> int:
     """配置里的并发上限是全局的;N 个 worker 进程各拿一份。"""
     return max(1, math.ceil(cap / max(1, workers)))
+
+
+def _agent_loop_worker_index() -> int | None:
+    """从 verl 的命名 actor 取稳定 worker index；非 Ray 调用保留池默认策略。"""
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return None
+        name = ray.get_runtime_context().get_actor_name() or ""
+    except Exception:  # noqa: BLE001——身份不可用时只降级调度，不影响机制
+        return None
+    prefix = "agent_loop_worker_"
+    if not name.startswith(prefix):
+        return None
+    try:
+        return int(name[len(prefix):].split("_", 1)[0])
+    except ValueError:
+        return None
 
 
 def _load_doc_table(path: str) -> dict[str, str]:
@@ -96,9 +129,37 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         )
         doc_table: dict[str, str] = {}
         gate_tracker = None
+        researcher_client = None
         if config.steering.enabled:
-            doc_table = _load_doc_table(config.steering.doc_table)
-            logger.info("steering doc table loaded: %d tasks", len(doc_table))
+            if config.steering.doc_source == "static":
+                doc_table = _load_doc_table(config.steering.doc_table)
+                logger.info("steering doc table loaded: %d tasks", len(doc_table))
+            else:
+                role = config.role("researcher")
+                # 配置并发是全局上限，按 agent worker 分摊；绝不按 n=8 副本放大。
+                role.max_concurrency = _per_worker(role.max_concurrency, workers)
+                pid = os.getpid()
+                tape = (
+                    TapeWriter(run_dir / "tape" / f"researcher.{pid}.jsonl")
+                    if config.run.tape else None
+                )
+                worker_index = _agent_loop_worker_index()
+                researcher_client = make_client(
+                    "researcher",
+                    role,
+                    tape=tape,
+                    pool_start_index=worker_index,
+                )
+                logger.info(
+                    "dynamic researcher ready: model=%s concurrency/worker=%d "
+                    "worker_index=%s pool_start=%s",
+                    role.model,
+                    role.max_concurrency,
+                    worker_index,
+                    None if worker_index is None else worker_index % max(
+                        1, len([e for e in role.endpoint.split(",") if e.strip()])
+                    ),
+                )
             if config.steering.gate_adaptive:
                 from ..steering.gate import GateThresholdTracker
                 from ..steering.ledger import D_HIST_BINS
@@ -124,6 +185,12 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 "factory": AlfworldEnvFactory(config.alfworld),
                 "doc_table": doc_table,
                 "gate_tracker": gate_tracker,
+                "archive": ResearchArchive(run_dir),
+                "researcher_client": researcher_client,
+                # 同一 worker/event loop 内按(step,task)共享一次 producer。
+                "research_tasks": {},
+                "executor_model_name": Path(config.train.model_path).name
+                or "the policy under training",
             }
         )
         return _STATE
@@ -139,6 +206,154 @@ class TraceAgentLoop(AgentLoopBase):
         self.factory: AlfworldEnvFactory = state["factory"]
         self.doc_table: dict[str, str] = state["doc_table"]
         self.gate_tracker = state["gate_tracker"]
+        self.archive: ResearchArchive = state["archive"]
+        self.researcher_client = state["researcher_client"]
+        self.research_tasks: dict = state["research_tasks"]
+        self.executor_model_name: str = state["executor_model_name"]
+
+    # -------------------------------------------------------------- research
+
+    def _narrate_fn(self, route: str):
+        """叙述始终复用当前 rollout engine，兼容 SGLang EngineGenerate 面。"""
+        return engine_narrate_fn(self.server_manager, self.tokenizer, request_id=route)
+
+    def _researcher_chat(self, task_id: str):
+        client = self.researcher_client
+        rcfg = self.cfg.research
+
+        async def chat(messages, tools):
+            return await client.chat(
+                messages,
+                tools=tools,
+                max_tokens=rcfg.researcher_max_tokens,
+                route_key=task_id,
+            )
+
+        return chat
+
+    async def _research(
+        self, adapter, global_step: int | None, route: str
+    ) -> tuple[str, dict[str, Any]]:
+        """在线 producer：任务级失败返回空文档；会话/实验/错误完整归档。"""
+        rcfg = self.cfg.research
+        router: ToolRouter | None = None
+        session: ResearchSession | None = None
+        result: SessionResult | None = None
+        error: str | None = None
+        try:
+            router = ToolRouter(
+                adapter=adapter,
+                research=rcfg,
+                narration=self.cfg.narration,
+                # 每个实验 episode 独立路由；均使用当前 step 冻结的 rollout policy。
+                generate_factory=lambda: EngineGenerate(
+                    self.server_manager,
+                    self.tokenizer,
+                    request_id=f"{route}:research:{uuid4().hex[:6]}",
+                ),
+                tokenizer=self.tokenizer,
+                delta=self.delta,
+                episode_response_budget=self.rollout_config.response_length,
+                narrate_fn=self._narrate_fn(route),
+            )
+            session = ResearchSession(
+                researcher_chat=self._researcher_chat(adapter.task_id),
+                toolproto=make_tool_protocol(rcfg.tool_protocol),
+                router=router,
+                system_prompt=build_researcher_system(
+                    task_brief=adapter.task_brief(),
+                    executor_model=self.executor_model_name,
+                    n_exp=rcfg.n_exp,
+                    doc_max_words=rcfg.doc_max_words,
+                    gt_text=None,
+                ),
+                max_turns=rcfg.max_turns,
+                wrapup_buffer=rcfg.wrapup_buffer,
+            )
+            result = await asyncio.wait_for(session.run(), timeout=rcfg.session_timeout_s)
+            error = result.error
+        except asyncio.TimeoutError:
+            error = f"research session exceeded {rcfg.session_timeout_s:.0f}s"
+            if session is not None:
+                result = session.snapshot(error=error)
+        except Exception as err:  # noqa: BLE001——仅任务级 producer 失败可降级
+            error = f"{type(err).__name__}: {err}"
+        if error:
+            logger.warning("research degraded for %s: %s", adapter.task_id, error)
+
+        records = list(router.state.episodes.values()) if router is not None else []
+        actual_policy_version: int | None = None
+        try:
+            actual_policy_version = research_policy_version(records)
+            if (
+                result is not None
+                and (result.experiments_used > 0 or bool(result.doc))
+                and actual_policy_version is None
+            ):
+                raise RuntimeError(
+                    "research output has no rollout policy version evidence"
+                )
+        except Exception as err:  # noqa: BLE001——版本不可信则文档不可入SPS
+            version_error = f"policy version {type(err).__name__}: {err}"
+            error = f"{error}; {version_error}" if error else version_error
+            logger.warning("research version invalid for %s: %s", adapter.task_id, err)
+
+        archive_path = ""
+        try:
+            path = await asyncio.to_thread(
+                self.archive.save,
+                task_id=adapter.task_id,
+                result=result,
+                records=records,
+                policy_version=actual_policy_version,
+                global_step=global_step,
+                extra_meta={
+                    "researcher_model": self.researcher_client.model,
+                    "tool_protocol": rcfg.tool_protocol,
+                    "narration_backend": self.cfg.narration.backend,
+                    "gt": rcfg.gt,
+                    "gt_injected": False,
+                    "error": error,
+                },
+            )
+            archive_path = str(path.relative_to(self.run_dir))
+        except Exception as err:  # noqa: BLE001——无 lineage 的文档绝不进入 SPS
+            logger.exception("research archive write failed for %s", adapter.task_id)
+            archive_error = f"archive {type(err).__name__}: {err}"
+            error = f"{error}; {archive_error}" if error else archive_error
+
+        doc = (
+            (result.doc or "")
+            if result is not None and archive_path and error is None
+            else ""
+        )
+        attempts = result.last_exp_attempts if result is not None else 0
+        fields: dict[str, Any] = {
+            "research_error": int(error is not None),
+            "research_experiments": result.experiments_used if result else 0,
+            "research_episodes": result.episodes_consumed if result else 0,
+            "research_turns": result.turns_used if result else 0,
+            "research_final_success": (
+                result.last_exp_successes / attempts if result is not None and attempts else 0.0
+            ),
+            "research_doc_words": len(doc.split()) if doc else 0,
+            "research_doc_missing": int(not doc),
+            "research_policy_version": (
+                actual_policy_version if actual_policy_version is not None else -1
+            ),
+            "research_archive": archive_path,
+        }
+        logger.info(
+            "research %s step=%s exp=%s eps=%s doc_words=%s%s archive=%s",
+            adapter.task_id,
+            global_step,
+            fields["research_experiments"],
+            fields["research_episodes"],
+            fields["research_doc_words"],
+            " ERROR" if error else "",
+            archive_path,
+        )
+        return doc, fields
 
     # --------------------------------------------------------------- prompts
 
@@ -185,23 +400,77 @@ class TraceAgentLoop(AgentLoopBase):
         extra_info = dict(kwargs["extra_info"])
         adapter = self.factory.adapter_from_item(extra_info)
         response_length = self.rollout_config.response_length
+        if (
+            self.cfg.steering.enabled
+            and self.cfg.steering.doc_source == "researcher"
+            and not validate
+            and global_step is None
+        ):
+            raise RuntimeError(
+                "dynamic researcher requires a non-null global_step for (step,task) dedupe"
+            )
         # 路由:per-episode 唯一后缀(长尾任务不锁死单 replica),轮内共享
         # 一个 key ⇒ 增长前缀的 KV 存活。
         route = f"task:{global_step}:{adapter.task_id}"
 
         steer_ctx = None
+        research_fields: dict[str, Any] = {}
         if self.cfg.steering.enabled and not validate:
+            # 分臂采样(v3.1,用户裁定 2026-08-06):session_id 由 verl TQ 层
+            # 逐副本传入,round(n×fraction) 个副本走 steered 臂,其余为纯 π
+            # 的 bare 臂——同组进 GRPO,恢复 bare 逐步读数与原生负梯度,
+            # 混合组 baseline 把"教师能成/policy 失败"的差距转成对比信号。
+            steered_arm = is_steered_arm(
+                _as_int(kwargs.get("session_id")),
+                self.cfg.train.rollout_n,
+                self.cfg.steering.steered_fraction,
+            )
             if self.gate_tracker is not None:
                 # 率控自适应:step 边界用上一 step 的 D 直方图 EMA 更新 θ_D
                 # (步内冻结;滞后一步)。
                 self.gate_tracker.maybe_step_update(global_step)
-            doc = self.doc_table.get(adapter.task_id, "")
-            steer_ctx = {"doc": doc, "doc_missing": int(not doc)}
+            if self.cfg.steering.doc_source == "researcher":
+                # student 启动前 await 文档;同 step 的 n=8 全部等待同一共享任务。
+                # bare 臂也 await:producer 按 (step,task) 只跑一次,bare 副本
+                # 等它只为携带同一份 research_fields(IF-09 批内 schema 恒齐),
+                # 文档本身不注入。
+                t_research = time.time()
+                doc, research_fields = await shared_task(
+                    self.research_tasks,
+                    (global_step, adapter.task_id),
+                    lambda: self._research(adapter, global_step, route),
+                )
+                metrics.tool_calls += time.time() - t_research
+            else:
+                doc = self.doc_table.get(adapter.task_id, "")
+            steer_ctx = {
+                # bare 臂强制空 doc ⇒ _make_generate 走纯 EngineGenerate,
+                # 零 verify、零倾斜、空账(W≡1)。doc_missing 保持任务级观测
+                # 语义(两臂同值),臂身份走独立字段。
+                "doc": doc if steered_arm else "",
+                "doc_missing": int(not doc),
+                "steered_arm": int(steered_arm),
+            }
 
         t0 = time.time()
         result = await self._student_rollout(
             adapter, sampling_params, response_length, route, steer_ctx
         )
+        if (
+            self.cfg.steering.enabled
+            and self.cfg.steering.doc_source == "researcher"
+            and not validate
+            and not research_fields.get("research_error")
+            and not research_fields.get("research_doc_missing")
+        ):
+            version = _as_int(research_fields.get("research_policy_version"))
+            if version is None or version < 0:
+                raise RuntimeError(
+                    "dynamic researcher produced a document without policy version evidence"
+                )
+            assert_rollout_policy_version(
+                result.gen_extra, version, label="student rollout"
+            )
         metrics.generate_sequences += time.time() - t0
 
         traj = result.trajectory
@@ -214,6 +483,9 @@ class TraceAgentLoop(AgentLoopBase):
 
             steer_fields["doc_missing"] = steer_ctx["doc_missing"]
             steer_fields["doc_overflow"] = steer_ctx.get("doc_overflow", 0)
+            # 分臂身份(v3.1)进账与曲线:steer_arm ∈ {0,1};聚合端
+            # (metric_utils)据此产出 won_bare/won_steered 条件率与 δ gap。
+            steer_fields["steer_arm"] = steer_ctx.get("steered_arm", 1)
             state = steer_ctx.get("state")
             # 审阅 IF-09:steering run 的每条训练轨迹都必须携带同一套 steer
             # 字段(缺 doc/超上下文的轨迹用空账 = 全 1 权重)。TQ 的
@@ -260,6 +532,7 @@ class TraceAgentLoop(AgentLoopBase):
                 "truncated": result.truncated,
                 **result.gen_extra,
                 **steer_fields,
+                **research_fields,
             },
         )
         # 曲线通道:数值标量 → swanlab(train: rollout_extra/<key>/mean)。
@@ -270,7 +543,7 @@ class TraceAgentLoop(AgentLoopBase):
             "truncated": int(result.truncated),
             **{
                 k: v
-                for k, v in steer_fields.items()
+                for k, v in {**steer_fields, **research_fields}.items()
                 if isinstance(v, (int, float)) and not isinstance(v, bool)
             },
         }
@@ -293,6 +566,11 @@ class TraceAgentLoop(AgentLoopBase):
                     "truncated": result.truncated,
                     "steering": {
                         k: v for k, v in steer_fields.items() if k != "ledger_fields"
+                    },
+                    "research": dict(research_fields),
+                    "policy_version": {
+                        "min_global_steps": result.gen_extra.get("min_global_steps"),
+                        "max_global_steps": result.gen_extra.get("max_global_steps"),
                     },
                     "trajectory": traj.to_dict(),
                     "response_token_len": len(result.tokens.response_ids),

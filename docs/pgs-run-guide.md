@@ -108,8 +108,16 @@ python trace_opd/scripts/launch_train.py \
 | 门率(`steer_n_base_open`/`steer_n_candidates`) | [5%,25%] | 滑出 ⇒ 记录,连续 10 step 出带 ⇒ 反馈 |
 | `steer_count` 均值 | ~4-8/轨迹(B_∞=20) | 恒 0 或暴涨 ⇒ 反馈 |
 | `steer_gate_alarm` | 0 | >0 持续 ⇒ 反馈 |
+| `rollout_extra/won_bare_rate/mean`(v3.1) | **主能力读数**:policy 纯 π 逐步真实成功率 | 与 val 趋势应一致;长期平 ⇒ 反馈 |
+| `rollout_extra/won_steered_rate/mean`(v3.1) | 教师臂成功率(E_b[R]) | 仅作教师增益参照,**不是能力读数** |
+| `rollout_extra/steer_arm_gap/mean`(v3.1) | δ=steered−bare,教师在线增益 | δ→0 = 文档退场信号(记录,退火二版);δ<0 持续 ⇒ 反馈 |
+| `rollout_extra/steer_arm/mean`(v3.1) | ≈ steered_fraction(0.5) | 偏离 ⇒ 臂分配失效,立即反馈 |
 | entropy | 不持续跌破 0.2 | 触发安全门(§3) |
 | val won(seen/unseen) | 臂间对比 | 单点跌 >10pp ⇒ 安全门 |
+
+⚠️ v3.1 分臂后 `rollout_extra/won/mean` 与 `critic/score/mean` 是**两臂混合值**,
+既非能力读数也非教师读数,且相对全臂 run 会**回落(挤水分,预期内)**——
+能力看 `won_bare_rate`,教师增益看 `steer_arm_gap`。
 | 响应长度/截断率 | 平稳 | 长度失控是既有崩塌前兆 |
 
 **日常离线(每天一次)**:
@@ -129,6 +137,12 @@ python trace_opd/scripts/pgs_viz.py --run-dir <run> --tokenizer $TRACE_MODEL_PAT
 轨迹页(逐 token 三态着色:蓝=候选未开门/绿=倾斜接受/红=拒绝重采并内联
 draft→final;点击 token 下钻 D vs θ_D 标尺、两侧 top-16 分布对比与倾斜后
 重算、W/预算余额;Esc 关闭)。旧 schema dump 自动降级 turn 表格模式。
+
+**训练机实时显微镜 + 本地 SSH 隧道**：完整启动、验活、端口冲突、API、停止和故障排查见
+[`docs/pgs-microscope-remote-access.md`](pgs-microscope-remote-access.md)。Dynamic researcher
+run 不得传旧 GT `--doc-table`；界面会按每条 rollout 的 `research.research_archive`
+安全载入当步 `ResearchArchive/doc.md` 与审计元数据，并明确区分 dynamic、static、bare、
+validation 和降级/归档异常状态。手工定位方法也保留在该手册中，供独立审计。
 
 **个案抽查(轻量单条)**:`pgs_traj.py <dump.json> --tokenizer ...`。
 
@@ -158,6 +172,7 @@ thought 逐字重复率 >55% / entropy 持续 <0.2 / val 单点跌 >10pp / 不�
 | `gate_rate_bounds` | [0.05,0.25] | 门率告警带 | 不动([0,1]=标定豁免) |
 | `r_max` | 4 | 每轮拒绝上限 | 不动 |
 | `w_beh_mode` | per_token | 训练纠偏口径 | 消融时(per_decision/vtrace) |
+| `steered_fraction` | 0.5(v3.1 主线) | 分臂:steered 臂占比,其余纯 π bare 臂同组进 GRPO | 1.0=历史全臂;**进指纹,改动=新 run_dir** |
 
 train 段关键:`adv_estimator: grpo_loo` + `norm_adv_by_std: false`(Dr.GRPO,
 审阅裁定主档,**两臂一致勿动**);其余训练键与 4B 主线同源,注释在模板。

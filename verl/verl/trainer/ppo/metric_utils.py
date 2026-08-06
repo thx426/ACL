@@ -444,6 +444,34 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
         arr = np.asarray(values)
         if arr.size and arr.dtype.kind in "bif":
             metrics[f"rollout_extra/{key}/mean"] = float(arr.mean())
+    # trace-opd PGS v3.1 arm-split: when the batch carries per-sample arm
+    # identity (steer_arm: 1=steered/tilted sampling, 0=bare pi sampling),
+    # emit per-arm conditional success rates and their gap. The plain
+    # rollout_extra/won/mean mixes E_b[R] with E_pi[R] and can no longer be
+    # read as either policy capability or teacher lift; these three curves
+    # restore both readings (won_bare = the de-confounded capability curve,
+    # gap = the per-step teacher lift delta = q - p).
+    if "steer_arm" in reward_extra_infos_dict and "won" in reward_extra_infos_dict:
+        arm = np.asarray(reward_extra_infos_dict["steer_arm"], dtype=np.float64)
+        won = np.asarray(reward_extra_infos_dict["won"], dtype=np.float64)
+        if arm.shape == won.shape and arm.size:
+            rates: dict[str, float] = {}
+            n_steered = float(arm.sum())
+            n_bare = float(arm.size - arm.sum())
+            if n_bare > 0:
+                rates["rollout_extra/won_bare_rate/mean"] = float(
+                    (won * (1.0 - arm)).sum() / n_bare
+                )
+            if n_steered > 0:
+                rates["rollout_extra/won_steered_rate/mean"] = float(
+                    (won * arm).sum() / n_steered
+                )
+            if n_bare > 0 and n_steered > 0:
+                rates["rollout_extra/steer_arm_gap/mean"] = (
+                    rates["rollout_extra/won_steered_rate/mean"]
+                    - rates["rollout_extra/won_bare_rate/mean"]
+                )
+            metrics.update(rates)
     return metrics
 
 

@@ -26,12 +26,15 @@ Usage (server, training venv):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -48,6 +51,177 @@ from trace_opd.common.config import (  # noqa: E402
     objective_fingerprint,
     template_drift,
 )
+from trace_opd.common.llm import OpenAICompatClient  # noqa: E402
+from trace_opd.research.toolproto import make_tool_protocol  # noqa: E402
+
+
+_PREFLIGHT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "trace_preflight_echo",
+        "description": "Return the provided nonce unchanged.",
+        "parameters": {
+            "type": "object",
+            "properties": {"nonce": {"type": "string"}},
+            "required": ["nonce"],
+            "additionalProperties": False,
+        },
+    },
+}
+_PREFLIGHT_NONCE = "trace-researcher-fncall-v1"
+
+
+def _visible_thinking(message: dict) -> str:
+    """返回 formal researcher 响应里可见的 thinking 证据；空串表示干净。"""
+    for key in ("reasoning", "reasoning_content"):
+        value = message.get(key)
+        if value not in (None, ""):
+            return f"non-empty {key}"
+    content = str(message.get("content") or "")
+    if "<think>" in content.lower() or "</think>" in content.lower():
+        return "visible <think> block"
+    return ""
+
+
+async def _preflight_researcher_protocol(endpoint: str, role) -> None:
+    """在一个 endpoint 上真实验证 non-thinking OpenAI fncall 两轮往返。"""
+    client = OpenAICompatClient(
+        role="researcher-preflight",
+        endpoint=endpoint,
+        model=role.model,
+        api_key=role.api_key,
+        max_concurrency=1,
+        temperature=0.0,
+        max_tokens=256,
+        timeout_s=min(float(role.timeout_s), 120.0),
+        max_retries=0,
+        extra_body=role.extra_body,
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "This is a transport preflight. Do not reason aloud. Call "
+                "trace_preflight_echo exactly once with nonce "
+                + _PREFLIGHT_NONCE
+                + ". After its result arrives, respond exactly PREFLIGHT_OK."
+            ),
+        },
+        {"role": "user", "content": "Perform the required tool call now."},
+    ]
+    try:
+        first = await client.chat(messages, tools=[_PREFLIGHT_TOOL])
+        thinking = _visible_thinking(first.raw_message)
+        if thinking:
+            raise RuntimeError(f"thinking mode is not disabled ({thinking})")
+        if len(first.tool_calls) != 1:
+            raise RuntimeError(
+                f"expected exactly one tool call, got {len(first.tool_calls)}"
+            )
+        call = first.tool_calls[0]
+        if call.name != "trace_preflight_echo" or call.arguments != {
+            "nonce": _PREFLIGHT_NONCE
+        }:
+            raise RuntimeError(
+                f"malformed tool call name/arguments: {call.name!r} {call.arguments!r}"
+            )
+        protocol = make_tool_protocol("fncall")
+        assistant = protocol.canonicalize_assistant(first)
+        messages.extend(
+            [
+                assistant,
+                protocol.tool_result_message(
+                    call,
+                    json.dumps(
+                        {"nonce": _PREFLIGHT_NONCE}, separators=(",", ":")
+                    ),
+                ),
+            ]
+        )
+        second = await client.chat(messages, tools=[_PREFLIGHT_TOOL], max_tokens=64)
+        thinking = _visible_thinking(second.raw_message)
+        if thinking:
+            raise RuntimeError(f"thinking mode is not disabled ({thinking})")
+        if second.tool_calls:
+            raise RuntimeError("follow-up unexpectedly requested another tool call")
+        if second.text.strip() != "PREFLIGHT_OK":
+            raise RuntimeError(
+                f"tool-result follow-up is not exact PREFLIGHT_OK: {second.text[:120]!r}"
+            )
+    finally:
+        await client.aclose()
+
+
+def preflight_researcher(cfg: Config) -> None:
+    """真实启动前逐 endpoint 核验认证、模型身份与 non-thinking fncall 往返。"""
+    if not (
+        cfg.steering.enabled
+        and cfg.steering.doc_source == "researcher"
+        and cfg.research.enabled
+    ):
+        return
+    role = cfg.role("researcher")
+    if not role.api_key_env:
+        raise SystemExit("FATAL: roles.researcher.api_key_env is empty")
+    if not role.api_key:
+        raise SystemExit(
+            f"FATAL: researcher API key environment variable {role.api_key_env!r} is unset or empty"
+        )
+    endpoints = [e.strip() for e in role.endpoint.split(",") if e.strip()]
+    healthy: list[str] = []
+    errors: list[str] = []
+    for endpoint in endpoints:
+        url = endpoint.rstrip("/") + "/models"
+        request = urllib.request.Request(url)
+        if role.api_key:
+            request.add_header("Authorization", f"Bearer {role.api_key}")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            served = {str(row.get("id")) for row in payload.get("data", [])}
+            if role.model not in served:
+                errors.append(f"{url}: model {role.model!r} not served ({sorted(served)})")
+                continue
+            asyncio.run(_preflight_researcher_protocol(endpoint, role))
+            healthy.append(endpoint)
+        except Exception as err:  # noqa: BLE001——汇总所有 endpoint 便于一次修齐
+            errors.append(f"{url}: {err}")
+    for message in errors:
+        print(f"[preflight] WARNING researcher endpoint unhealthy — {message}")
+    # external_pool 的并发容量是实验合同；真实启动要求 N/N 全健康，
+    # 不能以 failover 为借口静默少一半 producer 吞吐。
+    if len(healthy) != len(endpoints):
+        raise SystemExit(
+            f"FATAL: researcher endpoint pool is not fully healthy "
+            f"({len(healthy)}/{len(endpoints)}): " + " | ".join(errors)
+        )
+    print(
+        f"[preflight] researcher OK: {role.model} @ "
+        f"{len(healthy)}/{len(endpoints)} endpoint(s) healthy: {', '.join(healthy)}"
+    )
+
+
+def preflight_static_doc_table(path: str) -> None:
+    """正式启动前核验静态 doc 表存在、非空且每行满足 task_id/doc 合同。"""
+    table = Path(path)
+    if not table.is_file():
+        raise SystemExit(f"FATAL: steering.doc_table {table} does not exist")
+    rows = 0
+    try:
+        with table.open(encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict) or "task_id" not in row:
+                    raise ValueError(f"line {line_no}: missing task_id")
+                if "doc" not in row:
+                    raise ValueError(f"line {line_no}: missing doc")
+                rows += 1
+    except Exception as err:  # noqa: BLE001——坏 JSON/编码/缺键均启动前拒绝
+        raise SystemExit(f"FATAL: invalid steering.doc_table {table}: {err}") from err
+    if rows == 0:
+        raise SystemExit(f"FATAL: steering.doc_table {table} is empty")
 
 
 def build_command(cfg: Config, run_dir: Path) -> list[str]:
@@ -222,12 +396,40 @@ def main() -> int:
     if not runs_root.is_absolute():
         runs_root = ROOT / runs_root
     run_dir = runs_root / cfg.run.name
+    fingerprint = objective_fingerprint(cfg)
+
+    # 改 objective 的 Hydra passthrough 无论 dry-run/正式都必须拒绝；科学键只走 --set。
+    objective_prefixes = ("algorithm.",)
+    objective_substrings = (
+        "loss_agg_mode", "adv_estimator", "optim.lr", "ppo_epochs",
+        "ppo_mini_batch_size", "train_files",
+    )
+    for item in passthrough:
+        key = item.split("=", 1)[0].lstrip("+")
+        if key.startswith(objective_prefixes) or any(sub in key for sub in objective_substrings):
+            raise SystemExit(
+                f"FATAL: passthrough override {item!r} changes the optimisation "
+                "objective but bypasses the fingerprint — use --set (config-level) instead"
+            )
+
+    # dry-run 是真正无副作用模式：严验配置、算指纹/命令并打印；不网络、不写盘。
+    if args.dry_run:
+        cmd = build_command(cfg, run_dir) + list(passthrough)
+        print(f"[launch] objective fingerprint: {fingerprint}")
+        print(f"[launch] dry-run run_dir={run_dir}")
+        print("[launch] " + " ".join(shlex.quote(c) for c in cmd))
+        return 0
+
+    # 正式依赖门必须先于 mkdir/effective/fingerprint，失败不污染 run_dir。
+    preflight_researcher(cfg)
+    if cfg.steering.enabled and cfg.steering.doc_source == "static":
+        preflight_static_doc_table(cfg.steering.doc_table)
+
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve template + profiles + overrides ONCE, write the result, and point
     # every consumer at that file (two readers resolving "the config"
     # differently is the same class of failure as an env var shadowing a file).
-    fingerprint = objective_fingerprint(cfg)
     effective_path = run_dir / "effective_config.yaml"
     header = (
         "# RESOLVED CONFIG — written by launch_train.py, read by every worker.\n"
@@ -257,12 +459,6 @@ def main() -> int:
     else:
         stamp_path.write_text(fingerprint + "\n", encoding="utf-8")
     print(f"[launch] objective fingerprint: {fingerprint}")
-
-    # Steering 预检:doc 表必须在场且非空(缺表启动 = 全程纯 bare,静默跑穿)。
-    if cfg.steering.enabled and not args.dry_run:
-        table = Path(cfg.steering.doc_table)
-        if not table.is_file():
-            raise SystemExit(f"FATAL: steering.doc_table {table} does not exist")
 
     # The vendored verl is prepended to PYTHONPATH so the run imports EXACTLY
     # the patched code shipped with this repo.
@@ -314,21 +510,6 @@ def main() -> int:
         print("[launch] SWANLAB_API_KEY not set — falling back to SWANLAB_MODE=offline")
         env["SWANLAB_MODE"] = "offline"
 
-    # 审阅 IF-10:passthrough 在 fingerprint 计算之后追加——改变优化目标的
-    # 键从这里溜进去会绕过 resume 守卫(同一 run 换 objective 续训)。这类
-    # 键必须走 --set(参与校验与指纹),不许走 passthrough。
-    _OBJECTIVE_PREFIXES = ("algorithm.",)
-    _OBJECTIVE_SUBSTRINGS = (
-        "loss_agg_mode", "adv_estimator", "optim.lr", "ppo_epochs",
-        "ppo_mini_batch_size", "train_files",
-    )
-    for item in passthrough:
-        key = item.split("=", 1)[0].lstrip("+")
-        if key.startswith(_OBJECTIVE_PREFIXES) or any(sub in key for sub in _OBJECTIVE_SUBSTRINGS):
-            raise SystemExit(
-                f"FATAL: passthrough override {item!r} changes the optimisation "
-                "objective but bypasses the fingerprint — use --set (config-level) instead"
-            )
     cmd = build_command(cfg, run_dir) + list(passthrough)
     if passthrough:
         print(f"[launch] WARNING: manual verl overrides appended: {passthrough}")
@@ -346,6 +527,24 @@ def main() -> int:
         "cmd": cmd,
         "run_dir": str(run_dir),
         "agent_workers": cfg.train.agent_num_workers,
+        "doc_source": cfg.steering.doc_source,
+        "research_contract": (
+            {
+                "backend": cfg.research.backend,
+                "tool_protocol": cfg.research.tool_protocol,
+                "model": cfg.role("researcher").model,
+                "endpoint": cfg.role("researcher").endpoint,
+                "n_exp": cfg.research.n_exp,
+                "k_default": cfg.research.k_default,
+                "k_max": cfg.research.k_max,
+                "max_turns": cfg.research.max_turns,
+                "session_timeout_s": cfg.research.session_timeout_s,
+                "thinking": cfg.role("researcher").extra_body.get(
+                    "chat_template_kwargs", {}
+                ).get("enable_thinking"),
+            }
+            if cfg.steering.doc_source == "researcher" else None
+        ),
         "verl_path": verl_path or "venv",
     }
     manifest_path = run_dir / f"launch_manifest_{time.strftime('%Y%m%d_%H%M%S')}.json"
@@ -355,8 +554,6 @@ def main() -> int:
     print(f"[launch] run_dir={run_dir}")
     print(f"[launch] manifest={manifest_path}")
     print("[launch] " + " ".join(shlex.quote(c) for c in cmd))
-    if args.dry_run:
-        return 0
     return subprocess.run(cmd, env=env).returncode
 
 

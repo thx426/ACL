@@ -175,3 +175,22 @@ R_max=4：达到后**该轮后续位置进入 η≡0 状态**（cap-active 计�
    (逐位置权重 = 截至该位置的乘积,非全轨迹比乘到所有项);vtrace =
    逐点 ρ̄=1 截断(非完整 V-trace 递推,不得引用其偏差/收缩结论)。
    配置名保留,实验表述按本条精确口径。
+8. **分臂采样(v3.1,用户裁定 2026-08-06)**:每任务 n 个 rollout 按
+   `steering.steered_fraction`(默认新主线 0.5)分为 steered 臂(SPS 倾斜,
+   带 W_beh 记账)与 bare 臂(纯 π,空账 W≡1),**同组进 GRPO**(混合组
+   LOO baseline;无偏性由 LOO 独立性保证,分组口径 A)。动机三条:
+   (a) 全臂干预使训练 score 测 E_b[R] 而非 E_π[R],逐步能力读数被污染;
+   (b) 组内成功率被抬升 ⇒ 组内方差坍缩,policy 自然失败样本稀疏化——
+   负梯度从高频低幅劣化为低频高幅;(c) per-token W_beh 不校正前缀测度,
+   命题 C 的一阶偏差项 O(ρH·tanh(δ_max/2)) 随 B_∞ 线性放大(B=400 下
+   较 B=20 放大 20×),分臂将其暴露面减半(根除需 per_decision/口径 C
+   消融)。分臂等价于**轨迹级 50% 探针**:组内配对给出逐 step 的
+   δ = q_steered − p_bare(教师增益在线测量,亦是文档退场/退火二版的
+   驱动信号);token 级 ε 探针保留在 steered 臂内不变。臂分配由
+   session_id 确定性前缀切分(steering/arms.py);fraction=1.0 为历史
+   全臂行为且不进 objective_fingerprint,<1.0 进指纹(换优化目标)。
+   已知次级效应(记录观察,不预修):steered 成功正信号被混合 baseline
+   放大(credit 泄漏 ↑);bare 珍贵成功被稀释(binary reward 下
+   advantage 恒非负,不复现 mixed-objective 时代的负 advantage 事故)。
+   消融留白:口径 B(两臂独立分组)、口径 C(steered 只作 baseline 不进
+   梯度,W_beh 全免)、δ 驱动的 fraction 退火。

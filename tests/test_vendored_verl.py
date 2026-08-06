@@ -130,6 +130,28 @@ def test_wbeh_expansion_wired_on_the_tq_put_path():
     assert "per_decision" in sw and "vtrace" in sw
 
 
+def test_arm_split_session_identity_reaches_the_agent_loop():
+    # 分臂采样(v3.1)依赖 verl TQ 层逐副本传 session_id,且基类 **kwargs
+    # 透传进 agent_loop.run() —— 任一环断掉,fraction<1 的 run 会在首个
+    # rollout fail loud(arms.is_steered_arm),这里把链锁在导出树上。
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert "session_id=i" in tq
+    base = (_VERL / "experimental" / "agent_loop" / "agent_loop.py").read_text(
+        encoding="utf-8"
+    )
+    i = base.index("async def _run_agent_loop")
+    body = base[i : i + 3000]
+    assert "await agent_loop.run(" in body and "**kwargs," in body
+
+
+def test_rollout_extra_metrics_emit_per_arm_rates():
+    # 分臂曲线:聚合端必须产出 bare/steered 条件率与 gap(won/mean 已不可
+    # 作为能力读数,这三条是去混杂后的替代读数)。
+    src = _read("trainer/ppo/metric_utils.py")
+    for key in ("won_bare_rate", "won_steered_rate", "steer_arm_gap"):
+        assert key in src, key
+
+
 def test_engine_workers_loss_is_plain_ppo():
     # 训练 loss 挂接点:无蒸馏分支,恒 ppo_loss。
     src = _read("workers/engine_workers.py")

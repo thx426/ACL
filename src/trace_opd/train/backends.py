@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..core.episode import GenResult
+from ..core.template_delta import render_ids
 
 
 class EngineGenerate:
@@ -60,3 +61,18 @@ class EngineGenerate:
             text=self._tokenizer.decode(ids, skip_special_tokens=True),
             extra=extra,
         )
+
+
+def engine_narrate_fn(server_manager, tokenizer, request_id: str | None = None):
+    """在当前 rollout engine 上做单轮轨迹叙述；不假设 vLLM 私有接口。"""
+
+    async def narrate(messages: list[dict[str, Any]], temperature: float, max_tokens: int) -> str:
+        prompt_ids = render_ids(tokenizer, messages, True)
+        out = await server_manager.generate(
+            request_id=request_id or uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params={"temperature": temperature, "max_tokens": max_tokens},
+        )
+        return tokenizer.decode(list(out.token_ids), skip_special_tokens=True)
+
+    return narrate
