@@ -194,3 +194,11 @@ R_max=4：达到后**该轮后续位置进入 η≡0 状态**（cap-active 计�
    advantage 恒非负,不复现 mixed-objective 时代的负 advantage 事故)。
    消融留白:口径 B(两臂独立分组)、口径 C(steered 只作 baseline 不进
    梯度,W_beh 全免)、δ 驱动的 fraction 退火。
+   **v3.2 候选(用户裁定 2026-08-06,待命)**:λ± outcome 块级校正
+   (`w_beh_mode: outcome_block`)——steered 成功轨迹整条乘
+   λ̂+=p̂/q̂(组内 bare/steered 成功率之比,替换 per_token W 非叠乘;
+   E_b[W_seq|结局] 恒等式,块级期望精确)。触发判据:δ 持续大且
+   won_bare_rate/val 平(泄漏主导);与替换 token 数无关。λ± 在
+   p̂→0 时自动趋近口径 C ⇒ 口径 C 独立消融优先级降低。截断前缀积
+   路线已按 2026-08-06 实测出清(实际轨迹失配仅几 nats,二阶)。
+   实现速记与判据全文:docs/research-notes/lit-ocgrpo-beta-opsd.md §3。
