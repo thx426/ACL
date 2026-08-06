@@ -202,6 +202,37 @@ research_rl:
 research.enabled;行布局 rollout.n = train.rollout_n + research_n(launcher
 推导);arms 三段 = v3.1 前缀切分的推广。
 
+## 5.5 SFT 冷启动(用户裁定 2026-08-06 第二批;scripts/sftgen_researcher.py)
+
+依据「OPD/RL 只能调已有行为,SFT 是唯一引入新行为的通道」(CD-004/CD-006
+实证):v4 起跑前须以强模型会话把 policy 的 researcher 角色能力从 ≈0 拉起。
+
+**数据采样**(裁定):固定 seed(默认 42)按 benchmark 类别**分层均匀**抽
+100 任务(桶内确定性排序+shuffle、round-robin 取满,桶间差 ≤1);每任务
+**8 个独立 research 会话**(与 research_n=8 的 RL 组形态分布匹配);
+researcher = Qwen3.6-35B-A3B 端点,executor/narrator = 目标 policy 的
+推理 server。**机制参数与 v4 训练器同一配置真源**(load_config 同一份
+yaml:text 协议、researcher system prompt、n_exp=16、max_turns=30、k=4、
+researcher_temperature=1.0、episode caps 全部同源)——35B 以 policy 将要
+使用的同一协议/同一提示词采样,SFT 学到的行为形态与 RL 推理形态一致。
+
+**分层声明**(用户要求显式划分):
+| 层 | 内容 | 换 benchmark 时 |
+|---|---|---|
+| benchmark 特定 | 任务分层抽样的 family 推导(adapter.task_type)、executor scaffold / task brief(经 adapter) | 换任务抽样函数 + adapter 工厂两处([BENCHMARK-SPECIFIC] 标注) |
+| 通用机制 | research 会话循环(session/toolproto/tools/narration)、断点续跑/落盘/筛选/转换、verl multiturn SFT 训练 | 原样复用 |
+
+**转换与训练**:messages(text 协议,system/user/assistant)原样落
+parquet ⇒ verl `MultiTurnSFTDataset` 对 assistant 轮自动 loss=1、其余=0
+——零格式改造。质量筛选:finalized & doc 非空 & 无 error;报告给出
+family 分布/finalize 率/轮数与长度分位(SFT max_length 依据)。训练走
+vendored verl `sft_trainer`(通用机制,与 benchmark 无关)。
+
+**信息状态**:35B 会话无 GT(gt: off 同源),数据 = researcher 可见
+信息,无特权泄漏。**M0 探针**:SFT 后把 policy server 当 researcher
+端点,用同一 sample 子命令小规模复采(如 10 任务×2),convert 报告的
+finalize 率/长度与 35B 报告直接对比 = Go/No-Go 读数(同脚本兼做探针)。
+
 ## 6. 留白(记账不实施)
 
 随机环境 seed 契约;bare 轨迹作 researcher 可选工具;turn 级 credit;
