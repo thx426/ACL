@@ -159,6 +159,20 @@ def _analytic_b(world, *, topk, obs_topk, eta, c):
 
 # ------------------------------------------------------------------- tests
 
+def test_policy_version_range_merges_all_draft_and_verify_calls():
+    extra = {}
+    SpsGenerate._merge_policy_range(
+        extra, {"min_global_steps": 7, "max_global_steps": 7}
+    )
+    SpsGenerate._merge_policy_range(
+        extra, {"min_global_steps": 8, "max_global_steps": 8}
+    )
+    SpsGenerate._merge_policy_range(
+        extra, {"min_global_steps": 6, "max_global_steps": 9}
+    )
+    assert extra == {"min_global_steps": 6, "max_global_steps": 9}
+
+
 def test_gate_closed_is_transparent():
     world = _World(seed=2)
     hook, state, draft, verify, sp = _mk_hook(world, theta_d=1e9)

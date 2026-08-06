@@ -167,6 +167,18 @@ class SpsGenerate:
         # 前缀后继续 draft,产出停止符之后的 token。
         self._stop_ids = frozenset(int(t) for t in stop_token_ids)
 
+    @staticmethod
+    def _merge_policy_range(gen_extra: dict[str, Any], out_extra: dict[str, Any]) -> None:
+        """跨draft/verify调用合并真实引擎权重版本区间。"""
+        lo = out_extra.get("min_global_steps")
+        hi = out_extra.get("max_global_steps")
+        if lo is not None:
+            current = gen_extra.get("min_global_steps")
+            gen_extra["min_global_steps"] = lo if current is None else min(current, lo)
+        if hi is not None:
+            current = gen_extra.get("max_global_steps")
+            gen_extra["max_global_steps"] = hi if current is None else max(current, hi)
+
     # ------------------------------------------------------------------ call
 
     async def __call__(self, prompt_ids: list[int], sampling_params: dict[str, Any]):
@@ -205,9 +217,9 @@ class SpsGenerate:
                     "flat_logprobs": True,
                 },
             )
-            for key in ("min_global_steps", "max_global_steps", "stop_reason"):
-                if key in draft_out.extra:
-                    gen_extra.setdefault(key, draft_out.extra[key])
+            self._merge_policy_range(gen_extra, draft_out.extra)
+            if "stop_reason" in draft_out.extra:
+                gen_extra["stop_reason"] = draft_out.extra["stop_reason"]
             if draft_out.extra.get("stop_reason") == "aborted":
                 if not executed:
                     return draft_out  # 纯透传:episode 按基建故障处理
@@ -242,7 +254,11 @@ class SpsGenerate:
                 continue
 
             pt_rows = await self._verify_rows(
-                prompt_ids, executed, gen_ids, n_positions=len(gen_ids)
+                prompt_ids,
+                executed,
+                gen_ids,
+                n_positions=len(gen_ids),
+                gen_extra=gen_extra,
             )
 
             rejected = False
@@ -362,6 +378,7 @@ class SpsGenerate:
         gen_ids: list[int],
         *,
         n_positions: int,
+        gen_extra: dict[str, Any],
     ) -> tuple[list[list[int]], list[list[float]]]:
         """教师前缀下对 draft 段逐位置打分,返回 (ids_rows, logprob_rows)。
 
@@ -394,6 +411,7 @@ class SpsGenerate:
                 "flat_logprobs": True,
             },
         )
+        self._merge_policy_range(gen_extra, out.extra)
         if out.extra.get("stop_reason") == "aborted":
             raise RuntimeError("steering verify aborted by the engine")
         rows_ids = out.extra.get("prompt_ids")
