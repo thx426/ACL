@@ -324,19 +324,18 @@ class SpsGenerate:
                     st.reject_cap.record_reject()
                     if st.reject_cap.cap_active:
                         st.ledger.turns_capped += 1
-                # 观察明细分层(v3.2 定案,防 maxopen 全开时 dump 膨胀):
-                # top-16 分布对比只随**拒绝位**携带(物理改写点=最高语义价值;
-                # 全位置携带在 always_on 下达 ~1.5MB/轨迹)。接受位仍有完整
-                # 训练账(log_pi/log_b)与 D/η 标量;viz 对无明细行自动降级。
+                # 观察明细:两侧 top-16 随**所有倾斜位**携带(用户裁定
+                # 2026-08-06:观察细致度优先于存储——maxopen 全开下
+                # ~1.5MB/轨迹的 dump 体积为预期成本,不做瘦身)。
+                pi_top16 = [
+                    [int(t), round(float(lp), 4)]
+                    for t, lp in zip(pi_topk_ids[g][:16], pi_topk_lps[g][:16])
+                ]
+                pt_top16 = [
+                    [int(t), round(float(lp), 4)]
+                    for t, lp in zip(pt_rows[0][g][:16], pt_rows[1][g][:16])
+                ]
                 if outcome.rejected:
-                    pi_top16 = [
-                        [int(t), round(float(lp), 4)]
-                        for t, lp in zip(pi_topk_ids[g][:16], pi_topk_lps[g][:16])
-                    ]
-                    pt_top16 = [
-                        [int(t), round(float(lp), 4)]
-                        for t, lp in zip(pt_rows[0][g][:16], pt_rows[1][g][:16])
-                    ]
                     # 冷起能力边界观察:重采进来的 token 在 π 的 rank——
                     # rank 贴近观测窗尾(obs_topk)说明教师在踩「保尾核只能
                     # 倾斜 π top-K 内 token」的边界(OPD 只能调已有行为的
@@ -346,7 +345,6 @@ class SpsGenerate:
                     except ValueError:
                         final_rank = -1  # p_T 侧候选恰在 π 明细窗外(known_pi 兜底)
                 else:
-                    pi_top16 = pt_top16 = None
                     final_rank = -1
                 st.ledger.append(TokenSteerRecord(
                     position=position,

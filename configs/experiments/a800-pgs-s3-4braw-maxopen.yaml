@@ -223,7 +223,9 @@ steering:
   epsilon: 0.0              # always_on 档无门决定可翻转(校验拒绝非 0);因果
                             # 读数由分臂轨迹级对照(δ=steer_arm_gap)承担
   gate_rate_bounds: [0.0, 1.0]    # always_on 档告警语义关闭(门率恒 1)
-  r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
+  r_max: 0                  # 无上限(用户裁定 2026-08-06,v3.2 默认):干预完全按
+                            # 两分布差异进行;拒绝计数照记为观察量,尾部墙钟由
+                            # 监控兜底(cap 行为态随门/预算同批退役)
   w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
                             # (消融开关,规范 §2.6)
   # ---- 分臂采样(机制 v3.1;用户裁定 2026-08-06,进 objective_fingerprint)----

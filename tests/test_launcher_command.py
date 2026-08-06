@@ -104,7 +104,7 @@ def test_steering_config_rejects_nonfinite_and_bad_structure(tmp_path):
         return load_config(path)
 
     base = 'steering: {enabled: true, doc_table: /tmp/d.jsonl, theta_d: 0.8, %s}'
-    for bad in ("c: .inf", "eta_max: .nan", "topk: 0", "r_max: 0",
+    for bad in ("c: .inf", "eta_max: .nan", "topk: 0", "r_max: -1",
                 "gate_rate_bounds: [0.5, 0.2]", "gate_rate_bounds: [0.0, 0.3, 1.0]"):
         with pytest.raises(ValueError):
             _load(base % bad)

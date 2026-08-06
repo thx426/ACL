@@ -498,9 +498,9 @@ def test_row_misalignment_is_detectable_by_the_positional_mock():
 
 
 def test_viz_channels_recorded():
-    # viz 数据面(v3.2 分层契约):候选位置 D 数组全量;两侧 top-16 明细
-    # 只随**拒绝位**携带(防 always_on 全开时 ~1.5MB/轨迹的 dump 膨胀),
-    # 拒绝位并带 final_token_pi_rank(冷起边界观察);接受位明细为 None。
+    # viz 数据面:候选位置 D 数组全量;两侧 top-16 明细随**所有倾斜位**
+    # 携带(用户裁定 2026-08-06:观察细致度优先于存储);拒绝位另带
+    # final_token_pi_rank(冷起边界观察),接受位该字段为 -1。
     def crush_top(pt_logits, pi):
         top = int(np.argmax(pi))
         pt_logits = pt_logits.copy()
@@ -515,16 +515,16 @@ def test_viz_channels_recorded():
     assert all(p2 >= p1 for p1, p2 in zip(led.cand_positions, led.cand_positions[1:]))
     steered = [r for r in led.records if r.eta > 0]
     assert steered
+    for r in steered:
+        assert r.pi_top16 and r.pt_top16
+        assert len(r.pi_top16) <= 16 and len(r.pi_top16[0]) == 2
     rejected = [r for r in steered if r.rejected]
     assert rejected, "crush_top 教师必须制造出拒绝位,否则本测试无效"
     for r in rejected:
-        assert r.pi_top16 and r.pt_top16
-        assert len(r.pi_top16) <= 16 and len(r.pi_top16[0]) == 2
         assert r.final_token_pi_rank >= 0          # 重采 token 的 π rank 已记
         assert r.final_token != r.draft_token
     for r in steered:
         if not r.rejected:
-            assert r.pi_top16 is None and r.pt_top16 is None
             assert r.final_token_pi_rank == -1
 
 

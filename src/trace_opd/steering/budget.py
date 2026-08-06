@@ -103,18 +103,25 @@ class TrajectoryBudget:
 
 
 class TurnRejectCap:
-    """每轮拒绝计数与 cap-active 行为态（进记账；规范 §2.5）。"""
+    """每轮拒绝计数与 cap-active 行为态（进记账；规范 §2.5）。
+
+    r_max=0(机制 v3.2,用户裁定 2026-08-06)= **无上限**:cap 永不激活,
+    干预完全按两分布差异进行,不受轮内拒绝数限制——分臂 bare 锚 + outcome
+    reward 语境下最后一个行为限制装置退役。终止性不依赖 cap:SPS 拒绝后
+    重采并**前进位置**,每位置至多判定一次,循环数自然 ≤ 轨迹长度;计数
+    照记(观察量),尾部墙钟由监控而非机制截断兜底。r_max≥1 保留历史行为。
+    """
 
     def __init__(self, r_max: int = 4) -> None:
-        if r_max < 1:
-            raise ValueError(f"r_max must be >= 1, got {r_max}")
+        if r_max < 0:
+            raise ValueError(f"r_max must be >= 0 (0 = uncapped), got {r_max}")
         self.r_max = int(r_max)
         self.count = 0
 
     @property
     def cap_active(self) -> bool:
-        """达到上限 ⇒ 该轮余下位置强制 η=0（无歧义：恰 r_max 次后关闭）。"""
-        return self.count >= self.r_max
+        """达到上限 ⇒ 该轮余下位置强制 η=0(r_max=0 时恒 False,无上限)。"""
+        return self.r_max > 0 and self.count >= self.r_max
 
     def record_reject(self) -> None:
         if self.cap_active:

@@ -300,7 +300,9 @@ class SteeringCfg:
     gate_ema_beta: float = 0.1     # EMA 慢速率 β
     epsilon: float = 0.05          # ε 探针概率
     gate_rate_bounds: tuple = (0.05, 0.25)   # spec 预注册区间
-    r_max: int = 4                 # 每轮拒绝上限(行为态)
+    r_max: int = 0                 # 每轮拒绝上限;0=无上限(v3.2 默认,用户裁定
+                                   # 2026-08-06:干预不受轮内拒绝数限制,bare 臂+
+                                   # outcome reward 锚定);≥1=历史 cap 行为态
     w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace(消融开关,规范 §2.6)
     budget_pacing: bool = False    # 预算解锁曲线(2026-08-05 用户裁定,修 s1 头部坍缩;
                                    # docs/pgs-budget-pacing-design.md):false=旧行为
@@ -415,8 +417,8 @@ def _validate(cfg: "Config") -> None:
             raise ValueError("steering.c 必须 > 0 且 b_max >= 0")
         if st.topk < 1:
             raise ValueError(f"steering.topk 必须 >= 1,得到 {st.topk}")
-        if st.r_max < 1:
-            raise ValueError(f"steering.r_max 必须 >= 1,得到 {st.r_max}")
+        if st.r_max < 0:
+            raise ValueError(f"steering.r_max 必须 >= 0(0=无上限),得到 {st.r_max}")
         if st.budget_pacing:
             if st.budget_profile_power <= 0:
                 raise ValueError(

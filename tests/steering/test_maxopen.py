@@ -106,3 +106,29 @@ def test_infinite_budget_never_limits_and_still_accounts_spend():
     assert b.admissible_eta(0.5) == 0.5             # 永不缩
     with pytest.raises(ValueError, match="pacing"):
         TrajectoryBudget(b_max=float("inf"), c=2.5, pacing=True, t_max=4)
+
+
+def test_r_max_zero_means_uncapped_rejections():
+    # v3.2(用户裁定 2026-08-06):r_max=0 = 无上限——cap 永不激活,拒绝
+    # 计数照记为观察量;≥1 保留历史 cap 行为;负值拒绝。
+    from trace_opd.steering.budget import TurnRejectCap
+
+    cap = TurnRejectCap(r_max=0)
+    for _ in range(1_000):                     # 远超历史 r_max=4 的拒绝量
+        assert not cap.cap_active
+        cap.record_reject()                    # 永不因 cap_active 抛错
+    assert cap.count == 1_000 and not cap.cap_active
+    cap.new_turn()
+    assert cap.count == 0
+    legacy = TurnRejectCap(r_max=2)            # 历史行为不受 0 语义影响
+    legacy.record_reject(); legacy.record_reject()
+    assert legacy.cap_active
+    with pytest.raises(ValueError, match="r_max"):
+        TurnRejectCap(r_max=-1)
+
+
+def test_config_accepts_r_max_zero_and_rejects_negative(tmp_path):
+    cfg = _load(tmp_path, steer_extra=_MAXOPEN + ", r_max: 0")
+    assert cfg.steering.r_max == 0
+    with pytest.raises(ValueError, match="r_max"):
+        _load(tmp_path, steer_extra=_MAXOPEN + ", r_max: -1")

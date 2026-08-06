@@ -203,12 +203,17 @@ R_max=4：达到后**该轮后续位置进入 η≡0 状态**（cap-active 计�
    (P50=.0027/P99=.3033)⇒ 门开位置本已占 ΣD(∝失配)的大头,全开的
    失配增量有限(≈+30-50% 非 ~7×);verify 本就全序列打分,全开不增
    GPU 成本。随门退役:ε 探针(因果读数由分臂 δ 对照承担)、θ_D 标定
-   与率控自适应子系统、率告警、pacing(B=∞ 下无定义)。`adaptive` 档
-   完整保留(历史行为,指纹不变,可回摆/对照)。观察分层配套:top-16
-   分布明细仅拒绝位携带(防全开 dump 膨胀),拒绝位新增
-   `final_token_pi_rank`(重采 token 的 π rank——保尾核「只能倾斜
-   π top-K 内 token」边界的直接观察,冷起实验的关键判据)。
-   `gate_mode` 进 objective_fingerprint(adaptive 不改 material)。
+   与率控自适应子系统、率告警、pacing(B=∞ 下无定义)、**r_max 每轮
+   拒绝上限(r_max: 0 = 无上限,用户裁定 2026-08-06 同批)**——干预
+   完全按两分布差异进行,不受轮内拒绝数限制;终止性不依赖 cap(SPS
+   拒绝后重采并前进位置,每位置至多判定一次),拒绝计数照记为观察量,
+   尾部墙钟由监控兜底。`adaptive` 档与 r_max≥1 完整保留(历史行为,
+   指纹不变,可回摆/对照)。观察面:top-16 分布明细随**所有倾斜位**
+   全量携带(用户裁定:观察细致度优先于存储,全开下 ~1.5MB/轨迹为
+   预期成本);拒绝位新增 `final_token_pi_rank`(重采 token 的 π
+   rank——保尾核「只能倾斜 π top-K 内 token」边界的直接观察,冷起
+   实验的关键判据)。`gate_mode` 进 objective_fingerprint(adaptive
+   不改 material;r_max 本就在指纹)。
    **v3.3 候选(原 v3.2 候选顺延,用户裁定 2026-08-06,待命)**:λ± outcome 块级校正
    (`w_beh_mode: outcome_block`)——steered 成功轨迹整条乘
    λ̂+=p̂/q̂(组内 bare/steered 成功率之比,替换 per_token W 非叠乘;

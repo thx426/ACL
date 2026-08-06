@@ -220,11 +220,16 @@ steered 臂的 D 观测**:每 worker 每 step 观测量减半,min_obs=500 下更
    admissible_eta 不缩、charge 永不透支、spent 照实累计(观察量);
    ledger finalize 对 budget_after/unlocked_at 的 inf 写 −1 哨兵
    (JSON/曲线安全)。
-4. 观察分层(防全开 dump 膨胀,~1.5MB→~200KB/轨迹):pi/pt_top16
-   仅**拒绝位**携带(所有模式统一;viz 对无明细行自动降级);拒绝位
-   新增 `final_token_pi_rank` → finalize `steer_final_pi_rank`(重采
-   token 的 π rank;冷起实验判据:分布贴 obs_topk=教师踩保尾核
-   「只倾斜 π top-K 内」边界=PGS 版「只能调已有行为」)。
-5. 全开下的量级参考:倾斜位≈候选数(门率恒 1)、替换仍集中高 D 位
+4. 观察面:pi/pt_top16 随**所有倾斜位**全量携带(用户裁定 2026-08-06:
+   细致度优先于存储;全开下 ~1.5MB/轨迹、n16 批 ~400MB/step、百步
+   ~40GB dump 为预期磁盘账)。拒绝位另有 `final_token_pi_rank` →
+   finalize `steer_final_pi_rank`(重采 token 的 π rank;冷起实验判据:
+   分布贴 obs_topk=教师踩保尾核「只倾斜 π top-K 内」边界=PGS 版
+   「只能调已有行为」)。
+5. r_max=0(同批裁定)= 每轮拒绝**无上限**:TurnRejectCap.cap_active
+   恒 False,计数照记观察量;终止性由位置前进保证(每位置至多一判,
+   循环数 ≤ 轨迹长度),无死循环风险;尾部墙钟改由监控兜底(盯
+   steer_reject_count 的 P99/max)。r_max≥1 保留历史 cap 行为。
+6. 全开下的量级参考:倾斜位≈候选数(门率恒 1)、替换仍集中高 D 位
    (替换数=ΣTV 不随门率线性放大)、失配增量有限(重尾 D 下门开位
-   本已占 ΣD 大头);r_max 每轮拒绝上限保留(行为态,盯 turns_capped)。
+   本已占 ΣD 大头)。
