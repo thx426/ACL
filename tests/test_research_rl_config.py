@@ -8,7 +8,7 @@ from trace_opd.common.config import load_config, objective_fingerprint
 YAML = """
 run: {name: t, runs_root: runs}
 alfworld: {data_root: /d, worker_python: /p}
-train: {model_path: /m, train_file: /t.parquet, val_files: [/v1.parquet]}
+train: {model_path: /m, train_file: /t.parquet, val_files: [/v1.parquet], agent_task_timeout_s: 0}
 eval: {}
 research: {enabled: true, backend: external, tool_protocol: fncall, gt: "off"}
 narration: {backend: engine}
