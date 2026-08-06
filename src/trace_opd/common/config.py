@@ -517,10 +517,19 @@ def _validate(cfg: "Config") -> None:
             problems: list[str] = []
             if not rcfg.enabled:
                 problems.append("research.enabled 必须为 true")
-            if rcfg.backend != "external":
-                problems.append("research.backend 必须为 external")
-            if rcfg.tool_protocol != "fncall":
-                problems.append("research.tool_protocol 必须为 fncall")
+            selfres = cfg.research_rl.enabled
+            if selfres:
+                # v4 自体研究员(engine + TextProtocol):external 角色面
+                # (endpoint/key/thinking)整体不适用,通用数值检查照旧。
+                if rcfg.backend != "engine":
+                    problems.append("research_rl 下 research.backend 必须为 engine(自体)")
+                if rcfg.tool_protocol != "text":
+                    problems.append("research_rl 下 research.tool_protocol 必须为 text")
+            else:
+                if rcfg.backend != "external":
+                    problems.append("research.backend 必须为 external")
+                if rcfg.tool_protocol != "fncall":
+                    problems.append("research.tool_protocol 必须为 fncall")
             if rcfg.gt != "off":
                 problems.append("research.gt 必须为 off")
             if cfg.narration.backend != "engine":
@@ -545,7 +554,9 @@ def _validate(cfg: "Config") -> None:
                 problems.append("research.researcher_max_tokens 必须 >=1")
             if not math.isfinite(rcfg.session_timeout_s) or rcfg.session_timeout_s <= 0:
                 problems.append("research.session_timeout_s 必须是有限正数")
-            if role is None:
+            if selfres:
+                pass                     # 自体模式无 external 角色面
+            elif role is None:
                 problems.append("roles.researcher 缺失")
             else:
                 if role.mode != "external_pool":

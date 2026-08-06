@@ -10,7 +10,7 @@ run: {name: t, runs_root: runs}
 alfworld: {data_root: /d, worker_python: /p}
 train: {model_path: /m, train_file: /t.parquet, val_files: [/v1.parquet], agent_task_timeout_s: 0}
 eval: {}
-research: {enabled: true, backend: external, tool_protocol: fncall, gt: "off"}
+research: {enabled: true, backend: engine, tool_protocol: text, gt: "off"}
 narration: {backend: engine}
 roles:
   researcher:
@@ -64,10 +64,20 @@ def test_research_rl_parameter_domains(tmp_path, monkeypatch):
 
 
 def test_research_rl_fingerprint_conditional(tmp_path, monkeypatch):
-    base = objective_fingerprint(_load(tmp_path, monkeypatch))
-    disabled = objective_fingerprint(
-        _load(tmp_path, monkeypatch, rrl_extra="research_rl: {enabled: false}")
-    )
+    # engine+text 仅在 research_rl.enabled 时合法(校验分叉),条件追加的
+    # 对照因此各用各的合法 YAML:external 基线上验证「显式 disabled 与
+    # 不写 research_rl 段指纹逐字节相同」;enabled 档验证参数进指纹。
+    ext = YAML.replace("backend: engine, tool_protocol: text",
+                       "backend: external, tool_protocol: fncall")
+
+    def _load_ext(rrl_extra=""):
+        monkeypatch.setenv("TEST_RRL_KEY", "k")
+        path = tmp_path / f"e{abs(hash(rrl_extra))}.yaml"
+        path.write_text(ext % ("", rrl_extra))
+        return load_config(path)
+
+    base = objective_fingerprint(_load_ext())
+    disabled = objective_fingerprint(_load_ext("research_rl: {enabled: false}"))
     assert disabled == base                  # 关断 = 历史指纹逐字节不变
     on = objective_fingerprint(_load(tmp_path, monkeypatch, rrl_extra=_RRL % ""))
     assert on != base                        # 开启 = 双目标,换指纹

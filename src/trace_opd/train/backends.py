@@ -63,6 +63,119 @@ class EngineGenerate:
         )
 
 
+class EngineResearcherChat:
+    """policy-as-researcher 的引擎聊天适配(v4,docs/pgs-self-researcher-design.md §1.1)。
+
+    对 ResearchSession 暴露与 external client 相同的 (messages, tools) →
+    ChatResult 契约(session.py 零改动),内部维护 **append-only token 流**
+    ——训练 token 必须 = 引擎实际采样 token(messages 重渲染有 BPE
+    roundtrip 不一致风险,历史设计红线):
+
+      * 首调:全量渲染当时 messages(system+kickoff[+reminder])+ 生成前缀
+        = 训练行 prompt_ids;
+      * 生成 token ids 原样 append(mask=1);
+      * 此后每调:diff 新增消息——assistant 轮必须逐字等于上次生成文本
+        (fail loud 防会话改写);新增 user 轮**合并**为一个 user 结构段
+        (glue + text + post_obs,mask=0;chat template 层面连续 user 的
+        安全合并,messages 归档保持原分列结构,语义一致);
+      * 会话结束由 training_row() 取 (prompt_ids, response_ids, mask)。
+
+    token 总量防线:流长逼近 max_total_tokens 时返回 finish_reason="length"
+    的空 tool 轮——会话靠轮数上限自然收敛;训练行超长降级由调用方按
+    research_max_sample_tokens 判(§1.6)。
+    """
+
+    def __init__(
+        self,
+        *,
+        generate,                     # (prompt_ids, sampling_params) -> GenResult
+        tokenizer,
+        delta,                        # core.template_delta.TemplateDelta
+        temperature: float,
+        max_tokens_per_turn: int,
+        max_total_tokens: int,
+    ) -> None:
+        self._generate = generate
+        self._tokenizer = tokenizer
+        self._delta = delta
+        self._temperature = float(temperature)
+        self._max_tokens_per_turn = int(max_tokens_per_turn)
+        self._max_total_tokens = int(max_total_tokens)
+        self.prompt_ids: list[int] = []
+        self._stream: list[int] = []          # response 流(prompt 之后)
+        self._mask: list[int] = []
+        self._seen_messages = 0
+        self._last_gen_text: str | None = None
+        self.aborted = False                  # 引擎 abort(基建故障,调用方处置)
+
+    def training_row(self) -> tuple[list[int], list[int], list[int]]:
+        return list(self.prompt_ids), list(self._stream), list(self._mask)
+
+    def _append_user_block(self, texts: list[str]) -> None:
+        """把新增 user 内容合并为一个 user 结构段(mask=0)。glue 的
+        stop-token 去重语义由 after_generation 按流尾真值处理(引擎生成
+        可能自带停止符);post_obs 末尾自带下一轮生成前缀。"""
+        if not texts:
+            return
+        merged = "\n\n".join(t for t in texts if t)
+        tail = self._stream[-1:]              # 上一段生成的最后一个 token
+        glue = self._delta.after_generation(tail)
+        obs_ids = self._tokenizer.encode(merged, add_special_tokens=False)
+        structure = glue + obs_ids + self._delta.post_obs
+        self._stream += structure
+        self._mask += [0] * len(structure)
+
+    async def __call__(self, messages: list[dict[str, Any]], tools) -> "ChatResult":
+        from ..common.llm import ChatResult
+
+        first_call = self._seen_messages == 0
+        new = messages[self._seen_messages:]
+        if first_call:
+            self.prompt_ids = render_ids(self._tokenizer, list(messages), True)
+        else:
+            user_texts: list[str] = []
+            for m in new:
+                if m["role"] == "assistant":
+                    # 会话对 assistant 轮的唯一合法来源是本对象的上一次生成
+                    if (m.get("content") or "") != (self._last_gen_text or ""):
+                        raise RuntimeError(
+                            "EngineResearcherChat: assistant message diverged from "
+                            "the engine's own generation — token stream would desync"
+                        )
+                elif m["role"] == "user":
+                    user_texts.append(str(m.get("content") or ""))
+                else:
+                    raise RuntimeError(
+                        f"EngineResearcherChat: unexpected role {m['role']!r} mid-session"
+                    )
+            self._append_user_block(user_texts)
+        self._seen_messages = len(messages)
+
+        budget = self._max_total_tokens - len(self.prompt_ids) - len(self._stream)
+        if budget < 32:
+            return ChatResult(content="", finish_reason="length")
+        gen = await self._generate(
+            self.prompt_ids + self._stream,
+            {
+                "temperature": self._temperature,
+                "max_tokens": min(self._max_tokens_per_turn, budget),
+            },
+        )
+        if gen.extra.get("stop_reason") == "aborted":
+            self.aborted = True
+            return ChatResult(content="", finish_reason="aborted")
+        gen_ids = list(gen.token_ids)
+        self._stream += gen_ids
+        self._mask += [1] * len(gen_ids)
+        self._last_gen_text = gen.text
+        return ChatResult(
+            content=gen.text,
+            prompt_tokens=len(self.prompt_ids) if first_call else 0,
+            completion_tokens=len(gen_ids),
+            finish_reason="stop",
+        )
+
+
 def engine_narrate_fn(server_manager, tokenizer, request_id: str | None = None):
     """在当前 rollout engine 上做单轮轨迹叙述；不假设 vLLM 私有接口。"""
 
