@@ -154,6 +154,8 @@ async def _preflight_researcher_protocol(endpoint: str, role) -> None:
 
 def preflight_researcher(cfg: Config) -> None:
     """真实启动前逐 endpoint 核验认证、模型身份与 non-thinking fncall 往返。"""
+    if cfg.research_rl.enabled:
+        return  # v4 自体研究员:engine-backed,无 external endpoint 可查
     if not (
         cfg.steering.enabled
         and cfg.steering.doc_source == "researcher"
@@ -322,7 +324,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         f"actor_rollout_ref.rollout.gpu_memory_utilization={t.rollout_gpu_mem}",
         # n student rollouts per task (one GRPO group); verl repeats the batch
         # and scales ppo_mini_batch_size by n internally.
-        f"actor_rollout_ref.rollout.n={t.rollout_n}",
+        # v4 自体研究员:每 prompt 行数 = executor rollout_n + research_n
+        # (三段布局 steering/arms.role_of;research 行独立 GRPO 组)
+        f"actor_rollout_ref.rollout.n={t.rollout_n + (cfg.research_rl.research_n if cfg.research_rl.enabled else 0)}",
         f"actor_rollout_ref.rollout.max_model_len={t.rollout_max_model_len}",
         # Chunked-prefill budget; also sizes the transient full-vocab logits
         # tensor vLLM materializes per chunk during prompt_logprobs scoring.

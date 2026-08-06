@@ -454,6 +454,15 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
     if "steer_arm" in reward_extra_infos_dict and "won" in reward_extra_infos_dict:
         arm = np.asarray(reward_extra_infos_dict["steer_arm"], dtype=np.float64)
         won = np.asarray(reward_extra_infos_dict["won"], dtype=np.float64)
+        # trace-opd v4: research rows carry steer_arm=0/won=0 placeholders —
+        # exclude them from the per-arm executor rates or won_bare_rate is
+        # silently diluted by rows that never faced the task.
+        if "role_research" in reward_extra_infos_dict:
+            keep = np.asarray(
+                reward_extra_infos_dict["role_research"], dtype=np.float64
+            ) < 0.5
+            if keep.shape == arm.shape:
+                arm, won = arm[keep], won[keep]
         if arm.shape == won.shape and arm.size:
             rates: dict[str, float] = {}
             n_steered = float(arm.sum())

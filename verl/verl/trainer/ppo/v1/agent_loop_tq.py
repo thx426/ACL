@@ -187,6 +187,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # OUTSIDE the PPO clip). Only steered trajectories carry the
             # ledger; everything else ships no field and trains untouched.
             extra = field.get("extra_fields") or {}
+            # trace-opd v4 (self-researcher): research rows form their own
+            # GRPO group — suffix the uid so advantage grouping (grpo_loo by
+            # uid) never mixes them with the task's executor rows. λ_r and
+            # warmup are folded into reward_score upstream (linear in the
+            # LOO-mean advantage), so this suffix is the ONLY trainer-side
+            # change the mechanism needs.
+            if extra.get("sample_role") == "research":
+                field["uid"] = f"{kwargs['uid']}:research"
             # 审阅 IF-09:判定用「PGS 协议在场」(steer_count 恒由 rollout 侧
             # finalize 写入,空账也在),而非「本轨迹有 steer 记录」——批内
             # schema 必须恒一致,空账展开为全 1 权重。

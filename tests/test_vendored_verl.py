@@ -152,6 +152,14 @@ def test_rollout_extra_metrics_emit_per_arm_rates():
         assert key in src, key
 
 
+def test_v4_research_rows_get_their_own_grpo_group():
+    # v4 自体研究员:research 行 uid 必须带 :research 后缀(独立 GRPO 组,
+    # grpo_loo 按 uid 分组)——这是机制在 trainer 侧的唯一改动,断言锁链。
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert 'extra.get("sample_role") == "research"' in tq
+    assert ':research"' in tq
+
+
 def test_engine_workers_loss_is_plain_ppo():
     # 训练 loss 挂接点:无蒸馏分支,恒 ppo_loss。
     src = _read("workers/engine_workers.py")

@@ -52,8 +52,19 @@ from ..research.versioning import (
     assert_rollout_policy_version,
     research_policy_version,
 )
-from ..steering.arms import is_steered_arm
-from .backends import EngineGenerate, engine_narrate_fn
+from ..steering.arms import ROLE_BARE, ROLE_RESEARCH, ROLE_STEERED, is_steered_arm, role_of, steered_arm_count
+from .backends import EngineGenerate, EngineResearcherChat, engine_narrate_fn
+from .selfres import CoordRegistry, TaskCoord, run_research_row
+
+#: v4 executor 行的 research 记账零占位(键集必须与 selfres.run_research_row
+#: 的 fields 一致——IF-09 批内 schema 恒齐纪律)。
+_V4_RESEARCH_ZERO: dict[str, Any] = {
+    "research_no_finalize": 0, "research_doc_words": 0, "research_turns": 0,
+    "research_experiments": 0, "research_episodes": 0, "research_error": 0,
+    "research_doc_overflow": 0, "research_valid_continuations": 0,
+    "research_degraded": 0, "research_replay_drift": 0, "research_overlong": 0,
+    "research_r_raw": 0.0, "research_warmup_active": 0,
+}
 
 logger = logging.getLogger(__file__)
 
@@ -134,6 +145,10 @@ def _shared_state(tokenizer) -> dict[str, Any]:
             if config.steering.doc_source == "static":
                 doc_table = _load_doc_table(config.steering.doc_table)
                 logger.info("steering doc table loaded: %d tasks", len(doc_table))
+            elif config.research_rl.enabled:
+                # v4 自体研究员:researcher chat 走本机引擎,无 external client
+                # (roles.researcher 已被校验豁免,不得在此求值)。
+                logger.info("v4 self-researcher: engine-backed researcher, no external client")
             else:
                 role = config.role("researcher")
                 # 配置并发是全局上限，按 agent worker 分摊；绝不按 n=8 副本放大。
@@ -189,6 +204,9 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 "researcher_client": researcher_client,
                 # 同一 worker/event loop 内按(step,task)共享一次 producer。
                 "research_tasks": {},
+                # v4 自体研究员:worker 级 (step,task)→TaskCoord 注册表
+                # (新 step 换桶回收;selfres.CoordRegistry)
+                "v4_registry": CoordRegistry(),
                 "executor_model_name": Path(config.train.model_path).name
                 or "the policy under training",
             }
@@ -209,6 +227,7 @@ class TraceAgentLoop(AgentLoopBase):
         self.archive: ResearchArchive = state["archive"]
         self.researcher_client = state["researcher_client"]
         self.research_tasks: dict = state["research_tasks"]
+        self._v4_registry: CoordRegistry = state["v4_registry"]
         self.executor_model_name: str = state["executor_model_name"]
 
     # -------------------------------------------------------------- research
@@ -391,6 +410,174 @@ class TraceAgentLoop(AgentLoopBase):
             )
         return teacher_prompt_ids
 
+    # ------------------------------------------------------- v4 research 行
+
+    async def _research_row_v4(
+        self, adapter, global_step, route, kwargs, coord, metrics, extra_info
+    ) -> AgentLoopOutput:
+        """v4 research 行:自体会话 → doc → 前缀续写评估 → 登记 → 训练行
+        (docs/pgs-self-researcher-design.md §0 尾段;编排在 train/selfres.py)。"""
+        rrl = self.cfg.research_rl
+        rcfg = self.cfg.research
+        sid = _as_int(kwargs.get("session_id"))
+        tag = f"{route}:res{sid}"
+        response_length = self.rollout_config.response_length
+
+        async def run_session():
+            chat = EngineResearcherChat(
+                generate=EngineGenerate(
+                    self.server_manager, self.tokenizer, request_id=tag
+                ),
+                tokenizer=self.tokenizer,
+                delta=self.delta,
+                temperature=rrl.researcher_temperature,
+                max_tokens_per_turn=rcfg.researcher_max_tokens,
+                max_total_tokens=max(
+                    4096, self.cfg.train.rollout_max_model_len - 2048
+                ),
+            )
+            router = ToolRouter(
+                adapter=adapter,
+                research=rcfg,
+                narration=self.cfg.narration,
+                generate_factory=lambda: EngineGenerate(
+                    self.server_manager, self.tokenizer,
+                    request_id=f"{tag}:exp:{uuid4().hex[:6]}",
+                ),
+                tokenizer=self.tokenizer,
+                delta=self.delta,
+                episode_response_budget=response_length,
+                narrate_fn=self._narrate_fn(tag),
+            )
+            session = ResearchSession(
+                researcher_chat=chat,
+                toolproto=make_tool_protocol(rcfg.tool_protocol),
+                router=router,
+                system_prompt=build_researcher_system(
+                    task_brief=adapter.task_brief(),
+                    executor_model=self.executor_model_name,
+                    n_exp=rcfg.n_exp,
+                    doc_max_words=rcfg.doc_max_words,
+                    gt_text=None,
+                ),
+                max_turns=rcfg.max_turns,
+                wrapup_buffer=rcfg.wrapup_buffer,
+            )
+            try:
+                sr = await asyncio.wait_for(
+                    session.run(), timeout=rcfg.session_timeout_s
+                )
+            except asyncio.TimeoutError:
+                sr = session.snapshot(
+                    error=f"research session exceeded {rcfg.session_timeout_s:.0f}s"
+                )
+            return sr, chat
+
+        # 教师前缀构造(对齐校验)复用 PGS 路径;student 前缀与 _make_generate
+        # 逐字节同参。
+        from ..core import protocol
+
+        student_prompt_ids = render_ids(
+            self.tokenizer,
+            [
+                {"role": "system",
+                 "content": inject_guidance(adapter.executor_scaffold(), "")},
+                {"role": "user",
+                 "content": protocol.truncate_obs(adapter.initial_obs)},
+            ],
+            True,
+        )
+        t0 = time.time()
+        rowres = await run_research_row(
+            session_id=sid,
+            global_step=int(global_step),
+            coord=coord,
+            run_session=run_session,
+            teacher_ids_for_doc=lambda d: self._teacher_prompt_ids(
+                adapter, d, student_prompt_ids, adapter.initial_obs
+            ),
+            make_generate=lambda tag2: EngineGenerate(
+                self.server_manager, self.tokenizer, request_id=f"{tag}:cont"
+            ),
+            adapter=adapter,
+            tokenizer=self.tokenizer,
+            delta=self.delta,
+            response_budget=response_length,
+            continuation_samples=rrl.continuation_samples,
+            continuation_temperature=rrl.continuation_temperature,
+            research_rl_weight=rrl.research_rl_weight,
+            research_warmup_steps=rrl.research_warmup_steps,
+            research_max_sample_tokens=rrl.research_max_sample_tokens,
+        )
+        metrics.generate_sequences += time.time() - t0
+
+        from ..steering.ledger import SteeringLedger
+
+        steer_zero = SteeringLedger(
+            d_hist_max=self.cfg.steering.c * self.cfg.steering.c
+        ).finalize()
+        fields: dict[str, Any] = {
+            "task_id": adapter.task_id,
+            "won": False,
+            "turn_spans": [],
+            "outcome": "research",
+            "env_steps": 0,
+            "invalid_format": 0,
+            "truncated": bool(rowres.fields.get("research_overlong")),
+            **steer_zero,
+            "steer_w_beh_mode": self.cfg.steering.w_beh_mode,
+            "steer_log_ratio_cap": 2.0 * self.cfg.steering.eta_max * self.cfg.steering.c,
+            "steer_theta_d": 0.0,
+            "doc_missing": 0,
+            "doc_overflow": 0,
+            "steer_arm": 0,
+            "sample_role": "research",
+            "role_research": 1,
+            **rowres.fields,
+        }
+        output = AgentLoopOutput(
+            prompt_ids=rowres.prompt_ids,
+            response_ids=rowres.response_ids,
+            response_mask=rowres.response_mask,
+            reward_score=rowres.reward_score,
+            num_turns=2 * int(rowres.fields.get("research_turns", 0)) + 1,
+            metrics=metrics,
+            extra_fields=dict(fields),
+        )
+        output.extra_fields["reward_extra_info"] = {
+            k: v for k, v in fields.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+        sr = rowres.session_result
+        try:
+            await asyncio.to_thread(
+                self._dump_rollout,
+                step=global_step,
+                validate=False,
+                payload={
+                    "task_id": adapter.task_id,
+                    "split": extra_info.get("split", ""),
+                    "validate": False,
+                    "global_step": global_step,
+                    "outcome": "research",
+                    "sample_role": "research",
+                    "session_id": sid,
+                    "research": dict(rowres.fields),
+                    "doc": (sr.doc or "") if sr is not None else "",
+                    "messages": list(sr.messages) if sr is not None else [],
+                    "continuations": [
+                        {"won": o.won, "error": o.error, "env_steps": o.env_steps,
+                         "gen_tokens": o.gen_tokens, "truncated": o.truncated}
+                        for o in rowres.outcomes
+                    ],
+                    "response_token_len": len(rowres.response_ids),
+                    "ts": time.time(),
+                },
+            )
+        except Exception:  # noqa: BLE001 — dump 永不搞挂样本
+            logger.exception("research row dump failed for %s", adapter.task_id)
+        return output
+
     # ------------------------------------------------------------------ run
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -413,9 +600,61 @@ class TraceAgentLoop(AgentLoopBase):
         # 一个 key ⇒ 增长前缀的 KV 存活。
         route = f"task:{global_step}:{adapter.task_id}"
 
+        # ---- v4 自体研究员分流(docs/pgs-self-researcher-design.md §0)----
+        # research 行完全独立路径;executor 行注入 v4 上下文后重入本方法
+        # (现有 v3.1/v3.2 组装路径零复制)。validate 照常 bare greedy。
+        if (
+            self.cfg.research_rl.enabled
+            and not validate
+            and "_v4_role" not in kwargs
+        ):
+            role = role_of(
+                _as_int(kwargs.get("session_id")),
+                self.cfg.train.rollout_n,
+                self.cfg.steering.steered_fraction,
+                self.cfg.research_rl.research_n,
+            )
+            rrl = self.cfg.research_rl
+            bare_expected = self.cfg.train.rollout_n - steered_arm_count(
+                self.cfg.train.rollout_n, self.cfg.steering.steered_fraction
+            )
+            coord = await self._v4_registry.get(
+                int(global_step), adapter.task_id,
+                lambda: TaskCoord(
+                    bare_expected=bare_expected,
+                    research_expected=rrl.research_n,
+                    quantiles=rrl.prefix_quantiles,
+                    tokenizer=self.tokenizer,
+                ),
+            )
+            if role == ROLE_RESEARCH:
+                return await self._research_row_v4(
+                    adapter, global_step, route, kwargs, coord, metrics, extra_info
+                )
+            kwargs["_v4_role"], kwargs["_v4_coord"] = role, coord
+            return await self.run(sampling_params, **kwargs)
+
         steer_ctx = None
         research_fields: dict[str, Any] = {}
-        if self.cfg.steering.enabled and not validate:
+        v4_coord = kwargs.get("_v4_coord")
+        if v4_coord is not None:
+            # v4 executor 行:bare 立即起跑(零依赖),steered 等 argmax doc;
+            # research_fields 用零占位保批内 schema 恒齐(键集与 research 行
+            # 的 fields 一致)。
+            steered_arm = kwargs["_v4_role"] == ROLE_STEERED
+            if steered_arm:
+                doc, _r_star = await v4_coord.argmax_future
+            else:
+                doc = ""
+            research_fields = dict(_V4_RESEARCH_ZERO)
+            research_fields["role_research"] = 0
+            research_fields["sample_role"] = kwargs["_v4_role"]
+            steer_ctx = {
+                "doc": doc if steered_arm else "",
+                "doc_missing": int(not doc) if steered_arm else 0,
+                "steered_arm": int(steered_arm),
+            }
+        elif self.cfg.steering.enabled and not validate:
             # 分臂采样(v3.1,用户裁定 2026-08-06):session_id 由 verl TQ 层
             # 逐副本传入,round(n×fraction) 个副本走 steered 臂,其余为纯 π
             # 的 bare 臂——同组进 GRPO,恢复 bare 逐步读数与原生负梯度,
@@ -456,8 +695,23 @@ class TraceAgentLoop(AgentLoopBase):
         result = await self._student_rollout(
             adapter, sampling_params, response_length, route, steer_ctx
         )
+        if v4_coord is not None and kwargs["_v4_role"] == ROLE_BARE:
+            # v4:bare 行终态登记进前缀池(第 bare_expected 条 resolve)。
+            traj = result.trajectory
+            v4_coord.register_bare({
+                "won": traj.won,
+                "response_ids": list(result.tokens.response_ids),
+                "response_mask": list(result.tokens.response_mask),
+                "turn_spans": [list(x) for x in result.tokens.turn_spans],
+                "steps": [
+                    {"action_norm": s.action_norm, "observation": s.observation,
+                     "acted": s.acted}
+                    for s in traj.steps
+                ],
+            })
         if (
-            self.cfg.steering.enabled
+            v4_coord is None
+            and self.cfg.steering.enabled
             and self.cfg.steering.doc_source == "researcher"
             and not validate
             and not research_fields.get("research_error")

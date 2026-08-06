@@ -47,6 +47,20 @@ def test_default_profile_and_rollout_n(tmp_path):
     assert not any(c.endswith("token_len_per_gpu=34816") for c in cmd)
 
 
+def test_v4_research_rows_extend_rollout_n(tmp_path):
+    # v4:rollout.n = rollout_n + research_n(三段布局);关断时保持原值。
+    steer = (
+        "steering: {enabled: true, doc_source: researcher, theta_d: 0.8}\n"
+        "research: {enabled: true, backend: engine, tool_protocol: text, gt: \"off\"}\n"
+        "narration: {backend: engine}\n"
+        "research_rl: {enabled: true, research_n: 8}"
+    )
+    cmd = _cmd(tmp_path, ", rollout_n: 16, agent_task_timeout_s: 0", steer)
+    assert "actor_rollout_ref.rollout.n=24" in cmd
+    cmd0 = _cmd(tmp_path, ", rollout_n: 16")
+    assert "actor_rollout_ref.rollout.n=16" in cmd0
+
+
 def test_pgs_loss_surface_is_plain_grpo(tmp_path):
     # PGS: the loss is plain GRPO — a distillation KEY in the launch command
     # means dead config resurrected somewhere. (Match on the key side only:
