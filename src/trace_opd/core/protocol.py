@@ -132,6 +132,17 @@ def parse_tool_calls(assistant_text: str) -> list[dict]:
     return calls
 
 
+def fc_format_reminder(*tool_names: str) -> str:
+    """FC 协议 benchmark 的标准格式提醒(parse_tool_calls 的配套件;
+    单一维护点,各 benchmark 传自己的工具名列表)。"""
+    return (
+        "(Your reply contained no valid tool call. End your message with "
+        "exactly one block of the form "
+        '<tool_call>{"name": <function-name>, "arguments": <args-json-object>}'
+        f"</tool_call>. Available functions: {', '.join(tool_names)}.)"
+    )
+
+
 def strip_tool_calls(assistant_text: str) -> str:
     """去除全部 tool_call 块后的剩余文本(react 的 thought 记账用;
     parse_tool_calls 的配套公共件——各 benchmark 勿引私有正则)。"""

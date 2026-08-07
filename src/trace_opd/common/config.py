@@ -175,7 +175,9 @@ class AppworldCfg:
     max_interactions: int = 50      # 传给引擎的交互硬上限(episode 步预算仍由
                                     # episode.max_env_steps 主导,此为引擎侧兜底)
     start_timeout_s: float = 180.0  # worker boot(载 world)超时
-    exec_timeout_s: float = 90.0    # 单次 execute/evaluate 超时
+    exec_timeout_s: float = 90.0    # 单次 execute 超时
+    eval_timeout_s: float = 300.0   # 终局 evaluate 超时(unit-test 走查可能
+                                    # 远慢于单步 execute;一次性,宽松无害)
     obs_max_chars: int = 3000       # worker 侧输出截断(token 流预算适配;
                                     # 旧引入"不截断"裁定在 API 客户端形态,
                                     # 硬预算形态下不可持续——方案 §1.4)

@@ -28,12 +28,7 @@ from ..pytool import clip_middle, run_python_script
 from .verifier import answers_equivalent, ensure_math_verify
 
 #: 无合法 tool call 时的提醒(裸文本;协议说明由模板渲染的工具块承担)
-FORMAT_REMINDER = (
-    "(Your reply contained no valid tool call. End your message with "
-    "exactly one block of the form "
-    '<tool_call>{"name": <function-name>, "arguments": <args-json-object>}'
-    "</tool_call>. Available functions: run_python, submit.)"
-)
+FORMAT_REMINDER = protocol.fc_format_reminder("run_python", "submit")
 
 # 工具 schema(OpenAI 格式单一真源,模板原生渲染;描述纪律:执行模型/
 # 前置条件/返回语义/失败与截断行为写全)。

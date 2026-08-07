@@ -209,6 +209,9 @@ async def main_async(args) -> int:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 return record
 
+        # avg@K 口径说明:summarize 对 (task, k) 记录做 micro 平均;K 对
+        # 所有任务恒定时与文献的 per-task macro 平均严格等价(变 K 评测
+        # 需先改 summarize,勿直接混跑)。
         results = list(await asyncio.gather(
             *[one(t, k) for t in tasks for k in range(args.n)]
         ))

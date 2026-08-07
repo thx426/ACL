@@ -38,7 +38,13 @@ EnvHandle / ActionOutcome)。机制核心对任务协议零假定——动作语
    非默认值自动进 objective_fingerprint——换环境=换优化目标)。
 5. **测试**:照 `tests/test_template_env.py` 写同款四组:契约完备、
    episode 端到端(赢局/部分分/格式失败提醒)、v4 前缀续写端到端、registry
-   装配。全绿后机制侧零改动即可跑训练/评估/SFT 三条流水。
+   装配。**另加两类定向自查**(2026-08-07 审阅实证:逐环境复制最易走样的
+   两处)——①资源记账平衡:episode 失败路径上 slot/gate 恰好释放一次
+   (参照 `test_slot_balance_on_boot_failure`);②漂移哨兵真触发:
+   `env.initial_obs` 必须 live 重构造(不得回传捕获值,否则比对恒真空转),
+   并用被改动的资产断言 ENV_ERROR(参照 `test_initial_obs_drift_detected`)。
+   全绿后机制侧零改动即可跑训练/评估/SFT 三条流水;起跑前置用统一预检:
+   `python -m trace_opd.envs.preflight --config <yaml> --parquet <valid>`。
 
 ## 机制侧已知边界(诚实声明,勿绕过)
 

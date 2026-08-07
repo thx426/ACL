@@ -32,12 +32,7 @@ from .recalc import find_soffice, recalculated_for_grading
 
 #: 无合法 tool call 时的提醒(裸文本——assistant 未发起调用,反馈不是
 #: tool 响应)
-FORMAT_REMINDER = (
-    "(Your reply contained no valid tool call. End your message with "
-    "exactly one block of the form "
-    '<tool_call>{"name": <function-name>, "arguments": <args-json-object>}'
-    "</tool_call>. Available functions: run_python, submit.)"
-)
+FORMAT_REMINDER = protocol.fc_format_reminder("run_python", "submit")
 
 # 工具 schema(OpenAI 通用 FC 格式,单一真源;用户裁定 2026-08-07):
 # 经 adapter.tools() 交 chat template 原生渲染进 prompt(分布内形态,

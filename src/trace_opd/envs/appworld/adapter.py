@@ -21,6 +21,7 @@ import re
 import select
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -114,6 +115,7 @@ class AppworldEpisode:
         self._slots = slots
         self.closed = False
         self._proc: subprocess.Popen | None = None
+        self._buf = ""
         slots.acquire()
         try:
             env = {
@@ -154,17 +156,31 @@ class AppworldEpisode:
 
     # ---- 协议往返 --------------------------------------------------------
 
+    def _read_line(self, timeout_s: float) -> str:
+        """fd 级自缓冲行读取:select 看 fd、os.read 进自缓冲——与
+        BufferedReader 的预读缓冲彻底解耦(审阅改进 2026-08-07:此前
+        select+readline 的正确性依赖「严格一问一答」协议契约;现在 worker
+        连发多行也不会造成 select 假阻塞)。绝不再碰 proc.stdout.readline。"""
+        fd = self._proc.stdout.fileno()  # type: ignore[union-attr]
+        deadline = time.monotonic() + timeout_s
+        while "\n" not in self._buf:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                raise WorkerFailure(f"worker event timeout after {timeout_s:.0f}s")
+            ready, _, _ = select.select([fd], [], [], remain)
+            if not ready:
+                raise WorkerFailure(f"worker event timeout after {timeout_s:.0f}s")
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise WorkerFailure(
+                    f"worker exited rc={self._proc.poll()} mid-protocol"
+                )
+            self._buf += chunk.decode("utf-8", errors="replace")
+        line, self._buf = self._buf.split("\n", 1)
+        return line
+
     def _read_event(self, timeout_s: float) -> dict:
-        # select 驱动超时(readline 本身阻塞);worker 逐行 emit+flush,
-        # 就绪后 readline 立即完成。
-        ready, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
-        if not ready:
-            raise WorkerFailure(f"worker event timeout after {timeout_s:.0f}s")
-        line = self._proc.stdout.readline()  # type: ignore[union-attr]
-        if not line:
-            raise WorkerFailure(
-                f"worker exited rc={self._proc.poll()} mid-protocol"
-            )
+        line = self._read_line(timeout_s)
         try:
             event = json.loads(line)
         except json.JSONDecodeError as err:
@@ -193,7 +209,9 @@ class AppworldEpisode:
         return str(ev.get("output", "")), bool(ev.get("completed"))
 
     def evaluate(self) -> tuple[bool, dict]:
-        ev = self._request({"op": "evaluate"}, self._cfg.exec_timeout_s)
+        # 终局一次性评估:大任务的 unit-test 走查可能远慢于单步 execute,
+        # 用独立宽超时(审阅改进;超时仍 fail-loud 转 ENV_ERROR 不误判)。
+        ev = self._request({"op": "evaluate"}, self._cfg.eval_timeout_s)
         if ev.get("event") != "evaluation":
             raise WorkerFailure(f"unexpected event for evaluate: {ev}")
         return bool(ev.get("success")), dict(ev.get("report") or {})
@@ -216,11 +234,31 @@ class AppworldEpisode:
             self._slots.release()
 
 
+def _find_requirement_list(obj, names: tuple[str, ...]):
+    """递归找 requirement 列表(worker 的 report 可能是顶层键,也可能藏在
+    TestTracker.to_dict() 的 detail 嵌套里——审阅改进:两种形态都吃)。"""
+    if isinstance(obj, dict):
+        for n in names:
+            v = obj.get(n)
+            if isinstance(v, list):
+                return v
+        for v in obj.values():
+            found = _find_requirement_list(v, names)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_requirement_list(v, names)
+            if found is not None:
+                return found
+    return None
+
+
 def _partial_score(success: bool, report: dict) -> float:
-    """score = requirement 通过比例(拿得到明细时);兜底二元。"""
-    passes = report.get("passes") or report.get("passed_tests")
-    failures = report.get("failures") or report.get("failed_tests")
-    if isinstance(passes, list) and isinstance(failures, list):
+    """score = requirement 通过比例(拿得到明细时);兜底二元(TGC)。"""
+    passes = _find_requirement_list(report, ("passes", "passed_tests"))
+    failures = _find_requirement_list(report, ("failures", "failed_tests"))
+    if passes is not None and failures is not None:
         total = len(passes) + len(failures)
         if total > 0:
             return len(passes) / total
