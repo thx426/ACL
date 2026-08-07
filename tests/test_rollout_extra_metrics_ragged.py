@@ -73,6 +73,36 @@ def test_ragged_dict_does_not_crash(capsys):
     assert "ragged" in out and "won" in out
 
 
+def test_research_metrics_are_not_diluted_by_executor_zero_padding():
+    """research_* 只在 research 行上取均值。
+
+    executor 行带 agent_loop._V4_RESEARCH_ZERO 零占位(为批内 schema 恒齐),
+    若算进分母,24 行布局下会把每条 research 曲线稀释精确 3×(384/128)。
+    2026-08-07 实测:no_finalize 真值 65% 被上报成 0.216。
+    """
+    # 8 executor 行(零占位) + 4 research 行,其中 3 条 no_finalize
+    d = {
+        "role_research": [0] * 8 + [1] * 4,
+        "research_no_finalize": [0] * 8 + [1, 1, 1, 0],
+        "research_doc_words": [0] * 8 + [400, 400, 400, 400],
+    }
+    m = compute_rollout_extra_metrics(d)
+    assert m["rollout_extra/research_no_finalize/mean"] == 0.75, "应为 3/4,不是 3/12"
+    assert m["rollout_extra/research_doc_words/mean"] == 400.0, "应为 400,不是 133.3"
+
+
+def test_non_research_keys_still_average_over_full_batch():
+    """只有 research_ 前缀改口径;executor 侧指标仍按全 batch 平均。"""
+    d = {
+        "role_research": [0] * 8 + [1] * 4,
+        "won": [1] * 4 + [0] * 4 + [0] * 4,     # 4/12 全 batch
+        "research_turns": [0] * 8 + [10] * 4,
+    }
+    m = compute_rollout_extra_metrics(d)
+    assert abs(m["rollout_extra/won/mean"] - 4 / 12) < 1e-9
+    assert m["rollout_extra/research_turns/mean"] == 10.0
+
+
 def test_backward_compatible_without_role_research():
     """v3.1 两段 batch(无 research 行):分臂读数与旧行为一致。"""
     m = compute_rollout_extra_metrics(

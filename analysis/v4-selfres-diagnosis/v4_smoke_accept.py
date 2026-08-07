@@ -127,12 +127,27 @@ miss_stu = [k for k in ("global_step", "task_id", "outcome") if any(k not in r f
 chk("student 行必需键齐", not miss_stu, f"缺 {miss_stu}")
 
 print("\n=== 7. 健康度 ===")
-for key in ("research_replay_drift", "research_degraded", "research_doc_overflow"):
+# 一致性哨兵:不该发生,必须全零。
+#   replay_drift = 环境重放的确定性契约被破坏
+#   degraded     = 会话降级
+for key in ("research_replay_drift", "research_degraded"):
     vals = [bool(x) for x in (rf(r, key) for r in research) if x is not None]
     if vals:
-        chk(f"{key} 全零", not any(vals), f"{sum(vals)}/{len(vals)} 命中")
+        chk(f"{key} 全零(一致性哨兵)", not any(vals), f"{sum(vals)}/{len(vals)} 命中")
     else:
         print(f"  [SKIP] {key} 未落盘")
+
+# 容量降级:设计内会发生(selfres.py 注释 "r=0:结构性长度压力")——
+# doc 太长 ⇒ teacher_ids_for_doc 返回 None ⇒ 塞不进 executor 的 prompt 预算。
+# 判据看比例而不是"必须为零",否则会把一条正常降级读成实验不可起。
+DOC_OVERFLOW_MAX = 0.05
+vals = [bool(x) for x in (rf(r, "research_doc_overflow") for r in research) if x is not None]
+if vals:
+    frac = sum(vals) / len(vals)
+    chk(f"research_doc_overflow ≤ {DOC_OVERFLOW_MAX:.0%}(容量降级,允许少量)",
+        frac <= DOC_OVERFLOW_MAX, f"{sum(vals)}/{len(vals)} = {frac:.1%}")
+else:
+    print("  [SKIP] research_doc_overflow 未落盘")
 
 for key in ("research_overlong", "research_no_finalize", "research_error"):
     xs = [x for x in (rf(r, key) for r in research) if x is not None]

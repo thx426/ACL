@@ -449,11 +449,27 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
             f"[rollout_extra] WARNING ragged reward_extra_info: 多数 key 长 {n_max},"
             f" 短缺的是 {ragged} —— 这些 key 的 mean 只覆盖部分行"
         )
+    # trace-opd v4: research_* 指标只在 research 行上有定义。executor 行携带的是
+    # agent_loop._V4_RESEARCH_ZERO 零占位(为"批内 schema 恒齐"而存在,本身是对的),
+    # 但把它们算进分母会把每条 research 曲线稀释 batch/research 倍 —— 24 行布局下
+    # 是精确 3×(384/128),实测 no_finalize 真值 65% 被上报成 0.216。
+    role_research = reward_extra_infos_dict.get("role_research")
+    research_mask = None
+    if role_research is not None:
+        _role = np.asarray(role_research, dtype=np.float64)
+        if _role.size:
+            research_mask = _role >= 0.5
+
     for key, values in reward_extra_infos_dict.items():
         if key == "reward":
             continue
         arr = np.asarray(values)
-        if arr.size and arr.dtype.kind in "bif":
+        if not (arr.size and arr.dtype.kind in "bif"):
+            continue
+        if (key.startswith("research_") and research_mask is not None
+                and research_mask.shape == arr.shape and research_mask.any()):
+            metrics[f"rollout_extra/{key}/mean"] = float(arr[research_mask].mean())
+        else:
             metrics[f"rollout_extra/{key}/mean"] = float(arr.mean())
     # trace-opd PGS v3.1 arm-split: when the batch carries per-sample arm
     # identity (steer_arm: 1=steered/tilted sampling, 0=bare pi sampling),
