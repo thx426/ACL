@@ -63,7 +63,7 @@ def test_contract_surface_complete():
         "task_id", "task_type", "initial_obs", "task_brief",
         "executor_scaffold", "open_episode", "gt_text", "domain_notes",
         "react", "replay_action", "normalize_action",
-        "observation_indicates_invalid", "format_reminder",
+        "observation_indicates_invalid", "format_reminder", "tools",
     ):
         assert hasattr(adapter, name), f"TaskAdapter contract missing: {name}"
     assert hasattr(factory, "adapter_from_item")

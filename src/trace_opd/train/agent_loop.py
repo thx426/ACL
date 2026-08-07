@@ -390,6 +390,7 @@ class TraceAgentLoop(AgentLoopBase):
                 {"role": "user", "content": protocol.truncate_obs(initial_obs)},
             ],
             True,
+            tools=adapter.tools(),
         )
         max_len = self.cfg.train.rollout_max_model_len
         if len(teacher_prompt_ids) + self.rollout_config.response_length + 8 > max_len:
@@ -484,6 +485,7 @@ class TraceAgentLoop(AgentLoopBase):
                  "content": protocol.truncate_obs(adapter.initial_obs)},
             ],
             True,
+            tools=adapter.tools(),
         )
         t0 = time.time()
         rowres = await run_research_row(
@@ -865,6 +867,7 @@ class TraceAgentLoop(AgentLoopBase):
                 {"role": "user", "content": protocol.truncate_obs(adapter.initial_obs)},
             ],
             True,
+            tools=adapter.tools(),
         )
         teacher_prompt_ids = self._teacher_prompt_ids(
             adapter, steer_ctx["doc"], student_prompt_ids, adapter.initial_obs

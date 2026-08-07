@@ -42,10 +42,14 @@
   - `submit()`:终局。检查 `output.xlsx` → 逐 case 评估 → done=True,
     score=soft;feedback 恒 "Submitted."(零评估信息)。output 缺失 ⇒ 不
     终局,feedback 提示缺失。
-- **prompt 层**:工具 schema 以 Qwen 官方 chat-template tools 渲染的同款
-  文本格式(`<tools>` JSON + `<tool_call>` 说明)内嵌 `executor_scaffold()`
-  ——分布内形态(4B 原生 FC 能力直接可用),`render_ids`/episode prompt
-  构造零改动。guidance(特权文档)仍经 `inject_guidance` 统一 header 追加。
+- **prompt 层(2026-08-07 用户裁定升级:通用 FC 格式 + 模板原生渲染)**:
+  工具 schema 以 **OpenAI tools 格式**结构化定义为单一真源(adapter 新契约
+  `tools()`,`envs/spreadsheetbench` 的 `TOOLS`),prompt 构造经
+  `render_ids(..., tools=...)` 交 **chat template 原生渲染**——逐字节
+  分布内,scaffold 绝不手写渲染块(原手写 `_TOOLS_BLOCK` 已废除,其
+  模板一致性对拍风险随之消灭)。guidance(特权文档)仍经
+  `inject_guidance` 统一 header 追加。文本动作协议 benchmark 的
+  `tools()` 返回 None,`render_ids` 行为逐字节不变(ALFWorld 线零影响)。
 - **解析层**:core/protocol.py 新增通用件 `parse_tool_calls(text)`
   (hermes `<tool_call>{json}</tool_call>`,取合法 JSON 调用列表)。这是
   **模板家族级**协议件(非任务级),与 parse_action 平级;SSB 的 react
@@ -54,8 +58,14 @@
 - **反馈层**:Qwen3 模板把 tool 响应渲染为 user 块内
   `<tool_response>\n{content}\n</tool_response>`——feedback 文本自带包裹,
   经现有 user 结构段进流,**TemplateDelta/episode 零机制改动**。
-  模板逐字节等价性列入服务器冒烟清单(真 tokenizer 对拍;不等价则回此节
-  升级 TemplateDelta 变体,机制侧改动已知且有界)。
+  模板逐字节等价性列入服务器冒烟清单(真 tokenizer 对拍,**范围只剩
+  反馈侧**——prompt 侧已由模板原生渲染保证;不等价则回此节升级
+  TemplateDelta 变体,机制侧改动已知且有界)。
+- **解析层为何不交引擎**(用户问询 2026-08-07 的裁定记录):引擎 FC 把
+  `<tool_call>` 解析成结构化 `tool_calls` 并丢弃原始文本,训练还原时
+  模板重渲染的 JSON(键序/空白/转义)与模型原始输出可能不逐字节一致 ⇒
+  历史轮 token 漂移。本架构 token-in-token-out:生成的原始 token 原样留
+  在训练流(mask=1),`parse_tool_calls` 只读不还原——训练保真最优。
 - 无合法 tool_call ⇒ `format_reminder()`(本环境习语,acted=False,
   防 spiral 计数照常)。normalize_action:strip-only(代码大小写敏感)。
 

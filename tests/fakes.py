@@ -54,11 +54,19 @@ class FakeTokenizer:
         messages,
         add_generation_prompt: bool = False,
         tokenize: bool = True,
+        tools: list | None = None,
         **kwargs: Any,
     ):
         s = ""
-        for m in messages:
-            s += f"{IM_START}{m['role']}\n{m['content']}{IM_END}\n"
+        for i, m in enumerate(messages):
+            content = m["content"]
+            # 真模板把 tools 渲染进 system 块;fake 用确定性等价物
+            # (JSON 拼接),测试只依赖一致性不依赖 Qwen 逐字节形态。
+            if i == 0 and m["role"] == "system" and tools:
+                import json as _json
+
+                content += "\n<tools>" + _json.dumps(tools, sort_keys=True) + "</tools>"
+            s += f"{IM_START}{m['role']}\n{content}{IM_END}\n"
         if add_generation_prompt:
             s += f"{IM_START}assistant\n"
         return self.encode(s) if tokenize else s
@@ -152,6 +160,9 @@ class ScriptedAdapter:
 
     def format_reminder(self) -> str:
         return "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
+
+    def tools(self) -> list[dict] | None:
+        return None
 
     def react(self, env, assistant_text: str):
         return protocol.text_action_react(self, env, assistant_text)

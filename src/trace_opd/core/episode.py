@@ -159,6 +159,7 @@ async def run_episode(
                 {"role": "user", "content": protocol.truncate_obs(initial_obs)},
             ],
             True,
+            tools=adapter.tools(),
         )
 
         env_steps = 0

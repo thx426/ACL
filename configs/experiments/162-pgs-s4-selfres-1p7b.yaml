@@ -104,9 +104,11 @@ episode:
                             # cap=30 保住 h3 训后 94.2% 的成功(中位 11 步),
                             # 失败 episode 不再烧满预算
   max_assistant_turns: 40   # 会话轮上限 = 步预算 + 格式失败余量(加载强校验 turns > steps)
-  max_tokens_per_turn: 2048 # 单轮生成上限(reasoning+action)| 2026-07-30 用户裁定改配置项;
-                            # 打满该上限的轮 won 率只剩 10.5%(CD-008 实测)。
-                            # 不进 objective_fingerprint(采样协议非优化目标)
+  max_tokens_per_turn: 4096 # 任务执行 agent 单轮生成上限(reasoning+action)|
+                            # 2026-08-07 用户裁定 2048→4096("researcher 8K,
+                            # 任务执行 agent 4K")。原值背景:打满 2048 的轮 won 率
+                            # 只剩 10.5%(CD-008 实测)——该读数是在 2048 上限下取的,
+                            # 放宽后需重测。不进 objective_fingerprint(采样协议非优化目标)
 
 alfworld:
   data_root: "${ALFWORLD_DATA}"              # json_2.1.1 数据根

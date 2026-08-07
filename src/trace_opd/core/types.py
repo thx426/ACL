@@ -65,8 +65,9 @@ class Step:
     """One executor turn.
 
     acted=False marks turns that never reached the environment (the reply
-    had no parseable <action> block; the recorded observation is then the
-    adapter's format reminder). valid=False marks environment no-ops
+    carried no parseable action under the benchmark's protocol; the
+    recorded observation is then the adapter's format reminder).
+    valid=False marks environment no-ops
     (adapter.observation_indicates_invalid; observability only, never a
     loss input)."""
 

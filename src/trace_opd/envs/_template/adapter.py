@@ -140,16 +140,19 @@ class TemplateTaskAdapter:
         ports = sorted(set(self._spec) | set(self._spec.values()))
         return (
             "Environment: a signal patchboard with ports "
-            f"{', '.join(ports)}.\n"
-            "Goal: route every required signal to its output, then run "
-            "diagnostics to finish.\n"
-            "The executor interacts one action per turn, in plain text:\n"
-            "  probe <port>       inspect one port\n"
-            "  link <a> <b>       connect two ports\n"
+            f"{', '.join(ports)}. Signal ports carry a named signal; output "
+            "ports expect one. Which signal a port carries or expects is "
+            "only revealed by probing it.\n"
+            "Goal: connect every signal port to the output port expecting "
+            "its signal, then run diagnostics to finish.\n"
+            "Executor actions (one per turn, plain text):\n"
+            "  probe <port>       reveal what the port carries/expects and "
+            "its current wiring\n"
+            "  link <a> <b>       connect two ports with a cable\n"
             "  run diagnostics    score the board and end the episode\n"
-            f"Unusable input gets: \"{REJECT_OBS}\"\n"
-            "Scoring: fraction of required links present at diagnostics time "
-            "(1.0 = success)."
+            f"Any other input gets: \"{REJECT_OBS}\"\n"
+            "Scoring at diagnostics time: fraction of required links present "
+            "(1.0 = success; partial credit for partially correct boards)."
         )
 
     def executor_scaffold(self) -> str:
@@ -157,12 +160,17 @@ class TemplateTaskAdapter:
         types.inject_guidance 以统一 header 追加)。声明动作文法与本任务的
         输出协议——这里用 core 的文本单动作协议,故按其格式契约书写。"""
         return (
-            "You are a technician at a signal patchboard. Route every "
-            "required signal to its output port, then run diagnostics.\n\n"
-            "Commands: probe <port> | link <a> <b> | run diagnostics\n\n"
+            "You are a technician at a signal patchboard. Connect every "
+            "signal port to the output port expecting its signal, then run "
+            "diagnostics to finish.\n\n"
+            "Available commands:\n"
+            "  probe <port>       inspect a port (what it carries or "
+            "expects, and its wiring)\n"
+            "  link <a> <b>       connect two ports with a cable\n"
+            "  run diagnostics    score the board and end the episode\n\n"
             "On every turn respond with exactly this format and nothing "
-            "else:\n<reasoning>brief reasoning</reasoning>\n"
-            "<action>one command</action>"
+            "else:\n<reasoning>brief reasoning about the current "
+            "situation</reasoning>\n<action>one command</action>"
         )
 
     # ---- 环境面 ----------------------------------------------------------
@@ -183,6 +191,13 @@ class TemplateTaskAdapter:
         """给 narrator 的可选领域提示(什么算关键事件);通用契约够用时
         返回空串。"""
         return ""
+
+    def tools(self) -> list[dict] | None:
+        """本玩具是文本动作协议 ⇒ 无 tools。原生 function-calling 型
+        benchmark 在此返回 OpenAI 格式 schema 列表(单一真源),由
+        chat template 原生渲染进 prompt——绝不在 scaffold 里手写渲染块
+        (参照 envs/spreadsheetbench 的 TOOLS)。"""
+        return None
 
     # ---- 交互面(react 抽象:机制核心唯一消费的执行接口) ----------------
 

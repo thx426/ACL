@@ -31,59 +31,101 @@ from ...core.adapter import ActionOutcome
 from .evaluator import evaluate, find_test_cases, preview_workbook
 from .recalc import find_soffice, recalculated_for_grading
 
-#: 无合法 tool call 时的提醒(本环境习语;裸文本——assistant 未发起调用,
-#: 反馈不是 tool 响应)
+#: 无合法 tool call 时的提醒(裸文本——assistant 未发起调用,反馈不是
+#: tool 响应)
 FORMAT_REMINDER = (
-    "(No valid tool call found. Reply with "
+    "(Your reply contained no valid tool call. End your message with "
+    "exactly one block of the form "
     '<tool_call>{"name": <function-name>, "arguments": <args-json-object>}'
-    "</tool_call> using one of: run_python, submit.)"
+    "</tool_call>. Available functions: run_python, submit.)"
 )
 
-_TOOLS_BLOCK = """# Tools
-
-You may call one function per turn to interact with the environment:
-
-<tools>
-{"type": "function", "function": {"name": "run_python", "description": "Execute a Python script in the working directory (openpyxl is available). Returns stdout and stderr.", "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "Python source code to execute"}}, "required": ["code"]}}}
-{"type": "function", "function": {"name": "submit", "description": "Finish the task. Call this only after output.xlsx has been written; the episode ends.", "parameters": {"type": "object", "properties": {}, "required": []}}}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>"""
+# 工具 schema(OpenAI 通用 FC 格式,单一真源;用户裁定 2026-08-07):
+# 经 adapter.tools() 交 chat template 原生渲染进 prompt(分布内形态,
+# 绝不手写渲染块);解析仍在文本层(parse_tool_calls)——生成的原始
+# token 原样留在训练流,引擎的结构化 tool_calls 表示从不参与还原。
+# 描述纪律:每个工具写全「执行模型(fresh interpreter,无跨调用状态)/
+# 前置条件 / 返回语义 / 失败与截断行为」——agent 依赖的行为契约。
+TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Run a Python script in the sandbox working directory and "
+                "return its combined stdout and stderr. Each call starts a "
+                "fresh interpreter: variables and imports do NOT persist "
+                "between calls — every script must be self-contained and "
+                "re-read any file it needs. openpyxl is available for "
+                "workbook access. A non-zero exit is reported with its exit "
+                "code; scripts exceeding the time limit are killed; long "
+                "output is truncated in the middle."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Complete Python source to execute as a "
+                            "standalone script (not a REPL fragment)."
+                        ),
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit",
+            "description": (
+                "Declare the task finished and end the episode. Call it "
+                "only after output.xlsx exists in the working directory; "
+                "if output.xlsx is missing, the episode continues and you "
+                "are told so. Grading happens after submission; no grading "
+                "feedback is ever returned."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
 
 # 评分前公式重算(官方 open_spreadsheet.py 语义;recalc.py)⇒ 写公式与写
 # 静态值都是合法解法。scaffold 只作中性说明(第二代同款口径,用户裁定
 # 2026-07-16「公式解法必须可判分」;48 探针台账的"禁公式"文案是第一代
-# 环境缺陷下的 workaround,勿回退)。
+# 环境缺陷下的 workaround,勿回退)。工具块不在此手写——由 chat template
+# 按 TOOLS 原生渲染。
 SYSTEM_PROMPT = (
-    "You are a spreadsheet expert who manipulates Excel workbooks with "
-    "Python. Your goal is functional correctness: output.xlsx must contain "
-    "the correct results in the specified cells.\n\n"
-    "Work in the current working directory:\n"
-    "- Read the input workbook from input.xlsx\n"
-    "- Write the completed workbook to output.xlsx\n"
-    "- Only modify cells within the answer position given in the task; keep "
-    "everything else unchanged.\n"
-    "- Formulas ARE recalculated before grading: you may write Excel "
-    "formulas or pre-computed static values, whichever fits the task. Note "
-    "that openpyxl itself does not evaluate formulas — if you read a "
-    "formula cell back with openpyxl to check your work, you will see the "
-    "formula string, not its value.\n\n"
-    + _TOOLS_BLOCK
+    "You are a spreadsheet-manipulation specialist working in a sandboxed "
+    "directory. Solve the task by editing a workbook with Python, then "
+    "submit.\n\n"
+    "Files (fixed names, relative to the working directory):\n"
+    "- input.xlsx — the task workbook, already present; read from here.\n"
+    "- output.xlsx — your deliverable; create it. Grading reads ONLY this "
+    "file.\n\n"
+    "How your work is graded:\n"
+    "- Only the cells inside the answer position stated in the task are "
+    "checked; keep every other cell exactly as it is in input.xlsx.\n"
+    "- The workbook is opened and formulas are recalculated before "
+    "grading, so writing Excel formulas and writing pre-computed values "
+    "are both acceptable.\n"
+    "- openpyxl itself never evaluates formulas: reading a formula cell "
+    "back in a later script returns the formula string, not its value — "
+    "verify formula results by recomputing them in Python, not by reading "
+    "them back."
 )
 
 
 def initial_obs_of(item: dict, preview: str) -> str:
-    """初始观察(build_dataset 捕获与 live episode 同源,逐字节一致)。"""
+    """初始观察(build_dataset 捕获与 live episode 同源,逐字节一致)。
+    文件路径约定已在 scaffold 声明,此处只给任务变量与工作簿预览。"""
     return (
         f"Task: {item['instruction']}\n\n"
-        f"instruction_type: {item['instruction_type']}\n"
-        f"answer_position: {item['answer_position']}\n"
-        "The input workbook is at input.xlsx; save your result to "
-        "output.xlsx.\n\n"
-        "# Workbook preview (first rows of each sheet)\n"
+        f"Answer type: {item['instruction_type']}\n"
+        f"Answer position: {item['answer_position']}\n\n"
+        "# Preview of input.xlsx (first rows of each sheet)\n"
         f"{preview}"
     )
 
@@ -163,24 +205,29 @@ class SpreadsheetbenchTaskAdapter:
     def task_brief(self) -> str:
         n_cases = len(self._test_cases())
         return (
-            "Environment: a spreadsheet manipulation task (SpreadsheetBench). "
-            "The executor works in a sandbox directory containing input.xlsx "
-            "(a copy of the task workbook) and must produce output.xlsx.\n"
-            "Executor tools, one call per turn:\n"
-            "  run_python(code) — run a Python script (openpyxl available) in "
-            "the sandbox\n"
-            "  submit() — finish; the produced output.xlsx is scored and the "
-            "episode ends\n"
-            f"Scoring: cell values in the answer region(s) "
+            "Environment: SpreadsheetBench — one Excel-workbook manipulation "
+            "task. The executor works in a sandbox directory holding "
+            "input.xlsx (a copy of the task workbook) and must produce "
+            "output.xlsx.\n"
+            "Executor tools (one call per turn):\n"
+            "  run_python(code) — run a standalone Python script in the "
+            "sandbox (openpyxl available; fresh interpreter per call, no "
+            "state carries over between calls)\n"
+            "  submit() — end the episode; the produced output.xlsx is then "
+            "graded\n"
+            f"Grading: cell values in the answer region(s) "
             f"[{self._item['answer_position']}] are compared against the "
-            f"expected result on {n_cases} hidden test case(s); the score is "
-            "the fraction passed (1.0 = success).\n"
+            f"expected result on {n_cases} test case(s); score = fraction "
+            "of cases passed (1.0 = success). The sandbox holds test case "
+            "1; the single submitted output.xlsx is graded against every "
+            "case. The executor never sees any grading feedback "
+            "(\"Submitted.\" is all it gets back).\n"
             "Evaluation mechanic: the produced workbook is opened and "
-            "formulas are recalculated before grading, so writing Excel "
-            "formulas and writing pre-computed static values are both valid "
-            "solution styles. Caveat worth teaching: openpyxl itself does "
-            "not evaluate formulas, so reading a formula cell back inside "
-            "the sandbox shows the formula string, not its value.\n"
+            "formulas are recalculated before grading, so Excel formulas "
+            "and pre-computed static values are both valid solution "
+            "styles. Caveat worth teaching: openpyxl never evaluates "
+            "formulas — reading a formula cell back inside the sandbox "
+            "returns the formula string, not its value.\n"
             f"Task instruction ({self._item['instruction_type']}): "
             f"{self._item['instruction']}\n"
             f"Budget: the executor has {protocol.MAX_ENV_STEPS} tool calls "
@@ -189,6 +236,9 @@ class SpreadsheetbenchTaskAdapter:
 
     def executor_scaffold(self) -> str:
         return SYSTEM_PROMPT
+
+    def tools(self) -> list[dict] | None:
+        return TOOLS
 
     def gt_text(self) -> str | None:
         """golden workbook 是测试答案本体(非过程参考),绝不进 researcher。"""

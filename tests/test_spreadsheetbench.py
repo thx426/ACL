@@ -28,6 +28,8 @@ from trace_opd.core.template_delta import TemplateDelta
 from trace_opd.envs import registry
 from trace_opd.envs.spreadsheetbench.adapter import (
     FORMAT_REMINDER,
+    SYSTEM_PROMPT,
+    TOOLS,
     SpreadsheetbenchEnvFactory,
     SpreadsheetbenchTaskAdapter,
     initial_obs_of,
@@ -131,6 +133,30 @@ def test_evaluate_and_case_discovery(tmp_path):
     assert not verdict["ok"]
     assert "pred=4" in verdict["reason"]              # GT SAFETY:只报 pred
     assert "3" not in verdict["reason"].split("pred=")[1]  # 不泄 golden 值
+
+
+def test_tools_schema_native_rendering_contract(tmp_path):
+    """FC 三层契约(用户裁定 2026-08-07):定义=OpenAI 格式单一真源;
+    渲染=chat template 原生(scaffold 绝不手写工具块);解析=文本层。"""
+    assert [t["function"]["name"] for t in TOOLS] == ["run_python", "submit"]
+    for t in TOOLS:
+        assert t["type"] == "function"
+        assert set(t["function"]) == {"name", "description", "parameters"}
+        assert t["function"]["parameters"]["type"] == "object"
+    assert TOOLS[0]["function"]["parameters"]["required"] == ["code"]
+    # scaffold 零手写渲染块(工具块由模板按 tools() 渲染)
+    assert "<tools>" not in SYSTEM_PROMPT and "<tool_call>" not in SYSTEM_PROMPT
+    item = _make_task(tmp_path, answers=[{"B1": 3}])
+    adapter = _adapter(tmp_path, item)
+    assert adapter.tools() is TOOLS
+    # prompt 渲染确实带上了 tools(fake 模板的确定性等价渲染)
+    from trace_opd.core.template_delta import render_ids
+
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs"}]
+    with_tools = render_ids(TOK, msgs, True, tools=TOOLS)
+    without = render_ids(TOK, msgs, True)
+    assert with_tools != without and len(with_tools) > len(without)
 
 
 # ------------------------------------------------------- episode 端到端(真执行)

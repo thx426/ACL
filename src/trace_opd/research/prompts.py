@@ -22,10 +22,10 @@ experience document condensing everything you verified.
 === THE EXECUTOR ===
 The executor is a small instruction-tuned model ({executor_model}). Each
 turn it reasons briefly and takes exactly one action through the task's
-action interface (described in the task panel above). It sees
-only the environment's observations plus your guidance text; it knows
-nothing else about the task. Expect real limitations: it can misread
-observations, repeat futile actions, or lose track of its progress.
+action interface (described in the task panel above). It sees only the
+environment's observations plus your guidance text; it knows nothing else
+about the task. Expect real limitations: it can misread observations,
+repeat futile actions, or lose track of its progress.
 {gt_block}
 === YOUR INSTRUMENTS ===
 - run_experiment(guidance, k): actually launches k parallel executor

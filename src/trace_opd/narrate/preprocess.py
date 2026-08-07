@@ -52,7 +52,7 @@ def _step_lines(traj: Trajectory, opts: RenderOpts, include_thought: bool) -> li
         if s.acted:
             desc = f"[t{s.t}] action: {s.action_norm} -> {truncate_middle(s.observation, opts.obs_max_chars)}"
         else:
-            desc = f"[t{s.t}] (no valid <action> block in reply) -> {truncate_middle(s.observation, opts.obs_max_chars)}"
+            desc = f"[t{s.t}] (reply contained no executable action) -> {truncate_middle(s.observation, opts.obs_max_chars)}"
         if run_len >= opts.fold_min:
             desc = (
                 f"[t{s.t}-t{steps[j].t}] action repeated {run_len}x: {s.action_norm} "

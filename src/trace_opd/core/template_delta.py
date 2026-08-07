@@ -33,13 +33,21 @@ logger = logging.getLogger(__file__)
 _CHAT_KWARGS = {"enable_thinking": False}
 
 
-def render_ids(tokenizer, messages, add_generation_prompt: bool) -> list[int]:
+def render_ids(
+    tokenizer, messages, add_generation_prompt: bool, tools: list[dict] | None = None
+) -> list[int]:
     """apply_chat_template → flat list[int], across transformers versions
-    (5.x returns a BatchEncoding where 4.x returned a plain list)."""
+    (5.x returns a BatchEncoding where 4.x returned a plain list).
+
+    tools(OpenAI 格式,来自 adapter.tools())非 None 时交给模板原生渲染
+    ——工具块必须是分布内形态,绝不在 scaffold 里手写;None 时不传该
+    kwarg,与历史调用逐字节等价。"""
+    extra = {"tools": tools} if tools is not None else {}
     out = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=add_generation_prompt,
         tokenize=True,
+        **extra,
         **_CHAT_KWARGS,
     )
     if not isinstance(out, list):

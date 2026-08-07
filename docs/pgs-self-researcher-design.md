@@ -279,6 +279,9 @@ messages 重渲染有 BPE roundtrip 风险,不可用);"narrator 不内化"裁定
    派生(把连续分接进 reward 是训练口径决策,非协议改动)。
 3. **确定性重放钩子**:`TaskAdapter.replay_action(env, action) →
    (feedback, ended)`——v4 前缀续写的硬前提显式化。
+3.5 **原生 function-calling 面**:`TaskAdapter.tools()`(OpenAI 格式单一
+   真源或 None);prompt 经 `render_ids(tools=...)` 由 chat template 原生
+   渲染,解析留文本层(`protocol.parse_tool_calls`)保训练 token 原始性。
 4. **环境句柄缩面**:`EnvHandle = {initial_obs, close}`;`step` 从 core
    契约移除(字符串命令族环境的实现细节)。
 5. **装配注册表**:`envs/registry.py` + 配置 `environment.name`(默认

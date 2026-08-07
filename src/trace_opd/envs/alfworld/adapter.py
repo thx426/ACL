@@ -304,6 +304,10 @@ class AlfworldTaskAdapter:
             "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
         )
 
+    def tools(self) -> list[dict] | None:
+        """文本动作协议(<reasoning>/<action>),非工具调用型:无 tools。"""
+        return None
+
     def react(self, env, assistant_text: str):
         """ALFWorld 是字符串单命令环境:react 一行委托标准文本动作协议
         (协议件 normalize/invalid/reminder 即本类上面三个方法)。"""

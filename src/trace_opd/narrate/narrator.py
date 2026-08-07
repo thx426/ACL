@@ -38,8 +38,9 @@ Rules:
   happened: key decisions, turning points, errors and the environment's
   responses to them. Routine uneventful steps may be summarized together;
   never silently drop events that changed the course of the attempt.
-- Quote error or failure messages verbatim when short. Keep entity names
-  exactly as they appear (e.g. "drawer 4", not "a drawer").
+- Quote error or failure messages verbatim when short. Keep names and
+  identifiers exactly as they appear in the log, character for character —
+  never paraphrase, pluralize, or generalize them.
 - Repeated behavior: state it as repetition with counts; do not omit it.
 - Reconstruct, never comment: no advice, no praise or blame, no guesses
   about what the agent "should" have done. Judgment belongs to the reader.

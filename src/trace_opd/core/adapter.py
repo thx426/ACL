@@ -106,6 +106,20 @@ class TaskAdapter(Protocol):
         the scaffold itself is locked — researchers cannot alter it."""
         ...
 
+    def tools(self) -> list[dict] | None:
+        """Native function-calling schemas for the EXECUTOR, in the OpenAI
+        tools format, or None for benchmarks whose action protocol is not
+        tool-calling (text-action benchmarks return None).
+
+        When present, prompt construction passes them to
+        ``apply_chat_template(tools=...)`` so the chat template renders the
+        tool block natively (byte-exact in-distribution formatting — never
+        hand-write the rendered block into the scaffold). Parsing stays
+        text-level (``protocol.parse_tool_calls`` inside react): the raw
+        generated tokens are what the training stream keeps, so the engine's
+        structured tool_calls representation is never round-tripped."""
+        ...
+
     def open_episode(self) -> EnvHandle:
         """Fresh episode of THIS task. Deterministic engines must yield an
         identical initial state every time. May block (subprocess boot);

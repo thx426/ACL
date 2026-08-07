@@ -37,6 +37,6 @@ def classify(traj: Trajectory) -> NarrationSkip | None:
     if all(not s.acted for s in traj.steps):
         return NarrationSkip(
             "all_unparseable",
-            f"none of the {traj.step_count} replies contained a parseable <action> block",
+            f"none of the {traj.step_count} replies contained an executable action",
         )
     return None

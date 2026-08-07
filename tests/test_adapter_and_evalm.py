@@ -39,6 +39,7 @@ def test_adapter_contract_surface_complete():
         assert impl.observation_indicates_invalid("Nothing happens.") is True
         assert impl.observation_indicates_invalid("You open the fridge.") is False
         assert "<action>" in impl.format_reminder()
+        assert impl.tools() is None    # 文本动作协议:无原生 FC 工具
 
 
 def test_alfworld_format_reminder_byte_identical_to_pre_migration():
