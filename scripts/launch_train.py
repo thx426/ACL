@@ -249,6 +249,17 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         if t.ulysses_sp > 1
         else []
     )
+    # fused linear+CE:logits 不落地(Qwen3.5 248k 词表显存刚需)。backend 走
+    # verl 的 fused_kernel_options.impl_backend(transformer_impl.py:295-298)。
+    fused_args = (
+        [
+            "actor_rollout_ref.model.use_fused_kernels=True",
+            "+actor_rollout_ref.model.fused_kernel_options.impl_backend="
+            f"{t.fused_kernels_backend}",
+        ]
+        if t.use_fused_kernels
+        else []
+    )
     # SPS verify 需要 per-position top-K prompt_logprobs;vLLM 的 max_logprobs
     # 是启动期参数(默认 20),必须 >= steering.topk,否则 verify 请求在运行
     # 中段被拒(P4 冒烟首查项,docs/pgs-impl-design.md)。
@@ -294,6 +305,7 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         f"+actor_rollout_ref.model.override_config.attn_implementation={attn_impl}",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         *sp_args,
+        *fused_args,
         "actor_rollout_ref.actor.use_kl_loss=False",
         # Entropy curve for the collapse watch. Metric only — entropy_coeff
         # stays 0 so the loss is untouched; cost lands in the TRAINING phase.

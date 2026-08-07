@@ -1,0 +1,175 @@
+# =============================================================================
+# A800 / Qwen3.5-9B(hybrid: 24×GatedDeltaNet + 8×full-attn,248k 词表)
+# v3.3 全套机制 · 门 5 冒烟档(2-step)—— 兼熵标定 dump 源
+# 方案真源:docs/qwen35-9b-env-plan.md;环境:env_pgs_sglang_a800_q35.sh
+# (sglang 0.5.10 平行环境;现有 env_sglang_train 零改动)。
+# ⚠ TRACE_MODEL_PATH 必须指向原始 Qwen/Qwen3.5-9B(HF 目录,VLM 形态
+#    ForConditionalGeneration)——preflight 首查 config.json model_type=qwen3_5。
+# ⚠ 熵门三参是 4B 语境占位值(仅验链路,语义无效):正式值由本冒烟 dump 经
+#    ent_calib.py 重标后另立正式配置回填,禁止拿本档跑正式实验。
+# 冒烟步数口径:执行侧按 2-step 惯例控制(产物齐后停机),save_freq=10 故
+# 冒烟不落 ckpt。正式 9B 档的 total_epochs/decay_steps 待单步墙钟实测后定版。
+# =============================================================================
+
+run:
+  name: pgs_q35_9b_smoke
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs
+  tape: true
+
+# ---------------------------------------------------------------------------
+# 在线 researcher 文档 producer(沿 v3.3 预算档;35B 仍走 162 隧道,与 9B 无关)
+# ---------------------------------------------------------------------------
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 8
+  k_default: 2
+  k_max: 4
+  max_turns: 30
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"
+  episode_temperature: 1.0
+  researcher_max_tokens: 8192
+  session_timeout_s: 3600
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+
+# ---------------------------------------------------------------------------
+# Episode 协议(训练/评测同构;逐字沿 v3.3 4B 档)
+# ---------------------------------------------------------------------------
+episode:
+  max_env_steps: 30
+  max_assistant_turns: 40
+  max_tokens_per_turn: 2048
+
+alfworld:
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  spawn_concurrency: 64
+  start_timeout_s: 300
+  step_timeout_s: 120
+  boot_concurrency: 32
+
+# ---------------------------------------------------------------------------
+# 训练:verl GRPO —— 与 4B v3.3 档的差异仅四处,均为 9B/hybrid 适配:
+#   ① use_fused_kernels(248k 词表 logits 不落地,显存刚需)
+#   ② rollout_max_num_seqs 256→128(mamba state pool ≈50MB/req,控池)
+#   ③ model_path → Qwen3.5-9B
+#   ④ SP=2 主档前置:环境须装 flash-linear-attention(verl qwen3_5 patch 在
+#      SP>1 时要求 FLA cp_context 支持,缺失即 raise;SP=1 fallback 免 FLA)
+# ---------------------------------------------------------------------------
+train:
+  model_path: "${TRACE_MODEL_PATH}"    # Qwen/Qwen3.5-9B 原始权重
+  train_file: "${TRACE_TRAIN_FILE}"
+  val_files:
+    - "${TRACE_VAL_SEEN_FILE}"
+    - "${TRACE_VAL_UNSEEN_FILE}"
+  experiment_name: pgs_q35_9b_smoke
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1
+  train_batch_size: 16
+  rollout_n: 16             # 分臂 8 bare + 8 steered(steered_fraction 0.5)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false
+  response_length: 32768    # 沿 4B 口径首试;冒烟显存读数紧(>75G 峰值)则降
+                            # 16384 重冒烟(裁定分支,docs/qwen35-9b-env-plan.md §3.5)
+  max_prompt_length: 2048
+  max_token_len_per_gpu: 34816
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2             # 主档;FLA 前置见上。fallback:1(联动 rmpad=off+sdpa,
+                            # 同时把两个 token_len 预算减半再冒烟)
+  use_fused_kernels: true   # fused linear+CE(torch backend 首发;triton 待验)
+  rollout_max_model_len: 40960
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5      # 40G 预算:权重 19.3 + mamba pool(128req≈6.4G)+ KV;
+                            # 起服失败或 KV 池告警则升 0.55 重试并回报
+  rollout_max_num_seqs: 128
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 2
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true    # 训前 val 即 9B raw 的 won_bare 基线读数(白拿)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16
+
+# ---------------------------------------------------------------------------
+# PGS steering —— v3.3 全套开关逐字沿 4B 正式档;仅熵门三参为占位(见文件头)
+# ---------------------------------------------------------------------------
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  w_beh_shaped_gamma: 0.1
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 240   # 冒烟 2 步内无效应;正式 9B 档随总步数定版
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  # ---- 熵门三参:4B 语境占位(P95=1.276 → 1.28;9B 分布未知)----
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28  # ⚠ 占位。9B 正式值 = 本冒烟 dump 的 steer_ent_hist
+  entropy_floor: 0.6        # ⚠ 占位。经 analysis/s3-arm-split-diagnosis/ent_calib.py
+  intensity_w_min: 0.05     #    重标(P95→init、floor 按分布形状报 CD-010 裁定)
+  steered_fraction: 0.5
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768
+  temperature: 0.0

@@ -386,3 +386,19 @@ def test_v33_alpha_schedule_params_always_forwarded(tmp_path):
     assert "+algorithm.steered_adv_weight=1.0" in cmd
     assert "+algorithm.steered_adv_decay_steps=0" in cmd
     assert "+algorithm.steered_adv_cap=0.0" in cmd
+
+
+def test_fused_kernels_default_off_and_flows_through(tmp_path):
+    # 默认关:命令里不得出现任何 fused 开关(既有 run 的命令面逐字节不变)。
+    cmd = _cmd(tmp_path)
+    assert not any("use_fused_kernels" in c for c in cmd)
+    assert not any("fused_kernel_options" in c for c in cmd)
+    # 开:两参成对出现,backend 走 fused_kernel_options.impl_backend(verl
+    # transformer_impl.py:295-298 的实际消费路径)。
+    cmd = _cmd(tmp_path, train_extra=", use_fused_kernels: true")
+    assert "actor_rollout_ref.model.use_fused_kernels=True" in cmd
+    assert "+actor_rollout_ref.model.fused_kernel_options.impl_backend=torch" in cmd
+    # backend 枚举校验在加载期失败(不是起跑后)。
+    import pytest
+    with pytest.raises(ValueError, match="fused_kernels_backend"):
+        _cmd(tmp_path, train_extra=", use_fused_kernels: true, fused_kernels_backend: cuda")

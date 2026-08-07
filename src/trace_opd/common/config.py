@@ -271,6 +271,13 @@ class TrainCfg:
     ulysses_sp: int = 1               # training-side Ulysses sequence parallel
                                       # (design §6.1). >1 makes the launcher flip
                                       # use_remove_padding=True + flash_attention_2
+    use_fused_kernels: bool = False   # verl fused linear+CE(logits 不落地)。
+                                      # Qwen3.5 248k 词表 × 长序列的训练显存刚需
+                                      # (32k×248k bf16 ≈ 16G/条);数学等价执行档,
+                                      # 不进 objective_fingerprint。verl 侧对
+                                      # qwen3_5 有专用实现(monkey_patch.py:270)
+    fused_kernels_backend: str = "torch"  # torch | triton(仅 use_fused_kernels
+                                      # 时消费;torch 首发保守档,triton 待验)
     rollout_gpu_mem: float = 0.35
     rollout_backend: str = "vllm"    # rollout 引擎:vllm | sglang(2026-08-05 用户
                                      # 裁定切换 SGLang:原生 logprob_start_len
@@ -525,6 +532,10 @@ def _validate(cfg: "Config") -> None:
         raise ValueError("train.model_path is required")
     if t.rollout_backend not in ("vllm", "sglang"):
         raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")
+    if t.fused_kernels_backend not in ("torch", "triton"):
+        raise ValueError(
+            f"train.fused_kernels_backend 必须是 torch|triton,得到 {t.fused_kernels_backend!r}"
+        )
     if t.rollout_n < 1:
         raise ValueError("train.rollout_n must be >= 1")
     st = cfg.steering
