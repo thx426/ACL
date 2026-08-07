@@ -14,3 +14,7 @@ __pycache__/
 .pytest_cache/
 # 系统
 .DS_Store
+
+# third-party related work (papers + reference codebases; INDEX.md tracked)
+related_work/*
+!related_work/INDEX.md
