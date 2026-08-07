@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from tests.fakes import FakeTokenizer, ScriptedGenerate
+from fakes import FakeTokenizer, ScriptedGenerate
 from trace_opd.core.template_delta import TemplateDelta, render_ids
 from trace_opd.train.backends import EngineResearcherChat
 

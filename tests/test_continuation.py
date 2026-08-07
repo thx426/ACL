@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from tests.fakes import FakeTokenizer, ScriptedAdapter, ScriptedGenerate, reply
+from fakes import FakeTokenizer, ScriptedAdapter, ScriptedGenerate, reply
 from trace_opd.core import protocol
 from trace_opd.core.template_delta import TemplateDelta
 from trace_opd.research.continuation import (

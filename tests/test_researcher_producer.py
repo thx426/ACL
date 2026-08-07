@@ -219,9 +219,14 @@ def test_policy_version_evidence_is_exact_and_frozen():
 
 
 def test_archive_failure_degrades_document(monkeypatch, tmp_path):
-    # agent_loop 生产依赖 verl；测试环境缺 tensordict 时仅跳过该集成点。
+    # agent_loop 生产依赖 verl;测试环境 import 不动 verl 全链(缺依赖,
+    # 或 verl 上游代码要 py3.11+ 的 StrEnum 而本地 3.10)时仅跳过该集成点
+    # ——服务器训练环境(py3.11)不受影响。
     pytest.importorskip("tensordict")
-    from trace_opd.train.agent_loop import TraceAgentLoop
+    try:
+        from trace_opd.train.agent_loop import TraceAgentLoop
+    except ImportError as err:
+        pytest.skip(f"verl import chain unavailable here: {err}")
 
     loop = object.__new__(TraceAgentLoop)
     loop.cfg = _load(tmp_path)

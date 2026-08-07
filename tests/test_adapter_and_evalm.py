@@ -32,7 +32,7 @@ def test_task_type_skips_split_segment():
 def test_adapter_contract_surface_complete():
     """通用性契约:两个 TaskAdapter 实现都必须具备 v4 新增的三个成员
     (task_type / observation_indicates_invalid / format_reminder)。"""
-    from tests.fakes import ScriptedAdapter
+    from fakes import ScriptedAdapter
 
     for impl in (_adapter("train/pick-Egg-1/trial_T1"), ScriptedAdapter()):
         assert isinstance(impl.task_type, str) and impl.task_type

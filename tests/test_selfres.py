@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from tests.fakes import FakeTokenizer, ScriptedAdapter, ScriptedGenerate, reply
+from fakes import FakeTokenizer, ScriptedAdapter, ScriptedGenerate, reply
 from trace_opd.core.template_delta import TemplateDelta
 from trace_opd.train.selfres import CoordRegistry, TaskCoord, run_research_row
 
