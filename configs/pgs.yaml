@@ -173,15 +173,31 @@ steering:
                             # 标定 run 配 theta_d=1e9(门恒关哨兵,行为=纯 bare)
                             # + epsilon=0(零干预)+ gate_rate_bounds=[0,1],跑几步后
                             # scripts/calibrate_theta_d.py 聚合 D 直方图出建议值
-  gate_adaptive: true   # 率控自适应(用户裁定 2026-08-04):θ_D 每 step
-                            # EMA 追踪目标门率;标定 run 必须 false(冻结哨兵)
+  gate_mode: adaptive       # 门控档(v3.3 M4 五档,进指纹):adaptive=D 硬门
+                            # +ε 探针(v3.0)| always_on=恒 η_max(v3.2 maxopen)
+                            # | entropy=G-E 软强度 w=min(1,h/H_q)(推荐首发;
+                            # 熵在 draft 侧免费,低强度段跳过教师 verify)|
+                            # d_var=G-D 软化 w=min(1,D/θ_D)(保教师异议信息,
+                            # 熵门盲区=confidently-wrong 的对照)| soft_or=
+                            # w=1−(1−w_E)(1−w_D)(两盲区互补,二版消融)
+  gate_adaptive: true   # 率控自适应(用户裁定 2026-08-04):阈值(θ_D 与/或
+                            # H_q,按 gate_mode 选信号)每 step EMA 追踪目标率;
+                            # 标定 run 必须 false(冻结哨兵)
   gate_target_rate: 0.10    # 目标门率 q(用户裁定默认 10%;消融 {5,10,20}%)
   gate_ema_beta: 0.1        # EMA 慢速率 β;θ_D 语义 = EMA 初值(标定回填)
   epsilon: 0.05             # ε 探针翻转概率(倾向得分可辨识性)| 规范 §2.3
   gate_rate_bounds: [0.05, 0.25]  # 开门率合法带(spec 预注册区间;P85 标定的
                             # 设计触发率 15% 居中),越界告警不自动调(冻结语义)
   r_max: 4                  # 每轮拒绝上限(行为态,进记账)| 规范 §2.5
-  w_beh_mode: per_token     # 训练侧行为校正口径:per_token(默认)| per_decision | vtrace
+  w_beh_mode: per_token     # 训练侧行为校正口径(v3.3 M3 扩为五档,推荐 off):
+                            # per_token(v3.0 忠实 IS)| per_decision | vtrace |
+                            # off(免行为分布 IS,ratio 分母统一 π_old——MENTOR
+                            #   口径;偏差由 asym advantage 的 [·]₊ 与 α 承接;
+                            #   s3 实测拒绝位 W 0.42-0.65、远 rank 0.01-0.1 正是
+                            #   吸收慢的第二重,v3.3 推荐默认)|
+                            # shaped_reject(仅拒绝位 f(π)=π/(π+γ),LUFFY 反向
+                            #   加权,低概率教学位拿更大梯度——消融臂)
+  w_beh_shaped_gamma: 0.1   # shaped_reject 的 γ(LUFFY 实证默认;进指纹)
   # ---- 分臂采样(机制 v3.1;用户裁定 2026-08-06,进 objective_fingerprint)----
   # 每任务 n 个 rollout 的 steered 臂占比:round(n×fraction) 个副本走 SPS
   # 倾斜采样,其余为纯 π 的 bare 臂(空账 W≡1),同组进 GRPO。动机:全臂
@@ -191,8 +207,34 @@ steering:
   # 曲线:rollout_extra/{won_bare_rate,won_steered_rate,steer_arm_gap}/mean。
   # 1.0=历史全臂(不进指纹,既有 run 可续);gap→0 是文档退场信号(退火二版)。
   steered_fraction: 0.5
-  # ---- 预算解锁曲线(pacing;2026-08-05 用户裁定,修 s1 头部坍缩。
-  # docs/pgs-budget-pacing-design.md;三键均进 objective_fingerprint)----
+  # ---- v3.3 M1/M2:不对称 advantage 与 α 有限期调度(用户裁定 2026-08-07;
+  # docs/pgs-v33-mixed-policy-design.md;s3 双病诊断的结构性修复。
+  # asym 档要求 train.adv_estimator: pgs_asym_grpo 联动,校验强制)----
+  adv_mode: legacy_shared   # legacy_shared = v3.1 两臂同组共享 LOO(既有语义;
+                            # s3 实证其臂间基线是弥散化膨胀病根)| asym =
+                            # bare 组内 LOO + steered=[R−mean_bare]₊×α_t
+                            # (失败零梯度不惩罚,MENTOR Eq.13;v3.3 推荐)
+  steered_adv_weight: 1.0   # α_0(steered 超额权重初值)
+  steered_adv_decay_steps: 0  # T_decay:cosine 衰减,t≥T 后 α=0 且 steered 臂
+                            # 停产(教师=有限期脚手架);建议总步数×2/3(给
+                            # 副动作族慢热留窗,162 实测 80-120 步起飞);
+                            # 0=不衰减
+  steered_adv_cap: 0.0      # 组内 steered advantage 总额上限(>0 激活;
+                            # MENTOR expert_cap 防御闸,默认关)
+  # ---- v3.3 M4:软强度门控(gate_mode: entropy|d_var|soft_or 时生效)----
+  # 门 = 强度函数 w∈[0,1],η=η_max·w;G-E 熵门为推荐首发(信号在 draft 侧
+  # 免费,w<w_min 的整段跳过教师 verify)。熵口径 = top-16 截断熵
+  # (steering/hook.py ENTROPY_TOPK,与 dump 的 pi_top16 同口径,历史 dump
+  # 直接可标定)。4B raw + researcher doc 语境标定(s3 step25/47/51,
+  # n=1,433,050):P50≈0 / P75=.014 / P90=.822 / **P95=1.28** / P99=1.89。
+  entropy_target_rate: 0.05 # 满强度位置目标占比(H_q 追踪 P_{1−rate};
+                            # MENTOR entropy_p=0.95 同款)
+  entropy_theta_init: 0.0   # H_q 初值(entropy/soft_or 档必填>0;上述语境
+                            # 用 1.28 = P95)
+  entropy_floor: 0.0        # H_q 硬地板(防阈值追熵坍缩,MENTOR max(·,1.5)
+                            # 先例;上述语境建议 0.6 ≈「至少 78/22 犹豫」)
+  intensity_w_min: 0.05     # w<w_min 视为关门(bypass;entropy 档整段全
+                            # bypass 时跳过 verify——工程红利)
   budget_pacing: false      # true: unlocked(t)=U0+(B−U0)·[1−(1−t/T_max)^p],花费只动
                             # 已解锁额度(token-bucket 攒额);false=旧行为(t=0 全解锁)。
                             # T_max=episode.max_assistant_turns(环境硬配置,零任务先验)

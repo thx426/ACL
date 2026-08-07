@@ -123,10 +123,16 @@ def candidate_d(log_pi: np.ndarray, ell: np.ndarray) -> float:
     return float(np.dot(w, (ell - mean) ** 2))
 
 
+#: 熵信号的截断宽度:与 dump 的 pi_top16 同口径——历史 rollout dump 直接
+#: 可用于 H_q 标定(标定/运行同口径自洽),且高熵位的排序与全宽几乎单调
+#: 一致;宽度进入信号定义,改它 = 换门控信号(须重标定)。
+ENTROPY_TOPK = 16
+
+
 def truncated_entropy(topk_logprobs) -> float:
-    """学生截断熵 h = −Σ_{topK} p·logp(观测窗内口径,尾部质量忽略——
+    """学生截断熵 h = −Σ_{top-ENTROPY_TOPK} p·logp(尾部质量忽略——
     G-E 门信号与标定同口径即自洽;draft 侧免费,任何门档都观察)。"""
-    lp = np.asarray(topk_logprobs, dtype=np.float64)
+    lp = np.asarray(topk_logprobs[:ENTROPY_TOPK], dtype=np.float64)
     if lp.size == 0:
         return 0.0
     p = np.exp(lp)

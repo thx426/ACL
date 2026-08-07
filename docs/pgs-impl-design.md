@@ -233,3 +233,40 @@ steered 臂的 D 观测**:每 worker 每 step 观测量减半,min_obs=500 下更
 6. 全开下的量级参考:倾斜位≈候选数(门率恒 1)、替换仍集中高 D 位
    (替换数=ΣTV 不随门率线性放大)、失配增量有限(重尾 D 下门开位
    本已占 ΣD 大头)。
+
+## v3.3 分臂修订实施落点(2026-08-07;设计真源 docs/pgs-v33-mixed-policy-design.md)
+
+commit 458b875(分支 pgs-v33);364 passed / 3 skipped。四模块的代码落点:
+
+1. **M1 asym advantage**:估计器 `verl/verl/trainer/ppo/core_algos.py::
+   compute_pgs_asym_outcome_advantage`(不进 registry——臂标签与 α 来自
+   trainer 侧通道);分支拦截在 **v1** `trainer_base.py::_compute_advantage`
+   (f8f26d5 教训:V0 是死路径,vendored 断言锁定);臂标签经
+   `agent_loop_tq.py` tags 通道(`steer_arm`,research 行缺省 None→unknown
+   →组内退回 grpo_loo no-std,数值等价性测试锁定)。all-bare 组与
+   grpo_loo 逐值一致(research 组安全);steered-无-bare 组 fail loud。
+2. **M2 α 调度**:`core_algos.py::pgs_steered_alpha`(cosine,T 后恒 0);
+   trainer 每步求值并记 `actor/pgs_steered_alpha` 曲线;rollout 端停产判定
+   `steering/arms.py::steered_retired`(纯函数;v3 臂分配与 v4 role_of 两处
+   短路,v4 同步修 coord.bare_expected);launcher 恒透传
+   `+algorithm.steered_adv_{weight,decay_steps,cap}`。
+3. **M3 W 档位**:`off` 在 `agent_loop_tq` 组装层短路(不写
+   rollout_is_weights,ratio 分母=π_old);`shaped_reject` 在
+   `steering_weights.py`(拒绝位 f(π)=π/(π+γ),消费 ledger 的
+   steer_rejected 行级标志;γ 经 `steer_w_beh_gamma` 字段传递)。
+4. **M4 门控组件化**:`steering/gate.py::IntensityGate` 五档统一强度函数
+   (adaptive/always_on 与旧 SteeringGate **逐字段等价**,测试锁定;
+   SteeringGate 类保留);hook 逐位算 top-16 截断熵(`ENTROPY_TOPK`,与
+   dump pi_top16 同口径——历史 dump 可直接标定)并 `observe_entropy`
+   (任何档都观察,直方图 `steer_ent_hist` 1024 桶/max 8.0);entropy 档
+   段内全部 w<w_min ⇒ **跳过教师 verify**(`n_gate_bypassed` 计数);
+   H_q 自适应复用 `GateThresholdTracker`(新 `floor` 硬地板参数),
+   worker 级 `ent_tracker` 与 D tracker 并存(soft_or 双开)。行级观察面:
+   `steer_intensity`/`steer_entropy`;轨迹快照 `steer_entropy_theta`。
+5. **标定(4B raw + researcher doc 语境,s3 step25/47/51,n=1,433,050)**:
+   熵分位 P75=.014 / P90=.822 / **P95=1.276** / P99=1.891 ⇒
+   `entropy_theta_init: 1.28`(rate=0.05)、`entropy_floor: 0.6` 建议值;
+   脚本 `ent_calib.py`(读 dump 的 pi_top16,任何 run 可复标)。
+   1.7B 语境(162)熵低一个量级,**不可沿用,须另标**。
+6. 指纹:adv_mode/α 三参/熵门参数/w_min/γ 全部条件追加(默认值不改
+   material,既有 run 指纹逐字节不变——测试锁定四开关各自变指纹)。
