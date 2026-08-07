@@ -56,10 +56,19 @@ def _build_math(config: "Config", workers: int) -> "EnvFactory":
     return MathEnvFactory(cfg)
 
 
+def _build_appworld(config: "Config", workers: int) -> "EnvFactory":
+    from .appworld.adapter import AppworldEnvFactory
+
+    cfg = config.appworld
+    cfg.engine_slots = _per_worker(cfg.engine_slots, workers)
+    return AppworldEnvFactory(cfg)
+
+
 _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "alfworld": _build_alfworld,
     "spreadsheetbench": _build_spreadsheetbench,
     "math": _build_math,
+    "appworld": _build_appworld,
 }
 
 

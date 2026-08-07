@@ -163,6 +163,25 @@ class SpreadsheetbenchCfg:
 
 
 @dataclass
+class AppworldCfg:
+    """AppWorld:每 episode 一个 worker 子进程(官方单 world/进程硬约束;
+    RAM ~300-500MB/world ⇒ engine_slots 是内存账,slot 覆盖 episode 全
+    生命期)。worker 解释器须为装有 appworld 的 py>=3.11 venv。"""
+
+    appworld_root: str = ""         # $APPWORLD_ROOT 数据 checkout(含 data/)
+    worker_python: str = ""         # APPWORLD_WORKER_PYTHON(py3.11 venv)
+    worker_script: str = ""         # 空 = 包内 envs/appworld/worker.py(测试注入用)
+    engine_slots: int = 64          # 全局 live worker 上限(RAM-bound;按 worker 折算)
+    max_interactions: int = 50      # 传给引擎的交互硬上限(episode 步预算仍由
+                                    # episode.max_env_steps 主导,此为引擎侧兜底)
+    start_timeout_s: float = 180.0  # worker boot(载 world)超时
+    exec_timeout_s: float = 90.0    # 单次 execute/evaluate 超时
+    obs_max_chars: int = 3000       # worker 侧输出截断(token 流预算适配;
+                                    # 旧引入"不截断"裁定在 API 客户端形态,
+                                    # 硬预算形态下不可持续——方案 §1.4)
+
+
+@dataclass
 class MathCfg:
     """Math benchmark(DAPO-17k × 六竞赛评测源)。无文件资产——任务全
     自足于 parquet extra_info,无 data_root。"""
@@ -414,6 +433,7 @@ class Config:
     alfworld: AlfworldCfg
     spreadsheetbench: SpreadsheetbenchCfg
     math: MathCfg
+    appworld: AppworldCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -439,7 +459,8 @@ def _build(dc, d: dict[str, Any]):
 
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
-    "train", "eval", "steering", "environment", "spreadsheetbench", "math"
+    "train", "eval", "steering", "environment", "spreadsheetbench", "math",
+    "appworld"
 }
 
 
@@ -873,6 +894,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
             SpreadsheetbenchCfg, data.get("spreadsheetbench") or {}
         ),
         math=_build(MathCfg, data.get("math") or {}),
+        appworld=_build(AppworldCfg, data.get("appworld") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),

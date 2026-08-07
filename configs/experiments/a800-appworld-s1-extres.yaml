@@ -1,0 +1,160 @@
+# =============================================================================
+# AppWorld × 外部端点 researcher(v3.x 模式)。与 selfres 差异仅:research
+# 走 external 35B、research_rl 禁用、run 名(researcher 双路长期并存)。
+# 方案:docs/appworld-integration-plan.md(自旧引入调整:fenced-code 协议、
+# 步数 50→30 预算适配、score=requirement 通过比例)。executor = 有状态
+# Python REPL(每轮一个 ```python 块;终局 = apis.supervisor.complete_task())。
+# ⚠ 起跑前置:py3.11 venv 装 appworld + 数据(APPWORLD_ROOT/
+# APPWORLD_WORKER_PYTHON);RAM 账:每 live world ~300-500MB × engine_slots;
+# c 需在 appworld 文档语境重标定。
+# =============================================================================
+
+run:
+  name: appworld_s1_extres_n16
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs
+  tape: true
+
+environment:
+  name: appworld            # envs/registry.py 分派键(非默认值,进指纹)
+
+research:
+  enabled: true
+  backend: external # 外部 35B 端点 researcher(roles.researcher)
+  tool_protocol: fncall
+  n_exp: 16
+  k_default: 4
+  k_max: 8
+  max_turns: 30
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"                 # SSB 下 gt_text 恒 None(golden=测试答案);此开关无效果位
+  episode_temperature: 1.0
+  researcher_max_tokens: 8192
+  session_timeout_s: 3600
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+
+roles:
+  researcher:               # v4 自体不消费(engine 豁免);保留段与 s4 同构
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+
+episode:
+  max_env_steps: 30         # 方案 §1.4:旧 50(API 客户端无总预算形态)在
+                            # response_length=32768 硬预算下必溢出;30 与
+                            # ALFWorld 同格,按截断率数据回调
+  max_assistant_turns: 40   # 步预算 + 格式失败余量(校验 turns > steps)
+  max_tokens_per_turn: 2048 # 代码块轮短(推理+一个代码块)
+
+appworld:
+  appworld_root: "${APPWORLD_ROOT}"           # 数据 checkout(含 data/)
+  worker_python: "${APPWORLD_WORKER_PYTHON}"  # py3.11 venv(装 appworld)
+  engine_slots: 64          # 全局 live worker 上限(RAM 账 ~300-500MB/world,
+                            # 按 agent worker 折算;A800 内存余量核算后可调)
+  max_interactions: 50      # 引擎侧交互兜底上限(步预算由 episode 段主导)
+  start_timeout_s: 180
+  exec_timeout_s: 90
+  obs_max_chars: 3000       # worker 侧输出截断(方案 §1.4 预算适配)
+
+train:
+  model_path: "${TRACE_MODEL_PATH}"    # 基座 Qwen3-4B-Instruct-2507
+  train_file: "${APPWORLD_TRAIN_FILE}" # build_dataset 产出 train.parquet(90)
+  val_files:
+    - "${APPWORLD_VAL_FILE}"           # valid.parquet(dev 57 + test_normal 168;
+                                       # data_source=appworld/{dev,test_normal}
+                                       # 双桶曲线;test_challenge 永不触碰)
+  experiment_name: appworld_s1_extres_n16
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1
+  train_batch_size: 16
+  rollout_n: 16             # 分臂 8 bare + 8 steered(+8 research 由 launcher 追加)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  response_length: 32768
+  max_prompt_length: 4096   # SSB 首轮 = scaffold(含 tools 块)+ 指令 + 多 sheet
+                            # 预览,比 ALFWorld 长;fail-loud 口径下取宽
+  max_token_len_per_gpu: 36864   # ≥ max_prompt_length + response_length
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  rollout_max_model_len: 40960
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 2
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16
+
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5                    # ⚠ appworld 文档语境必须重标定(规范 §2.1;此值
+                            # 为 ALFWorld 语境起点,起跑前标定三件套)
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: always_on
+  gate_adaptive: false
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0
+  gate_rate_bounds: [0.0, 1.0]
+  r_max: 0
+  w_beh_mode: per_token
+  steered_fraction: 0.5
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768
+  temperature: 0.0
+
+research_rl:
+  enabled: false            # 外部 researcher 路:无自体双目标(24 行退化 16 行)
+  research_n: 8
+  prefix_quantiles: [0.05, 0.15, 0.30, 0.50, 0.75]
+  continuation_samples: 4
+  continuation_temperature: 1.0
+  researcher_temperature: 1.0
+  research_rl_weight: 0.1
+  research_warmup_steps: 0
+  research_max_sample_tokens: 24576
