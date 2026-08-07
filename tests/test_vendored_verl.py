@@ -286,3 +286,13 @@ def test_v33_wbeh_off_short_circuits_and_shaped_reject_exists():
     sw = _read("trainer/ppo/steering_weights.py")
     assert '"shaped_reject"' in sw
     assert "shaped_gamma" in sw
+
+
+def test_v33_padding_rows_forced_to_unknown_arm():
+    """padding 行 deepcopy 真实行 tag(含 steer_arm),独立 pad-uid 组里若带
+    arm=1 会触发 estimator 的 steered-无-bare fail-loud——拦截分支必须先按
+    is_padding 豁免为 unknown(-1)。"""
+    tb = _read("trainer/ppo/v1/trainer_base.py")
+    assert '-1 if t.get("is_padding")' in tb
+    pu = _read("trainer/ppo/padding_utils.py")
+    assert "is_padding=True" in pu and "pad_uid" in pu   # 前提事实不变则守卫有效

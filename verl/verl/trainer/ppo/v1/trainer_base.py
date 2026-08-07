@@ -1557,8 +1557,15 @@ class PPOTrainer(ABC):
                 pgs_steered_alpha,
             )
 
+            # Padding rows deep-copy a REAL row's tag (padding_utils), so they
+            # can carry steer_arm=1 while sitting alone in their pad-uid group
+            # — without this guard a partially-filled step would trip the
+            # "steered without bare" fail-loud. Forcing them to unknown (-1)
+            # routes them through plain LOO over all-zero rm_scores => zero
+            # advantage, matching their zeroed response_mask.
             steer_arm = np.array(
-                [int(t.get("steer_arm", -1)) if t.get("steer_arm") is not None else -1
+                [-1 if t.get("is_padding")
+                 else (int(t["steer_arm"]) if t.get("steer_arm") is not None else -1)
                  for t in batch.tags],
                 dtype=np.int64,
             )
