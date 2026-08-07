@@ -222,6 +222,18 @@ def test_episode_format_failure_and_premature_submit(tmp_path):
     assert result.invalid_format == 1
 
 
+def test_initial_obs_drift_detected(tmp_path):
+    """审阅修复回归:episode 的 initial_obs 由 live 重算(preview 同源)
+    ——数据集捕获后 xlsx 被改动必须 ENV_ERROR(此前回传捕获值恒真)。"""
+    from trace_opd.core.types import OUTCOME_ENV_ERROR
+
+    item = _make_task(tmp_path, answers=[{"B1": 3}])
+    _wb(tmp_path / "spreadsheet" / "T1" / "1_t1_input.xlsx", {"A1": 999})  # 漂移
+    result = _episode(item, tmp_path, [_call("submit")])
+    assert result.trajectory.outcome == OUTCOME_ENV_ERROR
+    assert "initial_obs mismatch" in (result.trajectory.error or "")
+
+
 def test_replay_action_deterministic_and_isolated(tmp_path):
     item = _make_task(tmp_path, answers=[{"B1": 3}])
     adapter = _adapter(tmp_path, item)

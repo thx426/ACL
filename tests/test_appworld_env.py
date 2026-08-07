@@ -33,9 +33,14 @@ DELTA = TemplateDelta(TOK)
 #: complete_task ⇒ completed;evaluate 按环境变量控制 success/report。
 _STUB = textwrap.dedent("""
     import json, os, sys
+    if os.environ.get("STUB_FATAL"):
+        print(json.dumps({"event": "fatal", "error": "boom at boot"}), flush=True)
+        sys.exit(1)
+    instruction = ("DRIFTED instruction." if os.environ.get("STUB_DRIFT")
+                   else "Find the spotify password.")
     print(json.dumps({
         "event": "ready",
-        "instruction": "Find the spotify password.",
+        "instruction": instruction,
         "supervisor": {"first_name": "Alex", "last_name": "Kim",
                        "email": "alex@x.io", "phone_number": "555"},
         "metadata": {"difficulty": 2},
@@ -149,6 +154,35 @@ def test_react_parsing_and_format_failure(stub_cfg):
         assert fb.startswith("OUT<") and not ended
     finally:
         env.close()
+
+
+def test_slot_balance_on_boot_failure(stub_cfg, monkeypatch):
+    """审阅修复回归:ready 失败路径 slot 必须恰好释放一次(此前 factory
+    与 episode 各 release 一处 ⇒ Semaphore 超发,RAM 门膨胀失效)。"""
+    from trace_opd.envs.appworld.adapter import WorkerFailure
+
+    factory = _factory(stub_cfg)
+    adapter = factory.adapter_from_item(ITEM)
+    monkeypatch.setenv("STUB_FATAL", "1")
+    for _ in range(2):
+        with pytest.raises(WorkerFailure):
+            adapter.open_episode()
+    assert factory._slots._value == stub_cfg.engine_slots   # 不泄漏、不超发
+    monkeypatch.delenv("STUB_FATAL")
+    env = adapter.open_episode()
+    env.close()
+    assert factory._slots._value == stub_cfg.engine_slots
+
+
+def test_initial_obs_drift_detected(stub_cfg, monkeypatch):
+    """审阅修复回归:env.initial_obs 由 ready 事件 live 构造——与数据集
+    捕获值不一致时 episode 必须 ENV_ERROR(此前回传捕获值恒真空转)。"""
+    from trace_opd.core.types import OUTCOME_ENV_ERROR
+
+    monkeypatch.setenv("STUB_DRIFT", "1")
+    result = _episode(stub_cfg, [_code("go", "print(1)")])
+    assert result.trajectory.outcome == OUTCOME_ENV_ERROR
+    assert "initial_obs mismatch" in (result.trajectory.error or "")
 
 
 def test_slot_released_on_close(stub_cfg):

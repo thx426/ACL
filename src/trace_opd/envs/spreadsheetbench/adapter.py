@@ -27,7 +27,7 @@ from ...common.config import SpreadsheetbenchCfg
 from ...core import protocol
 from ...core.adapter import ActionOutcome
 from ..pytool import clip_middle, run_python_script
-from .evaluator import evaluate, find_test_cases, preview_workbook
+from .evaluator import evaluate, find_test_cases, preview_workbook  # noqa: F401 — preview 供 live 重算
 from .recalc import find_soffice, recalculated_for_grading
 
 #: 无合法 tool call 时的提醒(裸文本——assistant 未发起调用,反馈不是
@@ -135,10 +135,13 @@ class SpreadsheetEpisode:
     交互执行经 adapter.react(run_python 子进程);本类只管目录生命周期。
     close() 幂等。"""
 
-    def __init__(self, case1_input: str, initial_obs: str) -> None:
+    def __init__(self, case1_input: str, item: dict) -> None:
         self.workdir = tempfile.mkdtemp(prefix="ssb_ep_")
         shutil.copy(case1_input, os.path.join(self.workdir, "input.xlsx"))
-        self._initial_obs = initial_obs
+        # live 重算初始观察(build_dataset 同源函数)——episode 开局与
+        # 数据集捕获值的比对是真实 drift 检测(xlsx 文件或 openpyxl 版本
+        # 漂移会被抓;审阅修复 2026-08-07:此前回传捕获值,比对恒真)。
+        self._initial_obs = initial_obs_of(item, preview_workbook(case1_input))
         self.closed = False
 
     @property
@@ -250,13 +253,13 @@ class SpreadsheetbenchTaskAdapter:
 
     def open_episode(self) -> SpreadsheetEpisode:
         cases = self._test_cases()
-        return SpreadsheetEpisode(cases[0][1], self.initial_obs)
+        return SpreadsheetEpisode(cases[0][1], self._item)
 
     # ---- 交互面(function-calling react) --------------------------------
 
     def react(self, env: SpreadsheetEpisode, assistant_text: str) -> ActionOutcome:
         calls = protocol.parse_tool_calls(assistant_text)
-        thought = _strip_tool_calls(assistant_text)
+        thought = protocol.strip_tool_calls(assistant_text)
         if not calls:
             return ActionOutcome(
                 thought=assistant_text.strip(),
@@ -384,10 +387,6 @@ def _tool_resp(content: str) -> str:
     文本流与原生 function-calling 分布对齐(服务器侧真 tokenizer 对拍
     冒烟见 GO 清单;不等价则升级 TemplateDelta 变体)。"""
     return f"<tool_response>\n{content}\n</tool_response>"
-
-
-def _strip_tool_calls(text: str) -> str:
-    return protocol._TOOL_CALL_RE.sub("", text or "").strip()
 
 
 def _norm_call(call: dict) -> str:

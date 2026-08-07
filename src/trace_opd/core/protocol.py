@@ -132,6 +132,12 @@ def parse_tool_calls(assistant_text: str) -> list[dict]:
     return calls
 
 
+def strip_tool_calls(assistant_text: str) -> str:
+    """去除全部 tool_call 块后的剩余文本(react 的 thought 记账用;
+    parse_tool_calls 的配套公共件——各 benchmark 勿引私有正则)。"""
+    return _TOOL_CALL_RE.sub("", assistant_text or "").strip()
+
+
 def parse_reasoning(assistant_text: str) -> str | None:
     """Content of the LAST <reasoning> block, or None if absent."""
     matches = _REASONING_RE.findall(assistant_text or "")

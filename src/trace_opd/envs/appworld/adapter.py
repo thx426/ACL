@@ -104,42 +104,53 @@ class WorkerFailure(RuntimeError):
 
 
 class AppworldEpisode:
-    """EnvHandle:一个 live worker 子进程。slot 在构造前由 factory
-    acquire,close() 释放(幂等)。"""
+    """EnvHandle:一个 live worker 子进程。slot 生命周期由本类全权管理
+    (__init__ 首行 acquire,任何路径经幂等 close() 恰好 release 一次
+    ——审阅修复 2026-08-07:此前 factory 与本类各 release 一处,ready
+    失败路径双 release 使 RAM 门逐次膨胀失效)。"""
 
-    def __init__(
-        self, task_id: str, cfg: AppworldCfg, slot_release, initial_obs: str
-    ) -> None:
+    def __init__(self, task_id: str, cfg: AppworldCfg, slots: threading.Semaphore) -> None:
         self._cfg = cfg
-        self._release = slot_release
-        self._initial_obs = initial_obs
+        self._slots = slots
         self.closed = False
-        env = {
-            **os.environ,
-            "APPWORLD_ROOT": cfg.appworld_root,
-            "PYTHONUNBUFFERED": "1",
-        }
-        self._proc = subprocess.Popen(
-            [
-                cfg.worker_python,
-                cfg.worker_script or _WORKER_SCRIPT,
-                task_id,
-                f"trace_{uuid.uuid4().hex[:12]}",
-                "minimal",                      # gt 防火墙:宿主永不调 gold
-                str(cfg.max_interactions),
-                str(cfg.obs_max_chars),
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            env=env,
-        )
-        ready = self._read_event(cfg.start_timeout_s)
-        if ready.get("event") != "ready":
+        self._proc: subprocess.Popen | None = None
+        slots.acquire()
+        try:
+            env = {
+                **os.environ,
+                "APPWORLD_ROOT": cfg.appworld_root,
+                "PYTHONUNBUFFERED": "1",
+            }
+            self._proc = subprocess.Popen(
+                [
+                    cfg.worker_python,
+                    cfg.worker_script or _WORKER_SCRIPT,
+                    task_id,
+                    f"trace_{uuid.uuid4().hex[:12]}",
+                    "minimal",                  # gt 防火墙:宿主永不调 gold
+                    str(cfg.max_interactions),
+                    str(cfg.obs_max_chars),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=env,
+            )
+            ready = self._read_event(cfg.start_timeout_s)
+            if ready.get("event") != "ready":
+                raise WorkerFailure(f"worker did not become ready: {ready}")
+            self.ready = ready
+            # live 构造初始观察(与 build_dataset 同源函数)——episode
+            # 开局与数据集捕获值比对是真实的 drift 检测(审阅修复:此前
+            # 回传捕获值,比对恒真空转)。
+            self._initial_obs = initial_obs_of({
+                "instruction": str(ready.get("instruction", "")),
+                "supervisor": ready.get("supervisor") or {},
+            })
+        except BaseException:
             self.close()
-            raise WorkerFailure(f"worker did not become ready: {ready}")
-        self.ready = ready
+            raise
 
     # ---- 协议往返 --------------------------------------------------------
 
@@ -192,16 +203,17 @@ class AppworldEpisode:
             return
         self.closed = True
         try:
-            if self._proc.poll() is None and self._proc.stdin is not None:
+            if (self._proc is not None and self._proc.poll() is None
+                    and self._proc.stdin is not None):
                 self._proc.stdin.write("__CLOSE__\n")
                 self._proc.stdin.flush()
                 self._proc.wait(timeout=10)
         except Exception:  # noqa: BLE001
             pass
         finally:
-            if self._proc.poll() is None:
+            if self._proc is not None and self._proc.poll() is None:
                 self._proc.kill()
-            self._release()
+            self._slots.release()
 
 
 def _partial_score(success: bool, report: dict) -> float:
@@ -278,15 +290,9 @@ class AppworldTaskAdapter:
         return ""
 
     def open_episode(self) -> AppworldEpisode:
-        """RAM-bound slot 覆盖 episode 全生命期(每 world ~300-500MB)。"""
-        self._slots.acquire()
-        try:
-            return AppworldEpisode(
-                self.task_id, self._cfg, self._slots.release, self.initial_obs
-            )
-        except BaseException:
-            self._slots.release()
-            raise
+        """RAM-bound slot 覆盖 episode 全生命期(每 world ~300-500MB);
+        slot 记账由 AppworldEpisode 单一负责。"""
+        return AppworldEpisode(self.task_id, self._cfg, self._slots)
 
     # ---- 交互面(fenced-code react) -------------------------------------
 

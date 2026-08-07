@@ -43,7 +43,7 @@ def _capture(args, task_id: str) -> dict:
          "minimal", "1", "0"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True,
-        env={"APPWORLD_ROOT": args.appworld_root, "PATH": "/usr/bin:/bin"},
+        env={**__import__("os").environ, "APPWORLD_ROOT": args.appworld_root},
     )
     try:
         line = proc.stdout.readline()

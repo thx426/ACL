@@ -119,7 +119,8 @@ def initial_obs_of(item: dict) -> str:
 
 class MathEpisode:
     """EnvHandle:一个空的 scratch 目录(run_python 的 cwd)。环境本身
-    无状态——数学任务的全部状态在推理文本里。close() 幂等。"""
+    无状态——数学任务的全部状态在推理文本里;无外部资产 ⇒ 无 drift 源,
+    initial_obs 传入即 live(SSB/AppWorld 则须 live 重构造)。close() 幂等。"""
 
     def __init__(self, initial_obs: str) -> None:
         self.workdir = tempfile.mkdtemp(prefix="math_ep_")
@@ -205,7 +206,7 @@ class MathTaskAdapter:
 
     def react(self, env: MathEpisode, assistant_text: str) -> ActionOutcome:
         calls = protocol.parse_tool_calls(assistant_text)
-        thought = protocol._TOOL_CALL_RE.sub("", assistant_text or "").strip()
+        thought = protocol.strip_tool_calls(assistant_text)
         if not calls:
             return ActionOutcome(
                 thought=assistant_text.strip(),
