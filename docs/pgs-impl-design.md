@@ -270,3 +270,27 @@ commit 458b875(分支 pgs-v33);364 passed / 3 skipped。四模块的代码落点
    1.7B 语境(162)熵低一个量级,**不可沿用,须另标**。
 6. 指纹:adv_mode/α 三参/熵门参数/w_min/γ 全部条件追加(默认值不改
    material,既有 run 指纹逐字节不变——测试锁定四开关各自变指纹)。
+
+## v3.3 配套监控/可视化落点(2026-08-07;commit 9913f8f)
+
+- **swanlab 自动曲线**(ledger 标量 → rollout_extra):`steer_intensity_mean`
+  (倾斜位平均强度 w̄,贴 1=退化 always_on)、`steer_entropy_mean`、
+  `steer_entropy_theta`(H_q 快照)、`steer_n_gate_bypassed`(墙钟红利);
+  trainer 侧 `actor/pgs_steered_alpha`。
+- **step 聚合唯一口径**:`pgs_microscope.py::build_step_entry`——导出器与
+  实时服务(`_meta_of` 轻量路径)共用,两端逐字段一致由测试锁定
+  (`test_v33_exporter_and_server_step_aggregation_identical`)。新字段:
+  wonBare/wonSteered/armGap/nBare/nSteered、entTheta/entMean/wMean、
+  gateBypassRate、alpha(从 effective_config 重算 cosine)、lenMean/lenMax、
+  absorbDlogpMed/absorbTop1Rate/rejDensity(**吸收进度三曲线**;top1 判定
+  = `pi_top16[0]==final`,即 0-based rank 0——勘误:deep2 的 rank 谱系
+  曾以 ≥1 过滤,标签整体偏一位,方向结论不变)、forkRed/forkEss
+  (**fork-token 双带 occurrence**,MENTOR Fig.3 口径;词表内置初版
+  `FORK_LEXICON`,`--fork-lexicon <json>` 数据驱动重标后覆盖)。
+- **前端**(pgs_microscope_app.html):新图 7 张(α 调度/H_q 带地板虚线/
+  软门工作面/吸收 Δlogπ/top1+拒绝密度/fork 双带/响应长度带 response_length
+  上限虚线),全部中文"怎么读"副标 + GLOSS 悬浮词条;KPI 加 α 卡与
+  **长度余量卡(lenMax≥90% 预算红条)**;token hover 卡与下钻抽屉带
+  w/h/H_q 标尺。条件渲染:非 asym/软门/无新字段的旧 run 自动隐藏新图,
+  历史 run 展示零变化。
+- 端到端:demo 数据 Playwright 真实渲染核验,零 JS 错误;全量 368 passed。
