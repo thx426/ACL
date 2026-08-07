@@ -28,6 +28,7 @@ prefix is byte-identical with research-time guidance injection (PG-7).
 
 from __future__ import annotations
 
+import json
 import re
 
 from .types import inject_guidance
@@ -102,6 +103,33 @@ def parse_action(assistant_text: str) -> str | None:
     command = command.splitlines()[0].strip()
     command = command.strip("\"'`").strip().lower()
     return command or None
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def parse_tool_calls(assistant_text: str) -> list[dict]:
+    """Extract hermes-style tool calls: ``<tool_call>{json}</tool_call>``.
+
+    模板家族级协议件(Qwen3 系 chat template 的原生 function-calling 输出
+    形态),与 parse_action 平级——用哪一个由各 benchmark 的 react 决定。
+    返回按出现顺序的合法调用列表,每项形如
+    ``{"name": str, "arguments": dict}``;JSON 不合法或缺 name 的块跳过
+    (坏输出交由 react 以 acted=False 处理,不在这里 raise)。"""
+    calls: list[dict] = []
+    for raw in _TOOL_CALL_RE.findall(assistant_text or ""):
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+            continue
+        args = obj.get("arguments")
+        calls.append({
+            "name": obj["name"],
+            "arguments": args if isinstance(args, dict) else {},
+        })
+    return calls
 
 
 def parse_reasoning(assistant_text: str) -> str | None:

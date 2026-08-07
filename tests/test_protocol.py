@@ -37,6 +37,27 @@ def test_alfworld_scaffold_guidance_injection():
     assert f"\n\n{GUIDANCE_HEADER}\nAlways go to the shelf first." in privileged
 
 
+def test_parse_tool_calls_hermes_format():
+    text = (
+        "let me check\n"
+        '<tool_call>\n{"name": "run_python", "arguments": {"code": "print(1)"}}\n</tool_call>'
+    )
+    calls = protocol.parse_tool_calls(text)
+    assert calls == [{"name": "run_python", "arguments": {"code": "print(1)"}}]
+    # 多调用保序;坏 JSON / 缺 name / arguments 非 dict 的块跳过或矫正
+    messy = (
+        '<tool_call>{"name": "a", "arguments": {"x": 1}}</tool_call>'
+        "<tool_call>not json</tool_call>"
+        '<tool_call>{"arguments": {}}</tool_call>'
+        '<tool_call>{"name": "b", "arguments": "oops"}</tool_call>'
+    )
+    calls = protocol.parse_tool_calls(messy)
+    assert [c["name"] for c in calls] == ["a", "b"]
+    assert calls[1]["arguments"] == {}
+    assert protocol.parse_tool_calls("no calls here") == []
+    assert protocol.parse_tool_calls("") == []
+
+
 def test_inject_guidance_empty_is_noop():
     assert inject_guidance("BASE", "") == "BASE"
     assert inject_guidance("BASE", "  \n ") == "BASE"

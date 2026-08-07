@@ -40,8 +40,17 @@ def _build_alfworld(config: "Config", workers: int) -> "EnvFactory":
     return AlfworldEnvFactory(cfg)
 
 
+def _build_spreadsheetbench(config: "Config", workers: int) -> "EnvFactory":
+    from .spreadsheetbench.adapter import SpreadsheetbenchEnvFactory
+
+    cfg = config.spreadsheetbench
+    cfg.exec_concurrency = _per_worker(cfg.exec_concurrency, workers)
+    return SpreadsheetbenchEnvFactory(cfg)
+
+
 _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "alfworld": _build_alfworld,
+    "spreadsheetbench": _build_spreadsheetbench,
 }
 
 

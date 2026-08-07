@@ -291,3 +291,8 @@ messages 重渲染有 BPE roundtrip 风险,不可用);"narrator 不内化"裁定
 一行 + 配置一行 + 照 `test_template_env.py` 写四组测试;机制侧(SPS/保尾核、
 W_beh、v4 三段/TaskCoord/前缀续写、SFT 转换)零改动。researcher 模板与
 文档规则已中性化(交互形态描述由 task_brief 承担)。
+
+**首个按此契约引入的真实第二 benchmark:SpreadsheetBench(verified 400,
+`envs/spreadsheetbench/`,原生 function-calling executor + 部分分评估)——
+方案与四项裁定见 `docs/spreadsheetbench-integration-plan.md`;core 仅新增
+`protocol.parse_tool_calls` 通用件,机制层零改动,实证了本契约。

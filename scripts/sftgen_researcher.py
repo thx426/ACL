@@ -15,11 +15,11 @@ docs/pgs-self-researcher-design.md §SFT)。
            质量筛选(finalized & doc 非空 & 无 error)+ 统计报告。
 
 分层声明(用户要求显式划分):
-  * benchmark 特定:任务分层抽样的 family 推导(ALFWorld task_type,经
-    AlfworldEnvFactory 取)、executor scaffold / task brief(经 adapter);
-  * 通用机制:research 会话循环(session/toolproto/tools/narration)、
-    续跑/落盘/转换、verl SFT 训练本身。换 benchmark 只换「任务抽样 +
-    adapter 工厂」两处(标注 [BENCHMARK-SPECIFIC])。
+  * benchmark 特定:family 语义(adapter.task_type 协议成员)、executor
+    scaffold / task brief(经 adapter)——全部在各 benchmark 的 adapter 内;
+  * 通用机制:本脚本全部逻辑(分层抽样按协议成员 task_type、research 会话
+    循环、续跑/落盘/转换、verl SFT 训练)。换 benchmark 零改动:工厂经
+    envs/registry.py 按 environment.name 分派。
 
 信息状态:researcher 无 GT(gt: off 同源生效),会话数据 = researcher
 可见信息,SFT 无特权泄漏(信息状态一致性红线合规)。
@@ -58,7 +58,7 @@ def _safe(task_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# [BENCHMARK-SPECIFIC] 任务分层抽样(ALFWorld:family = adapter.task_type)
+# 任务分层抽样(family = adapter.task_type,TaskAdapter 协议成员,通用)
 # ---------------------------------------------------------------------------
 
 def stratified_sample_tasks(
@@ -166,7 +166,7 @@ async def _one_session(
         result = session.snapshot(error="session timeout")
     payload = {
         "task_id": adapter.task_id,
-        "family": adapter.task_type,          # [BENCHMARK-SPECIFIC] 观察字段
+        "family": adapter.task_type,          # 协议成员(通用观察字段)
         "session_idx": session_idx,
         "seed": args.seed,
         "messages": result.messages,
@@ -198,7 +198,7 @@ async def cmd_sample(args) -> int:
     from transformers import AutoTokenizer
 
     from trace_opd.core import protocol
-    from trace_opd.envs.alfworld.adapter import AlfworldEnvFactory  # [BENCHMARK-SPECIFIC]
+    from trace_opd.envs.registry import make_env_factory
 
     cfg = load_config(args.config)
     protocol.configure_episode_caps(
@@ -206,7 +206,7 @@ async def cmd_sample(args) -> int:
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
-    factory = AlfworldEnvFactory(cfg.alfworld)   # [BENCHMARK-SPECIFIC]
+    factory = make_env_factory(cfg)   # environment.name 分派(registry)
 
     items = load_tasks([args.train_file])
     tasks = stratified_sample_tasks(items, args.n_tasks, args.seed, factory)

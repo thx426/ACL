@@ -146,6 +146,20 @@ class NarrationCfg:
 
 
 @dataclass
+class SpreadsheetbenchCfg:
+    """SpreadsheetBench(verified 400)专属配置;xlsx 数据与执行资源。
+    部署事实走 env(SSB_DATA),不进 yaml 字面量。"""
+
+    data_root: str = ""             # 任务 xlsx 根目录(必填,SSB_DATA)
+    exec_concurrency: int = 32      # run_python 子进程全局并发门(按 worker
+                                    # 折算;CPU 饥饿教训:环境子进程抢光 CPU
+                                    # 会饿死推理引擎)
+    python_timeout_s: int = 120     # 单次 run_python 超时
+    obs_max_chars: int = 3500       # 工具输出截断(< protocol 全局 4000,
+                                    # 保 <tool_response> 包裹完整)
+
+
+@dataclass
 class EnvironmentCfg:
     """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
     benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
@@ -385,6 +399,7 @@ class Config:
     episode: EpisodeCfg
     environment: EnvironmentCfg
     alfworld: AlfworldCfg
+    spreadsheetbench: SpreadsheetbenchCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -410,7 +425,7 @@ def _build(dc, d: dict[str, Any]):
 
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
-    "train", "eval", "steering", "environment"
+    "train", "eval", "steering", "environment", "spreadsheetbench"
 }
 
 
@@ -840,6 +855,9 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         episode=_build(EpisodeCfg, data.get("episode") or {}),
         environment=_build(EnvironmentCfg, data.get("environment") or {}),
         alfworld=_build(AlfworldCfg, data.get("alfworld") or {}),
+        spreadsheetbench=_build(
+            SpreadsheetbenchCfg, data.get("spreadsheetbench") or {}
+        ),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),
