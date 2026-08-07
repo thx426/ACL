@@ -207,13 +207,14 @@ async def run_episode(
             if command is None:
                 invalid_format += 1
                 consecutive_bad += 1
+                reminder = adapter.format_reminder()
                 traj.steps.append(
                     Step(
                         t=len(traj.steps) + 1,
                         thought=text.strip(),
                         action_raw="",
                         action_norm="",
-                        observation=protocol.FORMAT_REMINDER_OBS,
+                        observation=reminder,
                         valid=False,
                         acted=False,
                     )
@@ -223,7 +224,7 @@ async def run_episode(
                     traj.outcome = DEGENERATE_PREFIX + "format"
                     traj.error = "no parseable <action> block repeatedly"
                     break
-                obs_text = protocol.FORMAT_REMINDER_OBS
+                obs_text = reminder
                 done = False
             else:
                 consecutive_bad = 0
@@ -238,7 +239,7 @@ async def run_episode(
                         action_raw=command,
                         action_norm=norm,
                         observation=obs,
-                        valid=obs.strip() != protocol.INVALID_ACTION_OBS,
+                        valid=not adapter.observation_indicates_invalid(obs),
                     )
                 )
                 if done:

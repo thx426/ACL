@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 import json
 import random
 import sys
@@ -43,7 +44,7 @@ import httpx  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from trace_opd.common.config import load_config  # noqa: E402
-from trace_opd.common.llm import OpenAICompatClient  # noqa: E402
+from trace_opd.common.llm import make_client  # noqa: E402
 from trace_opd.core.template_delta import TemplateDelta, render_ids  # noqa: E402
 from trace_opd.evalm.run_eval import external_generate, load_tasks  # noqa: E402
 from trace_opd.research.prompts import build_researcher_system  # noqa: E402
@@ -218,17 +219,31 @@ async def cmd_sample(args) -> int:
     # researcher = 外部强模型端点(35B);温度与 v4 训练器同源
     # (research_rl.researcher_temperature,用户裁定 1.0);thinking 关闭
     # (历史裁定:researcher 统一关 thinking)。
-    researcher_client = OpenAICompatClient(
-        role="researcher-sftgen",
+    # 客户端经 make_client 从 RoleCfg 构造 —— 与训练器 agent_loop 同一路径。
+    # 两条必须走工厂的理由(均为实测事故,2026-08-07 162 阶段A 试跑):
+    #   ① 鉴权:配置已声明 roles.researcher.api_key_env,RoleCfg 构造时解析为
+    #      role.api_key;硬编码空串 ⇒ 全量 401,表征为 "finalize 0/8" 而非鉴权错;
+    #   ② 多端点:逗号分隔的 endpoint 必须走 PooledClient(会话粘滞+故障切换);
+    #      直接塞进单端点客户端会拼出 ".../v1,http://.../v1/chat/completions" ⇒ 全量 404。
+    # 部署事实(端点/模型名)由 CLI 覆盖配置,配置纪律不变。
+    researcher_role = replace(
+        cfg.role("researcher"),
         endpoint=args.researcher_api_base,
         model=args.researcher_model,
-        api_key="",
         max_concurrency=args.researcher_concurrency,
         temperature=cfg.research_rl.researcher_temperature,
         max_tokens=cfg.research.researcher_max_tokens,
         timeout_s=600.0,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
+    if not researcher_role.api_key_env:
+        raise SystemExit("FATAL: roles.researcher.api_key_env is empty")
+    if not researcher_role.api_key:
+        raise SystemExit(
+            f"FATAL: researcher API key env var {researcher_role.api_key_env!r} "
+            "is unset or empty — 采样会全量 401"
+        )
+    researcher_client = make_client("researcher-sftgen", researcher_role)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(args.concurrency)

@@ -258,3 +258,28 @@ research 行隔离纪律(mask/指标/超长);全零组自然跳过;warmup;
 会话 token 面 append-only 构流(训练 token = 引擎实际采样 token,
 messages 重渲染有 BPE roundtrip 风险,不可用);"narrator 不内化"裁定
 已被演进推翻(现 narration.backend=engine)。
+
+## 9. 通用性契约(2026-08-06/07 审计后固化;引入新 benchmark 的完整改动面)
+
+机制层(steering/research/train/selfres/core)零任务字面量;任务内容全部经
+`core/adapter.py::TaskAdapter` 协议进入。引入新 benchmark 需要且只需要:
+
+1. **实现 TaskAdapter**(`envs/<bench>/adapter.py`),含 v4 审计固化的三个成员:
+   - `task_type`(类别/family;分层抽样与分组统计用,无类别返回常量);
+   - `observation_indicates_invalid(obs)`(环境无效动作文本判定;core 不解析
+     环境语义,无此信号返回 False——Step.valid 只是观测字段,永不进 loss);
+   - `format_reminder()`(格式失败提醒;协议部分用
+     `protocol.DEFAULT_FORMAT_REMINDER`,可加环境习语前缀)。
+   executor 提示词(scaffold)、动作语法、命令表全部由 adapter 自持
+   (ALFWorld 的 SYSTEM_PROMPT_BARE/COMMAND_REFERENCE 已从 core/protocol 迁入
+   `envs/alfworld/adapter.py`,行为逐字节不变,有字节锁测试)。
+2. **数据集构建脚本**(初始观察捕获 + parquet;参照 build_datasets.py,该脚本
+   本身是 ALFWorld 装配件)。
+3. **装配点接线**:AlfworldEnvFactory 直连处(agent_loop._shared_state、
+   evalm/run_eval、sftgen_researcher、build_datasets)。此为已知裁定项:
+   工厂注册表化(environment.name 键)是引入第二个 benchmark 时的第一工程项,
+   当前单 benchmark 阶段维持直连。
+
+researcher 模板(prompts.py)与文档规则已中性化(交互形态描述由 task_brief
+承担);SFT 管线中 [BENCHMARK-SPECIFIC] 段已显式标注。`<action>` 输出协议、
+episode 预算、SPS/保尾核、W_beh、v4 前缀续写/TaskCoord 与任务无关,零改动。

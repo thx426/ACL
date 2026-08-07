@@ -4,9 +4,10 @@ Everything that defines the executor<->environment conversation lives here so
 research experiments, the training rollout (verl agent loop), the teacher
 prompt construction, and the standalone evaluator can never drift apart:
 
-  * the bare system prompt, and guidance injection via
-    ``types.inject_guidance`` (the SAME ``## Task guidance`` block serves
-    researcher guidance, the privileged teacher prefix, and +doc eval arms);
+  * guidance injection via ``types.inject_guidance`` (the SAME ``## Task
+    guidance`` block serves researcher guidance, the privileged teacher
+    prefix, and +doc eval arms); the bare system prompt itself is benchmark
+    material and lives with each adapter (``executor_scaffold``);
   * the assistant output contract: ``<reasoning>...</reasoning>`` followed by
     ``<action>...</action>`` in plain content.  Custom tags are load-bearing —
     the Qwen chat template strips literal ``<think>...</think>`` blocks from
@@ -18,10 +19,6 @@ prompt construction, and the standalone evaluator can never drift apart:
 No admissible-command list is ever shown: dynamic action knowledge is exactly
 the surface the experience document fills, and the privileged/bare contrast
 must share one contract.
-
-COMMAND_REFERENCE is quoted from the engine's own ``help`` output (AlfredTWEnv
-text mode), captured verbatim on the target server (CD-003,
-experiments/h3_pilot/notes/engine_help.txt) — never paraphrase.
 
 Inherited verbatim from the CD-003 contract (PG-3) with ONE deliberate
 change: the privileged section header is the project-wide GUIDANCE_HEADER
@@ -68,54 +65,22 @@ def configure_episode_caps(max_env_steps: int, max_assistant_turns: int) -> None
     MAX_ENV_STEPS = max_env_steps
     MAX_ASSISTANT_TURNS = max_assistant_turns
 
-# Command reference ---------------------------------------------------------
-COMMAND_REFERENCE = """\
-Available commands:
-  look:                             look around your current location
-  inventory:                        check your current inventory
-  go to (receptacle):               move to a receptacle
-  open (receptacle):                open a receptacle
-  close (receptacle):               close a receptacle
-  take (object) from (receptacle):  take an object from a receptacle
-  move (object) to (receptacle):  place an object in or on a receptacle
-  examine (something):              examine a receptacle or an object
-  use (object):                     use an object
-  heat (object) with (receptacle):  heat an object using a receptacle
-  clean (object) with (receptacle): clean an object using a receptacle
-  cool (object) with (receptacle):  cool an object using a receptacle
-  slice (object) with (object):     slice an object using a sharp object"""
-
-SYSTEM_PROMPT_BARE = (
-    "You are an agent in the ALFRED text-based household environment. "
-    "Complete the task stated after 'Your task is to:' by issuing exactly one "
-    "environment command per turn.\n\n"
-    + COMMAND_REFERENCE
-    + "\n\n"
-    "Use exact entity names with their numbers as observed (e.g. 'bread 1', "
-    "'countertop 2'). An invalid or currently impossible command returns "
-    "'Nothing happens.'.\n\n"
-    "On every turn respond with exactly this format and nothing else:\n"
-    "<reasoning>brief reasoning about the current situation</reasoning>\n"
-    "<action>one command</action>\n\n"
-    "The episode ends automatically when the task goal is reached; there is "
-    "no submit command and no partial credit."
-)
-
-
-def build_system_prompt(guidance: str | None = None) -> str:
-    """Bare system prompt, or the privileged variant with guidance appended
-    under the project-wide GUIDANCE_HEADER (single injection format)."""
-    return inject_guidance(SYSTEM_PROMPT_BARE, guidance or "")
-
+# Benchmark prompt material -------------------------------------------------
+# (v4 通用性整改,用户裁定 2026-08-06)ALFWorld 的 COMMAND_REFERENCE 与
+# SYSTEM_PROMPT_BARE 已迁至 envs/alfworld/adapter.py —— core 只持有与任务
+# 无关的输出协议(<reasoning>/<action> 契约、解析、通用格式提醒)。
+# executor 提示词一律经 adapter.executor_scaffold() 获取。
 
 # Assistant output parsing --------------------------------------------------
 
 _ACTION_RE = re.compile(r"<action>(.*?)</action>", re.DOTALL | re.IGNORECASE)
 _REASONING_RE = re.compile(r"<reasoning>(.*?)</reasoning>", re.DOTALL | re.IGNORECASE)
 
-INVALID_ACTION_OBS = "Nothing happens."
-FORMAT_REMINDER_OBS = (
-    "Nothing happens. (Your reply had no <action>...</action> block — respond "
+#: 通用格式提醒(输出协议自身的内容,无环境语感)。benchmark 可在
+#: adapter.format_reminder() 里加环境习语前缀(如 ALFWorld 的
+#: "Nothing happens. " 开头),使提醒读起来像一次正常环境响应。
+DEFAULT_FORMAT_REMINDER = (
+    "(Your reply had no <action>...</action> block — respond "
     "with <reasoning>...</reasoning> then <action>one command</action>.)"
 )
 

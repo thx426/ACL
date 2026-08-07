@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from trace_opd.core import protocol
 from trace_opd.core.episode import GenResult
 from trace_opd.core.types import Trajectory
 
@@ -111,6 +112,10 @@ class ScriptedAdapter:
         return self._task_id
 
     @property
+    def task_type(self) -> str:
+        return "fake"
+
+    @property
     def initial_obs(self) -> str:
         return self._initial_obs
 
@@ -140,6 +145,13 @@ class ScriptedAdapter:
 
     def normalize_action(self, raw: str) -> str:
         return raw.strip().lower()
+
+    def observation_indicates_invalid(self, observation: str) -> bool:
+        # ScriptedEnv 的 miss 响应就是这个字面量(与 ALFWorld 同风格)
+        return observation.strip() == "Nothing happens."
+
+    def format_reminder(self) -> str:
+        return "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
 
 
 class ScriptedGenerate:

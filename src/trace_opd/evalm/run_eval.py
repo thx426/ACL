@@ -36,7 +36,7 @@ from ..core import protocol
 from ..core.episode import GenResult, run_episode
 from ..core.template_delta import TemplateDelta
 from ..core.types import OUTCOME_ENV_ERROR
-from ..envs.alfworld.adapter import AlfworldEnvFactory
+from ..envs.alfworld.adapter import SYSTEM_PROMPT_BARE, AlfworldEnvFactory
 
 
 def load_tasks(parquet_paths: list[str]) -> list[dict]:
@@ -146,7 +146,7 @@ async def main_async(args) -> int:
         "doc_dir": args.doc_dir,
         "doc_file": args.doc_file,
         "system_prompt_sha1": hashlib.sha1(
-            protocol.SYSTEM_PROMPT_BARE.encode("utf-8")
+            SYSTEM_PROMPT_BARE.encode("utf-8")
         ).hexdigest()[:12],
         "config": config.raw,
     }

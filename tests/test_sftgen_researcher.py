@@ -120,3 +120,42 @@ def test_convert_fails_loud_when_nothing_survives(tmp_path):
 
     with pytest.raises(SystemExit, match="no sessions survived"):
         sftgen.cmd_convert(_Args())
+
+
+def test_researcher_client_uses_config_declared_api_key():
+    """采样必须用 roles.researcher.api_key_env 解析出的 key。
+
+    实测事故(2026-08-07,162 v4 阶段A 试跑):脚本硬编码 api_key="",8/8 会话
+    在首个 researcher 调用上 401,表征为 "finalize 0/8" —— 看起来像 text 协议
+    或模型能力问题,实为鉴权。缺 key 必须在采样启动前 fail loud,而不是把
+    401 吞成 no_finalize 记进数据集。
+    """
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert 'api_key=""' not in src, "researcher client 不得硬编码空 api_key"
+    assert "make_client(" in src, "必须走 make_client 工厂(逗号端点=PooledClient)"
+    assert "OpenAICompatClient(" not in src, (
+        "不得直接构造单端点客户端:逗号分隔端点会拼出 "
+        "'.../v1,http://.../v1/chat/completions' ⇒ 全量 404"
+    )
+    # 缺 key / 缺变量名两种情况都要在建客户端前 fail loud
+    assert "FATAL: roles.researcher.api_key_env is empty" in src
+    assert "is unset or empty" in src
+    guard_at = src.index("researcher_role = replace(")
+    client_at = src.index("researcher_client = make_client(")
+    assert guard_at < client_at, "校验必须先于建客户端"
+
+
+def test_config_resolves_researcher_key_from_env(monkeypatch):
+    """RoleCfg 从 api_key_env 解析 key —— 脚本依赖的这条链路本身不能断。"""
+    import sys
+    sys.path.insert(0, str(_SCRIPT.resolve().parents[1] / "src"))
+    from trace_opd.common.config import RoleCfg
+
+    monkeypatch.setenv("TRACE_TEST_KEY_X", "value-from-env")
+    role = RoleCfg.from_dict({"endpoint": "http://x/v1", "model": "m",
+                              "api_key_env": "TRACE_TEST_KEY_X"})
+    assert role.api_key == "value-from-env"
+    monkeypatch.delenv("TRACE_TEST_KEY_X")
+    role2 = RoleCfg.from_dict({"endpoint": "http://x/v1", "model": "m",
+                               "api_key_env": "TRACE_TEST_KEY_X"})
+    assert role2.api_key == ""

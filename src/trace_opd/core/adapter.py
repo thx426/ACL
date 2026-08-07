@@ -34,6 +34,13 @@ class TaskAdapter(Protocol):
     def task_id(self) -> str: ...
 
     @property
+    def task_type(self) -> str:
+        """Task category/family for stratified sampling and per-family
+        stats (v4 SFT pipeline, analysis). Benchmarks without a natural
+        taxonomy return a constant (e.g. "default")."""
+        ...
+
+    @property
     def initial_obs(self) -> str:
         """Deterministic initial observation (captured at dataset build time;
         deterministic engines must reproduce it on open_episode)."""
@@ -70,4 +77,20 @@ class TaskAdapter(Protocol):
 
     def normalize_action(self, raw: str) -> str:
         """Conservative, semantics-free normalization (no repair)."""
+        ...
+
+    def observation_indicates_invalid(self, observation: str) -> bool:
+        """Whether this observation means the action was a no-op/invalid —
+        an ENVIRONMENT-TEXT judgement, so it belongs to the benchmark, not
+        to the task-agnostic core (通用性硬约束:core 不解析环境语义)。
+        Benchmarks without such a signal return False (Step.valid stays
+        True; it is an observability field, never a loss input)."""
+        ...
+
+    def format_reminder(self) -> str:
+        """Observation text fed back when the assistant reply had no
+        parseable action block. The PROTOCOL part (the <action> contract)
+        is generic; benchmarks may prefix it with their own environment
+        idiom so the reminder reads like a normal environment response
+        (protocol.DEFAULT_FORMAT_REMINDER is the neutral base)."""
         ...

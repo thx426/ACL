@@ -35,7 +35,12 @@ import pandas as pd
 from ..common.config import AlfworldCfg, load_config
 from ..core import protocol
 from ..envs.alfworld import gt as gt_mod
-from ..envs.alfworld.adapter import GT_SENTINEL, WorkerFailure, _Worker
+from ..envs.alfworld.adapter import (
+    GT_SENTINEL,
+    SYSTEM_PROMPT_BARE,
+    WorkerFailure,
+    _Worker,
+)
 
 # Official split cardinalities — a shrunken data directory must fail the
 # build, not silently produce a reduced task pool (review P1-4).
@@ -124,7 +129,7 @@ def build_rows(
         rows.append(
             {
                 "prompt": [
-                    {"role": "system", "content": protocol.SYSTEM_PROMPT_BARE},
+                    {"role": "system", "content": SYSTEM_PROMPT_BARE},
                     {"role": "user", "content": protocol.truncate_obs(cap["initial_obs"])},
                 ],
                 # verl groups val metrics by data_source: per-split values give

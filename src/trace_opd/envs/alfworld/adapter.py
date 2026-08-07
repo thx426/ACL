@@ -168,6 +168,47 @@ def normalize_command(raw: str) -> str:
     return command.strip("\"'").strip().lower()
 
 
+# --- ALFWorld executor prompt material(2026-08-06 自 core/protocol.py 迁入,
+#     内容逐字节不变;通用性整改:任务提示词归 benchmark 实现自持)---------
+# COMMAND_REFERENCE is quoted from the engine's own ``help`` output
+# (AlfredTWEnv text mode), captured verbatim on the target server (CD-003,
+# experiments/h3_pilot/notes/engine_help.txt) — never paraphrase.
+COMMAND_REFERENCE = """\
+Available commands:
+  look:                             look around your current location
+  inventory:                        check your current inventory
+  go to (receptacle):               move to a receptacle
+  open (receptacle):                open a receptacle
+  close (receptacle):               close a receptacle
+  take (object) from (receptacle):  take an object from a receptacle
+  move (object) to (receptacle):  place an object in or on a receptacle
+  examine (something):              examine a receptacle or an object
+  use (object):                     use an object
+  heat (object) with (receptacle):  heat an object using a receptacle
+  clean (object) with (receptacle): clean an object using a receptacle
+  cool (object) with (receptacle):  cool an object using a receptacle
+  slice (object) with (object):     slice an object using a sharp object"""
+
+SYSTEM_PROMPT_BARE = (
+    "You are an agent in the ALFRED text-based household environment. "
+    "Complete the task stated after 'Your task is to:' by issuing exactly one "
+    "environment command per turn.\n\n"
+    + COMMAND_REFERENCE
+    + "\n\n"
+    "Use exact entity names with their numbers as observed (e.g. 'bread 1', "
+    "'countertop 2'). An invalid or currently impossible command returns "
+    "'Nothing happens.'.\n\n"
+    "On every turn respond with exactly this format and nothing else:\n"
+    "<reasoning>brief reasoning about the current situation</reasoning>\n"
+    "<action>one command</action>\n\n"
+    "The episode ends automatically when the task goal is reached; there is "
+    "no submit command and no partial credit."
+)
+
+#: ALFWorld 的无效动作环境响应(判定与提醒习语;core 不再持有该字面量)。
+INVALID_ACTION_OBS = "Nothing happens."
+
+
 class AlfworldTaskAdapter:
     """TaskAdapter implementation bound to one dataset row."""
 
@@ -213,7 +254,7 @@ class AlfworldTaskAdapter:
             "Exactly what the executor sees at episode start (scene + goal):\n"
             f"{self.initial_obs}\n\n"
             "Action grammar available to the executor:\n"
-            f"{protocol.COMMAND_REFERENCE}\n\n"
+            f"{COMMAND_REFERENCE}\n\n"
             "Evaluation: binary — the engine itself detects goal satisfaction "
             f"(no partial credit). Episode step budget: {protocol.MAX_ENV_STEPS} "
             "steps; invalid commands return 'Nothing happens.' and consume a "
@@ -221,7 +262,7 @@ class AlfworldTaskAdapter:
         )
 
     def executor_scaffold(self) -> str:
-        return protocol.SYSTEM_PROMPT_BARE
+        return SYSTEM_PROMPT_BARE
 
     def open_episode(self) -> AlfworldEnvHandle:
         gamefile = str(Path(self._cfg.data_root) / str(self._item["gamefile"]))
@@ -250,6 +291,18 @@ class AlfworldTaskAdapter:
 
     def normalize_action(self, raw: str) -> str:
         return normalize_command(raw)
+
+    def observation_indicates_invalid(self, observation: str) -> bool:
+        """无效/不可执行命令的引擎响应恒为 'Nothing happens.'(环境语义
+        判定归 benchmark;core 不解析环境文本)。"""
+        return observation.strip() == INVALID_ACTION_OBS
+
+    def format_reminder(self) -> str:
+        """格式失败提醒:以 ALFWorld 习语开头(与 core 迁移前逐字节一致,
+        提示词行为零变化)。"""
+        return (
+            "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
+        )
 
 
 class AlfworldEnvFactory:

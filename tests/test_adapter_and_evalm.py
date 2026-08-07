@@ -29,6 +29,28 @@ def test_task_type_skips_split_segment():
     assert b.task_type == "pick_and_place_simple"
 
 
+def test_adapter_contract_surface_complete():
+    """通用性契约:两个 TaskAdapter 实现都必须具备 v4 新增的三个成员
+    (task_type / observation_indicates_invalid / format_reminder)。"""
+    from tests.fakes import ScriptedAdapter
+
+    for impl in (_adapter("train/pick-Egg-1/trial_T1"), ScriptedAdapter()):
+        assert isinstance(impl.task_type, str) and impl.task_type
+        assert impl.observation_indicates_invalid("Nothing happens.") is True
+        assert impl.observation_indicates_invalid("You open the fridge.") is False
+        assert "<action>" in impl.format_reminder()
+
+
+def test_alfworld_format_reminder_byte_identical_to_pre_migration():
+    """行为锁:提示词材料迁入 adapter 后,发给模型的格式提醒必须与迁移前
+    core/protocol.FORMAT_REMINDER_OBS 逐字节一致(s4 行为零变化)。"""
+    a = _adapter("train/pick-Egg-1/trial_T1")
+    assert a.format_reminder() == (
+        "Nothing happens. (Your reply had no <action>...</action> block — "
+        "respond with <reasoning>...</reasoning> then <action>one command</action>.)"
+    )
+
+
 def test_task_brief_carries_real_type_and_scene():
     a = _adapter("train/look_at_obj_in_light-Book-None-DeskLamp-308/trial_T1")
     brief = a.task_brief()

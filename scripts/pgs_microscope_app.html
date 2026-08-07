@@ -127,6 +127,13 @@ svg.mini{width:100%;height:118px;display:block}
   background:var(--probe-bg);border:1px solid #fde68a;border-radius:8px;padding:9px 12px;color:#78350f;
   max-height:220px;overflow-y:auto}
 .priv-none{font-size:12.5px;color:var(--text3);background:var(--bg);border:1px dashed var(--border2);border-radius:8px;padding:10px 12px}
+.priv-alert{font-size:12px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:8px 11px;margin-bottom:8px;word-break:break-word}
+.priv-source{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:8px}
+.priv-source .archive{font-family:var(--mono);font-size:10.5px;color:var(--text3);word-break:break-all;min-width:0}
+.audit-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:6px;margin-top:9px}
+.audit-it{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:6px 8px;min-width:0}
+.audit-it .ak{font-size:10px;color:var(--text3)}
+.audit-it .av{font-family:var(--mono);font-size:11px;color:var(--text2);margin-top:1px;overflow-wrap:anywhere}
 .tk-demo{font-family:var(--mono);font-size:12px;padding:1px 5px;border-radius:4px}
 
 /* turn 卡 */
@@ -256,16 +263,27 @@ svg .tgt{stroke:var(--ok);stroke-width:1;stroke-dasharray:4 3}
 <script>
 "use strict";
 /* ═══════════ 数据层:live(API)/ static(data/*.js)双模 ═══════════ */
-let R = window.PGS_RUN || {name:"—", steps:[], vals:[]};
+let R = window.PGS_RUN || {name:"—", steps:[], vals:[], config:{bmax:20}};
 let LIVE = false, LAST_TS = null, POLL = null;
 window.PGS_STEP_DATA = window.PGS_STEP_DATA || {};
 const stepMeta = {};   // live 模式:dir -> {trajs:[meta]}
-const trajCache = {};  // live 模式:dir/i -> traj
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const pct = x => (100*x).toFixed(1)+"%";
-const Q_TARGET=0.10, BAND=[0.05,0.25], EXPECT_TILT=[4,8], C_CLIP=2.5, BMAX=20;
+const Q_TARGET=0.10, BAND=[0.05,0.25], C_CLIP=2.5, DEFAULT_BMAX=20;
+// maxopen 档(v3.2)b_max=.inf:后端传 bmax:null + bmaxUnbounded:true。
+// null 表示"无上限",不是"缺失"——绝不能回退成 DEFAULT_BMAX,否则无上限预算
+// 会被显示成"接近上限 → 后续可能旁路",与实测 bypassed=0 直接矛盾。
+const isUnbounded = () => !!(R.config&&R.config.bmaxUnbounded);
+// always_on(v3.2):无门判定,开门率恒 1、θ_D 无语义。仍按自适应档的 5-25%
+// 绿带判读会把"正确常态"标成"严重超标",必须切换口径。
+const isAlwaysOn = () => (R.config&&R.config.gateMode)==="always_on";
+const runBmax = () => isUnbounded() ? null
+  : (Number.isFinite(Number(R.config&&R.config.bmax))&&Number(R.config.bmax)>0 ? Number(R.config.bmax) : DEFAULT_BMAX);
+const fmtB = v => v===null?"∞":fmtNum(v);
+const nearCap = (spent,b) => b!==null && spent>=b-1;
+const fmtNum = x => Number(x).toLocaleString("zh-CN",{maximumFractionDigits:4});
 
 async function boot(){
   try{
@@ -296,14 +314,41 @@ async function getStepList(dir){
   const j = await r.json();
   stepMeta[dir] = j.trajs; return j.trajs;
 }
-async function getTraj(dir,i){
+const trajCache = new Map();          // `${dir}/${i}` -> traj(精简档)
+const recDistCache = new Map();       // `${dir}/${i}/${ref}` -> {pi,pt}
+const TRAJ_CACHE_MAX = 12;
+function cachePut(m,k,v,max){ m.delete(k); m.set(k,v); while(m.size>max) m.delete(m.keys().next().value); }
+
+async function getTraj(dir,i,{prefetch=false}={}){
   if(!LIVE) return ((window.PGS_STEP_DATA[dir]||{}).trajs||[])[i];
-  const k = dir+"/"+i;
-  if(trajCache[k]) return trajCache[k];
-  const r = await fetch(`api/traj/${dir}/${i}`,{cache:"no-store"});
+  const key=`${dir}/${i}`;
+  if(trajCache.has(key)) return trajCache.get(key);
+  try{
+    const r = await fetch(`api/traj/${dir}/${i}`,{cache:"no-store"});
+    const j = await r.json();
+    if(j.error) return null;
+    // 进行中的 step 数据会变,不缓存;完成态才缓存。
+    if(!isPartial(dir)) cachePut(trajCache,key,j,TRAJ_CACHE_MAX);
+    return j;
+  }catch(e){ if(prefetch) return null; throw e; }
+}
+// 看完一条通常接着看相邻条:后台预取,不阻塞当前渲染,失败静默。
+function prefetchNeighbors(dir,i){
+  if(!LIVE) return;
+  const n=(R.steps.find(x=>x.dir===dir)||{}).n||0;
+  [i+1,i-1].filter(j=>j>=0&&j<n).forEach(j=>{
+    if(!trajCache.has(`${dir}/${j}`)) getTraj(dir,j,{prefetch:true}).catch(()=>{});
+  });
+}
+// top16 分布占 payload 95%,轨迹接口已省略,点开抽屉才按需取。
+async function getRecDists(dir,i,ref){
+  const key=`${dir}/${i}/${ref}`;
+  if(recDistCache.has(key)) return recDistCache.get(key);
+  const r = await fetch(`api/rec/${dir}/${i}/${ref}`,{cache:"no-store"});
   const j = await r.json();
-  if(!j.error) trajCache[k]=j;
-  return j.error?null:j;
+  if(j.error) return null;
+  cachePut(recDistCache,key,j,240);
+  return j;
 }
 function isPartial(dir){ const s=R.steps.find(x=>x.dir===dir); return s&&s.partial; }
 /* 静态模式的 step js 懒加载 */
@@ -322,9 +367,9 @@ const GLOSS = {
   val:["验证成功率","274 个 val 任务的裸 policy greedy 评测(无教师、无文档)。seen=训练见过的任务类型,unseen=未见类型(泛化)。每 10 步一个点。"],
   gate:["开门率","D 门打开的候选占比 = Σ开门/Σ候选。目标 q=10%,合法带 5–25%(绿带)。分母只含未旁路的候选位置。"],
   theta:["θ_D 阈值","D 门阈值。自适应模式:θ(t+1)=(1−β)θ(t)+β·P(1−q)(实测 D 分布分位),每 step 更新。"],
-  tilt:["倾斜次数/轨迹","实际执行分布倾斜(η>0)的位置数。预算 B∞=20、每次扣 2ηc=2.5 ⇒ 上限 8;健康区间 4–8。"],
+  tilt:["倾斜次数/轨迹","实际执行分布倾斜(η>0)的位置数。预算上限随当前 run 的实收 steering.b_max 显示；不同预算档不能套用同一个固定健康区间。"],
   rej:["拒绝重采/轨迹","倾斜后投机判定拒绝、残差重采换 token 的次数——唯一真正改变 token 的干预形态。"],
-  spent:["预算消耗/轨迹","B∞=20 nats 的逐轨迹消耗。≈20=预算打满,之后全部旁路。"],
+  spent:["预算消耗/轨迹","逐轨迹消耗 / 当前 run 的实收 B∞。接近 B∞ 才表示预算打满；之后的位置会旁路。"],
   bypass:["旁路 token/轨迹","预算耗尽后不再判定、直通的 token 数(零干预、零开销)。"],
   cand:["候选位置","进入 D 门判定的位置数(预算耗尽前);旁路位置不计入。"],
   D:["D 值","教师-学生分歧强度 = Var_{π|S}[ℓ̃],ℓ̃=clip(ln p_T−ln π,±c)。超 θ_D 才开门。"],
@@ -365,9 +410,13 @@ function crumbs(items){
 function viewOverview(){
   crumbs([["总览","#/"]]);
   const S = R.steps||[], Vall = R.vals||[], V = Vall.filter(v=>!v.partial), L = S[S.length-1]||{};
+  // 分臂 run(v3.1):混合 won 是 E_b[R] 与 E_π[R] 的平均,既非能力也非教师上限。
+  // 能力读数 = bare 臂;教师增益 = δ gap。两者必须分开呈现。
+  const HAS_ARMS = S.some(s=>s.wonBare!=null);
+  const BMAX=runBmax();
   const Vp = Vall.find(v=>v.partial);
   const lastV = V[V.length-1];
-  const gateCls = L.gate>=BAND[0]&&L.gate<=BAND[1]?"good":"warn";
+  const gateCls = isAlwaysOn() ? "good" : (L.gate>=BAND[0]&&L.gate<=BAND[1]?"good":"warn");
   const howto = localStorage.msHow1?"":`
     <div class="howto"><button class="x" onclick="this.parentNode.remove();localStorage.msHow1=1">✕</button>
     <b>怎么读:</b>卡片=最新读数(悬浮 <b>?</b> 看定义与健康区间);曲线看趋势 ——
@@ -376,11 +425,17 @@ function viewOverview(){
   $("#view").innerHTML = `${howto}
   <div class="grid cards" style="margin-bottom:16px">
     ${kpi("最新 val", lastV?pct(lastV.won):"待首个 val 点", (lastV?`step ${lastV.id} · seen ${pct(lastV.seen)} / unseen ${pct(lastV.unseen)}`:"每 10 步产生")+(Vp?` · step ${Vp.id} 评测中 ${Vp.n}/274(未计入)`:""), "val","")}
-    ${kpi("训练成功率", L.won!=null?pct(L.won):"—", `step ${L.id??"—"}${L.partial?` · 进行中 ${L.n}/128`:""}`, "won","")}
-    ${kpi("开门率", L.gate!=null?pct(L.gate):"—", `目标 q=${pct(Q_TARGET)} · 带 ${pct(BAND[0])}–${pct(BAND[1])}`, "gate",gateCls)}
-    ${kpi("θ_D", L.theta??"—", "自适应 EMA 追踪", "theta","")}
-    ${kpi("倾斜/轨迹", L.tilt??"—", `预期 ${EXPECT_TILT[0]}–${EXPECT_TILT[1]}`, "tilt", L.tilt>=4&&L.tilt<=8?"good":"warn")}
-    ${kpi("预算消耗", L.spent!=null?`${L.spent}/${BMAX}`:"—", L.spent>=BMAX-1?"打满 → 前端速烧":"有余量", "spent", L.spent>=BMAX-1?"warn":"")}
+    ${HAS_ARMS
+      ? kpi("能力 (bare 臂)", L.wonBare!=null?pct(L.wonBare):"—",
+            `教师臂 ${L.wonSteered!=null?pct(L.wonSteered):"—"} · δ gap ${L.armGap!=null?(L.armGap>=0?"+":"")+pct(L.armGap):"—"} · step ${L.id??"—"}${L.partial?` · 进行中 ${L.n}/${L.expected||R.config?.expectedTrainTrajs||256}`:""}`,
+            "won","")
+      : kpi("训练成功率", L.won!=null?pct(L.won):"—", `step ${L.id??"—"}${L.partial?` · 进行中 ${L.n}/${L.expected||R.config?.expectedTrainTrajs||128}`:""}`, "won","")}
+    ${kpi("开门率", L.gate!=null?pct(L.gate):"—", isAlwaysOn()?"always_on:无门判定,恒 100% 是正确常态":`目标 q=${pct(Q_TARGET)} · 带 ${pct(BAND[0])}–${pct(BAND[1])}`, "gate",gateCls)}
+    ${kpi("θ_D", L.theta??"—", isAlwaysOn()?"always_on 档:θ 无语义(恒 0),不参与判定":"自适应 EMA 追踪", "theta","")}
+    ${kpi("倾斜/轨迹", L.tilt??"—", `B∞=${fmtB(BMAX)} · 不套用跨预算固定区间`, "tilt", "")}
+    ${kpi("预算消耗", L.spent!=null?(BMAX===null?`${L.spent}`:`${L.spent}/${fmtNum(BMAX)}`):"—",
+          BMAX===null?"B∞=∞ · 预算不绑定,此值仅为观察量":(nearCap(L.spent,BMAX)?"接近上限 → 后续可能旁路":"有余量"),
+          "spent", nearCap(L.spent,BMAX)?"warn":"")}
   </div>
   <div class="grid charts" style="margin-bottom:16px">
     ${chart("val 成功率(每 10 步)","效果的最终裁判:总/seen/unseen 三线;进行中的 val 点不画(部分读数有偏)。", [
@@ -388,11 +443,20 @@ function viewOverview(){
       {label:"seen",color:"#059669",pts:V.map(v=>[v.id,v.seen])},
       {label:"unseen",color:"#d97706",pts:V.map(v=>[v.id,v.unseen])}],
       {y0:0,y1:Math.max(.55,...V.flatMap(v=>[v.won,v.seen,v.unseen]))*1.12,fmt:pct})}
-    ${chart("开门率 gate rate","应收敛进绿带(5–25%);虚线=目标 q=10%。", [{label:"开门率",color:"#4f46e5",pts:S.map(s=>[s.id,s.gate])}],
-      {y0:0,y1:Math.max(.5,...S.map(s=>s.gate||0))*1.12,fmt:pct,band:BAND,target:Q_TARGET})}
-    ${chart("θ_D(EMA 轨迹)","自适应阈值;持平初值=EMA 尚未推进或已收敛。", [{label:"θ_D",color:"#4f46e5",pts:S.map(s=>[s.id,s.theta])}], {fmt:v=>v.toFixed(4)})}
-    ${chart("训练成功率 won%","T=1.0 采样,逐步波动大是任务抽样噪声。", [{label:"won",color:"#4f46e5",pts:S.map(s=>[s.id,s.won])}], {y0:0,y1:1,fmt:pct})}
-    ${chart("预算消耗/轨迹","贴 20=预算打满(前端速烧形态)。", [{label:"消耗",color:"#4f46e5",pts:S.map(s=>[s.id,s.spent])}], {y0:0,y1:BMAX+1,fmt:v=>v.toFixed(1)})}
+    ${chart("开门率 gate rate",isAlwaysOn()?"always_on:每个候选位置恒倾斜,开门率≡100% 即机制按设计工作;绿带/目标线在本档无意义,已隐藏。":"应收敛进绿带(5–25%);虚线=目标 q=10%。", [{label:"开门率",color:"#4f46e5",pts:S.map(s=>[s.id,s.gate])}],
+      isAlwaysOn()?{y0:0,y1:1.12,fmt:pct}:{y0:0,y1:Math.max(.5,...S.map(s=>s.gate||0))*1.12,fmt:pct,band:BAND,target:Q_TARGET})}
+    ${isAlwaysOn()?"":chart("θ_D(EMA 轨迹)","自适应阈值;持平初值=EMA 尚未推进或已收敛。", [{label:"θ_D",color:"#4f46e5",pts:S.map(s=>[s.id,s.theta])}], {fmt:v=>v.toFixed(4)})}
+    ${HAS_ARMS
+      ? chart("训练成功率:分臂","bare=纯 π(能力真读数);steered=教师干预上限;两者之差 δ 是教师增益。混合线仅作对照,不可当能力。", [
+          {label:"bare(纯π)",color:"#4f46e5",pts:S.map(s=>[s.id,s.wonBare])},
+          {label:"steered(教师)",color:"#059669",pts:S.map(s=>[s.id,s.wonSteered])},
+          {label:"混合",color:"#9ca3af",pts:S.map(s=>[s.id,s.won])}],
+          {y0:0,y1:1,fmt:pct})
+      : chart("训练成功率 won%","T=1.0 采样,逐步波动大是任务抽样噪声。", [{label:"won",color:"#4f46e5",pts:S.map(s=>[s.id,s.won])}], {y0:0,y1:1,fmt:pct})}
+    ${HAS_ARMS?chart("δ gap = steered − bare","教师增益。δ→0 = 示范已被内化(或教师失去增量信息);δ 长期不收窄而 bare 平 = back-generalization 失败。", [{label:"δ gap",color:"#d97706",pts:S.map(s=>[s.id,s.armGap])}], {fmt:pct}):""}
+    ${chart("预算消耗/轨迹",BMAX===null?"实收 B∞=∞：预算不绑定，本曲线只是干预强度的观察量，没有“打满”一说。":`实收 B∞=${fmtNum(BMAX)}；接近上限才表示预算打满。`,
+      [{label:"消耗",color:"#4f46e5",pts:S.map(s=>[s.id,s.spent])}],
+      {y0:0,y1:Math.max(BMAX===null?0:BMAX,...S.map(s=>s.spent||0))*1.03,fmt:v=>v.toFixed(1)})}
     ${chart("拒绝重采/轨迹","真正改 token 的干预密度。", [{label:"拒绝",color:"#e11d48",pts:S.map(s=>[s.id,s.rej])}], {y0:0,fmt:v=>v.toFixed(2)})}
   </div>
   <div class="card table-card"><div class="table-scroll"><table>
@@ -403,7 +467,7 @@ function viewOverview(){
       <th data-tipkey="theta">θ_D <span class="q">?</span></th><th></th></tr></thead>
     <tbody>${S.map(s=>`<tr class="click" onclick="location.hash='#/step/${s.id}'">
       <td><b>step ${s.id}</b></td>
-      <td>${s.partial?`<span class="bdg info">进行中 ${s.n}/128</span>`:`<span class="bdg dim">完成</span>`}</td>
+      <td>${s.partial?`<span class="bdg info">进行中 ${s.n}/${s.expected||R.config?.expectedTrainTrajs||128}</span>`:`<span class="bdg dim">完成</span>`}</td>
       <td>${s.n}</td><td>${pct(s.won)}</td><td>${pct(s.gate)}</td>
       <td>${s.tilt}</td><td>${s.rej}</td><td>${s.spent}</td><td>${s.bypass}</td><td>${s.theta}</td>
       <td><a href="#/step/${s.id}">进入 →</a></td></tr>`).join("")}
@@ -449,13 +513,16 @@ function chart(title,how,series,o={}){
 }
 
 /* ═══════════ Step 视图 ═══════════ */
-let F = {res:"all", rejOnly:false, q:"", sort:"rej"};
+let F = {res:"all", rejOnly:false, q:"", sort:"rej", arm:"all"};
 async function viewStep(id){
   const st = stepById(id);
   if(!st) return viewOverview();
   crumbs([["总览","#/"],[`step ${id}`,`#/step/${id}`]]);
   const render = (list)=>{
+    // 分臂 run:一半副本是纯 π。臂列/臂筛选只在该 run 确实分臂时出现。
+    const hasArms = list.some(t=>t.arm===0) && list.some(t=>t.arm===1);
     let rows = list.map((t,i)=>({t,i}));
+    if(hasArms && F.arm!=="all") rows = rows.filter(r=> F.arm==="bare"?r.t.arm===0:r.t.arm===1);
     if(F.res!=="all") rows = rows.filter(r=> F.res==="win"?r.t.won:!r.t.won);
     if(F.rejOnly) rows = rows.filter(r=>r.t.m.rej>0);
     if(F.q) rows = rows.filter(r=>r.t.task.toLowerCase().includes(F.q.toLowerCase()));
@@ -464,17 +531,18 @@ async function viewStep(id){
     $("#view").innerHTML = `
     <div class="filters">
       <div class="seg">${["all","win","lose"].map(k=>`<button class="${F.res===k?"on":""}" onclick="F.res='${k}';viewStep(${id})">${{all:"全部",win:"成功",lose:"失败"}[k]}</button>`).join("")}</div>
+      ${hasArms?`<div class="seg" title="bare=纯 π 采样(能力读数);steered=SPS 倾斜采样(教师上限)">${["all","bare","steered"].map(k=>`<button class="${F.arm===k?"on":""}" onclick="F.arm='${k}';viewStep(${id})">${{all:"两臂",bare:"bare",steered:"steered"}[k]}</button>`).join("")}</div>`:""}
       <label><input type="checkbox" ${F.rejOnly?"checked":""} onchange="F.rejOnly=this.checked;viewStep(${id})"> 只看有拒绝重采</label>
       <input type="search" placeholder="搜任务名…" value="${esc(F.q)}" onchange="F.q=this.value;viewStep(${id})">
       <span style="flex:1"></span>
-      ${st.partial?`<span class="bdg info">进行中 ${st.n}/128</span><button class="btn" onclick="delete stepMeta['${st.dir}'];viewStep(${id})">刷新</button>`:""}
+      ${st.partial?`<span class="bdg info">进行中 ${st.n}/${st.expected||R.config?.expectedTrainTrajs||128}</span><button class="btn" onclick="delete stepMeta['${st.dir}'];viewStep(${id})">刷新</button>`:""}
       <label>排序 <select onchange="F.sort=this.value;viewStep(${id})">
         ${[["rej","拒绝数"],["gate","开门率"],["bypass","旁路量"],["len","响应长度"]].map(([k,l])=>`<option value="${k}" ${F.sort===k?"selected":""}>${l}</option>`).join("")}
       </select></label>
       <span class="chip">${rows.length}/${list.length} 条 · 全部可点</span>
     </div>
     <div class="card table-card"><div class="table-scroll"><table>
-      <thead><tr><th>任务</th><th>split</th><th>结果</th>
+      <thead><tr><th>任务</th><th>split</th>${hasArms?"<th>臂</th>":""}<th>结果</th>
         <th data-tipkey="tilt">倾斜 <span class="q">?</span></th><th data-tipkey="rej">拒绝 <span class="q">?</span></th>
         <th data-tipkey="gate">开门率 <span class="q">?</span></th><th data-tipkey="cand">候选 <span class="q">?</span></th>
         <th data-tipkey="bypass">旁路 <span class="q">?</span></th><th>响应 tok</th><th></th></tr></thead>
@@ -482,6 +550,7 @@ async function viewStep(id){
         <tr class="click" onclick="location.hash='#/traj/${id}/${i}'">
           <td class="tname" title="${esc(t.task)}">${esc(t.task.replace(/^train\//,""))}</td>
           <td><span class="chip">${esc(t.split||"train")}</span></td>
+          ${hasArms?`<td>${t.arm===0?'<span class="bdg dim" title="纯 π 采样,教师未介入">bare</span>':t.arm===1?'<span class="bdg info" title="SPS 倾斜采样">steered</span>':""}</td>`:""}
           <td>${t.won?'<span class="bdg win">✓ 成功</span>':'<span class="bdg lose">✕ 失败</span>'}</td>
           <td>${t.m.tilt}</td><td>${t.m.rej?`<b style="color:var(--bad)">${t.m.rej}</b>`:0}</td>
           <td>${pct(t.m.open/Math.max(t.m.cand,1))}</td>
@@ -507,15 +576,59 @@ async function viewTraj(stepId, idx){
     const t = await getTraj(st.dir, idx);
     if(!t) return $("#view").innerHTML=`<div class="empty">轨迹不存在</div>`;
     go(t);
+    prefetchNeighbors(st.dir, idx);
   } else loadStaticStep(st.dir, ()=>{
     const t=(window.PGS_STEP_DATA[st.dir].trajs||[])[idx];
     t?go(t):$("#view").innerHTML=`<div class="empty">轨迹不存在</div>`;
   });
 }
+function renderPrivilege(t){
+  const p=t.privilege||{
+    state:t.doc?"static_gt":"bare", source:t.doc?"static_gt":"none", doc:t.doc||"", archive:"", meta:{}, error:"", usedByTeacher:!!t.doc
+  };
+  const labels={
+    dynamic_researcher:["动态 researcher","info"],
+    arm_bare:["bare 臂(纯 π)","dim"],
+    researcher_degraded:["researcher 降级","lose"],
+    static_gt:["静态 GT","info"],
+    validation_bare:["validation bare","dim"],
+    bare:["bare","dim"],
+    static_missing:["静态文档缺失","lose"],
+    archive_missing:["归档不完整","lose"],
+    archive_error:["归档读取错误","lose"]
+  };
+  const [label,cls]=labels[p.state]||[p.state||"未知状态","dim"];
+  // 分臂 run:steer_arm=0 的副本与同组 steered 共享 archive 记录,但教师未介入
+  // 本轨迹。徽章必须把"本副本没被干预"与"同组用了哪份文档"分开表述。
+  const armBadge = p.arm===0?'<span class="bdg dim" title="本副本走纯 π 采样,教师未介入;下方文档是同组 steered 副本使用的,列出仅供对照">未被干预</span>'
+                 : p.arm===1?'<span class="bdg info" title="本副本走 SPS 倾斜采样">steered 臂</span>':'';
+  const source=`<div class="priv-source"><span class="bdg ${cls}">${esc(label)}</span>${armBadge}${p.usedByTeacher?'<span class="bdg win">已进入教师</span>':p.doc?'<span class="bdg dim">仅归档审计</span>':''}${p.archive?`<span class="archive" title="ResearchArchive 相对当前 run 的路径">${esc(p.archive)}</span>`:""}</div>`;
+  const alert=p.error?`<div class="priv-alert"><b>审计提示：</b>${esc(p.error)}</div>`:"";
+  const meta=p.meta&&typeof p.meta==="object"?p.meta:{};
+  const metaLabels={global_step:"global step",policy_version:"policy version",experiments_used:"experiments",episodes_consumed:"episodes",turns_used:"turns",finalized:"finalized",no_finalize:"no finalize",doc_words:"doc words",error:"research error",session_error:"session error",gt:"GT mode",gt_injected:"GT injected"};
+  const audit=Object.entries(metaLabels).filter(([k])=>Object.prototype.hasOwnProperty.call(meta,k)).map(([k,l])=>{
+    const raw=meta[k], value=raw===null?"null":typeof raw==="object"?JSON.stringify(raw):String(raw);
+    return `<div class="audit-it"><div class="ak">${esc(l)}</div><div class="av">${esc(value)}</div></div>`;
+  }).join("");
+  const auditGrid=audit?`<div class="audit-grid">${audit}</div>`:"";
+  const armNote = p.arm===0?'<div class="priv-alert"><b>分臂说明：</b>本副本属 bare 臂（纯 π 采样），教师全程未介入（倾斜次数 0）。下方文档由同组 steered 副本使用，此处列出仅供对照——不要把它读成本轨迹的输入。</div>':"";
+  if(p.doc) return `${source}${alert}${armNote}<div class="priv-doc">${esc(p.doc)}</div>${auditGrid}`;
+  const empty={
+    validation_bare:"这是裸 policy validation 轨迹：按实验合同无教师、无特权文档。",
+    arm_bare:"本副本属 bare 臂（纯 π 采样），教师未介入；同组 steered 副本的文档未能载入。",
+    bare:"该轨迹没有 researcher 关联或静态文档；教师侧未记录任务特权信息。",
+    researcher_degraded:"researcher 未产生可供教师使用的文档，本轨迹按降级路径运行。",
+    static_missing:"该任务不在静态 doc 表中，教师没有获得对应任务文档。",
+    archive_missing:"rollout 指向 ResearchArchive，但正文或元数据不完整。",
+    archive_error:"rollout 指向 ResearchArchive，但显微镜为安全起见未载入异常归档。"
+  }[p.state]||"该轨迹没有可显示的特权文档。";
+  return `${source}${alert}<div class="priv-none">${esc(empty)}</div>${auditGrid}`;
+}
 function renderTraj(stepId, idx, t){
   CUR = {stepId, idx, t, iv:-1};
   crumbs([["总览","#/"],[`step ${stepId}`,`#/step/${stepId}`],[t.task.replace(/^train\//,""),""]]);
   const gate = t.m.open/Math.max(t.m.cand,1);
+  const BMAX=isUnbounded()?null:(Number.isFinite(Number(t.m.bmax))&&Number(t.m.bmax)>0?Number(t.m.bmax):runBmax());
   const ivs = ivList();
   const howto = localStorage.msHow2?"":`
     <div class="howto"><button class="x" onclick="this.parentNode.remove();localStorage.msHow2=1">✕</button>
@@ -534,10 +647,10 @@ function renderTraj(stepId, idx, t){
   </div>
   <div class="grid cards" style="margin-bottom:14px">
     ${kpi("结果", t.won?"成功":"失败", esc(t.outcome||""), "won", t.won?"good":"bad")}
-    ${kpi("倾斜次数", t.m.tilt, `预期 ${EXPECT_TILT[0]}–${EXPECT_TILT[1]}`, "tilt","")}
+    ${kpi("倾斜次数", t.m.tilt, `本轨迹 · B∞=${fmtB(BMAX)}`, "tilt","")}
     ${kpi("拒绝重采", t.m.rej, "真正改 token 的位置", "rej", t.m.rej?"bad":"")}
     ${kpi("开门率", pct(gate), `候选 ${t.m.cand} · 开门 ${t.m.open}`, "gate","")}
-    ${kpi("预算", `${t.m.spent}/${BMAX}`, t.m.spent>=BMAX-1?"已打满 → 后续全旁路":"仍有余量", "spent", t.m.spent>=BMAX-1?"warn":"good")}
+    ${kpi("预算", BMAX===null?`${t.m.spent}`:`${t.m.spent}/${fmtNum(BMAX)}`, BMAX===null?"B∞=∞ · 不绑定,仅观察量":(nearCap(t.m.spent,BMAX)?"接近上限 → 后续可能旁路":"仍有余量"), "spent", nearCap(t.m.spent,BMAX)?"warn":"good")}
     ${kpi("旁路 token", t.m.bypass, `占全响应 ${pct(t.m.bypass/Math.max(t.len,1))}`, "bypass","")}
     ${kpi("θ_D", t.theta, "本轨迹判定阈值", "theta","")}
     ${kpi("响应长度", t.len+" tok", `${t.turns.length} 轮 · env ${t.env??"—"} 步`, "cand","")}
@@ -552,10 +665,8 @@ function renderTraj(stepId, idx, t){
       ${t.iobs?`<div class="obs" onclick="this.classList.toggle('full')">${esc(t.iobs)}<span class="obs-tag">初始观测 · 点击展开</span></div>`:'<div class="priv-none">无初始观测记录</div>'}
     </div>
     <div class="card ctx-card priv">
-      <h4>特权文档 · 仅教师可见<span class="q" data-tip="教师 p_T 的 system prompt 注入内容(## Task guidance 段):一份该任务的分步参考解。学生完全看不到它——教师正是凭这份信息对学生的采样分布做定向倾斜,所有绿/红干预位的方向都源于此。">?</span></h4>
-      ${t.doc?`<div class="priv-doc">${esc(t.doc)}</div>`
-        :(R.hasDocs===false||t.m.cand===0)?`<div class="priv-none">对照臂(纯 GRPO):无教师、无特权文档。</div>`
-        :`<div class="priv-none">⚠ 该任务在 doc 表中无文档(doc_missing)——本轨迹教师退化为无文档教师,倾斜方向不含任务特权信息。</div>`}
+      <h4>特权文档 · 仅教师可见<span class="q" data-tip="教师 p_T 的 system prompt 注入内容。学生完全看不到；来源徽章区分动态 researcher、静态 GT、裸评测与降级状态，archive 和审计元数据用于核对当步真实文档。">?</span></h4>
+      ${renderPrivilege(t)}
     </div>
   </div>
   <div class="card mini-card">
@@ -708,6 +819,9 @@ function openCand(ref){
 }
 function openRec(ref){
   const t=CUR.t, r=t.recs[ref], th=t.theta;
+  // 实时档的 rec 不带 pi/pt(payload 95% 在那里),渲染后异步补。
+  const needDists = LIVE && !r.pi && !r.pt;
+  const bmax=isUnbounded()?null:(Number.isFinite(Number(t.m.bmax))&&Number(t.m.bmax)>0?Number(t.m.bmax):runBmax());
   CUR.iv = ref;
   document.querySelectorAll(".tk.sel").forEach(x=>x.classList.remove("sel"));
   const tkEl=document.getElementById(`rec-${ref}`); if(tkEl) tkEl.classList.add("sel");
@@ -723,13 +837,28 @@ function openRec(ref){
       ${kv("倾向得分","prop",r.prop)}${kv("ℓ̃ = ln b−ln π","ell",(r.lb-r.lp).toFixed(3))}
     </div></div>
     <div class="sec"><h5>预算</h5>
-      <div class="bud"><i style="width:${Math.min((BMAX-r.after)/BMAX*100,100).toFixed(1)}%"></i></div>
-      <div class="bud-lab"><span>本位置结算后已用 ${(BMAX-r.after).toFixed(2)}</span><span>余 ${r.after} / ${BMAX}</span></div>
+      ${bmax===null
+        ? `<div class="bud-lab"><span>B∞=∞ · 预算不绑定</span><span>本位置扣费 ${r.delta}</span></div>
+           <div class="bud-lab" style="color:var(--text2)"><span>累计消耗仅作观察量，不会触发旁路</span></div>`
+        : `<div class="bud"><i style="width:${Math.max(0,Math.min((bmax-r.after)/bmax*100,100)).toFixed(1)}%"></i></div>
+           <div class="bud-lab"><span>本位置结算后已用 ${Math.max(0,bmax-r.after).toFixed(2)}</span><span>余 ${r.after} / ${fmtNum(bmax)}</span></div>`}
     </div>
     ${r.rej?`<div class="sec"><h5>token 变更</h5>
       <div class="df"><span class="a">${esc(r.draft)}</span><span class="ar">→</span><span class="b">${esc(r.final)}</span></div>
       <div class="dist"><div class="note">学生 draft 提案被投机判定拒绝,从残差分布重采得到最终 token。</div></div></div>`:""}
-    ${secDist(r)}`);
+    <div id="dist-slot">${needDists?'<div class="sec"><h5>候选分布对照</h5><div class="empty" style="padding:14px">载入分布…</div></div>':secDist(r)}</div>`);
+  if(needDists){
+    const st=stepById(CUR.stepId);
+    getRecDists(st.dir, CUR.idx, ref).then(j=>{
+      if(!j || CUR.iv!==ref) return;            // 用户已切走则丢弃
+      r.pi=j.pi; r.pt=j.pt;                     // 回填,再点同一位置直接命中
+      const slot=document.getElementById("dist-slot");
+      if(slot) slot.innerHTML=secDist(r);
+    }).catch(()=>{
+      const slot=document.getElementById("dist-slot");
+      if(slot && CUR.iv===ref) slot.innerHTML='<div class="sec"><h5>候选分布对照</h5><div class="empty" style="padding:14px">分布载入失败</div></div>';
+    });
+  }
   drawer.classList.add("on");
   const cnt=$("#ivcnt");
   if(cnt){ const ivs=ivList(); const at=ivs.findIndex(x=>x.i===ref); if(at>=0) cnt.textContent=`干预 ${at+1}/${ivs.length}`; }

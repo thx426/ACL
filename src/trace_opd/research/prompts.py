@@ -21,7 +21,8 @@ experience document condensing everything you verified.
 
 === THE EXECUTOR ===
 The executor is a small instruction-tuned model ({executor_model}). Each
-turn it reasons briefly and issues exactly one environment command. It sees
+turn it reasons briefly and takes exactly one action through the task's
+action interface (described in the task panel above). It sees
 only the environment's observations plus your guidance text; it knows
 nothing else about the task. Expect real limitations: it can misread
 observations, repeat futile actions, or lose track of its progress.
@@ -89,8 +90,8 @@ remedies you verified by experiment.
 Verified environment facts and transferable tips.
 
 Write task-anchored, situation-level knowledge: "WHEN <observable
-situation> DO <specific action pattern>", with real command names and real
-symptoms. Do not write abstract slogans; do not paste a long verbatim
+situation> DO <specific action pattern>", with the task's real action
+vocabulary and real observed symptoms. Do not write abstract slogans; do not paste a long verbatim
 action sequence as the whole answer; do not mention this training or
 tooling context inside the document."""
 

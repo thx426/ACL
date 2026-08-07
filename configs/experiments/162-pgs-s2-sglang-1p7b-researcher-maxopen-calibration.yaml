@@ -1,0 +1,138 @@
+# 162 / Qwen3-1.7B / dynamic researcher / max-open P80 calibration.
+# This file is intentionally a zero-intervention calibration arm. It must never
+# be used as the formal treatment: materialize_162_researcher_maxopen.py writes
+# a separate formal config after a complete dynamic calibration step passes.
+run:
+  name: pgs_s2_sgl_1p7b_162_researcher_maxopen_calib_p80
+  runs_root: /data4/ws/PGS
+  tape: true
+
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 16
+  k_default: 4
+  k_max: 8
+  max_turns: 30
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"
+  episode_temperature: 1.0
+  researcher_max_tokens: 8192
+  session_timeout_s: 3600
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+
+episode:
+  max_env_steps: 30
+  max_assistant_turns: 40
+  max_tokens_per_turn: 2048
+
+alfworld:
+  data_root: /data3/wushang/data/alfworld_data
+  worker_python: /data3/wushang/workspace/TRACE-OPD/venv_alfworld/bin/python
+  spawn_concurrency: 128
+  start_timeout_s: 300
+  step_timeout_s: 120
+  boot_concurrency: 32
+
+train:
+  model_path: /data3/wushang/model/Qwen/Qwen3-1.7B
+  train_file: /data3/wushang/workspace/TRACE-OPD/trace_opd-pgc/data/rl_train_v2.parquet
+  val_files:
+    - /data3/wushang/workspace/TRACE-OPD/trace_opd/data/out/valid_seen.parquet
+    - /data3/wushang/workspace/TRACE-OPD/trace_opd/data/out/valid_unseen.parquet
+  experiment_name: pgs_s2_sgl_1p7b_162_researcher_maxopen_calib_p80
+  project_name: trace_opd
+  n_gpus: 4
+  rollout_tp: 1
+  train_batch_size: 16
+  rollout_n: 8
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  response_length: 32768
+  max_prompt_length: 2048
+  max_token_len_per_gpu: 34816
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  rollout_max_model_len: 40960
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_attention_backend: ""
+  rollout_gpu_mem: 0.5
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  adv_estimator: grpo_loo
+  norm_adv_by_std: false
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 2
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16
+
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  # Finite-horizon non-binding bound: response_length * (2 * eta_max * c).
+  b_max: 81920.0
+  topk: 64
+  obs_topk: 256
+  # Calibration sentinel: verify and record D at every assistant token, never tilt.
+  theta_d: 1000000000.0
+  gate_adaptive: false
+  gate_target_rate: 0.20
+  gate_ema_beta: 0.1
+  epsilon: 0.0
+  gate_rate_bounds: [0.0, 1.0]
+  # Strictly above the entire response horizon, so it cannot bind any turn.
+  r_max: 32769
+  w_beh_mode: per_token
+  budget_pacing: false
+  # Inert while pacing=false; retained to keep all other mechanism fields fixed.
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768
+  temperature: 0.0

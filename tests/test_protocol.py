@@ -27,11 +27,13 @@ def test_parse_reasoning():
     assert protocol.parse_reasoning("plain") is None
 
 
-def test_build_system_prompt_uses_guidance_header():
-    bare = protocol.build_system_prompt(None)
-    assert GUIDANCE_HEADER not in bare
-    privileged = protocol.build_system_prompt("Always go to the shelf first.")
-    assert privileged.startswith(bare)
+def test_alfworld_scaffold_guidance_injection():
+    # scaffold 归 benchmark 自持(通用性整改);注入组合契约不变
+    from trace_opd.envs.alfworld.adapter import SYSTEM_PROMPT_BARE
+
+    assert GUIDANCE_HEADER not in SYSTEM_PROMPT_BARE
+    privileged = inject_guidance(SYSTEM_PROMPT_BARE, "Always go to the shelf first.")
+    assert privileged.startswith(SYSTEM_PROMPT_BARE)
     assert f"\n\n{GUIDANCE_HEADER}\nAlways go to the shelf first." in privileged
 
 

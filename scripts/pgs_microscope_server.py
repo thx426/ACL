@@ -14,15 +14,17 @@ API(前端 pgs_microscope_app.html 自动探测,探测失败即退回静态 data
     GET /api/step/<dir>       该 step 的轨迹列表元数据(轻量,不含逐 token)
     GET /api/traj/<dir>/<i>   单条轨迹逐 token 全量(与静态导出同 schema,i=sorted 文件序)
 
-设计:零第三方依赖(标准库 http.server);聚合结果按 (目录, 文件数) 缓存,
-完成态 step 只算一次,运行中 step 文件数变化才重算;tokenizer 常驻 + 单 token
-解码缓存 ⇒ 单轨迹接口 ~50ms。只读文件系统,不碰训练进程;绑 127.0.0.1。
+设计:零第三方依赖(标准库 http.server);聚合结果按 JSON 文件名/大小/mtime
+指纹缓存，同一缓存 key 以 single-flight 合并并发冷请求；完成态 step 只算一次，
+运行中 step 变化才重算。tokenizer 常驻 + 单 token 解码缓存 ⇒ 热缓存单轨迹接口
+约50ms。只读文件系统,不碰训练进程;绑 127.0.0.1。
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import json
+import re
 import sys
 import threading
 import time
@@ -35,35 +37,99 @@ import pgs_microscope as M  # noqa: E402  复用 Dec / build_traj / r
 RUN: Path = None
 DEC: "M.Dec" = None
 DOCS: dict = {}
+CONFIG: dict = {}
 APP = Path(__file__).with_name("pgs_microscope_app.html")
+_STEP_DIR = re.compile(r"^step_[0-9]+(?:_val)?$")
 
 _lock = threading.Lock()
-_cache: dict[str, tuple[int, object]] = {}   # key -> (n_files, payload)
+_cache: dict[str, tuple[tuple, object]] = {}
+_inflight: dict[str, threading.Event] = {}
+_dump_cache: dict[str, tuple[int, dict]] = {}
+_DUMP_CACHE_MAX = 6
+_meta_cache: dict[str, tuple[tuple, dict]] = {}
+_META_CACHE_MAX = 20000
 
 
 def _files(d: Path) -> list[str]:
     return sorted(glob.glob(str(d / "*.json")))
 
 
+def _fingerprint(fs: list[str]) -> tuple:
+    rows = []
+    for name in fs:
+        try:
+            stat = Path(name).stat()
+            rows.append((name, stat.st_size, stat.st_mtime_ns))
+        except FileNotFoundError:
+            rows.append((name, -1, -1))
+    return tuple(rows)
+
+
 def _cached(key: str, d: Path, builder):
     fs = _files(d)
+    fingerprint = _fingerprint(fs)
+    while True:
+        with _lock:
+            hit = _cache.get(key)
+            if hit and hit[0] == fingerprint:
+                return hit[1]
+            event = _inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                _inflight[key] = event
+                break
+        event.wait()
+
+    try:
+        out = builder(fs)
+    except BaseException:
+        with _lock:
+            _inflight.pop(key, None)
+            event.set()
+        raise
     with _lock:
-        hit = _cache.get(key)
-        if hit and hit[0] == len(fs):
-            return hit[1]
-    out = builder(fs)
-    with _lock:
-        _cache[key] = (len(fs), out)
+        _cache[key] = (fingerprint, out)
+        _inflight.pop(key, None)
+        event.set()
     return out
+
+
+def _meta_cached(path: str) -> dict:
+    """单文件元数据 memo(按 mtime+size 失效)。
+
+    一条 rollout 写完就不再变,进行中的 step 只是追加新文件 —— 但整步聚合的
+    指纹会因此改变,旧实现于是把全部文件重解析一遍。maxopen 下单文件约 2.9MB、
+    一步 256 条,冷解析实测 7.5s,而盯在跑的 step 每次刷新都要重付。按文件 memo
+    后,刷新只解析新到的那几条。
+    """
+    try:
+        st = Path(path).stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (-1, -1)
+    with _lock:
+        hit = _meta_cache.get(path)
+        if hit and hit[0] == key:
+            return hit[1]
+    with open(path) as fh:
+        meta = _meta_of(json.load(fh))
+    with _lock:
+        _meta_cache[path] = (key, meta)
+        while len(_meta_cache) > _META_CACHE_MAX:
+            _meta_cache.pop(next(iter(_meta_cache)))
+    return meta
 
 
 def _meta_of(d: dict) -> dict:
     s = d.get("steering") or {}
+    arm = s.get("steer_arm")
     return dict(
         task=d.get("task_id", "?"),
         won=bool(d.get("won")),
         outcome=d.get("outcome", ""),
         split=d.get("split", ""),
+        # 分臂采样(v3.1):None=非分臂 run(历史全臂);0=bare 臂;1=steered 臂
+        arm=int(arm) if arm is not None else None,
         len=d.get("response_token_len", 0),
         m=dict(
             cand=s.get("steer_n_candidates", 0),
@@ -88,7 +154,7 @@ def api_run() -> dict:
                 def vb(fs, name=d.name):
                     tot = dict(n=0, won=0, seen_n=0, seen_w=0, un_n=0, un_w=0)
                     for f in fs:
-                        j = json.load(open(f))
+                        j = _meta_cached(f)
                         tot["n"] += 1
                         tot["won"] += bool(j.get("won"))
                         if "unseen" in (j.get("split") or ""):
@@ -108,8 +174,11 @@ def api_run() -> dict:
             else:
                 def sb(fs, name=d.name):
                     agg = dict(won=0, cand=0, open=0, tilt=0.0, rej=0.0, spent=0.0, theta=0.0, bypass=0.0)
+                    # 分臂 run 的能力读数必须分开:混合 won 是 E_b[R] 与 E_π[R] 的
+                    # 平均,既不是能力也不是教师上限(v3.1 裁定的核心动机)。
+                    arms = {0: [0, 0], 1: [0, 0]}   # arm -> [n, won]
                     for f in fs:
-                        t = _meta_of(json.load(open(f)))
+                        t = _meta_cached(f)
                         agg["won"] += t["won"]
                         agg["cand"] += t["m"]["cand"]
                         agg["open"] += t["m"]["open"]
@@ -118,8 +187,11 @@ def api_run() -> dict:
                         agg["spent"] += t["m"]["spent"]
                         agg["theta"] += t["theta"]
                         agg["bypass"] += t["m"]["bypass"]
+                        if t["arm"] in arms:
+                            arms[t["arm"]][0] += 1
+                            arms[t["arm"]][1] += t["won"]
                     n = max(len(fs), 1)
-                    return dict(
+                    out = dict(
                         id=int(name.split("_")[1]), dir=name, n=len(fs),
                         won=M.r(agg["won"] / n, 4),
                         gate=M.r(agg["open"] / max(agg["cand"], 1), 4),
@@ -128,33 +200,101 @@ def api_run() -> dict:
                         spent=M.r(agg["spent"] / n, 2), theta=M.r(agg["theta"] / n, 4),
                         bypass=M.r(agg["bypass"] / n, 1),
                     )
+                    if arms[0][0] and arms[1][0]:
+                        out["wonBare"] = M.r(arms[0][1] / arms[0][0], 4)
+                        out["wonSteered"] = M.r(arms[1][1] / arms[1][0], 4)
+                        out["armGap"] = M.r(out["wonSteered"] - out["wonBare"], 4)
+                        out["nBare"], out["nSteered"] = arms[0][0], arms[1][0]
+                    return out
                 steps.append(_cached("step:" + d.name, d, sb))
-    # 进行中标注:最后一个 train step 若文件数 < batch(以历史最大为准)
-    full = max((s["n"] for s in steps), default=0)
+    # 完成态必须由实收batch合同判定。旧逻辑用历史最大n推断full，首个partial
+    # step会把自己的64条当成“历史最大”而误标完成。只有旧run缺配置时才回退历史值。
+    expected_train = int(CONFIG.get("expectedTrainTrajs") or 0)
+    full = expected_train or max((s["n"] for s in steps), default=0)
     for s in steps:
         s["partial"] = bool(full and s["n"] < full)
+        s["expected"] = full
     vals = sorted(vals, key=lambda v: v["id"])
     vfull = max((v["n"] for v in vals), default=0)
     for v in vals:
         v["partial"] = bool(vfull and v["n"] < vfull)
-    return dict(name=RUN.name, live=True, hasDocs=bool(DOCS), ts=time.time(), steps=steps, vals=vals)
+    return dict(
+        name=RUN.name,
+        live=True,
+        hasDocs=bool(DOCS),
+        docs={"staticCount": len(DOCS), "dynamicArchives": (RUN / "research").is_dir()},
+        config=CONFIG,
+        ts=time.time(),
+        steps=steps,
+        vals=vals,
+    )
+
+
+def _step_dir(dirname: str) -> Path | None:
+    if not _STEP_DIR.fullmatch(dirname):
+        return None
+    path = RUN / "rollouts" / dirname
+    return path if path.is_dir() else None
 
 
 def api_step(dirname: str) -> dict:
-    d = RUN / "rollouts" / dirname
-    if not d.is_dir():
+    d = _step_dir(dirname)
+    if d is None:
         return {"error": "no such step"}
 
     def lb(fs):
-        return {"trajs": [_meta_of(json.load(open(f))) for f in fs]}
+        return {"trajs": [_meta_cached(f) for f in fs]}
     return _cached("list:" + dirname, d, lb)
 
 
+def _traj_file(dirname: str, idx: int) -> str | None:
+    d = _step_dir(dirname)
+    if d is None:
+        return None
+    fs = _files(d)
+    return fs[idx] if 0 <= idx < len(fs) else None
+
+
+def _load_dump(path: str) -> dict:
+    """原始 dump 的小 LRU。maxopen 下单文件可达 8MB,解析成本高;抽屉按需取
+    分布时会反复命中同一条轨迹,不缓存则每次重新读盘+反序列化。"""
+    with _lock:
+        hit = _dump_cache.get(path)
+    try:
+        mtime = Path(path).stat().st_mtime_ns
+    except OSError:
+        mtime = -1
+    if hit and hit[0] == mtime:
+        return hit[1]
+    with open(path) as fh:
+        raw = json.load(fh)
+    with _lock:
+        _dump_cache[path] = (mtime, raw)
+        while len(_dump_cache) > _DUMP_CACHE_MAX:
+            _dump_cache.pop(next(iter(_dump_cache)))
+    return raw
+
+
 def api_traj(dirname: str, idx: int) -> dict:
-    fs = _files(RUN / "rollouts" / dirname)
-    if not (0 <= idx < len(fs)):
-        return {"error": "index out of range"}
-    return M.build_traj(json.load(open(fs[idx])), DEC, DOCS)
+    path = _traj_file(dirname, idx)
+    if path is None:
+        return {"error": "no such step or index out of range"}
+    # 实时后端走精简档:省掉占 payload 95% 的 top16 分布,抽屉再按需取。
+    return M.build_traj(
+        _load_dump(path),
+        DEC,
+        DOCS,
+        run=RUN,
+        bmax=CONFIG["bmax"],
+        with_dists=False,
+    )
+
+
+def api_rec(dirname: str, idx: int, ref: int) -> dict:
+    path = _traj_file(dirname, idx)
+    if path is None:
+        return {"error": "no such step or index out of range"}
+    return M.build_rec_dists(_load_dump(path), DEC, ref)
 
 
 class H(BaseHTTPRequestHandler):
@@ -177,6 +317,10 @@ class H(BaseHTTPRequestHandler):
         try:
             if p in ("", "index.html"):
                 return self._send(200, APP.read_bytes(), "text/html; charset=utf-8")
+            if p == "data/run.js":
+                return self._send(200, b"", "application/javascript; charset=utf-8")
+            if p == "favicon.ico":
+                return self._send(204, b"", "image/x-icon")
             if p == "api/run":
                 return self._json(api_run())
             if p.startswith("api/step/"):
@@ -184,6 +328,9 @@ class H(BaseHTTPRequestHandler):
             if p.startswith("api/traj/"):
                 _, _, d, i = p.split("/")
                 return self._json(api_traj(d, int(i)))
+            if p.startswith("api/rec/"):
+                _, _, d, i, ref = p.split("/")
+                return self._json(api_rec(d, int(i), int(ref)))
             return self._send(404, b"not found", "text/plain")
         except BrokenPipeError:
             pass
@@ -192,7 +339,7 @@ class H(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    global RUN, DEC, DOCS
+    global RUN, DEC, DOCS, CONFIG
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--tokenizer", required=True)
@@ -201,10 +348,16 @@ def main() -> int:
     ap.add_argument("--doc-table", default=None, help="task_id→特权文档 jsonl(s1 臂)")
     a = ap.parse_args()
     RUN = Path(a.run_dir)
+    CONFIG = M.load_run_config(RUN)
     print(f"[server] loading tokenizer {a.tokenizer} …", flush=True)
     DEC = M.Dec(M.load_tok(a.tokenizer))
     DOCS = M.load_docs(a.doc_table)
     print(f"[server] doc table: {len(DOCS)} 条", flush=True)
+    print(
+        f"[server] budget B∞={CONFIG['bmax']} ({CONFIG['bmaxSource']})"
+        + (f" WARNING: {CONFIG['bmaxWarning']}" if CONFIG["bmaxWarning"] else ""),
+        flush=True,
+    )
     srv = ThreadingHTTPServer((a.host, a.port), H)
     print(f"[server] run={RUN}  http://{a.host}:{a.port}  (本地: ssh -N -L {a.port}:127.0.0.1:{a.port} …)", flush=True)
     srv.serve_forever()

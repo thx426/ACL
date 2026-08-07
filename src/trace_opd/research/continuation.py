@@ -249,7 +249,7 @@ async def continue_from_prefix(
                 if consecutive_bad >= protocol.MAX_CONSECUTIVE_FORMAT_FAILURES:
                     out.truncated = True
                     break
-                obs_text = protocol.FORMAT_REMINDER_OBS
+                obs_text = adapter.format_reminder()
             else:
                 consecutive_bad = 0
                 norm = adapter.normalize_action(command)

@@ -523,3 +523,654 @@ sglang 起服(flashinfer/sgl-kernel/cudagraph 全 kernel 面)才是 A800 终审�
 (起服/往返/256宽+radix三断言/memory-saver)统一待空 GPU:162 四卡在 pgs_s1
 (step~50)、A800 八卡在 pgs_base_a800(step~75)。base 自然完成约 +14h;
 s1 是否提前停(已确认 θ_D 死锁版,让位 S2/SGLang 验证)待用户裁定。
+
+## 2026-08-05 · [P0] SGLang PoC 门 2–4 通过:tail-only+radix 实测约 41×;旧探针断言是假红
+
+**结论**:162 单卡 PoC 已完成,迁移的两个一票项均成立:top-256 可用、tail-only
+打分结合 radix cache 带来约 **41×** 的实测降时。memory-saver 模式也已真实起服
+并完成生成往返。因此允许进入完整 verl+SPS 冒烟。
+
+**环境/门 1**(方案 B,独立 `/data3/.../venv_sglang`):sglang 0.5.8 / torch
+2.9.1+cu128 / flashinfer-python 0.6.1 / sgl-kernel 0.3.21 / transformers
+5.11.0;flash-attn 未装(该独立环境的单卡 SGLang PoC 不需要)。
+
+**门 2**:A800(sm80)自动选择 `flashinfer` attention backend,无需 triton 回摆;
+模型真实往返通过(`The capital of France is`→` Paris...`)。
+
+**门 3 五个计时**(~2001 prompt token,top_logprobs_num=256):
+
+| 请求 | latency | rows | top width | 首行 |
+|---|---:|---:|---:|---|
+| full-A | 2.981s | 2001 | 256 | null |
+| full-B | 3.102s | 2001 | 256 | null |
+| full-C | 3.068s | 2001 | 256 | null |
+| tail-A | 0.075s | 8 | 256 | null |
+| tail-B | 0.060s | 8 | 256 | null |
+
+- 断言① top width 256:PASS;
+- 断言② tail rows=8、首行 null:实测 PASS。服务器 `sgl_probe.py:29` 仍是旧口径
+  `not first_null`,所以打印 `assert2=false` 是**探针假红**,不是引擎失败;请将脚本同步
+  为环境册 2026-08-05 修正版并加“其余 7 行非 null”的显式断言;
+- 断言③ tail-A < 0.6×full-C:PASS(0.075/3.068=0.0244,约 40.9×)。
+- 证据:`/data3/wushang/workspace/TRACE-OPD-PGS/logs/sgl_probe_retest.out`、
+  `logs/sgl_server_gate3retest.log`。
+
+**门 4**:`--enable-memory-saver --mem-fraction-static 0.6` 起服、health 与真实往返
+PASS。独立 venv 的 torch-memory-saver 子进程若从系统优先解析 CUDA runtime 会报
+`libc10_cuda.so: undefined symbol cudaGetDriverEntryPointByVersion`;**有效修复是把
+venv 内 `nvidia/cuda_runtime/lib` 前置到 `LD_LIBRARY_PATH`**。`LD_PRELOAD` cudart
+无效。起服时 SGL kernel JIT 因系统 nvcc 不支持 `-std=c++20` 报错,但预编译/fallback
+路径继续完成 cudagraph 并健康服务;正式环境需用 conda CUDA compiler 消除该噪声。
+证据:`logs/sgl_server_gate4c.log`。
+
+## 2026-08-05 · [P0] 用户调度已执行:base 以 A800 step-110 为锚迁到 162;新机制臂占 A800 八卡
+
+**base**:A800 `global_step_110` 的 train 128/128、val 274/274 与 8 份模型/优化器
+分片均完整;用户将原 step-80 迁移锚点改为 **step 110**。8→4 卡无法直接加载 FSDP
+optimizer shard,故模型合并为 HF(7.6G)后传 162;`model.safetensors` SHA-256
+`f0c0c9bf62a58f9a8947eb680fdf9520ffb82403d9d85f89f76ce0983a46e410`,两机一致。
+
+**数据序列并未重头开始**:原 `global_step_110/data.pt` 也跨机迁移(SHA-256
+`81092cd...cd7b`),通过“actor load_contents=[] + HF 模型路径”的桥接 checkpoint
+恢复逻辑 global_step=110 与 StatefulDataLoader 状态。两机回放的 next-batch 索引完全
+一致(`[1145,2535,1729,2284,1663,2829,28,1742,2709,885,881,110,942,2103,69,683]`),
+且 162 实际 `step_00111` 的 16 个 task 集合逐项匹配。训练 parquet SHA-256
+`61020b6a...fe31` 两机一致。optimizer/调度/RNG 的 FSDP extra state 因 world-size
+变化未恢复;LR 为 constant,故 scheduler reset 行为无效应,但 Adam moments reset 必须
+作为迁移口径披露。
+
+**总步数**:dataset=2875、batch=16、drop_last=true⇒179 step/epoch、2 epoch=358。
+162 设逻辑终点 358,实际继续 111–358 共 248 update。run:
+`/data4/ws/PGS/pgs_base_162_from110`;启动后 step-110 val 274/274、step-111 128/128,
+错误 0,已进入后续 step。
+
+**新机制臂**:A800 base 已安全停机,八卡释放;代码已同步 `pgs-sglang@fa11dc8`,
+S2 配置语义 = θ 分片修复 + pacing + B∞=400 + SGLang。按用户要求优先复用 conda
+成熟训练栈,新建独立 `env_sglang_train`(不改 env_train/env_vllm),目标钉死
+pytorch 2.9.1 + flash-attn 2.8.3 + SGLang 0.5.8;环境与全链路冒烟完成后从共同
+`sft_step6` 从头跑 2 epoch。
+
+## 2026-08-05 · [P1] A800 正式 S2/SGLang 已起跑；2-step 产物全过但 clean-exit 未过，显微镜实时服务已绑定正式 run
+
+**正式 run**：`/fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs/pgs_s2_sgl_a800`，
+2026-08-04 23:21 +08 启动。实收无 manual override：8 GPU、SGLang 0.5.8、rollout
+TP=1、actor Ulysses SP=2、adaptive θ_D、pacing、B∞=400、共同 `sft_step6`、2 epochs
+（358 logical steps）、训前 val、save/test 每 10 步。入口下真实 torch/FA kernel 通过；八卡
+初始化 `ready to fit`，训前 val 274/274 JSON-valid，首步轨迹已实时落盘，启动错误面为 0。
+
+**2-step smoke 的判决要分两层**：
+- 产物/训练链 PASS：2×128 train rollout、两次 actor update 和 SGLang weight update、
+  8+8+8 shard 的 step-2 checkpoint（含 `data.pt`）、274 val 全齐；IS off-1 fraction
+  约 3.73%/3.63%，steering/pacing 非零。
+- clean-exit FAIL：上述产物全部完成后，DataLoader worker 被 signal 杀死，主进程记录
+  RuntimeError，SwanLab 标 error。无 OOM、EngineDead、fatal NCCL。正式 run 长期监控已将
+  DataLoader worker fatal 单列，不能把 smoke 写成干净退出。
+
+**实时观察面**：远端只读显微镜 `127.0.0.1:8793`，绑定正式 run 并加载 2875 条 doc；
+本地经同端口 SSH tunnel 访问。`/api/run`、`/api/step/step_00001`、
+`/api/traj/step_00001/0` 已真实探活；逐轨迹返回目标、初始 observation、特权文档、
+turn/token 与机制事件。旧 8792 服务仍绑定 base，未覆盖。
+
+
+**前三步闭环（同 run Ray 原始 TaskRunner 输出）**：step 1–3 均 128/128 JSON-valid，三次
+actor update 与 SGLang weight update 完成；`rollout_is_weight_off1_frac` = 3.876% /
+3.654% / 3.907%，entropy = 0.669 / 0.641 / 0.680，actor max allocated = 24.88 /
+28.76 / 31.11 GiB，整步 207.2 / 188.0 / 191.9s。θ_D 平滑更新 0.0338 → 0.03249 →
+0.03077；平均 tilt 105.8 → 128.6 → 128.0，pacing wait 1105.6 → 1356.1 → 1478.2，
+说明自适应阈值与 pacing 均在跨步真实生效。前三步零 Traceback/OOM/EngineDead/fatal NCCL/
+DataLoader worker/RayTaskError；step 4 已开始。待核：step1/2 的 `doc_missing=0.0625`
+（恰一组 8 rollout）而 step3=0，需定位是数据覆盖还是 task-id 对齐问题。
+
+## 2026-08-05 · [P0·正式数据口径] pacing 已消除头部速烧；但 GT doc 仅 2828/2875 非空，47 个缺失且集中于 pick_two
+
+**pacing 的首步位置实证（A800 正式 `pgs_s2_sgl_a800/step_00001`，128/128）**：
+实际 `eta>0` 干预 13,545 次。相对全轨迹位置 P10/P25/P50/P75/P90 = 8.50% /
+19.82% / 42.32% / 67.33% / 85.77%；仅 240/13,545 = **1.77%** 落在全局前
+16 token，98.23% 在后续 turn。120/120 个有 doc 且发生干预的轨迹，最后一次干预都在
+position 16 后；last-relative median **98.19%**（IQR 96.03–99.10%），last-turn median
+27。turn0 每条恰 spend=5.0，141,511 次 pacing wait。相较旧 s1 全部干预堆前约16 token，
+本正式实现已从行为层消除头部速烧（这是同机制前后事实比较，不作性能因果结论）。
+
+**W_beh 双侧闭环**：rollout JSON 的稀疏行可重建 372,537 个 dense weight，mean=0.999953、
+off1=3.173%、范围 0.1904–3.0449，schema/invariant 0 失败；Ray 原始 TaskRunner 训练指标
+step1 `actor/rollout_is_weight_mean=0.9999419`、`off1_frac=3.8764%`，并有
+`update_actor=28.46s`、`update_weights=4.67s`，故 loss-side delivery 已证实，不只是在 artifact
+中“有字段”。
+
+**P0 数据覆盖缺口**：doc table 2875 个 key 中仅 **2828 非空，47 空（1.6348%）**；
+`pick_two` 占 38/674 = **5.638%**，不是随机缺失。step1/2 的 `doc_missing=0.0625` 各对应
+恰一个任务组×8 rollout，key 均 exact-match doc table，但 doc 是空串；step3 缺失为0。
+原 parquet 的 `gt_text` 非空却是 high-level ALFRED annotation，`gt.py` 有意只接受 Engine
+walkthrough，因此安全降级为 nodoc——不是 task-id 键错或 SGLang 故障。
+
+**对正式臂的影响与冻结处置**：这些样本按设计退化为 bare GRPO；step1/2 的有效 dose 覆盖
+各120/128=93.75%，前三步合计16/384=4.167% rollout 无 treatment。不中途补 doc/改数据，
+避免改变 treatment；run 继续。最终必须同时报告：① intention-to-treat 全量；② `doc_present`
+分层；③按 family（尤其 pick_two）分层。原“2875 GT walkthrough 全覆盖”表述不成立，需机制/
+数据侧后续补齐 47 条 Engine walkthrough 后另起干净对照，不得回填当前 run。
+
+**其他首步健康信号**：thought 相邻逐字重复率轨迹均值0.539%、pooled 0.786%，仅2条非零且
+均 lost，0条超过55%崩塌阈；无早期重复崩塌。全量证据路径：
+`/fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs/pgs_s2_sgl_a800/rollouts/step_00001/`；
+doc table 同生产根 `data/gt_docs_rl_train_v2.jsonl`。
+
+## 2026-08-05 · [P0·运行恢复] step-60 checkpoint 并发写失败；从完整 step 50 恢复，在线只保留 1 个 checkpoint
+
+**故障分型**：正式 run 已完成 `step_00060` 的 128/128 train JSON，但在 2026-08-05
+02:49 +08 保存 `global_step_60` 时，8 个 actor rank 均报
+`PytorchStreamWriter failed writing file ...: file write failed`，随后 Ray 级联正常退出。残缺目录仅有
+8 个 model shard（5,516,867,328 bytes），无 optimizer/extra/`data.pt`/HF metadata；latest marker
+仍为 50，故 step 60 **不是可恢复 checkpoint**。无 OOM、NCCL、EngineDead、DataLoader worker；
+八卡已释放且 `nvidia-smi` 正常，故不是 GPU/驱动故障。
+
+**存储证据与处置边界**：`/fs/fast` 全局仍余约39T、inode 使用6%，同目录128MiB写入+fsync
+探针通过，无法把根因严格写成“全盘耗尽”；更符合 Lustre 八 rank 并发大文件写的瞬时失败或配额/
+目录容量压力。故障时在线 checkpoint 占约140GiB（三份完整30/40/50 + 残缺60）。按用户裁定，恢复后
+`train.max_ckpt_to_keep=1`；该键不进 objective fingerprint，指纹仍为 `52431755eb79`，优化目标
+未变。
+
+**保全与恢复**：删除在线旧 checkpoint 前，完整 step 50 已复制到本机独立盘
+`/disk/trace-opd-recovery/pgs_s2_sgl_a800/global_step_50`；31文件、48,286,310,244 bytes，
+源/副本逐文件 SHA-256 全相等。第一次 attempt 的 step 51–60（10×128 JSON）与原始主/Ray日志
+已归档到 `/disk/trace-opd-recovery/pgs_s2_sgl_a800/attempt1_failed_step60_20260805T024918+0800/`；
+活跃 rollout 51–60 移出后再重跑，防 UUID 文件叠加污染128条口径。在线只保留合法
+`global_step_50`，marker=50；以 `resume_mode=auto`、`max_actor_ckpt_to_keep=1` 重启。03:19日志
+明确 `Resuming from .../global_step_50, setting global step to 50`，8 rank model/optimizer 已加载，
+03:20 新 `step_00051` 开始产出。
+
+**恢复闭环（03:31 +08）**：重新生成的 step 51 任务多重集与失败前完全相等（16 task×8），
+证明 `data.pt` 游标连续；128/128 JSON-valid，W_beh off-1=11.42%、actor update=22.43s、
+weight sync=4.63s、artifact全局门率10.94%、θ_D=0.0338、pacing位置P50=48.59%，错误面全零。
+step 60 随后形成 train 128/128、val 274/274、checkpoint 31文件/48,286,310,244 bytes且
+marker=60；save checkpoint=8.48s，无新写盘/fatal。step60 W_beh off-1=11.37%、entropy=0.0649、
+θ_D=0.02873、artifact全局门率10.25%、pacing位置P50=49.98%、thought重复率0；step61也已
+128/128。由于恢复进程的轮转注册表不包含旧step50，本次在验证step60与`/disk` step50灾备后
+人工删除在线step50；Lustre现仅保留完整`global_step_60`约45GB。后续同进程会按
+`max_actor_ckpt_to_keep=1`在新点成功注册后安全轮转旧点。
+
+恢复时 `val_before_train=true` 额外重跑同一step50 checkpoint：原正式端点216/274，重跑
+221/274；两组恰各274、task集合相同。第二组已单独归档到
+`/disk/trace-opd-recovery/pgs_s2_sgl_a800/resume_20260805T0315/val_before_train_step_00050_val/`，
+活跃目录只保留原274条标准端点。该5题差异再次印证greedy评测非逐字确定，不能混成548分母。
+
+**已知恢复语义缺口**：model、optimizer、LR scheduler、RNG 与 StatefulDataLoader 均从 step 50
+恢复；但 worker 内 `GateThresholdTracker` 的 adaptive θ_D 状态目前不进 checkpoint，重启会从配置
+初值0.0338重新收敛，而 step 50 实收均值为0.04924。不得伪造状态；恢复后须优先监控前几步
+θ_D/门率，并请 CD-010 将自适应门控状态纳入后续 checkpoint 设计。恢复最终闭环需同时满足：
+step 51 128/128 + actor/W_beh 指标正常，以及下一次 step-60 checkpoint 在单保留策略下形成
+8 model + 8 optimizer + 8 extra + `data.pt` + HF metadata、marker=60。
+
+## 2026-08-05 · [P0·预注册安全停机] step-70 固定 val 93.07%，但 entropy 连续 <0.2；按安全门停于完整 checkpoint
+
+**执行结论**：`docs/pgs-validation-design.md:48-49` 预注册“熵持续跌破0.2 ⇒ 停机保 ckpt，
+按崩塌处置”。A800 正式臂 entropy 在 step30/40/50/60/70 连续为 **0.1791 / 0.1078 /
+0.0620 / 0.0649 / 0.0389**，已明确触发；不能因 val 上升而事后修改门槛。2026-08-05
+03:45 +08 在完整 `global_step_70`（31文件、marker=70）向精确 PGID 71516 发送TERM；17秒内
+训练/Ray/SGLang进程组干净退出，八卡显存归零。无新 Traceback/OOM/NCCL/EngineDead/
+DataLoader worker/写盘失败。显微镜 `127.0.0.1:8793` PID50055保留；旧watchdog PID101534
+已停止，避免把有意停机误报为故障。
+
+**step-70 端点**：固定274-task val = **255/274=93.07%**（seen 132/140=94.29%，unseen
+123/134=91.79%），相对step0 26.64%为+66.42pp；invalid=0、truncated=0、平均响应503 token。
+by-family：look_at 26/31、simple 57/59、clean 56/58、cool 45/46、heat 33/39、pick_two
+38/41。thought逐字重复率均值0.24%、pooled0.64%、0条>55%，随性能上升而下降。训练批
+step70为128/128全赢，grad norm=0，说明该批GRPO组内零advantage；W_beh仍送达loss（off-1
+8.32%），artifact全局门率7.19%/Ray轨迹均值7.20%，θ_D=0.02678，pacing位置P50=47.8%，
+机制健康门仍在带内。checkpoint保存15.1s，单保留策略成功滚动到step70；旧step60 actor被自动删但
+遗留`data.pt`空壳，验证step70后已精确删除，在线仅剩完整step70。
+
+**解释边界**：执行口径按预注册必须停，但现象并非此前“输轨迹高重复+val崩”指纹：这里val持续
+上升、长度缩短、invalid/truncation与重复率归零，低熵可能是能力收敛/任务饱和，也可能是过度
+确定化的前置阶段。当前只称“entropy安全门触发”，不将机理结论提前写死；step70需以多次固定val、
+同数据序base与行为多样性进一步裁定。停机前step71–74各128 JSON也完整，但无更新checkpoint，
+不得作为可恢复模型点；恢复锚只认70。
+
+## 2026-08-05 · [监控] A800 step-70 安全停点保持；162 base 完成 step-250 端点
+
+A800 审计确认未被意外重启：最新train仍为step74（128/128）、val为step70（274/274），在线唯一
+`global_step_70`仍为31文件/48,286,310,244 bytes、8 model+8 optimizer+8 extra+`data.pt`+
+HF metadata，marker=70；无基础设施fatal，八卡显存0，显微镜8793在线。该状态是预注册entropy门
+触发后的有意停机，不作自动恢复。
+
+162 base 已封闭到train step251，step252继续产出；val/checkpoint marker=250均完整（274条，4+4+4
+shard及`data.pt`）。step250固定val=250/274=91.24%（seen132/140、unseen118/134），近期
+step220/230/240/250为90.88%/93.07%/92.70%/91.24%；单点-1.46pp不触发>10pp安全门且在greedy
+方差范围内。entropy=0.388、grad norm=0.0782，错误面全零。`/data4`余5.2T；`/data3`仍余
+478G（97%使用）列容量预警，但无证据支持清理。
+
+## 2026-08-05 · [监控] 162 base step-270 高点回落，不是相对近期基线的连续崩塌
+
+A800 step-70安全停点无变化：train尾仍74、val/marker仍70、唯一checkpoint31文件完整、错误面
+全零、八卡显存0，仅显微镜8793在线；无新事实，不自动重启。
+
+162 base已封闭到train273（step274继续）、val/checkpoint270；4+4+4 shard、`data.pt`、HF/FSDP
+metadata完整，marker270，错误面全零。固定val step250/260/270为91.24%/95.62%/89.78%；
+260→270表面−5.84pp且同任务3升/19降（配对`p=0.000855`），但250→270仅−1.46pp、9升/13降
+（`p=0.523`），故更符合step260异常高点回落，不是相对近期基线的持续退化。回落主要来自
+look_at 24/31→16/31、pick_two 40/41→35/41、heat 38/39→35/39；clean仍58/58，cool升至
+46/46。step270 entropy=0.347、grad norm=0.0492，未触发低熵或>10pp安全门；继续运行并以step280
+确认连续性，不干预。
+
+## 2026-08-05 · [监控] step280–300 否定 base 连续退化，固定 val 恢复至94.53%
+
+A800安全停点保持不变：train尾74、val/marker70、唯一31文件checkpoint完整、错误面全零、八卡
+显存0，仅8793显微镜在线；未被意外重启。
+
+162 base已封闭到train301（step302继续）、val/checkpoint300；最新三个checkpoint 280/290/300
+均19文件（4 model+4 optimizer+4 extra+`data.pt`+HF/FSDP metadata），marker300，错误面全零。
+固定val step270/280/290/300依次为89.78%/92.70%/93.07%/**94.53%**；step300 seen
+136/140、unseen123/134，invalid/truncated均0。相邻同任务配对净变化为+2.92/+0.37/+1.46pp，
+250→300为+3.28pp（17升/8降，`p=0.108`）。故step270回落是单点波动，后续三点明确恢复，
+不支持连续退化。entropy 0.305/0.294/0.362，grad norm均非零；不触发安全门，继续到358。
+
+## 2026-08-05 · [监控] 162 base 末段 step330 仍稳定高位，距终点24步
+
+A800 step-70安全停点仍无变化：train尾74、val/marker70、唯一完整checkpoint，错误面全零、八卡
+显存0、仅8793显微镜在线；不自动恢复。
+
+162 base已封闭到train334（持续产出）、val/checkpoint330；最近checkpoint 300/310/320/330均
+4+4+4 shard、`data.pt`、HF/FSDP metadata完整，marker330，错误面全零。固定val
+step300/310/320/330为94.53%/95.26%/96.35%/95.62%；相邻配对净变化+0.73/+1.10/−0.73pp，
+均不显著，末段稳定高位。step330 seen135/140、unseen127/134，invalid/truncated各1；thought
+重复率均值1.17%、pooled3.19%、仅1条>55%，继续下降。entropy 0.315/0.293/0.254仍高于0.2，
+grad norm均非零；无安全门。距逻辑终点358尚24步，继续运行并在最终train/val/checkpoint齐全后验收。
+
+## 2026-08-05 · [终验] 162 base 完成 step358：最终96.72%，产物全齐；clean-exit因DataLoader尾错失败
+
+A800安全停点仍无变化：train尾74、val/marker70、唯一31文件checkpoint完整、错误面全零、八卡
+显存0、仅8793显微镜在线；不自动恢复。
+
+**162 base产物级完成**：`step_00358` train 128/128、`step_00358_val` 274/274；
+`global_step_358`共19文件/48,283,717,276 bytes，4 model+4 optimizer+4 extra，含`data.pt`、
+HF/FSDP metadata，latest marker=358。主训练与四卡服务已退出，显存约14MiB/卡。
+
+**最终固定val**：step358 = **265/274=96.72%**（seen136/140=97.14%，unseen129/134=
+96.27%），invalid=1、truncated=1。相对迁移锚step110的240/274=87.59%提升**9.12pp**；同任务
+31升/6降，配对二项`p=4.13e-5`。末段step330/340/350/358为95.62/96.35/95.62/96.72%，
+已在高位平台。by-family：look_at30/31、simple58/59、clean57/58、cool45/46、heat37/39、
+pick_two38/41。step358 entropy=0.267、grad norm=0.0205；最终val thought重复率均值1.23%、
+pooled3.70%、3条>55%，无低熵或val下跌安全门。
+
+**clean-exit必须单列FAIL**：日志顺序为358/358完成→最终checkpoint→274 val及final metrics打印→
+SwanLab atexit `finish()` 等待期间报`DataLoader worker ... killed by signal: Killed`，产生1个
+Traceback/RuntimeError。无OOM/NCCL/EngineDead/RayTaskError/写盘失败。故准确判定为“训练/
+评测/checkpoint完成，clean-exit失败”；不重启、不补跑。完整报告：
+`docs/pgs-base-162-from110-final-report.md`。
+
+## 2026-08-05 · [维护复核] A800最新更新为step74但恢复锚仍70；162终点未漂移，旧点空壳范围修正
+
+A800产物级复核：step1–74的train目录均各128条且JSON-valid，最新固定val仍step70的274条，
+唯一checkpoint仍`global_step_70`（31文件/48,286,310,244 bytes，8 model+8 optimizer+8 extra+
+`data.pt`，marker70）。Ray原始指标证明停机命令落地前step71–74均已完成actor update和SGLang
+weight update，而不只是生成轨迹；step74 entropy=0.0507、grad norm=0.799、W_beh off-1=9.03%。
+但这四步无checkpoint/固定val，故最新完成更新为74，唯一可恢复且有固定评测的锚仍只认70，绝不
+自动恢复或把74伪装成可恢复点。step70训练artifact：门率7.19%、θ_D=0.02678、pacing干预位置
+P50=47.82%、相邻thought exact-dup均值0.078%/pooled0.102%/0条>55%；固定val重复率为
+0.237%/0.643%/0条>55%。低熵门仍触发，未见复读型崩塌。恢复attempt的Ray错误面全零；首次
+attempt仅保留已知step60写盘失败。八卡显存0、`/fs/fast`余39T，无恢复动作。
+
+162 base终点未漂移：step358 train128/128、val274/274、完整四卡checkpoint19文件/
+48,283,717,276 bytes、marker358，`data.pt` SHA-256仍为
+`82f463108b484bfeb014b4f25ece47d6a5458f4088aad2e1e260c17b16c0525c`；四卡显存14MiB，无训练
+进程，旧DataLoader尾错仍是唯一fatal。维护审计修正一项报告细节：step110–320的历史轮转目录均
+只剩`data.pt`空壳，不只是310/320；完整可恢复点为330/340/350/358。这不影响marker358与终点
+结论，但checkpoint枚举必须按shard+`data.pt`完整性，不可只按目录名。
+
+## 2026-08-05 · [162·1.7B正式臂] 隔离SGLang训练栈通过全门；正式run已从原始base干净启动
+
+按用户裁定，以A800 4B正式`pgs_s2_sgl_a800/effective_config.yaml`为模板，在162从原始
+`/data3/wushang/model/Qwen/Qwen3-1.7B`启动GT特权信息S2臂。新环境与代码均隔离在
+`/data4/ws/PGS/`，未修改旧`venv_train/venv_sglang`：torch2.9.1/CUDA12.9、flash-attn2.8.3、
+SGLang0.5.8、Transformers5.11.0、Ray2.56.1、TensorDict0.13.0。代码bundle精确同步A800正式
+臂8个SGLang/pacing/adaptive-gate闭环文件；正式配置hash
+`7f3ed56c5305a435f4e69e2580a713e57446d4a71ee0cc7cd793b54e710c7d4c`。
+
+启动门真实通过：单卡matmul+FA kernel；双卡NCCL SUM=3；SGLang memory-saver普通生成；
+145-row full top256=0.215s、8-row tail=0.0397s（5.41×，首行None、后7行每行256）；27项
+adapter/steering测试；正式dry-run。首次JIT发现nvcc默认误用系统GCC9导致`<concepts>`缺失，最小
+CUDA C++20复现证明`NVCC_PREPEND_FLAGS=-ccbin=<conda g++>`是充分修复，固化后SGLang起服不再
+fallback。GT表重核2875唯一key、2828非空/47空，hash
+`25367813d29477f9f5b4695016bb032a1b72bb88c2d84f4117129ae96a1a0dbd`；不回填。
+
+首次actor smoke在Ray TaskRunner导入期因环境闭包漏`cachetools`退出，未起GPU更新/rollout，
+失败证据保留。按A800完整Python分发差集补齐后，v2 smoke形成step1 128/128、完整四卡checkpoint
+19文件/20,660,399,665 bytes、marker1；actor update24.96s、SGLang weight update3.51s、grad
+norm0.466、entropy0.0217、W_beh mean1.00003/off-1=2.67%。artifact门率2.74%、干预10,522、
+θ_D=0.0338、pacing位置P50=42.82%、doc_missing=8/128。全部产物后DataLoader worker在atexit被
+signal Killed，判“端到端门通过/clean-exit失败”，不复用smoke checkpoint。
+
+1.7B smoke相邻thought exact-dup均值36.10%、pooled39.19%、45/128条>55%；既有1.7B base早期
+基线约45.7%，故不能机械套4B绝对重复阈值，正式前三步需重新定标。正式run
+`pgs_s2_sgl_1p7b_162_gt`于10:42 +08从不存在的干净目录启动，PID/PGID=3707792；fingerprint
+`e9ef2835e0af`，manifest `overrides=[]/config_overrides=[]`，明确实收原始1.7B、SGLang TP1、
+actor SP2、16×8、2 epochs、每10步val/save、`B∞=400`、adaptive θ_D与pacing，无smoke限制
+泄漏。主日志与运行卡：`/data4/ws/PGS/trace_opd_1p7b_s2_bundle/logs/pgs_s2_sgl_1p7b_162_gt.log`、
+`docs/pgs-s2-1p7b-162-run-card.md`。
+
+正式训前val已274/274：14/274=5.11%（seen6/140、unseen8/134），invalid6、truncated2；
+by-family仅simple10/59和cool4/46非零，其余四族为0。相邻thought重复率均值41.08%、
+pooled42.72%、118/274条>55%，thought字符中位98，这是本基座正式零点。正式step1随后128/128并
+完成更新：22/128 won、invalid9、truncated3、entropy0.02406、grad norm0.592、W_beh off-1
+2.55%，actor update22.54s、weight update3.37s；artifact门率2.63%、干预9394、θ_D=0.0338、
+pacing P50=42.68%、doc_missing8/128，重复率均值36.56%/pooled40.87%/44条>55%。错误面全零，
+step2已开始。高重复与低熵都已在训前零点存在，不能把step1单点定性为训练诱发崩塌；前三步继续
+看相对漂移与adaptive θ_D是否从初值移动。
+
+## 2026-08-05 · [P0·预注册安全停机] 1.7B原始base在step10连续极低熵；val早期上升但不覆盖“任一触发”门
+
+**执行结论**：162正式run `pgs_s2_sgl_1p7b_162_gt` 已在首个完整step10端点按
+`docs/pgs-validation-design.md:48-49`受控停机。step1–10 entropy依次为0.02406/0.01759/
+0.02216/0.02092/0.01770/0.02135/0.01800/0.02216/0.02062/0.02294，十步均值0.02075、
+最大0.02406，连续远低于预注册0.2门；现行规则是thought重复>55%、entropy持续<0.2、val单点
+跌>10pp任一触发即停。不能因本次val上涨而事后撤销安全门。约11:12 +08向精确训练PGID
+3707792发送TERM，并停止只读watchdog PGID3838700；新连接复核两组均为空、四卡14MiB/0%，
+错误面无Traceback/OOM/NCCL/EngineDead/RayTaskError/DataLoader worker/写盘失败。
+
+**step10固定端点**：val **23/274=8.39%**（seen13/140、unseen10/134），相对训前
+14/274=5.11%为+3.28pp；同任务12升/3降、paired exact binomial `p=0.0352`，invalid=6、
+truncated=2、平均响应2004 token。family为simple14/59、clean3/58、cool6/46，其余look_at/
+heat/pick_two均0。固定val相邻thought exact-dup从训前均值41.08%/pooled42.72%/118条>55%
+改善到35.14%/37.26%/99条>55%，字符中位98→95；没有复读恶化指纹。故准确结论只能是
+“entropy安全门触发”，不能先写成训练诱发的复读型崩塌；+3.28pp也只是单次greedy早期正信号，
+受274×1功效和greedy非逐字确定限制，尚非机制有效定论。
+
+**step10机制/更新**：train14/128 won、invalid3、truncated1；entropy0.02294、grad0.5481、
+W_beh mean1.000108/off-1=3.274%；actor update22.16s、SGLang weight update3.12s、整步
+111.14s。artifact全局门率3.287%、干预12,032、θ_D=0.014843（worker 0.014833–0.014854），
+相对step1的0.0338持续下降，adaptive tracker活着但门率仍远低10%目标；pacing P50=42.29%。
+step10 train重复率均值26.60%/pooled28.50%/32条>55%，字符中位94。
+
+**checkpoint与不可恢复尾部**：`global_step_10`为19文件/20,660,399,665 bytes，4 model+
+4 optimizer+4 extra+`data.pt`+HF/FSDP metadata，marker10；`data.pt` SHA-256=
+`85a92d66881a57a4dedc4d3eb0e788ef7886f2d02cd4ed3eeb1ae8fe9a110632`。adaptive θ_D状态仍不进
+checkpoint，未来resume会从0.0338而非0.014843重收敛，因此这只是模型/optimizer/RNG/数据游标
+恢复锚，不是机制状态逐位连续锚；本轮不自行恢复。
+
+停机命令落地前流水线已完成step11–14的actor和weight update（不是只有rollout），其entropy仍为
+0.02069/0.02515/0.02744/0.02298；四步各128 train dump但无val/checkpoint，step15仅9/128。
+最新完成参数更新为14，但唯一有固定val且可恢复的科学端点只认10。**P0机制/运维请求**：外部
+十步产物审计产生约4个update的停止延迟；后续应把安全门的连续性状态、端点判决和停止动作内置
+trainer/checkpoint边界，至少在step10 save+val后阻止step11 dispatch。同时将adaptive θ_D状态纳入
+checkpoint；若要把0.2 entropy门改为按模型族/训前基线定标，必须新实验前预注册，不能追溯修改本run。
+正式数字与证据路径见`docs/pgs-s2-1p7b-162-run-card.md`。
+
+## 2026-08-05 · [维护复核] A800安全停点与162 base终点均无漂移；不恢复、不补跑
+
+A800 `pgs_s2_sgl_a800`：train step1–74均128个非空JSON-valid，固定val step0–70均274个
+非空JSON-valid；最新完成actor/SGLang更新仍为74，最新val/checkpoint/marker仍为70。
+`global_step_70`共31文件/48,286,310,244 bytes，8 model+8 optimizer+8 extra+`data.pt`+
+HF/FSDP metadata；`data.pt` SHA-256=
+`6bd547bc04260670cd3308d777e1d659afa590103be70301fd1c27cfd436f682`。step74为115/128 won、
+entropy0.0507、grad0.799、W_beh off-1=9.03%；artifact门率1505/16772=8.97%、干预2143、
+θ_D均值0.02196（worker 0.00733–0.03545）、pacing P50=50.0%，thought重复率均值0.108%/
+pooled0.346%/0条>55%。机制链路仍活且无复读恶化，但连续低熵预注册门仍成立；74无val/ckpt，
+恢复锚只认70。训练PGID71516、watchdog PGID101534均无成员，PID文件只是陈旧记录；仅显微镜
+50055监听127.0.0.1:8793。八卡0MiB/0%，`/fs/fast`余约38.37TiB；恢复attempt无新增fatal，
+历史step60写盘失败仍单列。不得自动恢复。
+
+162 `pgs_base_162_from110`：step358 train128/128、val274/274、checkpoint19文件/
+48,283,717,276 bytes、marker358、`data.pt`哈希均不变；完整点仍仅330/340/350/358。最终val
+265/274，train127/128 won；唯一Traceback仍是358/358、checkpoint和val全部落盘后的SwanLab
+atexit/DataLoader worker尾错，OOM/EngineDead/RayTaskError/PytorchStreamWriter/写盘失败均0。
+无training/verl/rollout进程，四卡14MiB/0%；`/data4`余约5.63TB，`/data3`使用97%/余约512GB，
+仅列容量预警，无证据支持清理。本run维持已完成/clean-exit失败，不重启、不补跑。
+
+口径澄清：step358 val的`invalid_format` scalar为事件计数3/274，但三次事件来自同一条轨迹；
+含invalid轨迹仍是1/274。详细证据见`docs/pgs-s2-a800-run-card.md`与
+`docs/pgs-base-162-from110-final-report.md`。
+
+## 2026-08-05 · [P0·组合缺口] 最新PGS/SGLang没有动态researcher文档入口；新A800正式臂须补纯producer闭环
+
+**结论**：用户要求以A800 4B `sft_step6`为共同起点、保持最新PGS/SGLang机制和训练设置，仅把GT
+静态文档替换为远端`qwen3.6-35b-a3b` researcher按当前任务/当前policy动态产出的文档。实际代码核验
+证明这不能只靠现有配置完成：`pgs-sglang@fa11dc8`的`agent_loop.py`只在启动时加载
+`steering.doc_table`，每样本按`task_id`查静态表；launcher只预检表文件；实现设计也明确第一版删除
+`_research*`、endpoint/tunnel、research配置和归档闭环。因此用户记忆中的动态配置确实存在，但真源
+在旧`mixed-objective`/PGC producer链，当前没有“动态researcher → PGS SPS”的可执行组合入口。
+
+**函数级合同与最小变更边界**：旧动态链按`(global_step, task_id)`经`shared_task`只运行一次，n=8
+副本共享文档；`ResearchSession`通过external-pool client和fncall `ToolRouter`用当步冻结policy跑独立
+ALFWorld实验，`ResearchArchive`落会话、实验轨迹、`doc.md`和policy_version lineage；researcher只读
+任务brief，`gt=off`，远端角色必须显式
+`extra_body.chat_template_kwargs.enable_thinking=false`。PGS侧应只复用这套**文档producer**，在
+`run()`开始student episode前得到doc并写入现有`steer_ctx`；随后完全复用既有
+`_teacher_prompt_ids → SpsGenerate → SteeringLedger → rollout_is_weights → 原生GRPO`链。不得恢复旧OPD
+teacher loss、mixed-SFT、research-RL或PGC critic，不得让doc进入bare actor scaffold，不得改tail-only
+top-K、adaptive θ_D、pacing或W_beh语义。
+
+**必须接受的调度语义**：旧OPD/PGC可让research与bare student并行，因为doc只在rollout后的teacher/
+critic路径消费；PGS在每轮draft–verify–resample开始前就需要doc，故同一任务的当前student不能与其
+producer完全重叠。正确语义是step内policy权重冻结，先由独立research episodes产doc，再启动该任务的
+8条共享doc SPS rollouts；不得用run前一次性预生成JSONL冒充逐step动态刷新。per-sample research失败可
+降级为空doc但必须计数、归档并保持全1空账；endpoint/model/auth等系统性错误须launcher preflight
+fail-loud。
+
+**A800正式门禁**：以旧GT run远端`effective_config.yaml`作全量基线，仅增加researcher来源配置并新建
+run目录；共同初始policy仍为`/fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/ckpt/sft_step6`。
+启动前须验证双隧道`/v1/models`模型身份、凭据仅来自`TRACE_RESEARCHER_API_KEY`、non-thinking真实响应、
+fncall工具往返、动态doc/lineage/tape落盘、n=8只生成一份step-task文档、actor保持bare、SPS有干预、
+W_beh off-1>0、actor update和SGLang weight update完成。旧A800 GT run与162 1.7B full run均不得覆盖、
+恢复或中途改变treatment。
+
+**准备证据（同日）**：A800旧GT正式臂的源YAML SHA-256为
+`60d16a5b5c9c300da22f2ee6d80353040c96d49cd9ac7b0060ece449ceff18f7`；初始manifest明确
+`config_overrides=[]/overrides=[]`、fingerprint=`52431755eb79`，实收`sft_step6`、SGLang TP1、actor
+SP2、16×8、`grpo_loo`、`norm_adv_by_std=false`、`seq-mean-token-mean`、LR 1e-6 constant、2 epochs、
+每10步val/save及完整S2 steering。新臂须逐字段复制该manifest；存储策略沿已知写盘事故后的用户裁定从
+起跑即`max_ckpt_to_keep=1`，该键不进objective fingerprint。
+
+A800→162外层隧道已由正式wrapper恢复，watchdog及两个精确SSH转发进程均存活；A800 loopback
+18888/18889真实监听，鉴权`/v1/models`均HTTP 200且唯一模型ID精确为`qwen3.6-35b-a3b`。两个端点
+分别做真实OpenAI function-call探针：显式`chat_template_kwargs.enable_thinking=false`后均
+`finish_reason=tool_calls`、恰调用指定无副作用工具一次、`reasoning_content`长度0、普通content长度0。
+无鉴权请求按预期401；正式凭据值未进入命令、文档或输出，只沿既有wrapper受控变量链使用。162内层
+18888/18889也有真实监听及两个SSH转发PID，故无需重启内层服务。当前只完成endpoint层，不等于动态
+ResearchSession或PGS训练链验收；后两者仍以完整doc归档和actor update为门。
+
+## 2026-08-05 · [P0纠正] 1.7B旧run是执行侧误停而非实验故障；已另起干净full run推进358步
+
+`pgs_s2_sgl_1p7b_162_gt`停止由CD-006主动TERM造成，不是162、SGLang、Ray或训练异常。执行侧在
+step10端点错误地把4B的`entropy<0.2`绝对门跨模型套到原始1.7B；但该基座训前entropy本来约
+0.02，阈值未做跨模型校准，且用户目标明确是完整运行。故该处置纠正为**操作性误停**。旧run与
+step10 checkpoint完整保留作为证据，不删除、不自动resume。
+
+不选择step10 resume的科学原因：adaptive θ_D worker状态未进checkpoint，恢复会从0.0338而不是
+0.014843重收敛；TERM落地前step11–14已完成更新但无checkpoint，resume会回退并重放数据，不能
+称连续实验。已使用同一原始Qwen3-1.7B、GT表、代码和机制配置，从不存在的新目录启动
+`pgs_s2_sgl_1p7b_162_gt_full`，目标358。配置/GT hash仍为
+`7f3ed56c…d4c`/`25367813…0dbd`，fingerprint仍`e9ef2835e0af`，manifest
+`overrides=[]/config_overrides=[]`，PID/PGID=`102239/102239`。dry-run生成的3文件空目录已原子
+改名留证，未覆盖/删除训练数据。
+
+新run已完成274-task训前val并SwanLab online：13/274=4.74%（seen5/140、unseen8/134），
+invalid/truncated均0；thought重复率均值38.08%、pooled39.22%、105条>55%，与旧run训前14/274
+及高重复基线同量级。四卡已真实起载，SGLang/Ray错误面全零并进入step1。后续低entropy只记录，
+**不得再用未校准的4B绝对0.2阈值自动中止这个1.7B full run**；真实fatal/写盘失败/产物停滞仍按
+证据诊断。运行身份和后续端点持续写`docs/pgs-s2-1p7b-162-run-card.md`。
+
+## 2026-08-05 · [P0已闭环/P1调度修复] dynamic researcher真实训练smoke通过；双端由哈希近似改为worker固定8/8
+
+**代码与配置闭环**：在`pgs-sglang@fa11dc8`上只接入纯文档producer；本地主会话独立复现
+`176 passed, 3 skipped`（含后续双端分片回归），compileall与`git diff --check`通过。A800使用独立bundle
+`trace_opd_researcher_pgs`，未覆盖旧GT生产树；关键文件同步前后SHA-256一致。正式dynamic配置以旧GT
+实收effective config逐字段闭合，除doc source/research合同、用户明确裁定的`n_exp=16`、
+`rollout_max_num_seqs=256`、外层timeout=5400s和只保留1个ckpt外，4B `sft_step6`、SGLang TP1、actor
+SP2、16×8、`grpo_loo`、no-std、seq-mean、LR 1e-6 constant、S2 SPS/W_beh和2 epochs均不变；新正式
+objective fingerprint=`976d84cfd3a3`。dry-run不联网/不建目录，正式双endpoint 2/2、认证和模型身份
+`qwen3.6-35b-a3b`已真实通过；secret值未落effective/manifest/tape，仅变量名入档。
+
+**单任务真实smoke**：原样复制正式parquet首行，保持`rollout_n=8`，只把research预算缩到2次用于技术门禁。
+真实链为`run_experiment → fetch_raw×多次 → finalize`，13轮35B fncall均error=0；ResearchArchive记录
+`global_step=policy_version=1`、`gt=off/gt_injected=false`、2 experiments/4 current-policy episodes、
+1507词doc、finalized且error=null。8条student rollout共享唯一archive和完全相同research字段，
+`research_error=0/doc_missing=0`；SPS实际steer count均值162.875、W_beh off-1=3.83%，actor update
+12.00s、SGLang weight update 4.53s、step 1/1完成。退出后唯一Traceback是已知atexit DataLoader worker
+Killed清理签名，发生于8/8产物、actor/weight update和进度100%之后；不是中途训练故障。
+
+**并发口径与修复**：`roles.researcher.max_concurrency=64`只约束外部35B HTTP，正式16个session的自然峰值
+约16（会话内轮次串行）；policy侧每次`run_experiment(k)`并行`k`条ALFWorld episode，正式k默认4/上限8，
+16 session常态约64、峰值128条current-policy episode。SGLang TP1×8 replica，用户裁定每replica
+`max_num_seqs=256`。原pool的least-active仅进程内可见，跨16 worker退化为task CRC32；真实首16任务预计算
+为12/4，不能声称负载均衡。已改为从verl Ray actor名`agent_loop_worker_<index>_*`取worker index，固定
+`index % 2`选择首端点，正式结构性8/8；session仍粘性、坏端仍failover。新增16-pool 8/8、粘性和failover
+回归，本地全量176/3通过，A800生产环境聚焦43 passed。正在以正式16任务、`n_exp=16`、k=4..8、
+max_num_seqs=256跑1-step门禁；放行条件包括16份archive、128 student轨迹、双端实际8/8 session、
+无secret、SPS/W_beh/actor/weight update及错误面全零。
+
+## 2026-08-05 · [P1已修复/门禁实证] 16任务完整预算单步通过；修正fncall启动门与真实policy版本lineage
+
+**16任务完整预算门终态**：A800独立run `pgs_s2_sgl_a800_researcher_gate1`使用正式parquet
+前16个唯一task、16 workers、n=8、`n_exp=16`、k=4..8、`max_num_seqs=256`，仅关闭val/save/
+SwanLab并限1 step。终态为16/16 ResearchArchive、16/16非空doc、128/128 student；research
+错误和doc overflow均0。每task同一步n=8共享唯一archive。双端实际16个session按worker固定8/8，观察期
+21次35B调用11/10、error=0且无异常跨端failover。actor entropy=0.6801，SPS steer count均值
+155.66、门率16.91%、预算支出354.05，`W_beh` off-1=3.327%；actor update=37.16s、SGLang
+weight update=4.67s、完整训练step=2171.53s。唯一Traceback仍是进度1/1与weight update完成后的
+DataLoader worker atexit Killed；OOM/EngineDead/RayTaskError/写盘错误均0。因此用户裁定的两项吞吐配置
+已通过真实一整步，不再重复16任务门。
+
+**P1纠正一（启动门）**：旧launcher只查双端`/models`，不能证明正式treatment所需non-thinking和
+OpenAI fncall可用。现已在创建run目录前逐endpoint执行实际`extra_body`下的两轮无副作用协议门：精确
+`trace_preflight_echo(nonce)` tool call → canonical assistant history → tool result回传 → 合法
+`PREFLIGHT_OK` follow-up；拒绝`reasoning/reasoning_content`、可见`<think>`、坏参数、多/少tool call或
+坏follow-up，任一端失败则N/N fail-closed。mock回归与A800双隧道2/2真实往返均通过，credential值不进
+消息、日志或产物。
+
+**P1纠正二（lineage）**：历史单任务smoke与16任务门把逻辑batch `global_step=1`同时写成
+`policy_version=1`，但首批research/student真实使用初始化后SGLang version 0；这是归档provenance偏一，
+不是生成或actor update错用权重。旧条目中的`global_step=policy_version=1`仅保留为当时记录，**不得继续
+解释为真实权重版本**。现修复为：LLM server返回的`global_steps`经`min/max_global_steps`贯穿每次
+research episode；写入trajectory meta和`episodes.jsonl`；归档前要求所有非ENV_ERROR episode均有版本、
+单episode不跨版本、整个session唯一版本，`meta.json`分别写逻辑`global_step`与真实`policy_version`。
+SPS对所有draft和verify调用取真实min/max而非首次setdefault；student完成后要求其版本区间单点且等于
+research版本，否则fail-loud不入训。无实验却产doc也因无版本证据降级bare。正式rollout dump另增
+`policy_version.{min,max}`审计字段。轻量版本回归、producer/SPS相关78项、本地全量180 passed/3 skipped、
+A800同步回归3项及compileall均通过；正式objective fingerprint保持`976d84cfd3a3`。
+
+**正式在线上报门**：用户要求正式run开启SwanLab远端同步。formal wrapper现要求真实启动时
+`SWANLAB_API_KEY`非空且`SWANLAB_MODE`不得为offline/disabled，否则在联网/建run目录前拒绝；dry-run仍
+无副作用。A800入口环境实测key存在且online允许，正式命令实收`trainer.logger=["console","swanlab"]`，
+无overrides，目标目录仍不存在。运行中的SwanLab run禁止执行`swanlab sync`。修复后单任务version gate
+正在独立PGID运行；其唯一放行目标是实证首批archive为`global_step=1, policy_version=0`并完成8条student、
+actor update和weight update，尚未完成前不得写成通过或启动358步正式run。
+
+## 2026-08-05 · [正式启动] A800 4B dynamic-researcher 358步长跑已上线，SwanLab online与只读watchdog双验收
+
+修复后lineage gate已完成：唯一archive精确`global_step=1, policy_version=0`，48条research episode
+全部版本0..0，8条student通过同版本运行时断言；research 12次/48 episodes/22 turns、doc 1437词，
+`research_error=0`，SPS门率17.04%、`W_beh` off-1=3.289%，actor update17.40s、SGLang
+weight update4.59s、step 1360.46s。唯一Traceback仍发生于1/1进度和weight update完成后的DataLoader
+worker atexit Killed；OOM/EngineDead/RayTaskError/写盘错误/secret命中均0。针对性只读复核以97–98%
+置信确认两个P1均修复且无新增P0/P1。
+
+正式run `pgs_s2_sgl_a800_researcher`已从全新目录启动，launcher PID/PGID=`41041/41041`；manifest
+`config_overrides=[]/overrides=[]`、fingerprint=`976d84cfd3a3`，实收4B `sft_step6`、2875条、
+2 epochs、16×8、`n_exp=16`、k=4..8、`max_num_seqs=256`、val/save=10、
+`max_ckpt_to_keep=1`、resume auto。正式启动前无旧训练进程、八卡0MiB、`/fs/fast`余39.53TiB；
+双端最终真实non-thinking fncall门2/2。新连接确认launcher与正式trainer子进程存活；八卡加载后约
+42.7–44.6GB/卡，采样GPU3/4功耗260.5/228.1W，错误面全零。
+
+SwanLab不是离线待sync：日志明确online登录及URL，run ID=`braki9u3`；只读
+`Api.run("Wushang/trace_opd/braki9u3")`返回name=`pgs_s2_sgl_a800_researcher`、state=`RUNNING`、
+finished_at=null。运行中禁止`swanlab sync`。正式wrapper对缺`SWANLAB_API_KEY`或offline mode在建目录前
+fail-closed，并设`PYTHONUNBUFFERED=1`保证实时日志。只读watchdog PID/PGID=`47341/47341`，周期600s、
+stale=7200s、目标358，首轮已确认launcher alive并记录八卡memory/utilization/power/temperature；绝不自动
+kill/restart。独立运行卡见`docs/pgs-s2-a800-researcher-run-card.md`。
+
+启动后训前bare validation已274/274 JSON有效：seen140/unseen134，70/274=25.55%，invalid事件9、
+truncated轨迹3；所有记录均`validate=true/global_step=0/research={}/steering={}`，ResearchArchive=0，
+确认validation未污染treatment。随后step1的16/16 researcher worker全部发起真实调用；首轮观察24次35B
+请求0错误，双端session精确8/8、无worker跨端。此时archive/student尚未落盘，符合先research finalize
+再启动n=8 student的时序，只作为正式启动与调度验收，不冒充完整step1效果数据。launcher仍存活，fatal全零。
+
+## 2026-08-05 · [正式启动/max-open] 162原始1.7B dynamic-researcher完全放开臂已上线，P80由目标语境实测
+
+**用户裁定与严格有限时域实现**：新独立臂关闭`epsilon`探针、`gate_target_rate=0.20`，并要求每个
+位置都允许D检测和后续教师干预、取消预算与拒绝cap约束。现有配置链要求有限数，故按32768-token
+硬响应时域构造严格非绑定值：`b_max=32768×(2×0.5×2.5)=81920`、
+`budget_pacing=false`、`r_max=32769>response_length`；`eta_max=0.5/c=2.5/W_beh=per_token`
+保持不变。运行时验收口径不是只信YAML，而是每条有文档轨迹
+`steer_d_count == Σ turn_token_spans`，且`steer_n_budget_blocked/steer_n_pacing_wait/
+steer_n_bypassed/steer_turns_capped/steer_n_probe_flipped`全零。
+
+**dynamic P80标定与启动门**：旧GT/P90不能迁移。独立标定run
+`/data4/ws/PGS/pgs_s2_sgl_1p7b_162_researcher_maxopen_calib_p80`使用`theta_d=1e9`、
+`gate_adaptive=false`、`epsilon=0`，完整产出16 archive/128 student，真实lineage为逻辑step1/
+policy version0，零tilt/probe并完成actor与SGLang weight update。完整D直方图给出P80
+`theta_d=0.00259473`；materializer才生成正式adaptive配置，正式仍从原始
+`/data3/wushang/model/Qwen/Qwen3-1.7B`开始，绝不复用标定权重。专项/全量回归分别8项与
+209 passed/3 skipped，162统一环境61 passed/2 skipped；双endpoint模型身份、non-thinking fncall和
+`PREFLIGHT_OK` 2/2通过。凭据只经SSH stdin进入子进程内存，不进argv/文件/manifest/日志。
+
+**正式在线身份**：run `pgs_s2_sgl_1p7b_162_researcher_maxopen`，目录
+`/data4/ws/PGS/pgs_s2_sgl_1p7b_162_researcher_maxopen`，PID/PGID=`2294717/2294717`，
+objective fingerprint=`c2a917a51eaf`，2 epochs/358步、16×8、`n_exp=16`、TP1/SP2、
+`max_num_seqs=256`、val/save=10、只保留1个ckpt。SwanLab明确online，run ID=`lg7bxx95`：
+`https://swanlab.cn/@Wushang/trace_opd/runs/lg7bxx95`；禁止sync。训前bare val已274/274，
+14/274=5.11%（seen6/140、unseen8/134），随后step1 dynamic treatment已开始。只读watchdog
+PID=`2295171`，600s/stale7200s；显微镜远端8793、本地18793，旧GT 8792未触碰。运行卡：
+`docs/pgs-s2-1p7b-162-researcher-maxopen-run-card.md`。
+
+**正式step1 max-open终验与可视化小修**：step1完成16/16非空archive、128/128 student，真实
+`global_step=1/policy_version=0`，actor/SGLang weight update=23.95s/3.22s、grad norm=0.5145、
+W_beh off-1=6.36%。157,343个assistant token逐字对应157,343个D观测；主门/tilt=9,988
+（6.35%）、红色替换972（reject/tilt=9.73%），五个非绑定硬验
+`budget_blocked/pacing_wait/bypassed/turns_capped/probe_flipped`总计全部为0，证明81920/32769并非
+只在配置字面上“放开”。498个run/config/log文本产物secret扫描零命中，审计JSON为
+`<bundle>/logs/maxopen_formal_step1_audit.json`。
+
+首个partial train step在64/128时曾被UI误标“完成”：旧后端以历史最大n估完整批，step1只有自己时
+64就成了历史最大。现改为从`effective_config.yaml`读取`train_batch_size×rollout_n=128`作为
+完成门，新增回归锁定64条partial、128条completed；仅热更新/重启显微镜（新PID2427431），训练PID
+2294717和本地18793隧道未动。
+
+## 2026-08-07 · [P1 已修复×2] sftgen_researcher 采样阶段两处阻断性缺陷(162 v4 阶段A 实测)
+
+**结论先行**:GO-V4 阶段A 在 162/1.7B 首跑 `finalize 0/8`,根因不是 text 协议或模型
+能力,而是 `scripts/sftgen_researcher.py` 构造 researcher 客户端时绕过了
+`make_client` 工厂,导致两处独立缺陷。两者均已在 CD-006 侧修复并加回归测试
+(`tests/test_sftgen_researcher.py` 新增 2 项),修复后同配置 `finalize 8/8`。
+**请 CD-005 在 pgs-selfres 分支合入同款修复**(改动仅限该脚本 22 行,不触机制)。
+
+**缺陷① 鉴权硬编码空串**:`OpenAICompatClient(..., api_key="")`。配置已声明
+`roles.researcher.api_key_env: TRACE_RESEARCHER_API_KEY`,RoleCfg 构造时即解析为
+`role.api_key`(config.py:67),launch_train.py 走的正是 `role.api_key`。脚本硬编码空串
+⇒ 全部会话首个 researcher 调用 401,会话以 `no_finalize=True` 落盘。
+**危害在于表征伪装**:读数是 "finalize 0/8",看起来像协议/能力问题,而非鉴权;若不
+逐条打开会话读 `error` 字段,会误判为 M0 门不通过并去调 SFT 配方。
+
+**缺陷② 多端点未走 PooledClient**:CLI 传入逗号分隔的 `18888,18889`(与训练器
+`roles.researcher.endpoint` 同形),但单端点客户端把整串直接拼 URL ⇒
+`http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1/chat/completions` ⇒ 全量 404。
+`make_client` 对逗号端点自动建 PooledClient(会话粘滞 + 故障切换),脚本绕过了它。
+
+**修复**:改走 `make_client("researcher-sftgen", replace(cfg.role("researcher"),
+endpoint=..., model=..., max_concurrency=..., temperature=..., ...))` —— 部署事实由 CLI
+覆盖 RoleCfg,配置纪律不变;并在建客户端前对空 `api_key_env` / 空 `api_key` 两种情况
+fail loud,不把 401 吞成 no_finalize 写进数据集。
+
+**顺带**:GO-V4 指导的阶段C 命令写的是 `model.partial_pretrain`,但 vendored verl 的
+`sft_trainer_engine.yaml` 真源键是 `model.path`(见 `verl/tests/special_e2e/sft/
+run_sft_engine.sh`);另 M0 探针要起服务,`checkpoint.save_contents` 需含 `hf_model`
+才产 HF 目录。已按真源执行,指导文档建议同步更正。
+
+## 2026-08-07 · [观察] researcher 只用 4.73/16 次实验就收工,而 guidance 质量曲线未收敛
+
+162 v4 阶段A 全量采样中期读数(n=44 会话,35B researcher + 原始 1.7B executor,
+text 协议、温度 1.0):finalize 100%,但**实验数中位 4、均值 4.73(上限 16)**,
+轮数中位 6(上限 30)。对照 A800 v3 同一 35B researcher(fncall、温度 0.7、SFT 过的
+4B executor)实测 `exp_mean 11.75–12.93`,差 2.5×。
+
+**关键证据:早停发生在质量曲线仍陡升时**。会话内逐次实验的 executor 成功率:
+第1次 0.5%(bare 基线)→ 第2次 23.3% → 第3次 41.2% → **第4次 49.2%(中位停点)**
+→ 第5次 63.4% → 第7次 71.4%。同会话配对(n=55):首次 0.9% → 末次 77.8%,
+**+76.9pp,48/55 改善、0 变差**。即第 4→5 次仍有 +14pp 空间,预算利用率仅 30%。
+
+prompt 的收工条件是 "approach **succeeds stably** AND understanding complete",
+而实际停点成功率只有 49% —— 属于**违反自身指令的早停**,非设计意图。对 v4 的含义:
+① SFT 会把"4 次收工"固化为先验;② compute-scaling 自进化的主要杠杆被闲置 3-4×。
+
+**用户裁定 2026-08-07:接受现状不重采**,赌 RL 能靠续写 reward 自行纠正早停先验
+(v4 reward = 前缀续写成功率,不直接奖励实验次数)。CD-006 将在 v4 训练期重点跟踪
+`research 行的 experiments_used 分布`是否随训练上移;若长期不动,再回头议 prompt 侧
+收工判据(候选:成功率未达稳定阈值则不许 finalize,除非预算耗尽)。

@@ -66,8 +66,9 @@ class Step:
 
     acted=False marks turns that never reached the environment (the reply
     had no parseable <action> block; the recorded observation is then the
-    format reminder we sent back). valid=False marks environment no-ops
-    ('Nothing happens.')."""
+    adapter's format reminder). valid=False marks environment no-ops
+    (adapter.observation_indicates_invalid; observability only, never a
+    loss input)."""
 
     t: int
     thought: str
