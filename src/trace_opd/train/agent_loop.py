@@ -962,9 +962,12 @@ class TraceAgentLoop(AgentLoopBase):
             self.ent_tracker.theta if self.ent_tracker is not None
             else st_cfg.entropy_theta_init
         )
+        # 率告警带只对 adaptive 硬门有意义(开门率≈目标率 q);软强度档的
+        # "w>0 占比"由斜坡形状决定、率控由 tracker 的 target_rate 承担,
+        # bounds 语义不适用——置 (0,1) 关闭,防常响假警。
         rate_bounds = (
-            (0.0, 1.0) if st_cfg.gate_mode == "always_on"
-            else tuple(st_cfg.gate_rate_bounds)
+            tuple(st_cfg.gate_rate_bounds) if st_cfg.gate_mode == "adaptive"
+            else (0.0, 1.0)
         )
         state = TrajectorySteerState(
             gate=IntensityGate(
