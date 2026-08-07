@@ -1174,3 +1174,68 @@ prompt 的收工条件是 "approach **succeeds stably** AND understanding comple
 (v4 reward = 前缀续写成功率,不直接奖励实验次数)。CD-006 将在 v4 训练期重点跟踪
 `research 行的 experiments_used 分布`是否随训练上移;若长期不动,再回头议 prompt 侧
 收工判据(候选:成功率未达稳定阈值则不许 finalize,除非预算耗尽)。
+
+## 2026-08-07 · [P0 阻断·已修] v4 research 行缺 policy 版本证据,导致 `_compute_metrics` 整步崩
+
+**结论先行**:162 上 v4 首次 2 步冒烟,step 1 的 **384 行全部正常产出**(16 任务 ×24 行,
+布局与 reward 通道均符合设计),但在**算指标时**整步崩溃,训练无法进入第 2 步。
+根因是 **research 行没有携带 `min_global_steps`/`max_global_steps`**。已在 CD-006 侧
+修复并加 5 项回归测试,**请 CD-005 在 pgs-selfres 分支合入**(改动仅 backends.py +
+selfres.py 两处,不触机制语义)。
+
+**崩溃点**:
+```
+verl/verl/trainer/ppo/v1/trainer_base.py:1658 in _compute_metrics
+    min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+```
+
+**机理**:`agent_loop.py` 的 verl 侧 `default_extra_keys` 只保证 `min/max_global_steps`
+这两个**键存在**,值取 `extra_fields.get(key)` —— 未设置就是 `None`。executor 行走
+`**result.gen_extra`(引擎生成时经 `backends.py:EngineGenerate` 写入)天然带上;
+**research 行走的是另一条组装路径**(`ResearchRowResult.fields` → `**rowres.fields`),
+`ResearchRowResult` 结构里根本没有版本字段。于是同一 batch 里 executor 行有值、
+research 行为 None,`dtype=int` 转换即抛。
+
+**为什么设计上应当由 research 行自己带**:v4 的版本谱系语义是完备的
+(`research/versioning.py` 的 `research_policy_version()` / `assert_rollout_policy_version()`),
+且 research 行的训练 token 与 executor 行**同出一个 rollout 引擎**,版本证据来源同源;
+让 metric 侧对 None 宽容会让谱系审计静默失真,比崩掉更难查。
+
+**修复**(两处,语义由现有设计唯一确定):
+1. `train/backends.py::EngineResearcherChat` 新增 `_track_policy_version()`,在每次
+   `self._generate(...)` 返回后累积区间(min of mins / max of maxes,兼容引擎把值
+   包在 `.data` 里的情形,非法值忽略);新增 `policy_version_fields()`,**缺证据时返回
+   空 dict**而不是填 0(填 0 会让谱系审计失真)。
+2. `train/selfres.py::run_research_row` 在构造 `ResearchRowResult` **之前**取该字段并
+   `fields.update(...)`;**缺证据直接 RuntimeError fail loud**。`fields` 经既有的
+   `**rowres.fields` 自动进 `extra_fields`,agent_loop 零改动。
+
+**回归测试**:`tests/test_research_policy_version_tag.py` 5 项 —— 区间累积、`.data`
+拆包与非法值忽略、无证据返回空 dict、行组装前 fail loud、`**rowres.fields` 契约不断。
+
+**冒烟其余项在崩溃前均已验过(见下条)**,故这是唯一阻断项;修复后应可直接续跑。
+
+## 2026-08-07 · [实证] v4 自体飞轮在 1.7B 上点着了(冒烟 step 1 读数)
+
+崩溃发生在指标聚合,step 1 的 rollout 数据完整可用,据此给出 v4 首份实证:
+
+- **`research_r_raw`:32 条 research 行中 66% 非零,中位 0.350,均值 0.355,值域
+  0.0–1.0 全铺开**。值域铺开比均值更关键:组内 `A_i = r_i − mean(r)` 有充分方差,
+  不会退化成零梯度。
+- `research_replay_drift = 0`、`research_degraded = 0`、`research_doc_overflow = 0`;
+  `research_valid_continuations` 中位 **20/20**(名义 5 分位 ×K_c=4 全部有效)——
+  环境重放的确定性契约成立,免费一致性哨兵未报警。
+- 行布局:每任务恰 **8 条 bare**;research 行 32 条。steered 臂在 step1 dump 中最后出现
+  (需等 argmax doc),与设计时序一致。
+- **bare 臂 won 32.0%** —— SFT 冷启动后 policy 已有真实任务能力(原始 1.7B 裸 val 仅 0.73%)。
+- 单条样例:4 次实验 / 6 轮 / doc 692 词 / 20 次续写成功 8 次 ⇒ r_raw 0.4。
+
+**观察项(非阻断)**:`research_overlong` 13/32(41%,mask 归零无梯度但 r 仍进 baseline,
+符合 §1.6 设计);`research_no_finalize` 11/32(与 M0 探针 finalize 0.75 一致);
+`experiments` 中位 3.5(35B 采样时为 5)—— 早停先验确实被 SFT 带进来了,将在训练期
+跟踪 RL 能否纠正。
+
+**墙钟实测**:单步约 **95 分钟**(16 任务 ×24 行 = 384 rollout,含 128 个 research 会话
+与 2560 次前缀续写)。故正式 run 按 GO-V4 指导取 `total_training_steps=100`(约 6.6 天),
+不跑配置里的 2 epochs(358 步 ≈ 23 天)。

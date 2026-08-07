@@ -97,6 +97,10 @@ def _mk_session(doc: str | None, error: str | None = None, aborted: bool = False
             p = TOK.encode("PROMPT")
             s = TOK.encode("SESSION-GEN")
             return p, s, [1] * len(s)
+        def policy_version_fields(self):
+            # research 行必须带 policy 版本证据(见 test_research_policy_version_tag.py):
+            # trainer 的 _compute_metrics 对每一行都 int() 转换,缺则整步崩。
+            return {"min_global_steps": 3, "max_global_steps": 3}
     class _SR:
         def __init__(self):
             self.doc = doc

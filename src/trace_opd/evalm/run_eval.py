@@ -36,7 +36,7 @@ from ..core import protocol
 from ..core.episode import GenResult, run_episode
 from ..core.template_delta import TemplateDelta
 from ..core.types import OUTCOME_ENV_ERROR
-from ..envs.alfworld.adapter import SYSTEM_PROMPT_BARE, AlfworldEnvFactory
+from ..envs.registry import make_env_factory
 
 
 def load_tasks(parquet_paths: list[str]) -> list[dict]:
@@ -119,8 +119,10 @@ async def main_async(args) -> int:
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
-    factory = AlfworldEnvFactory(config.alfworld)
+    factory = make_env_factory(config)
     tasks = load_tasks(args.parquet)
+    if not tasks:
+        raise SystemExit("FATAL: no tasks loaded from the given parquet files")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "episodes.jsonl"
@@ -145,8 +147,10 @@ async def main_async(args) -> int:
         "response_budget": config.eval.response_budget,
         "doc_dir": args.doc_dir,
         "doc_file": args.doc_file,
+        # 生效 scaffold 的身份指纹(经 adapter,任务无关;ALFWorld 下与
+        # 历史 protocol.SYSTEM_PROMPT_BARE 哈希逐字节一致)
         "system_prompt_sha1": hashlib.sha1(
-            SYSTEM_PROMPT_BARE.encode("utf-8")
+            factory.adapter_from_item(tasks[0]).executor_scaffold().encode("utf-8")
         ).hexdigest()[:12],
         "config": config.raw,
     }

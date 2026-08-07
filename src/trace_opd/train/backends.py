@@ -107,9 +107,40 @@ class EngineResearcherChat:
         self._seen_messages = 0
         self._last_gen_text: str | None = None
         self.aborted = False                  # 引擎 abort(基建故障,调用方处置)
+        # research 行的训练 token 同样由引擎生成,必须与 executor 行一样携带
+        # policy 版本区间:trainer 的 _compute_metrics 对**每一行**都做
+        # np.array([tag["min_global_steps"] ...], dtype=int),缺键取到 None
+        # 就 TypeError 整步崩(2026-08-07 162 v4 冒烟实测)。
+        self.min_global_steps: int | None = None
+        self.max_global_steps: int | None = None
 
     def training_row(self) -> tuple[list[int], list[int], list[int]]:
         return list(self.prompt_ids), list(self._stream), list(self._mask)
+
+    def _track_policy_version(self, extra) -> None:
+        """累积本会话全部生成的 policy 版本区间(min of mins / max of maxes)。
+
+        与 executor 行同源:两者的训练 token 都出自同一 rollout 引擎,版本证据
+        必须同样落到 extra_fields,否则 research 行在 trainer 侧是 None。
+        """
+        for key, agg in (("min_global_steps", min), ("max_global_steps", max)):
+            raw = (extra or {}).get(key)
+            raw = getattr(raw, "data", raw)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            current = getattr(self, key)
+            setattr(self, key, value if current is None else agg(current, value))
+
+    def policy_version_fields(self) -> dict[str, int]:
+        """给行组装用:缺版本证据时返回空 dict,由调用方 fail loud。"""
+        if self.min_global_steps is None or self.max_global_steps is None:
+            return {}
+        return {"min_global_steps": self.min_global_steps,
+                "max_global_steps": self.max_global_steps}
 
     def _append_user_block(self, texts: list[str]) -> None:
         """把新增 user 内容合并为一个 user 结构段(mask=0)。glue 的
@@ -164,6 +195,7 @@ class EngineResearcherChat:
         if gen.extra.get("stop_reason") == "aborted":
             self.aborted = True
             return ChatResult(content="", finish_reason="aborted")
+        self._track_policy_version(gen.extra)
         gen_ids = list(gen.token_ids)
         self._stream += gen_ids
         self._mask += [1] * len(gen_ids)

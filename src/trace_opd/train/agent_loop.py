@@ -43,7 +43,8 @@ from ..core.episode import EpisodeResult, run_episode
 from ..core.template_delta import TemplateDelta, render_ids
 from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
 from ..docstore.archive import ResearchArchive
-from ..envs.alfworld.adapter import AlfworldEnvFactory
+from ..core.adapter import EnvFactory
+from ..envs.registry import make_env_factory
 from ..research.prompts import build_researcher_system
 from ..research.session import ResearchSession, SessionResult
 from ..research.toolproto import make_tool_protocol
@@ -135,9 +136,6 @@ def _shared_state(tokenizer) -> dict[str, Any]:
             config.episode.max_env_steps, config.episode.max_assistant_turns
         )
         workers = int(os.environ.get("TRACE_AGENT_WORKERS", config.train.agent_num_workers))
-        config.alfworld.spawn_concurrency = _per_worker(
-            config.alfworld.spawn_concurrency, workers
-        )
         doc_table: dict[str, str] = {}
         gate_tracker = None
         researcher_client = None
@@ -197,7 +195,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 "config": config,
                 "run_dir": run_dir,
                 "delta": TemplateDelta(tokenizer),
-                "factory": AlfworldEnvFactory(config.alfworld),
+                "factory": make_env_factory(config, workers=workers),
                 "doc_table": doc_table,
                 "gate_tracker": gate_tracker,
                 "archive": ResearchArchive(run_dir),
@@ -221,7 +219,7 @@ class TraceAgentLoop(AgentLoopBase):
         self.cfg: Config = state["config"]
         self.run_dir: Path = state["run_dir"]
         self.delta: TemplateDelta = state["delta"]
-        self.factory: AlfworldEnvFactory = state["factory"]
+        self.factory: EnvFactory = state["factory"]
         self.doc_table: dict[str, str] = state["doc_table"]
         self.gate_tracker = state["gate_tracker"]
         self.archive: ResearchArchive = state["archive"]

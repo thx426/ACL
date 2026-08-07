@@ -199,6 +199,16 @@ async def run_research_row(
         mask = [0] * len(mask)                         # 零梯度;r 留组内 baseline
     fields["research_overlong"] = int(overlong)
     fields["research_r_raw"] = r
+    # policy 版本证据:research 行的训练 token 与 executor 行一样出自 rollout
+    # 引擎,trainer 的 _compute_metrics 对**每一行**都 np.array(..., dtype=int),
+    # 缺则取到 None 直接 TypeError 崩整步(2026-08-07 162 v4 冒烟实测)。
+    version_fields = chat.policy_version_fields() if hasattr(chat, "policy_version_fields") else {}
+    if not version_fields:
+        raise RuntimeError(
+            f"research row session={session_id} has no rollout policy version evidence "
+            "(engine did not report min/max_global_steps)"
+        )
+    fields.update(version_fields)
     # λ_r 预乘 + warmup 置零:reward 的线性变换与 advantage 缩放等价
     # (组内去均值是线性算子),vendored 侧因此零改动(§1.6)。
     warmup = global_step is not None and global_step < research_warmup_steps

@@ -146,6 +146,15 @@ class NarrationCfg:
 
 
 @dataclass
+class EnvironmentCfg:
+    """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
+    benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
+    不进 objective_fingerprint(条件追加,保既有 run 指纹逐字节不变)。"""
+
+    name: str = "alfworld"
+
+
+@dataclass
 class EpisodeCfg:
     """Episode protocol caps (train/research/eval isomorphic, PG-3). Entry
     points push these into core.protocol via configure_episode_caps()."""
@@ -374,6 +383,7 @@ class Config:
     narration: NarrationCfg
     roles: dict[str, RoleCfg]
     episode: EpisodeCfg
+    environment: EnvironmentCfg
     alfworld: AlfworldCfg
     train: TrainCfg
     eval: EvalCfg
@@ -400,7 +410,7 @@ def _build(dc, d: dict[str, Any]):
 
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
-    "train", "eval", "steering"
+    "train", "eval", "steering", "environment"
 }
 
 
@@ -737,6 +747,10 @@ def objective_fingerprint(cfg: "Config") -> str:
             st.budget_pacing, st.budget_u0, st.budget_profile_power,
         )
     )
+    # 任务环境本身当然定义优化目标;条件追加:默认 alfworld(历史唯一环境)
+    # 不改 material,既有 run 指纹逐字节不变。
+    if cfg.environment.name != "alfworld":
+        material += f"|environment={cfg.environment.name}"
     # 分臂采样(v3.1)改变优化目标(组内一半样本换回 π 采样),必须进指纹;
     # 条件追加:fraction=1.0(历史全臂)不改 material,既有 run 指纹逐字节不变
     # (researcher source 哨兵同款先例)。
@@ -824,6 +838,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         narration=_build(NarrationCfg, data.get("narration") or {}),
         roles=roles,
         episode=_build(EpisodeCfg, data.get("episode") or {}),
+        environment=_build(EnvironmentCfg, data.get("environment") or {}),
         alfworld=_build(AlfworldCfg, data.get("alfworld") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),

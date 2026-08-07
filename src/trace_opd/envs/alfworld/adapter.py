@@ -304,6 +304,15 @@ class AlfworldTaskAdapter:
             "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
         )
 
+    def react(self, env, assistant_text: str):
+        """ALFWorld 是字符串单命令环境:react 一行委托标准文本动作协议
+        (协议件 normalize/invalid/reminder 即本类上面三个方法)。"""
+        return protocol.text_action_react(self, env, assistant_text)
+
+    def replay_action(self, env, action_norm: str) -> tuple[str, bool]:
+        obs, done, _won = env.step(action_norm)
+        return obs, done
+
 
 class AlfworldEnvFactory:
     """Mints per-task adapters sharing one spawn gate (per process)."""

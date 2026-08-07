@@ -112,6 +112,47 @@ def parse_reasoning(assistant_text: str) -> str | None:
     return matches[-1].strip() or None
 
 
+def text_action_react(adapter, env, assistant_text: str):
+    """Reusable ``TaskAdapter.react`` for string-command benchmarks: the
+    ``<reasoning>...</reasoning><action>one command</action>`` contract,
+    executed against an env exposing ``step(command) -> (obs, done, result)``.
+
+    这只是文本单动作协议的标准实现件——react 抽象本身不假定它;工具调用/
+    代码执行型 benchmark 自写 react,不经此函数。step 的第三个返回值按
+    float 保真进 ActionOutcome.score:bool(传统二元 won,True→1.0)与
+    [0,1] 标量(部分分)都直接成立。Blocking (env.step) — callers put
+    the whole react call in a thread."""
+    from .adapter import ActionOutcome
+
+    command = parse_action(assistant_text)
+    if command is None:
+        return ActionOutcome(
+            thought=assistant_text.strip(),
+            action_raw="",
+            action_norm="",
+            feedback=adapter.format_reminder(),
+            done=False,
+            score=0.0,
+            acted=False,
+            valid=False,
+            consumed_env_step=False,
+        )
+    thought = parse_reasoning(assistant_text) or assistant_text.strip()
+    norm = adapter.normalize_action(command)
+    obs, done, result = env.step(norm)
+    return ActionOutcome(
+        thought=thought,
+        action_raw=command,
+        action_norm=norm,
+        feedback=obs,
+        done=done,
+        score=float(result),
+        acted=True,
+        valid=not adapter.observation_indicates_invalid(obs),
+        consumed_env_step=True,
+    )
+
+
 def truncate_obs(obs: str, limit: int = OBS_TRUNCATE_CHARS) -> str:
     if len(obs) <= limit:
         return obs

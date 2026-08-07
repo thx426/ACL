@@ -259,27 +259,35 @@ research 行隔离纪律(mask/指标/超长);全零组自然跳过;warmup;
 messages 重渲染有 BPE roundtrip 风险,不可用);"narrator 不内化"裁定
 已被演进推翻(现 narration.backend=engine)。
 
-## 9. 通用性契约(2026-08-06/07 审计后固化;引入新 benchmark 的完整改动面)
+## 9. 通用性契约(2026-08-07 定稿;引入新 benchmark 的完整改动面)
 
-机制层(steering/research/train/selfres/core)零任务字面量;任务内容全部经
-`core/adapter.py::TaskAdapter` 协议进入。引入新 benchmark 需要且只需要:
+> 操作指南与参考实现:**`src/trace_opd/envs/_template/`**(完整可运行的
+> 独立玩具 benchmark + README 交互点总表);契约唯一真源 `core/adapter.py`。
+> 分离性由 `tests/test_template_env.py` 机器证明:非 ALFWorld 环境上真实
+> 跑通 episode 运行器与 v4 前缀续写,零机制改动。
 
-1. **实现 TaskAdapter**(`envs/<bench>/adapter.py`),含 v4 审计固化的三个成员:
-   - `task_type`(类别/family;分层抽样与分组统计用,无类别返回常量);
-   - `observation_indicates_invalid(obs)`(环境无效动作文本判定;core 不解析
-     环境语义,无此信号返回 False——Step.valid 只是观测字段,永不进 loss);
-   - `format_reminder()`(格式失败提醒;协议部分用
-     `protocol.DEFAULT_FORMAT_REMINDER`,可加环境习语前缀)。
-   executor 提示词(scaffold)、动作语法、命令表全部由 adapter 自持
-   (ALFWorld 的 SYSTEM_PROMPT_BARE/COMMAND_REFERENCE 已从 core/protocol 迁入
-   `envs/alfworld/adapter.py`,行为逐字节不变,有字节锁测试)。
-2. **数据集构建脚本**(初始观察捕获 + parquet;参照 build_datasets.py,该脚本
-   本身是 ALFWorld 装配件)。
-3. **装配点接线**:AlfworldEnvFactory 直连处(agent_loop._shared_state、
-   evalm/run_eval、sftgen_researcher、build_datasets)。此为已知裁定项:
-   工厂注册表化(environment.name 键)是引入第二个 benchmark 时的第一工程项,
-   当前单 benchmark 阶段维持直连。
+机制核心对任务协议**零假定**(用户裁定 2026-08-07):
 
-researcher 模板(prompts.py)与文档规则已中性化(交互形态描述由 task_brief
-承担);SFT 管线中 [BENCHMARK-SPECIFIC] 段已显式标注。`<action>` 输出协议、
-episode 预算、SPS/保尾核、W_beh、v4 前缀续写/TaskCoord 与任务无关,零改动。
+1. **交互协议抽象**:`TaskAdapter.react(env, assistant_text) → ActionOutcome`
+   ——动作语法(文本标签/JSON 工具调用/代码补丁)、执行接口、无效判定、
+   格式提醒全部封装在任务实现内;core 循环只消费 ActionOutcome(token 流、
+   预算、防 spiral、记账)。文本单动作协议作为可复用件下沉
+   `protocol.text_action_react`(ALFWorld/模板一行委托)。
+2. **评估反馈抽象**:`ActionOutcome.score: float ∈ [0,1]`——二元 won 是
+   `score∈{0,1}` 特例;部分分保真进 `Trajectory.score` 与
+   `ContinuationOutcome.score`。当前 GRPO/续写口径的 won 由 `score>=1.0`
+   派生(把连续分接进 reward 是训练口径决策,非协议改动)。
+3. **确定性重放钩子**:`TaskAdapter.replay_action(env, action) →
+   (feedback, ended)`——v4 前缀续写的硬前提显式化。
+4. **环境句柄缩面**:`EnvHandle = {initial_obs, close}`;`step` 从 core
+   契约移除(字符串命令族环境的实现细节)。
+5. **装配注册表**:`envs/registry.py` + 配置 `environment.name`(默认
+   alfworld,默认值不进 objective_fingerprint——s4 指纹逐字节不变,有测试
+   锁)。装配点(agent_loop/run_eval/sftgen)一律 `make_env_factory(config)`,
+   资源 per-worker 折算归各 builder。工厂契约:`adapter_from_item(extra_info)`,
+   parquet 行的 extra_info 必须自足(字段契约见 `_template/build_dataset.py`)。
+
+引入新 benchmark = 复制 `_template/` 实现 adapter + 数据集脚本 + registry
+一行 + 配置一行 + 照 `test_template_env.py` 写四组测试;机制侧(SPS/保尾核、
+W_beh、v4 三段/TaskCoord/前缀续写、SFT 转换)零改动。researcher 模板与
+文档规则已中性化(交互形态描述由 task_brief 承担)。

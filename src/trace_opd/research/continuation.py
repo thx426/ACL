@@ -163,6 +163,7 @@ def build_prefix_set(
 @dataclass
 class ContinuationOutcome:
     won: bool = False
+    score: float = 0.0              # 终态评估保真(won = score>=1.0 派生)
     error: str | None = None        # 非 None = 作废(重放漂移/基建故障)
     env_steps: int = 0              # 续写期新增环境步
     gen_tokens: int = 0
@@ -202,8 +203,8 @@ async def continue_from_prefix(
             return out
         # ---- 环境重放(确定性契约 + 逐步校验兜底) ----
         for act, expected in zip(spec.replay_actions, spec.replay_observations):
-            obs, done, _won = await asyncio.to_thread(env.step, act)
-            if done:
+            obs, ended = await asyncio.to_thread(adapter.replay_action, env, act)
+            if ended:
                 out.error = "replay_drift: episode ended during replay"
                 return out
             if obs.strip() != expected.strip():
@@ -240,24 +241,26 @@ async def continue_from_prefix(
             turns += 1
             stream += gen_ids
             out.gen_tokens += len(gen_ids)
-            # 半轮承接:action 解析作用于「半轮前缀文本 + 续写文本」拼接
+            # 半轮承接:动作解析作用于「半轮前缀文本 + 续写文本」拼接;
+            # 交互协议整体归 adapter.react(与 episode 同一抽象)。
             full_text = half_text + gen.text
             half_text = ""
-            command = protocol.parse_action(full_text)
-            if command is None:
+            outcome = await asyncio.to_thread(adapter.react, env, full_text)
+            if not outcome.acted:
                 consecutive_bad += 1
                 if consecutive_bad >= protocol.MAX_CONSECUTIVE_FORMAT_FAILURES:
                     out.truncated = True
                     break
-                obs_text = adapter.format_reminder()
+                obs_text = outcome.feedback
             else:
                 consecutive_bad = 0
-                norm = adapter.normalize_action(command)
-                obs, done, won_now = await asyncio.to_thread(env.step, norm)
-                env_steps += 1
-                obs_text = protocol.truncate_obs(obs)
+                if outcome.consumed_env_step:
+                    env_steps += 1
+                obs_text = protocol.truncate_obs(outcome.feedback)
+                done = outcome.done
                 if done:
-                    won = won_now
+                    out.score = outcome.score
+                    won = outcome.score >= 1.0
             if done or env_steps + spec.env_steps_used >= protocol.MAX_ENV_STEPS:
                 break
             structure = delta.after_generation(gen_ids) + tokenizer.encode(

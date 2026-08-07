@@ -112,6 +112,9 @@ class Trajectory:
     steps: list[Step] = field(default_factory=list)
     outcome: str = OUTCOME_FAILED
     won: bool = False
+    #: 终态评估分数(ActionOutcome.score 透传;won = score >= 1.0 的派生
+    #: 视图,二元 benchmark 下两者信息等价;部分分 benchmark 的保真通道)
+    score: float = 0.0
     error: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -134,6 +137,7 @@ class Trajectory:
             "steps": [s.to_dict() for s in self.steps],
             "outcome": self.outcome,
             "won": self.won,
+            "score": self.score,
             "error": self.error,
             "meta": self.meta,
         }
@@ -149,6 +153,7 @@ class Trajectory:
             steps=[Step.from_dict(s) for s in d.get("steps", [])],
             outcome=str(d.get("outcome", OUTCOME_FAILED)),
             won=bool(d.get("won", False)),
+            score=float(d.get("score", 1.0 if d.get("won") else 0.0)),
             error=d.get("error"),
             meta=dict(d.get("meta", {})),
         )

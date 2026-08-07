@@ -201,49 +201,39 @@ async def run_episode(
                     gen_extra[key] = out.extra[key]
 
             text = out.text
-            command = protocol.parse_action(text)
-            thought = protocol.parse_reasoning(text) or text.strip()
-
-            if command is None:
+            # 交互协议整体归 adapter(react 抽象):动作语法、执行、评估
+            # 反馈都是任务实现的事;core 只消费 ActionOutcome。
+            outcome = await asyncio.to_thread(adapter.react, env, text)
+            traj.steps.append(
+                Step(
+                    t=len(traj.steps) + 1,
+                    thought=outcome.thought,
+                    action_raw=outcome.action_raw,
+                    action_norm=outcome.action_norm,
+                    observation=outcome.feedback,
+                    valid=outcome.valid,
+                    acted=outcome.acted,
+                )
+            )
+            if not outcome.acted:
                 invalid_format += 1
                 consecutive_bad += 1
-                reminder = adapter.format_reminder()
-                traj.steps.append(
-                    Step(
-                        t=len(traj.steps) + 1,
-                        thought=text.strip(),
-                        action_raw="",
-                        action_norm="",
-                        observation=reminder,
-                        valid=False,
-                        acted=False,
-                    )
-                )
                 if consecutive_bad >= protocol.MAX_CONSECUTIVE_FORMAT_FAILURES:
                     truncated = True
                     traj.outcome = DEGENERATE_PREFIX + "format"
-                    traj.error = "no parseable <action> block repeatedly"
+                    traj.error = "no parseable action repeatedly"
                     break
-                obs_text = reminder
+                obs_text = outcome.feedback
                 done = False
             else:
                 consecutive_bad = 0
-                norm = adapter.normalize_action(command)
-                obs, done, won_now = await asyncio.to_thread(env.step, norm)
-                env_steps += 1
-                obs_text = protocol.truncate_obs(obs)
-                traj.steps.append(
-                    Step(
-                        t=len(traj.steps) + 1,
-                        thought=thought,
-                        action_raw=command,
-                        action_norm=norm,
-                        observation=obs,
-                        valid=not adapter.observation_indicates_invalid(obs),
-                    )
-                )
+                if outcome.consumed_env_step:
+                    env_steps += 1
+                obs_text = protocol.truncate_obs(outcome.feedback)
+                done = outcome.done
                 if done:
-                    won = won_now
+                    traj.score = outcome.score
+                    won = outcome.score >= 1.0
             if done or env_steps >= protocol.MAX_ENV_STEPS:
                 break
 

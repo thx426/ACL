@@ -153,6 +153,13 @@ class ScriptedAdapter:
     def format_reminder(self) -> str:
         return "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
 
+    def react(self, env, assistant_text: str):
+        return protocol.text_action_react(self, env, assistant_text)
+
+    def replay_action(self, env, action_norm: str) -> tuple[str, bool]:
+        obs, done, _won = env.step(action_norm)
+        return obs, done
+
 
 class ScriptedGenerate:
     """GenerateFn double: yields the scripted texts in order (re-tokenized by
