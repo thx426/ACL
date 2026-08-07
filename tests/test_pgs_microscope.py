@@ -773,9 +773,12 @@ def _v33_steering(arm, *, rej=False):
         "steer_n_candidates": 4, "steer_n_base_open": 2, "steer_count": 1,
         "steer_reject_count": int(rej), "steer_budget_spent": 0.6,
         "steer_n_bypassed": 0, "steer_n_pt_window_miss": 0,
-        "steer_n_probe_flipped": 0, "steer_n_gate_bypassed": 3,
-        "steer_theta_d": 0.03, "steer_entropy_theta": 1.28,
-        "steer_entropy_mean": 0.4, "steer_intensity_mean": 0.5,
+        # bare 行的软门量是 0.0 哨兵(真实形态:bare 无 steering state)
+        "steer_n_gate_bypassed": 3 if arm == 1 else 0,
+        "steer_theta_d": 0.03,
+        "steer_entropy_theta": 1.28 if arm == 1 else 0.0,
+        "steer_entropy_mean": 0.4 if arm == 1 else 0.0,
+        "steer_intensity_mean": 0.5 if arm == 1 else 0.0,
         "steer_cand_positions": [1], "steer_d_all": [0.5],
     }
 
@@ -803,12 +806,13 @@ def test_v33_step_entry_absorb_fork_alpha_and_soft_gate_fields():
     t_st = M.build_traj(_v33_row(1, False, rej=True), FakeDec(), bmax=20.0)
     # 行级观察面:软强度 w/h 进 rec;吸收中间量按 0-based rank(top1=首位)
     assert t_st["recs"][0]["w"] == 0.5 and t_st["recs"][0]["h"] == 1.1
-    assert t_st["absorb"] == {"dlogp": [-0.9], "top1": 1, "nrej": 1}
+    assert t_st["absorb"] == {"dlogp": [-0.9], "top1": 1, "miss16": 0, "nrej": 1}
     assert t_bare["fork"] == {"redundancy": 1, "essence": 1}
     e = M.build_step_entry(50, "step_00050", [t_bare, t_st], _V33_CFG)
     assert e["alpha"] == 0.5                       # cosine(50/100)
+    # 审阅 C3/C6:软门量只在 steered 行上聚合(bare 的 0.0 哨兵不进分母)
     assert e["entTheta"] == 1.28 and e["wMean"] == 0.5
-    assert e["gateBypassRate"] == round(6 / 4, 4)  # 2 条 ×3 bypass / 4 tok
+    assert e["gateBypassRate"] == round(3 / 2, 4)  # steered 行 3 bypass / 2 tok
     assert e["absorbDlogpMed"] == -0.9 and e["absorbTop1Rate"] == 1.0
     assert e["forkRed"] == 1.0 and e["forkEss"] == 1.0
     assert e["armGap"] == -1.0 and e["lenMax"] == 2

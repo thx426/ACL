@@ -62,9 +62,13 @@ research:
   enabled: true
   backend: engine   # v4 自体:researcher chat 走本机引擎
   tool_protocol: text  # v4 自体:TextProtocol(policy 无 fncall parser)
-  n_exp: 16                  # 用户裁定：每个 (step, task) 最多 16 次 researcher 实验
-  k_default: 4
-  k_max: 8
+  # 用户裁定 2026-08-07(原 n_exp 16 / k_default 4 / k_max 8):降 episode 开销。
+  # 实测 128 条 research 会话消耗 3054 个 ALFWorld episode(中位 20/会话),
+  # 而 timing_s/gen 占整步 84.5%(3810s/4508s)。k 4→2 使 episode 数减半;
+  # k_max 同步 8→4,否则 tools.py 的 min(k_req,k_max) 允许模型填 8 绕过新默认。
+  n_exp: 8                   # 每 (step, task) 最多 8 次 researcher 实验
+  k_default: 2               # 每次 run_experiment 默认跑 2 个 episode
+  k_max: 4                   # 模型可自主提到 4(= 原默认),不能更高
   max_turns: 30
   wrapup_buffer: 2
   fetch_raw_limit: 20
@@ -172,11 +176,17 @@ train:
                             # ⚠ 这堵墙是 research 会话失败的物理根因:respLen 落在
                             #   (36864, 40960] 的 78 条(61%)finalize 成功率 **0%**,
                             #   而 ≤32768 的 40 条成功率 85–93%。
-  rollout_max_num_batched_tokens: 8192  # vLLM chunked-prefill 预算 | 2026-07-28 用户裁定
-                            # 模板级 8192(step-17 illegal-access 绕过 + 独占拓扑显存账);
-                            # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048。
+  rollout_max_num_batched_tokens: 32768 # 用户裁定 2026-08-07(原 8192)。
+                            # 原值背景:2026-07-28 定的模板级 8192 是 **vLLM 时代**
+                            # 为绕 step-17 illegal-access + 独占拓扑显存账设的,
+                            # 而本 run 的后端已是 SGLang(rollout_backend: sglang)。
+                            # 实测 rollout 阶段只占 42GB/80GB、timing_s/gen 占整步
+                            # 84.5%、吞吐仅 280 token/s/卡 —— 批次预算是可疑的绑定约束。
+                            # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048;本 run 是 v4 自体
+                            #   researcher(engine-backed,无 sidecar),不受该约束。
                             # 同时决定 prompt_logprobs 打分(SPS verify)的临时 logits
-                            # 显存:本值 × vocab × 2B ×2
+                            # 显存:本值 × vocab × 2B ×2 —— 32768×151936×2×2 ≈ 19.9GB,
+                            # 在 gpu_memory_utilization=0.5 留出的余量内。
   rollout_backend: sglang   # 2026-08-05 用户裁定(vllm=回摆通道);verl 侧自动映射
                             # mem_fraction_static←rollout_gpu_mem、
                             # max_running_requests←rollout_max_num_seqs;

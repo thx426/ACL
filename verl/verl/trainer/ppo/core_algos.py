@@ -738,9 +738,11 @@ def compute_pgs_asym_outcome_advantage(
         positive excess over the bare mean only; a failed guided rollout gets
         exactly zero advantage (its failure may be caused by the intervention,
         attribution is unclear, so it must not push gradients).
-      * unknown rows (arm<0, e.g. v4 research rows whose uid carries the
-        ":research" suffix and therefore forms its own group): plain LOO,
-        byte-equivalent to grpo_loo's no-std branch.
+      * unknown rows (arm<0): plain LOO, byte-equivalent to grpo_loo's
+        no-std branch. In practice only padding rows take this path — v4
+        research rows carry an explicit steer_arm=0 and land in the bare
+        branch of their own ":research"-suffixed uid group, which is the
+        SAME plain LOO (equivalence locked by test).
       * steered_cap>0: if the group's steered advantages sum above the cap,
         scale them down proportionally (MENTOR expert_cap guard; off by
         default).
@@ -762,11 +764,22 @@ def compute_pgs_asym_outcome_advantage(
             steered = [i for i in rows if steer_arm[i] == 1]
             unknown = [i for i in rows if steer_arm[i] < 0]
             if steered and not bare:
-                raise ValueError(
-                    "pgs_asym_grpo: a group contains steered rows but no bare "
-                    "rows — the steered baseline (bare mean) is undefined. "
-                    "Arm assignment / uid grouping is corrupted; failing loud."
-                )
+                # Orphan steered group — reachable through the trainer's OWN
+                # designed partial-failure path (review C0): a session timeout /
+                # EngineDead cancels the still-running bare sessions after >=1
+                # steered row landed in TQ; the uid is marked failure but stays
+                # sampleable. Raising here would abort a multi-day run on an
+                # operational transient. Degrade instead: zero advantage for
+                # every row of the group (the design's attribution-unclear rule,
+                # same no-op semantics as an expired alpha). Do NOT remap to
+                # unknown (plain LOO would hand these rows full-weight
+                # advantages OUTSIDE the alpha schedule) and do NOT skip (out
+                # starts as scores.clone() — untouched rows would train on raw
+                # scores). The trainer branch pre-scans and reports the count
+                # (actor/pgs_orphan_steered_groups) so this stays visible.
+                for i in steered + unknown:
+                    out[i] = torch.zeros_like(scores[i])
+                continue
             # bare rows: LOO over the bare arm only (no-std).
             if len(bare) >= 2:
                 r = torch.stack([scores[i] for i in bare])
@@ -776,17 +789,20 @@ def compute_pgs_asym_outcome_advantage(
                     out[i] = r[k] - mean_loo[k]
             elif len(bare) == 1:
                 out[bare[0]] = torch.zeros_like(scores[bare[0]])
-            # steered rows: positive excess over the bare mean, scaled by alpha.
+            # steered rows: positive excess over the bare mean; cap the RAW
+            # excess sum first, then scale by alpha (MENTOR order, review L22
+            # — capping after alpha would pin the advantage flat during the
+            # cosine decay, silently defeating the schedule while cap binds).
             if steered:
                 bare_mean = torch.stack([scores[i] for i in bare]).mean()
-                adv = [torch.clamp_min(scores[i] - bare_mean, 0.0) * alpha
-                       for i in steered]
+                excess = [torch.clamp_min(scores[i] - bare_mean, 0.0)
+                          for i in steered]
                 if steered_cap > 0.0:
-                    total_adv = torch.stack(adv).sum()
-                    if float(total_adv) > steered_cap:
-                        adv = [a * (steered_cap / total_adv) for a in adv]
+                    total = torch.stack(excess).sum()
+                    if float(total) > steered_cap:
+                        excess = [e * (steered_cap / total) for e in excess]
                 for k, i in enumerate(steered):
-                    out[i] = adv[k]
+                    out[i] = excess[k] * alpha
             # unknown rows (research groups etc.): plain LOO, grpo_loo no-std.
             if len(unknown) >= 2:
                 r = torch.stack([scores[i] for i in unknown])
@@ -795,9 +811,16 @@ def compute_pgs_asym_outcome_advantage(
                 for k, i in enumerate(unknown):
                     out[i] = r[k] - mean_loo[k]
             elif len(unknown) == 1:
-                # plain-GRPO single-row convention (raw score through),
-                # matching grpo_loo's n==1 branch.
-                pass
+                if bare or steered:
+                    # A lone unlabeled row INSIDE a labeled task group can only
+                    # be a lost/corrupted tag (real groups are fully labeled;
+                    # research/padding groups have their own uid). Raw-through
+                    # would hand it the largest advantage in the batch while
+                    # the sibling corruption mode degrades to zero — zero it
+                    # for consistency (review L2).
+                    out[unknown[0]] = torch.zeros_like(scores[unknown[0]])
+                # else: pure single-row group keeps the plain-GRPO convention
+                # (raw score through), matching grpo_loo's n==1 branch.
         out = out.unsqueeze(-1) * response_mask
     return out, out
 

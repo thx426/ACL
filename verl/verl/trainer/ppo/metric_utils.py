@@ -460,6 +460,20 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
         if _role.size:
             research_mask = _role >= 0.5
 
+    # trace-opd v3.3 (review C3/C6): soft-gate observables are only defined on
+    # steered rows — bare/research rows carry 0.0 sentinels (schema uniformity),
+    # and averaging those in dilutes H_q/w̄ by the arm ratio, producing a fake
+    # "H_q sits on the floor" reading. Same disease, same cure as research_*.
+    _STEERED_ONLY = ("steer_entropy_theta", "steer_intensity_mean",
+                     "steer_entropy_mean")
+    steered_mask = None
+    if "steer_arm" in reward_extra_infos_dict:
+        _arm = np.asarray(reward_extra_infos_dict["steer_arm"], dtype=np.float64)
+        if _arm.size:
+            steered_mask = _arm >= 0.5
+            if research_mask is not None and research_mask.shape == steered_mask.shape:
+                steered_mask &= ~research_mask
+
     for key, values in reward_extra_infos_dict.items():
         if key == "reward":
             continue
@@ -469,6 +483,9 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
         if (key.startswith("research_") and research_mask is not None
                 and research_mask.shape == arr.shape and research_mask.any()):
             metrics[f"rollout_extra/{key}/mean"] = float(arr[research_mask].mean())
+        elif (key in _STEERED_ONLY and steered_mask is not None
+                and steered_mask.shape == arr.shape and steered_mask.any()):
+            metrics[f"rollout_extra/{key}/mean"] = float(arr[steered_mask].mean())
         else:
             metrics[f"rollout_extra/{key}/mean"] = float(arr.mean())
     # trace-opd PGS v3.1 arm-split: when the batch carries per-sample arm

@@ -381,7 +381,7 @@ const GLOSS = {
   hq:["H_q 熵阈值","G-E 熵门的强度标尺:w=min(1, h/H_q)。EMA 追踪学生熵分布的 P95;虚线=硬地板(防阈值追着熵坍缩跑)。贴地板走=分布已低于地板,只有绝对高熵位仍受干预。"],
   wmean:["平均强度 w̄","倾斜位的平均强度(η=η_max·w)。软门下应显著低于 1(只有关键位拿满强度);贴 1=退化成 always_on,检查 H_q。"],
   gbypass:["强度旁路率","w<w_min 而整段跳过教师 verify 的 token 占比——G-E 的墙钟红利读数。越高教师开销越省;骤降=熵分布整体抬升(检查是否弥散化复发)。"],
-  absorb:["吸收进度","「最后一公里」三读数:Δlogπ(draft−final)中位→0 =教师换上的 token 正被 π 内化;final=π-top1 率高=教师多在降噪;拒绝密度降=师生趋同。"],
+  absorb:["吸收进度","「最后一公里」三读数:Δlogπ(draft−final)中位→0 =教师换上的 token 正被 π 内化;final=π-top1 率高=教师多在降噪;拒绝密度降=师生趋同。⚠ Δlogπ 只统计 draft/final 均在 π-top16 内的拒绝位,远 rank 硬知识按删失计入 absorbMiss16Rate——删失率升高时中位曲线会偏乐观,须并读。"],
   fork:["fork-token 双带","MENTOR Fig.3 口径:该词至少出现一次的轨迹占比。红带(wait/however/but…)升+长度涨=冗余分叉膨胀(s3 病);essence 带(check/verify)升=有用校验被吸收(良性)。"],
   lenmax:["响应长度","lenMean=均值;lenMax=最长轨迹。lenMax 逼近 response_length 上限(虚线)= 截断风险:截断按约定判输且会把能力上升伪装成下跌,红条即处置。"],
 };
@@ -488,7 +488,8 @@ function viewOverview(){
     ${chart("响应长度","lenMax 逼近 response_length(虚线)= 截断风险(截断判输且伪装能力下跌),红条即处置。", [
       {label:"均值",color:"#4f46e5",pts:S.map(s=>[s.id,s.lenMean]).filter(p=>p[1]!=null)},
       {label:"最长",color:"#d97706",pts:S.map(s=>[s.id,s.lenMax]).filter(p=>p[1]!=null)}],
-      {y0:0,fmt:v=>Math.round(v),target:CFG.responseLength||undefined})}
+      {y0:0,y1:Math.max(CFG.responseLength||0,...S.map(s=>s.lenMax||0))*1.06||undefined,
+       fmt:v=>Math.round(v),target:CFG.responseLength||undefined})}
   </div>
   <div class="card table-card"><div class="table-scroll"><table>
     <thead><tr><th>step</th><th>状态</th><th>轨迹</th>

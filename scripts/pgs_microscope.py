@@ -70,10 +70,25 @@ def _kv_line(key: str, *, word: bool = False) -> re.Pattern:
 #: 于轨迹 thought 的轨迹占比)。初始词表为通用英文推理分叉词;数据驱动重标
 #: 用 --fork-lexicon 传 json {"redundancy": [...], "essence": [...]} 覆盖。
 FORK_LEXICON = {
-    "redundancy": ("wait", "however", "but ", "alternatively", "actually",
+    "redundancy": ("wait", "however", "but", "alternatively", "actually",
                    "let me re", "hmm"),
     "essence": ("check", "verify", "confirm", "double-check"),
 }
+_FORK_PATTERNS: dict[str, re.Pattern] = {}
+
+
+def set_fork_lexicon(lex: dict) -> None:
+    """安装词表并预编译**词边界**匹配(审阅 L27:裸子串在 agentic 语境
+    有系统性假阳——'wait' 命中任务字面义等待、'check'⊂'checkout')。
+    多词短语按字面嵌入,首尾仍受 \b 约束。"""
+    FORK_LEXICON.update({k: tuple(str(w).lower() for w in v) for k, v in lex.items()})
+    for band, words in FORK_LEXICON.items():
+        _FORK_PATTERNS[band] = re.compile(
+            r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b"
+        )
+
+
+set_fork_lexicon({})
 
 
 def load_tok(path: str):
@@ -446,6 +461,7 @@ def build_traj(
     # 「最后一公里」读数;final 是 π-top1(rank 0-based == 0)= 教师只在降噪)
     ab_dlogp: list[float] = []
     ab_top1 = 0
+    ab_miss16 = 0
     for i in range(n_rec):
         p = s["steer_positions"][i]
         dr, fi = s["steer_draft_token"][i], s["steer_final_token"][i]
@@ -474,6 +490,10 @@ def build_traj(
             lut = {int(t): float(l) for t, l in top}
             if dr in lut and fi in lut:
                 ab_dlogp.append(lut[dr] - lut[fi])
+            else:
+                # 删失计数(审阅 L26):远 rank(>top16)拒绝位算不出 Δlogπ,
+                # 静默剔除会让曲线在"硬知识增多"时反向移动——份额必须可见。
+                ab_miss16 += 1
             if int(top[0][0]) == fi:
                 ab_top1 += 1
         if with_dists:
@@ -563,6 +583,7 @@ def build_traj(
         absorb=dict(
             dlogp=[r(x, 3) for x in ab_dlogp],
             top1=ab_top1,
+            miss16=ab_miss16,
             nrej=int(s.get("steer_reject_count", 0)),
         ),
         fork=fork_hits(traj_meta),
@@ -575,13 +596,13 @@ def build_traj(
 
 def fork_hits(traj_meta: dict) -> dict:
     """fork-token 双带命中(v3.3 M6;MENTOR Fig.3 occurrence 口径:该词是否
-    出现在轨迹的 thought 文本里)。"""
+    出现在轨迹的 thought 文本里;词边界匹配防 agentic 语境假阳)。"""
     text = " ".join(
         (st.get("thought") or "") for st in traj_meta.get("steps") or []
     ).lower()
     return {
-        band: int(any(w in text for w in words))
-        for band, words in FORK_LEXICON.items()
+        band: int(bool(pat.search(text)))
+        for band, pat in _FORK_PATTERNS.items()
     }
 
 
@@ -610,8 +631,10 @@ def build_step_entry(sid: int, dirname: str, trajs: list[dict], config: dict) ->
     rej = tot(lambda t: t["m"]["rej"])
     bare = [t for t in trajs if t.get("arm") == 0]
     steered = [t for t in trajs if t.get("arm") == 1]
+    soft_rows = [t for t in trajs if t.get("arm") != 0]
     dlogp = sorted(x for t in trajs for x in t.get("absorb", {}).get("dlogp", []))
     top1 = tot(lambda t: t.get("absorb", {}).get("top1", 0))
+    miss16 = tot(lambda t: t.get("absorb", {}).get("miss16", 0))
     nrej_ab = tot(lambda t: t.get("absorb", {}).get("nrej", 0))
     toks = tot(lambda t: t["len"])
     entry = dict(
@@ -635,16 +658,26 @@ def build_step_entry(sid: int, dirname: str, trajs: list[dict], config: dict) ->
         armGap=(r(sum(t["won"] for t in steered) / len(steered)
                   - sum(t["won"] for t in bare) / len(bare), 4)
                 if bare and steered else None),
-        entTheta=r(tot(lambda t: t.get("enttheta", 0.0)) / n, 3),
-        entMean=r(tot(lambda t: t.get("entmean", 0.0)) / n, 3),
-        wMean=r(tot(lambda t: t.get("wmean", 0.0)) / n, 3),
-        gateBypassRate=r(tot(lambda t: t["m"].get("gbypass", 0)) / max(toks, 1), 4),
+        # 软门观察量只在 steered 行有定义(bare/research 行携 0.0 哨兵;
+        # 审阅 C3/C6:混入分母会按臂占比稀释 H_q/w̄,制造"已贴地板"的
+        # 系统性误读)。soft_rows = 非 bare 行(历史全臂 arm=None 视作
+        # steered;v4 research 行 steer_arm=0 恰被排除)。
+        entTheta=(r(sum(t.get("enttheta", 0.0) for t in soft_rows)
+                    / len(soft_rows), 3) if soft_rows else 0.0),
+        entMean=(r(sum(t.get("entmean", 0.0) for t in soft_rows)
+                   / len(soft_rows), 3) if soft_rows else 0.0),
+        wMean=(r(sum(t.get("wmean", 0.0) for t in soft_rows)
+                 / len(soft_rows), 3) if soft_rows else 0.0),
+        gateBypassRate=r(
+            sum(t["m"].get("gbypass", 0) for t in soft_rows)
+            / max(sum(t["len"] for t in soft_rows), 1), 4),
         alpha=pgs_alpha(sid, config),
         lenMean=r(toks / n, 0),
         lenMax=max((t["len"] for t in trajs), default=0),
         # 吸收进度三曲线(docs/pgs-v33-mixed-policy-design.md M6)
         absorbDlogpMed=(r(dlogp[len(dlogp) // 2], 3) if dlogp else None),
         absorbTop1Rate=(r(top1 / nrej_ab, 4) if nrej_ab else None),
+        absorbMiss16Rate=(r(miss16 / nrej_ab, 4) if nrej_ab else None),
         rejDensity=r(rej / max(toks, 1), 5),
         # fork-token 双带 occurrence(轨迹占比)
         forkRed=r(tot(lambda t: t.get("fork", {}).get("redundancy", 0)) / n, 4),
@@ -676,10 +709,7 @@ def main() -> int:
                          "(数据驱动重标后覆盖内置词表)")
     a = ap.parse_args()
     if a.fork_lexicon:
-        FORK_LEXICON.update({
-            k: tuple(str(w).lower() for w in v)
-            for k, v in json.load(open(a.fork_lexicon)).items()
-        })
+        set_fork_lexicon(json.load(open(a.fork_lexicon)))
 
     run = Path(a.run_dir)
     out = Path(a.out_dir) if a.out_dir else run / "microscope"

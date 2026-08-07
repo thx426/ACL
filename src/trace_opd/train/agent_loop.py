@@ -628,6 +628,14 @@ class TraceAgentLoop(AgentLoopBase):
         metrics = AgentLoopMetrics()
         validate = bool(kwargs.get("validate", False))
         global_step = _as_int(kwargs.get("global_step"))
+        if self.cfg.steering.enabled and not validate:
+            # 阈值自适应的步界推进必须在 v3/v4 分流之前(审阅 C1/C2:原先只挂
+            # 在 v3 elif 分支,v4 executor 行走 _v4_coord 分支永不经过,θ_D/H_q
+            # 静默冻结在初值)。幂等:同 step 重入是 no-op。
+            if self.gate_tracker is not None:
+                self.gate_tracker.maybe_step_update(global_step)
+            if self.ent_tracker is not None:
+                self.ent_tracker.maybe_step_update(global_step)
         extra_info = dict(kwargs["extra_info"])
         adapter = self.factory.adapter_from_item(extra_info)
         response_length = self.rollout_config.response_length
@@ -719,24 +727,24 @@ class TraceAgentLoop(AgentLoopBase):
                 self.cfg.train.rollout_n,
                 self.cfg.steering.steered_fraction,
             )
-            if self.gate_tracker is not None:
-                # 率控自适应:step 边界用上一 step 的 D 直方图 EMA 更新 θ_D
-                # (步内冻结;滞后一步)。
-                self.gate_tracker.maybe_step_update(global_step)
-            if self.ent_tracker is not None:
-                self.ent_tracker.maybe_step_update(global_step)
             if self.cfg.steering.doc_source == "researcher":
                 # student 启动前 await 文档;同 step 的 n=8 全部等待同一共享任务。
                 # bare 臂也 await:producer 按 (step,task) 只跑一次,bare 副本
                 # 等它只为携带同一份 research_fields(IF-09 批内 schema 恒齐),
                 # 文档本身不注入。
                 t_research = time.time()
-                doc, research_fields = await shared_task(
-                    self.research_tasks,
-                    (global_step, adapter.task_id),
-                    lambda: self._research(adapter, global_step, route),
-                )
-                metrics.tool_calls += time.time() - t_research
+                if self._steered_arm_retired(global_step):
+                    # M2 停产后 doc 无消费者(steered 槽位已全转 bare,文档
+                    # 永不注入)——跳过 producer,researcher 墙钟(整步大头)
+                    # 在退火尾程归零(审阅 L7)。
+                    doc = ""
+                else:
+                    doc, research_fields = await shared_task(
+                        self.research_tasks,
+                        (global_step, adapter.task_id),
+                        lambda: self._research(adapter, global_step, route),
+                    )
+                    metrics.tool_calls += time.time() - t_research
             else:
                 doc = self.doc_table.get(adapter.task_id, "")
             steer_ctx = {
@@ -952,7 +960,7 @@ class TraceAgentLoop(AgentLoopBase):
 
         # v3.3 M4:统一强度门(五档;always_on/adaptive 为 v3.2/v3.0 的
         # 等价适配,decide 产出与旧 SteeringGate 逐字段一致——等价性由
-        # tests/steering/test_intensity_gate.py 锁定)。阈值一条轨迹内冻结:
+        # tests/test_v33_mechanism.py 锁定)。阈值一条轨迹内冻结:
         # 自适应经 worker 级 tracker 跨 step 慢更,构造时取当前快照。
         theta_now = (
             self.gate_tracker.theta if self.gate_tracker is not None

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""从 s3 dump 的 pi_top16 标定学生截断熵分布(top-16 口径,与 v3.3
-ENTROPY_TOPK 一致)。用法: python3 ent_calib.py <run_dir> <step> [...]"""
+"""从 dump 的 pi_top16 标定学生截断熵分布(top-16 口径,与 v3.3
+ENTROPY_TOPK 一致)。用法: python3 ent_calib.py <run_dir> <step> [...]
+
+⚠ 采样面警告(审阅 L29):数据源是 ledger 记录位(η>0 行)。maxopen/
+always_on run(记录≈全部生成位)给出无偏分位;从 adaptive(D 门选中的
+~10% 位)或 entropy 档(w≥w_min 位)的 dump 复标时,样本对门控信号
+条件化,分位有选择偏差——跨档复标请优先用 steer_ent_hist 全量直方图
+(v3.3 起随账落盘,覆盖含 bypass 的全部执行位)。"""
 import glob, json, math, os, sys
 
 def main():

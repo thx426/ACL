@@ -41,7 +41,13 @@ def test_research_rl_defaults_load_and_require_researcher_stack(tmp_path, monkey
     assert rrl.research_n == 8 and rrl.continuation_samples == 4
     assert rrl.prefix_quantiles == [0.05, 0.15, 0.30, 0.50, 0.75]
     assert rrl.researcher_temperature == 1.0 and rrl.continuation_temperature == 1.0
-    assert cfg.research.n_exp == 16          # 用户裁定:默认对齐生产配置
+    # 用户裁定:默认对齐生产配置。2026-08-07 由 16/4/8 降到 8/2/4 以砍 episode 开销
+    # (162 v4 实测 128 条 research 会话烧掉 3054 个 ALFWorld episode,
+    #  而 timing_s/gen 占整步墙钟 84.5%)。k_max 必须一起降 ——
+    #  tools.py 用 min(k_req, k_max),留着 8 则模型填 8 即绕过 k_default。
+    assert cfg.research.n_exp == 8
+    assert cfg.research.k_default == 2
+    assert cfg.research.k_max == 4
     # 依赖:必须 steering+doc_source=researcher+research.enabled
     with pytest.raises(ValueError, match="research_rl.enabled"):
         _load(tmp_path, monkeypatch,

@@ -54,9 +54,12 @@ research:
   enabled: true
   backend: engine   # v4 自体:researcher chat 走本机引擎
   tool_protocol: text  # v4 自体:TextProtocol(policy 无 fncall parser)
-  n_exp: 16                  # 用户裁定：每个 (step, task) 最多 16 次 researcher 实验
-  k_default: 4
-  k_max: 8
+  # 用户裁定 2026-08-07(原 16/4/8):降 episode 开销,与 162 v4 同步改动
+  # (两机 v4 机制须逐字一致才可对照)。依据见 162 版注释与
+  # docs/collab/cd010-cd006/experiment-feedback.md 的耗时拆解条目。
+  n_exp: 8                   # 每 (step, task) 最多 8 次 researcher 实验
+  k_default: 2               # 每次 run_experiment 默认跑 2 个 episode
+  k_max: 4                   # 模型可自主提到 4(= 原默认),不能更高
   max_turns: 30
   wrapup_buffer: 2
   fetch_raw_limit: 20
@@ -145,7 +148,10 @@ train:
                             # 历史成熟配置。执行档改动,不进指纹,两臂一致
                             # 需可用 flash-attn —— 仅 162 venv 有,A800-SXM 不可用)
   rollout_max_model_len: 40960   # rollout 单序列 ctx ≥ 教师前缀(scaffold+doc+obs)+ response
-  rollout_max_num_batched_tokens: 8192  # vLLM chunked-prefill 预算 | 2026-07-28 用户裁定
+  rollout_max_num_batched_tokens: 32768 # 用户裁定 2026-08-07(原 8192),与 162 v4 同步。
+                            # 原 8192 是 vLLM 时代为绕 step-17 illegal-access 设的,
+                            # 本 run 后端已是 SGLang;v4 自体 researcher 无 sidecar。
+                            # 旧注释保留如下:
                             # 模板级 8192(step-17 illegal-access 绕过 + 独占拓扑显存账);
                             # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048。
                             # 同时决定 prompt_logprobs 打分(SPS verify)的临时 logits

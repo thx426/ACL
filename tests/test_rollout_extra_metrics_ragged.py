@@ -110,3 +110,29 @@ def test_backward_compatible_without_role_research():
     )
     assert m["rollout_extra/won_bare_rate/mean"] == 0.5
     assert m["rollout_extra/won_steered_rate/mean"] == 0.75
+
+
+def test_v33_steered_only_keys_not_diluted_by_sentinels():
+    """审阅 C6:软门观察量(H_q/w̄/熵均值)只在 steered 行有定义;bare 与
+    research 行的 0.0 哨兵不得进分母(否则 8+8 分臂下 H_q 被精确减半,
+    与未稀释的 entropy_floor 参考线同图对比会误读成"已贴地板")。"""
+    mod = _load()
+    info = {
+        "steer_arm": [0, 0, 1, 1, 0],          # 最后一行是 research 占位
+        "role_research": [0, 0, 0, 0, 1],
+        "won": [0, 1, 1, 0, 0],
+        "steer_entropy_theta": [0.0, 0.0, 1.28, 1.28, 0.0],
+        "steer_intensity_mean": [0.0, 0.0, 0.5, 0.7, 0.0],
+        "steer_entropy_mean": [0.0, 0.0, 0.4, 0.2, 0.0],
+        "steer_count": [0, 0, 3, 5, 0],        # 非 steered-only 键:仍全批均值
+    }
+    m = mod.compute_rollout_extra_metrics(info)
+    assert m["rollout_extra/steer_entropy_theta/mean"] == pytest.approx(1.28)
+    assert m["rollout_extra/steer_intensity_mean/mean"] == pytest.approx(0.6)
+    assert m["rollout_extra/steer_entropy_mean/mean"] == pytest.approx(0.3)
+    assert m["rollout_extra/steer_count/mean"] == pytest.approx(8 / 5)
+    # 无 steer_arm(历史非分臂)⇒ 回退全批均值,不崩
+    m2 = mod.compute_rollout_extra_metrics(
+        {"steer_entropy_theta": [1.0, 1.0], "won": [0, 1]}
+    )
+    assert m2["rollout_extra/steer_entropy_theta/mean"] == pytest.approx(1.0)

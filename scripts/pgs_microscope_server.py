@@ -125,7 +125,7 @@ def _meta_of(d: dict) -> dict:
     arm = s.get("steer_arm")
     # v3.3 吸收进度(dump 已整读,增量 O(拒绝数)):拒绝位上 π 的
     # draft−final logp 差 + final=π-top1(rank 0-based==0)计数。
-    ab_dlogp, ab_top1 = [], 0
+    ab_dlogp, ab_top1, ab_miss16 = [], 0, 0
     tops = s.get("steer_pi_top16") or []
     rejs = s.get("steer_rejected") or []
     for i, isrej in enumerate(rejs):
@@ -136,6 +136,8 @@ def _meta_of(d: dict) -> dict:
         lut = {int(t): float(lp) for t, lp in tops[i]}
         if dr in lut and fi in lut:
             ab_dlogp.append(M.r(lut[dr] - lut[fi], 3))
+        else:
+            ab_miss16 += 1
         if int(tops[i][0][0]) == fi:
             ab_top1 += 1
     fork = M.fork_hits(d.get("trajectory") or {})
@@ -160,7 +162,7 @@ def _meta_of(d: dict) -> dict:
         enttheta=M.r(s.get("steer_entropy_theta", 0.0), 3),
         entmean=M.r(s.get("steer_entropy_mean", 0.0), 3),
         wmean=M.r(s.get("steer_intensity_mean", 0.0), 3),
-        absorb=dict(dlogp=ab_dlogp, top1=ab_top1,
+        absorb=dict(dlogp=ab_dlogp, top1=ab_top1, miss16=ab_miss16,
                     nrej=int(s.get("steer_reject_count", 0))),
         fork=fork,
     )
@@ -342,9 +344,12 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--doc-table", default=None, help="task_id→特权文档 jsonl(s1 臂)")
+    ap.add_argument("--fork-lexicon", default=None, help="fork 词表 json 覆盖(与导出器同格式)")
     a = ap.parse_args()
     RUN = Path(a.run_dir)
     CONFIG = M.load_run_config(RUN)
+    if a.fork_lexicon:
+        M.set_fork_lexicon(json.load(open(a.fork_lexicon)))
     print(f"[server] loading tokenizer {a.tokenizer} …", flush=True)
     DEC = M.Dec(M.load_tok(a.tokenizer))
     DOCS = M.load_docs(a.doc_table)

@@ -1575,6 +1575,20 @@ class PPOTrainer(ABC):
                 decay_steps=int(self.config.algorithm.get("steered_adv_decay_steps", 0)),
             )
             metrics["actor/pgs_steered_alpha"] = alpha
+            # Orphan steered groups (partial-failure shape, review C0): the
+            # estimator degrades them to zero advantage; count them here so a
+            # rising curve exposes systemic session-loss instead of silence.
+            _uid2arms: dict = {}
+            for _i, _u in enumerate(data.non_tensor_batch["uid"]):
+                _uid2arms.setdefault(_u, set()).add(int(steer_arm[_i]))
+            orphan = sum(1 for a in _uid2arms.values() if 1 in a and 0 not in a)
+            metrics["actor/pgs_orphan_steered_groups"] = orphan
+            if orphan:
+                logger.warning(
+                    "pgs_asym_grpo: %d orphan steered group(s) this step "
+                    "(partial-failure shape) — degraded to zero advantage",
+                    orphan,
+                )
             adv, ret = compute_pgs_asym_outcome_advantage(
                 token_level_rewards=data.batch["token_level_rewards"],
                 response_mask=data.batch["response_mask"],

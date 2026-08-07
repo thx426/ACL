@@ -627,3 +627,28 @@ def test_entropy_gate_half_intensity_scales_eta():
     for r in state.ledger.records:
         assert r.intensity == pytest.approx(0.5, rel=1e-3)
         assert r.eta == pytest.approx(0.25, rel=1e-3)
+
+
+def test_entropy_observation_counts_each_executed_position_once():
+    """审阅 C4:熵观察=「执行位恰一次」。拒绝重采截断的 draft 尾段不入账、
+    重 draft 不重复入账 ⇒ ent_count 恒等于实际执行 token 数(旧口径在有
+    拒绝的轨迹上按 draft 次数多重计数)。seed 组合实测产生 8 次拒绝。"""
+    world = _World(seed=4)
+    state = TrajectorySteerState(
+        gate=IntensityGate(mode="always_on", eta_max=0.5, epsilon=0.0),
+        budget=TrajectoryBudget(b_max=1e9, c=2.5, pacing=False, u0=0.0,
+                                profile_power=2.0, t_max=1),
+        reject_cap=TurnRejectCap(r_max=0),
+        rng=np.random.default_rng(0),
+    )
+    draft = _MockDraft(world, 16, np.random.default_rng(50))
+    verify = _MockVerify(world, 16, (101, 102, 103))
+    hook = SpsGenerate(
+        draft=draft, verify=verify,
+        teacher_prefix_ids=[101, 102, 103], student_prompt_ids=[7, 8, 9],
+        state=state, tokenizer=_Tok(), topk=8, c=2.5, obs_topk=16,
+    )
+    out = _run(hook([7, 8, 9], {"max_tokens": 24, "temperature": 1.0}))
+    n_rej = sum(1 for r_ in state.ledger.records if r_.rejected)
+    assert n_rej > 0, "world must actually produce rejections for this test to bite"
+    assert state.ledger.ent_count == len(out.token_ids)

@@ -85,10 +85,11 @@ class ResearchCfg:
     enabled: bool = False
     backend: str = "external"
     tool_protocol: str = "fncall"
-    n_exp: int = 16                # 每会话实验预算(用户裁定 2026-08-06:默认
-                                   # 对齐生产配置 16;历史默认 12)
-    k_default: int = 4
-    k_max: int = 8
+    n_exp: int = 8                 # 每会话实验预算(用户裁定 2026-08-07:16→8,
+                                   # 降 episode 开销;历史 12→16→8)
+    k_default: int = 2             # 每次 run_experiment 的 episode 数(4→2)
+    k_max: int = 4                 # 硬上限:tools.py 用 min(k_req, k_max),
+                                   # 留大则模型填大即绕过 k_default
     max_turns: int = 30
     wrapup_buffer: int = 2
     fetch_raw_limit: int = 20
@@ -431,6 +432,9 @@ class SteeringCfg:
                                    # 不惩罚;MENTOR Eq.13 口径,s3 弥散化病根
                                    # 的结构性修复)。进 objective_fingerprint;
                                    # asym 要求 train.adv_estimator=pgs_asym_grpo
+    steered_adv_decay_mode: str = "cosine_steps"  # 调度族枚举(设计 M2 留位;
+                                   # 当前唯一实现 cosine_steps,后续自适应版
+                                   # 加枚举值不动结构)。asym 档进指纹
     steered_adv_weight: float = 1.0    # α_0(asym 档 steered 超额的权重初值)
     steered_adv_decay_steps: int = 0   # T_decay:α_t=α_0·½(1+cos(π·t/T)),
                                    # t≥T 后恒 0 **且 steered 臂停产**(教师=
@@ -462,6 +466,11 @@ class SteeringCfg:
                   "intensity_w_min"):
             setattr(self, f, float(getattr(self, f)))
         self.steered_adv_decay_steps = int(self.steered_adv_decay_steps)
+        # YAML 1.1 陷阱(审阅 L17):不带引号的 `w_beh_mode: off` 被解析成
+        # 布尔 False(CLI override 经 yaml.safe_load 同样中招)——按用户意图
+        # 归一;True 无对应档,落进枚举校验被拒。
+        if self.w_beh_mode is False:
+            self.w_beh_mode = "off"
         self.topk = int(self.topk)
         self.obs_topk = int(self.obs_topk)
         self.r_max = int(self.r_max)
@@ -523,11 +532,24 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"steering.doc_source 必须是 static|researcher,得到 {st.doc_source!r}"
         )
+    if not st.enabled and (
+        t.adv_estimator == "pgs_asym_grpo" or st.adv_mode not in ("", "legacy_shared")
+    ):
+        # 反向联动必须站在 enabled 门之外(审阅 L3/L16:原先整块在
+        # `if st.enabled:` 内,steering 关掉即绕过"两处必须联动"守卫——
+        # estimator 会在无臂标签的 batch 上把全部行当 unknown 训练)。
+        raise ValueError(
+            "steering.enabled=false 与 pgs_asym_grpo/adv_mode=asym 不相容——"
+            "asym advantage 需要分臂标签,请开 steering 或换回 grpo_loo"
+        )
     if st.enabled:
         # 审阅 IF-13:数值面先过有限性——NaN/inf 能绕过大小比较,错误会
         # 延迟到 rollout 中段才爆。b_max 例外:+inf 是 maxopen 档的一等语义
         # (无限预算,v3.2),仍拒 NaN/−inf。
-        for name in ("eta_max", "c", "theta_d", "epsilon"):
+        for name in ("eta_max", "c", "theta_d", "epsilon",
+                     "steered_adv_weight", "steered_adv_cap",
+                     "w_beh_shaped_gamma", "entropy_theta_init",
+                     "entropy_floor", "intensity_w_min"):
             if not math.isfinite(getattr(st, name)):
                 raise ValueError(f"steering.{name} 必须是有限数,得到 {getattr(st, name)!r}")
         if math.isnan(st.b_max) or st.b_max == -math.inf:
@@ -559,11 +581,24 @@ def _validate(cfg: "Config") -> None:
                 raise ValueError(
                     f"steering.entropy_target_rate 必须在 (0,1),得到 {st.entropy_target_rate}"
                 )
-        if st.gate_mode in ("entropy", "d_var", "soft_or"):
+        if st.gate_mode in ("always_on", "entropy", "d_var", "soft_or"):
+            # always_on 也消费 w_min(decide 的软档分支 base_open 判定与 hook
+            # 段级 bypass;审阅 L15:w_min>1 会把 maxopen 静默变成零干预)。
             if not (0.0 <= st.intensity_w_min < 1.0):
                 raise ValueError(
                     f"steering.intensity_w_min 必须在 [0,1),得到 {st.intensity_w_min}"
                 )
+        if st.gate_mode in ("entropy", "soft_or") and st.obs_topk < 16:
+            # 熵信号 = draft top-obs_topk 明细的前 16 个(steering/hook.py 的
+            # ENTROPY_TOPK;审阅 L20)——窗口窄于 16 会静默换熵口径,标定失配。
+            raise ValueError(
+                f"steering.obs_topk({st.obs_topk}) 必须 >= 16(熵信号截断宽度"
+                " ENTROPY_TOPK;与标定同口径)"
+            )
+        if not (0.0 <= st.epsilon < 0.5):
+            # 配置期即拒(审阅 L18:原先只在首条 steered 轨迹构造 IntensityGate
+            # 时才炸,静态可查的错误被推迟成半程崩溃)。
+            raise ValueError(f"steering.epsilon 必须在 [0, 0.5),得到 {st.epsilon}")
         if st.gate_mode == "always_on":
             # maxopen 档参数纪律(参数真值必须显式可见,不做静默忽略):
             # 门语义整体退役 ⇒ 探针/率控自适应必须显式关闭,θ_D 免标定。
@@ -637,10 +672,30 @@ def _validate(cfg: "Config") -> None:
                 raise ValueError(
                     f"steering.steered_adv_weight 必须 > 0,得到 {st.steered_adv_weight}"
                 )
+            if t.norm_adv_by_std:
+                raise ValueError(
+                    "adv_mode=asym 下 estimator 不做 std 归一——"
+                    "train.norm_adv_by_std=true 会被静默忽略且污染指纹,"
+                    "请显式 false(参数真值纪律,审阅 L1)"
+                )
         elif t.adv_estimator == "pgs_asym_grpo":
             raise ValueError(
                 "train.adv_estimator=pgs_asym_grpo 要求 steering.adv_mode=asym"
                 "(estimator 需要臂标签与 α,legacy 口径不产)"
+            )
+        else:
+            # legacy 档的 α 三参完全惰性——非默认值必是配置错觉,拒绝静默
+            # 忽略(always_on 档参数纪律先例;审阅 L19)。
+            if (st.steered_adv_weight != 1.0 or st.steered_adv_decay_steps != 0
+                    or st.steered_adv_cap != 0.0):
+                raise ValueError(
+                    "steered_adv_{weight,decay_steps,cap} 仅在 adv_mode=asym 下"
+                    "生效——legacy_shared 配非默认值会被静默忽略,请删除或切 asym"
+                )
+        if st.steered_adv_decay_mode != "cosine_steps":
+            raise ValueError(
+                f"未知 steered_adv_decay_mode {st.steered_adv_decay_mode!r}"
+                "(当前仅 cosine_steps)"
             )
         if st.steered_adv_decay_steps < 0 or st.steered_adv_cap < 0:
             raise ValueError("steered_adv_decay_steps/steered_adv_cap 必须 >= 0")
@@ -927,6 +982,7 @@ def objective_fingerprint(cfg: "Config") -> str:
             f"|adv_mode={st.adv_mode}"
             f"|steered_adv={st.steered_adv_weight}"
             f":{st.steered_adv_decay_steps}:{st.steered_adv_cap}"
+            f":{st.steered_adv_decay_mode}"
         )
     # v3.3 M3 shaped_reject 的 γ 决定拒绝位梯度权重;条件追加。
     if st.enabled and st.w_beh_mode == "shaped_reject":

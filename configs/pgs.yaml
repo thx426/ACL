@@ -25,9 +25,13 @@ research:
   enabled: false             # researcher 源必须 true；static 源保持 false
   backend: external          # PGS 只允许 external researcher
   tool_protocol: fncall      # 强模型的 OpenAI function calling
-  n_exp: 12
-  k_default: 4
-  k_max: 8
+  # 实验预算 | 用户裁定 2026-08-07:降 episode 开销。162 v4 实测 128 条 research
+  # 会话消耗 3054 个 ALFWorld episode(中位 20/会话 = exps 中位 5 × k_default 4),
+  # 而 rollout 生成占整步墙钟 84.5%。k_default 4→2 直接把 episode 数减半。
+  # k_max 必须同步降:tools.py 是 min(k_req, k_max),留着 8 则模型填 8 就绕过新默认。
+  n_exp: 8
+  k_default: 2
+  k_max: 4
   max_turns: 30
   wrapup_buffer: 2
   fetch_raw_limit: 20

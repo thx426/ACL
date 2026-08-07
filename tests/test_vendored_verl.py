@@ -296,3 +296,14 @@ def test_v33_padding_rows_forced_to_unknown_arm():
     assert '-1 if t.get("is_padding")' in tb
     pu = _read("trainer/ppo/padding_utils.py")
     assert "is_padding=True" in pu and "pad_uid" in pu   # 前提事实不变则守卫有效
+
+
+def test_v33_orphan_steered_group_degrades_not_raises():
+    """审阅 C0:部分失败组(timeout 取消慢 bare 后 steered 独存)必须零
+    advantage 降级 + 计数曲线,绝不 raise 崩整步;且不 remap unknown
+    (绕过 α 调度)、不跳组(raw score 残留)。"""
+    ca = _read("trainer/ppo/core_algos.py")
+    assert "Orphan steered group" in ca
+    assert 'raise ValueError(\n                    "pgs_asym_grpo: a group contains steered' not in ca
+    tb = _read("trainer/ppo/v1/trainer_base.py")
+    assert "actor/pgs_orphan_steered_groups" in tb

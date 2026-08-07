@@ -57,7 +57,7 @@ __all__ = ["SpsGenerate", "TrajectorySteerState", "position_candidates", "candid
 class TrajectorySteerState:
     """一条轨迹的 steering 全部可变状态(episode 级生命周期)。"""
 
-    gate: SteeringGate
+    gate: "IntensityGate"
     budget: TrajectoryBudget
     reject_cap: TurnRejectCap
     ledger: SteeringLedger = field(default_factory=SteeringLedger)
@@ -257,6 +257,14 @@ class SpsGenerate:
                     "missing (vllm_async_server logprobs=K path)"
                 )
 
+            # v3.3 M4:逐位学生截断熵(draft 侧免费;所有门档都观察)。
+            # 观察口径 = 「被执行的位置恰一次」(审阅 C4):拒绝截断后丢弃的
+            # draft 尾段不入账,重 draft 的新段是新位置不会重复;直通段
+            # (pacing/budget/gate-bypass)整段执行、整段观察。
+            seg_entropy = [
+                truncated_entropy(pi_topk_lps[g]) for g in range(len(gen_ids))
+            ]
+
             steerable = st.budget.available > 0 and not st.reject_cap.cap_active
             if not steerable:
                 if st.reject_cap.cap_active or st.budget.remaining <= 0:
@@ -264,18 +272,13 @@ class SpsGenerate:
                 else:
                     # pacing:总额未尽但本 turn 额度未解锁(与耗尽区分)
                     st.ledger.n_pacing_wait += len(gen_ids)
+                for h in seg_entropy:
+                    st.ledger.observe_entropy(h)
                 executed += gen_ids
                 executed_logpi += [float(x) for x in pi_lp]
                 finished = draft_finished
                 continue
 
-            # v3.3 M4:逐位学生截断熵(draft 侧免费;所有门档都观察——
-            # 直方图是任何后续熵门标定的数据面)。
-            seg_entropy = [
-                truncated_entropy(pi_topk_lps[g]) for g in range(len(gen_ids))
-            ]
-            for h in seg_entropy:
-                st.ledger.observe_entropy(h)
             if not st.gate.needs_teacher:
                 # G-E(entropy)档:强度只依赖学生熵,verify 前即可判——
                 # 段内全部 w<w_min 时整段直通,教师 verify 请求归零
@@ -285,6 +288,8 @@ class SpsGenerate:
                     st.gate.base_w(entropy=h) for h in seg_entropy
                 ) < st.gate.w_min:
                     st.ledger.n_gate_bypassed += len(gen_ids)
+                    for h in seg_entropy:
+                        st.ledger.observe_entropy(h)
                     executed += gen_ids
                     executed_logpi += [float(x) for x in pi_lp]
                     finished = draft_finished
@@ -303,6 +308,9 @@ class SpsGenerate:
                 y = int(y)
                 log_pi_y = float(pi_lp[g])
                 position = stream_len + len(executed)
+                # 每次迭代恰执行一个 token(三个分支都 append),此处观察
+                # 恰是「执行位一次」;拒绝 break 后的尾段不进迭代、不入账。
+                st.ledger.observe_entropy(seg_entropy[g])
                 if st.budget.available <= 0 or st.reject_cap.cap_active:
                     if st.reject_cap.cap_active or st.budget.remaining <= 0:
                         st.ledger.n_bypassed += 1

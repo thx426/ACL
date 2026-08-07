@@ -163,17 +163,57 @@ def test_asym_all_bare_group_equals_grpo_loo():
     assert torch.allclose(ref, got)
 
 
-def test_asym_steered_without_bare_fails_loud():
-    with pytest.raises(ValueError, match="no bare"):
-        _adv([1, 0], [1, 1], ["t", "t"])
+def test_asym_orphan_steered_group_degrades_to_zero():
+    """部分失败组(timeout 取消慢 bare 后 steered 独存;审阅 C0):不 raise
+    崩整步,也不 remap unknown(会绕过 α 调度)——整组显式零 advantage。"""
+    a = _adv([1, 0], [1, 1], ["t", "t"], alpha=1.0)
+    assert a == [0.0, 0.0]
+    # 与正常组共存时互不影响
+    a2 = _adv([1, 0, 1, 0], [1, 1, 0, 0], ["orphan", "orphan", "ok", "ok"])
+    assert a2[0] == 0.0 and a2[1] == 0.0
+    assert a2[2] == pytest.approx(1.0) and a2[3] == pytest.approx(-1.0)
+
+
+def test_v33_config_rejects_nan_inf_on_new_float_fields(tmp_path, monkeypatch):
+    """审阅 C5:新增浮点字段必须过 isfinite 纪律(IF-13)。"""
+    for bad in (", steered_adv_weight: .nan", ", entropy_floor: .inf",
+                ", w_beh_shaped_gamma: .nan"):
+        with pytest.raises(ValueError, match="有限数"):
+            _load(tmp_path, monkeypatch, steer_extra=bad)
+
+
+def test_v33_tracker_step_update_sits_before_v4_fork():
+    """审阅 C1/C2:maybe_step_update 必须在 run() 的 v3/v4 分流之前的公共
+    位置(v4 executor 行走 _v4_coord 分支,原 elif 挂点永不经过 ⇒ θ_D/H_q
+    静默冻结)。文本断言锁位置关系。"""
+    src = (Path(__file__).resolve().parents[1]
+           / "src/trace_opd/train/agent_loop.py").read_text(encoding="utf-8")
+    run_body = src.split("async def run(", 1)[1]
+    tick = run_body.index("maybe_step_update")
+    v4_fork = run_body.index("_v4_role")
+    assert tick < v4_fork, "tracker step update must precede the v4 role fork"
+    assert run_body.count("maybe_step_update") == 2  # gate + ent,各恰一处
 
 
 def test_asym_steered_cap_rescales():
-    # 3 条 steered 全胜(bare 全败):每条超额 1×α=1,总额 3 > cap=1.5 ⇒ 减半
+    # 3 条 steered 全胜(bare 全败):RAW 超额和 3 > cap=1.5 ⇒ 先减半再乘 α
+    # (MENTOR 顺序,审阅 L22——cap 若作用在 α 后总额,cosine 退火期会被
+    # cap 钉平)。α=0.5 时:0.5(capped excess)×0.5 = 0.25;旧顺序会给 0.5。
     scores = [0, 0, 1, 1, 1]
     arms = [0, 0, 1, 1, 1]
     a = _adv(scores, arms, ["t"] * 5, alpha=1.0, cap=1.5)
     assert a[2] == pytest.approx(0.5)
+    a2 = _adv(scores, arms, ["t"] * 5, alpha=0.5, cap=1.5)
+    assert a2[2] == pytest.approx(0.25)
+
+
+def test_asym_lone_unknown_inside_labeled_group_zeroed():
+    # labeled 组内孤儿 unknown(丢标签)不得 raw-through 拿全批最大 advantage
+    # (审阅 L2);纯 unknown 单行组保持 grpo_loo n==1 惯例(raw through)。
+    a = _adv([1, 0, 1], [0, 0, -1], ["t", "t", "t"])
+    assert a[2] == 0.0
+    b = _adv([0.7], [-1], ["solo"])
+    assert b[0] == pytest.approx(0.7)
 
 
 def test_steered_alpha_schedule():
