@@ -1546,16 +1546,49 @@ class PPOTrainer(ABC):
             metrics.update(is_metrics)
 
         # 3. compute advantages
-        data = compute_advantage_for_multi_trajectories(
-            data,
-            batch_keys=batch.keys,
-            adv_estimator=self.config.algorithm.adv_estimator,
-            gamma=self.config.algorithm.gamma,
-            lam=self.config.algorithm.lam,
-            num_repeat=self.config.actor_rollout_ref.rollout.n,
-            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-            config=self.config.algorithm,
-        )
+        if str(self.config.algorithm.adv_estimator) == "pgs_asym_grpo":
+            # trace-opd PGS v3.3 M1/M2: asymmetric two-arm advantage with the
+            # cosine-scheduled steered weight. Explicit branch (not registry
+            # dispatch) because the estimator needs the per-row arm labels
+            # (tag channel) and the step-scheduled alpha — neither flows
+            # through the generic compute_advantage() signature.
+            from verl.trainer.ppo.core_algos import (
+                compute_pgs_asym_outcome_advantage,
+                pgs_steered_alpha,
+            )
+
+            steer_arm = np.array(
+                [int(t.get("steer_arm", -1)) if t.get("steer_arm") is not None else -1
+                 for t in batch.tags],
+                dtype=np.int64,
+            )
+            alpha = pgs_steered_alpha(
+                self.global_steps,
+                alpha0=float(self.config.algorithm.get("steered_adv_weight", 1.0)),
+                decay_steps=int(self.config.algorithm.get("steered_adv_decay_steps", 0)),
+            )
+            metrics["actor/pgs_steered_alpha"] = alpha
+            adv, ret = compute_pgs_asym_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=data.batch["response_mask"],
+                index=data.non_tensor_batch["uid"],
+                steer_arm=steer_arm,
+                alpha=alpha,
+                steered_cap=float(self.config.algorithm.get("steered_adv_cap", 0.0)),
+            )
+            data.batch["advantages"] = adv
+            data.batch["returns"] = ret
+        else:
+            data = compute_advantage_for_multi_trajectories(
+                data,
+                batch_keys=batch.keys,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                config=self.config.algorithm,
+            )
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]

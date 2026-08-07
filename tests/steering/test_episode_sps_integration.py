@@ -20,7 +20,7 @@ from fakes import FakeTokenizer, ScriptedAdapter, reply  # noqa: E402
 from trace_opd.core.episode import GenResult, run_episode  # noqa: E402
 from trace_opd.core.template_delta import TemplateDelta, render_ids  # noqa: E402
 from trace_opd.core.types import inject_guidance  # noqa: E402
-from trace_opd.steering import SteeringGate, TrajectoryBudget, TurnRejectCap  # noqa: E402
+from trace_opd.steering import IntensityGate, TrajectoryBudget, TurnRejectCap  # noqa: E402
 from trace_opd.steering.hook import SpsGenerate, TrajectorySteerState  # noqa: E402
 
 TOK = FakeTokenizer()
@@ -103,7 +103,7 @@ def _episode_with_sps(texts):
     draft = _ScriptedDraft(texts)
     verify = _EchoVerify(teacher_prefix)
     state = TrajectorySteerState(
-        gate=SteeringGate(theta_d=0.5, eta_max=0.5, epsilon=0.0),
+        gate=IntensityGate(mode="adaptive", theta_d=0.5, eta_max=0.5, epsilon=0.0),
         budget=TrajectoryBudget(b_max=6.0, c=2.5),
         reject_cap=TurnRejectCap(r_max=4),
         rng=np.random.default_rng(0),

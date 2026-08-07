@@ -10,7 +10,7 @@ import asyncio
 import numpy as np
 import pytest
 
-from trace_opd.steering import SteeringGate, TrajectoryBudget, TurnRejectCap
+from trace_opd.steering import IntensityGate, TrajectoryBudget, TurnRejectCap
 from trace_opd.steering.hook import SpsGenerate, TrajectorySteerState
 
 
@@ -111,7 +111,7 @@ def _mk_hook(world, *, theta_d, eta_max=0.5, c=2.5, b_max=6.0, topk=8,
              teacher_prefix=(101, 102, 103), student_prompt=(7, 8, 9),
              pacing=False, u0=0.0, profile_power=2.0, t_max=1):
     state = TrajectorySteerState(
-        gate=SteeringGate(theta_d=theta_d, eta_max=eta_max, epsilon=epsilon),
+        gate=IntensityGate(mode="adaptive", theta_d=theta_d, eta_max=eta_max, epsilon=epsilon),
         budget=TrajectoryBudget(b_max=b_max, c=c, pacing=pacing, u0=u0,
                                 profile_power=profile_power, t_max=t_max),
         reject_cap=TurnRejectCap(r_max=r_max),
@@ -446,7 +446,7 @@ def _run_with_verify(verify, draft_texts_len=6, seed=0, teacher_prefix=(101, 102
                      student_prompt=(7, 8, 9), obs_topk=16):
     world = _World(seed=seed)
     state = TrajectorySteerState(
-        gate=SteeringGate(theta_d=1e9, eta_max=0.5, epsilon=0.0),   # 门恒关:只验行对齐
+        gate=IntensityGate(mode="adaptive", theta_d=1e9, eta_max=0.5, epsilon=0.0),   # 门恒关:只验行对齐
         budget=TrajectoryBudget(b_max=10.0, c=2.5),
         reject_cap=TurnRejectCap(r_max=4),
         rng=np.random.default_rng(seed),
@@ -561,3 +561,69 @@ def test_pacing_spreads_spend_and_counts_wait():
     _run(hook2(list(sp2), {"max_tokens": 8, "temperature": 1.0}))
     assert st2.budget.remaining < 1e-6
     assert st2.ledger.n_pacing_wait == 0
+
+
+# --------------------------------------------------- v3.3 M4:entropy 档
+
+def _mk_entropy_hook(world, *, entropy_theta, w_min=0.05, eta_max=0.5,
+                     c=2.5, b_max=100.0, topk=8, obs_topk=16, seed=0,
+                     teacher_prefix=(101, 102, 103), student_prompt=(7, 8, 9)):
+    state = TrajectorySteerState(
+        gate=IntensityGate(mode="entropy", eta_max=eta_max,
+                           entropy_theta=entropy_theta, w_min=w_min),
+        budget=TrajectoryBudget(b_max=b_max, c=c, pacing=False, u0=0.0,
+                                profile_power=2.0, t_max=1),
+        reject_cap=TurnRejectCap(r_max=0),
+        rng=np.random.default_rng(seed),
+    )
+    draft = _MockDraft(world, obs_topk, np.random.default_rng(seed + 1))
+    verify = _MockVerify(world, obs_topk, teacher_prefix)
+    hook = SpsGenerate(
+        draft=draft, verify=verify,
+        teacher_prefix_ids=list(teacher_prefix),
+        student_prompt_ids=list(student_prompt),
+        state=state, tokenizer=_Tok(), topk=topk, c=c, obs_topk=obs_topk,
+    )
+    return hook, state, draft, verify, list(student_prompt)
+
+
+def test_entropy_gate_low_intensity_segment_skips_teacher_verify():
+    """G-E 工程红利:段内全部 w<w_min ⇒ 教师 verify 请求为零,draft 直通,
+    n_gate_bypassed 记账;熵观察(直方图)照常发生——标定数据面不缩水。"""
+    world = _World(seed=3)
+    hook, state, draft, verify, sp = _mk_entropy_hook(world, entropy_theta=1e9)
+    out = _run(hook(sp, {"max_tokens": 32, "temperature": 1.0}))
+    assert len(verify.calls) == 0
+    assert state.ledger.n_gate_bypassed == len(out.token_ids)
+    assert state.ledger.records == []
+    assert state.budget.spent == 0.0
+    assert state.ledger.ent_count == len(out.token_ids)
+
+
+def test_entropy_gate_full_intensity_steers_and_records_observability():
+    """H_q 极小 ⇒ w=1(等价 always_on):verify 发生、每位落行、行携带
+    intensity/entropy 观察面,η = η_max·w。"""
+    world = _World(seed=4)
+    hook, state, draft, verify, sp = _mk_entropy_hook(world, entropy_theta=1e-9)
+    out = _run(hook(sp, {"max_tokens": 8, "temperature": 1.0}))
+    assert len(verify.calls) >= 1
+    assert state.ledger.records, "full-intensity segment must produce ledger rows"
+    for r in state.ledger.records:
+        assert r.intensity == pytest.approx(1.0)
+        assert r.entropy > 0.0
+        assert r.eta == pytest.approx(0.5) or r.eta == 0.0  # 预算裁剪外恒 η_max
+
+
+def test_entropy_gate_half_intensity_scales_eta():
+    from trace_opd.steering.hook import truncated_entropy
+
+    world = _World(seed=6)
+    _ids, lps = world.topk_rows(world.pi, 16)
+    h = truncated_entropy(lps)
+    hook, state, draft, verify, sp = _mk_entropy_hook(
+        world, entropy_theta=2.0 * h)
+    _run(hook(sp, {"max_tokens": 4, "temperature": 1.0}))
+    assert state.ledger.records
+    for r in state.ledger.records:
+        assert r.intensity == pytest.approx(0.5, rel=1e-3)
+        assert r.eta == pytest.approx(0.25, rel=1e-3)

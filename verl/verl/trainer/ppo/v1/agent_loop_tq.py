@@ -198,7 +198,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # 审阅 IF-09:判定用「PGS 协议在场」(steer_count 恒由 rollout 侧
             # finalize 写入,空账也在),而非「本轨迹有 steer 记录」——批内
             # schema 必须恒一致,空账展开为全 1 权重。
-            if "steer_count" in extra:
+            wbeh_mode = str(extra.get("steer_w_beh_mode", "per_token"))
+            if "steer_count" in extra and wbeh_mode != "off":
                 # Hydra ALWAYS materialises algorithm.rollout_correction as a
                 # mapping (sub-keys default to null) — `is not None` would trip
                 # on every default config. The native feature only writes
@@ -220,8 +221,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     log_pi=extra.get("steer_log_pi") or [],
                     log_b=extra.get("steer_log_b") or [],
                     response_len=int(field["response_mask"].shape[-1]),
-                    mode=str(extra.get("steer_w_beh_mode", "per_token")),
+                    mode=wbeh_mode,
                     log_ratio_cap=extra.get("steer_log_ratio_cap"),
+                    rejected=extra.get("steer_rejected") or [],
+                    shaped_gamma=float(extra.get("steer_w_beh_gamma", 0.1)),
                 )
                 field["rollout_is_weights"] = torch.from_numpy(dense)
             # TODO: uniform response_mask and loss_mask
@@ -245,6 +248,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    # trace-opd PGS v3.3: per-row arm label for the asymmetric
+                    # advantage (0=bare, 1=steered; absent e.g. on research
+                    # rows -> None, the estimator treats it as "unknown" and
+                    # falls back to plain LOO within the row's own uid group).
+                    "steer_arm": field["extra_fields"].get("steer_arm"),
                 }
             )
 

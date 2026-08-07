@@ -11,7 +11,7 @@
 """
 
 from .budget import TrajectoryBudget, TurnRejectCap
-from .gate import GateDecision, SteeringGate, robust_quantile_update
+from .gate import GateDecision, IntensityGate, SteeringGate, robust_quantile_update
 from .kernel import SteeringKernel, truncated_increment
 from .ledger import SteeringLedger, TokenSteerRecord
 from .sps import SpsOutcome, accept_or_resample
@@ -19,6 +19,7 @@ from .sps import SpsOutcome, accept_or_resample
 __all__ = [
     "GateDecision",
     "SpsOutcome",
+    "IntensityGate",
     "SteeringGate",
     "SteeringKernel",
     "SteeringLedger",

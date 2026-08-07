@@ -273,6 +273,11 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         # 与样本无关,严格满足条件 iv);开=有偏稳定化消融档。
         f"algorithm.norm_adv_by_std_in_grpo={t.norm_adv_by_std}",
         "algorithm.use_kl_in_reward=False",
+        # v3.3 M1/M2(asym advantage 的 α 调度三参;legacy 档取默认值时
+        # trainer 分支不读它们,行为零漂移)。
+        f"+algorithm.steered_adv_weight={cfg.steering.steered_adv_weight}",
+        f"+algorithm.steered_adv_decay_steps={cfg.steering.steered_adv_decay_steps}",
+        f"+algorithm.steered_adv_cap={cfg.steering.steered_adv_cap}",
         f"data.train_files=['{t.train_file}']",
         f"data.val_files={val_files}",
         f"data.train_batch_size={t.train_batch_size}",

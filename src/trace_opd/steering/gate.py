@@ -26,16 +26,17 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["GateDecision", "GateThresholdTracker", "SteeringGate"]
+__all__ = ["GateDecision", "GateThresholdTracker", "IntensityGate", "SteeringGate"]
 
 
 @dataclass(frozen=True)
 class GateDecision:
-    eta: float             # 本位置的 η（0 = 不干预）
+    eta: float             # 本位置的 η（0 = 不干预;软强度档 = η_max·w）
     d_value: float         # D_j（诊断/事后因果分析）
-    base_open: bool        # 主门（D ≥ Θ_D）的确定性决定
-    probe_flipped: bool    # ε 探针是否翻转了主门决定
+    base_open: bool        # 主门确定性决定(软档:base_w ≥ w_min)
+    probe_flipped: bool    # ε 探针是否翻转了主门决定(软档:是否被置零)
     propensity: float      # 实际执行「开」的分配概率（事后 ITT 用，不进权重）
+    intensity: float = 1.0 # 软强度 w ∈[0,1](v3.3 M4;硬门档恒 1/0)
 
 
 class SteeringGate:
@@ -96,6 +97,129 @@ class SteeringGate:
         return None
 
 
+class IntensityGate:
+    """v3.3 M4 统一强度门(docs/pgs-v33-mixed-policy-design.md):门从
+    「开/关 + 恒 η_max」重构为强度函数 w∈[0,1],η = η_max·w。五档:
+
+      always_on  w ≡ 1(maxopen,v3.2 等价适配);
+      adaptive   w ∈ {0,1} 硬门 D≥θ_D + ε 双向探针(v3.0 等价适配——
+                 decide 产出与 SteeringGate 逐字段一致);
+      entropy    G-E:w = min(1, h/H_q)(h=学生截断熵,draft 侧免费;
+                 不需要教师信号 ⇒ needs_teacher=False,支持段级 bypass);
+      d_var      G-D 软化:w = min(1, D/θ_D);
+      soft_or    G-SOR:w = 1 − (1−w_E)(1−w_D)(两盲区互补)。
+
+    软强度档(entropy/d_var/soft_or)的 ε 探针是**单向置零**(base_w>0 的
+    位置以 ε 概率 w→0;连续强度下「翻开」无定义),propensity = 1−ε
+    (base_w>0)/ 0(base_w=0)。硬门档保留 v3.0 双向翻转语义。
+    阈值(θ_D / H_q)一条轨迹内冻结(因果性;自适应经 tracker 跨 step 慢更)。
+    """
+
+    NEEDS_TEACHER = {"adaptive": True, "always_on": False, "entropy": False,
+                     "d_var": True, "soft_or": True}
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        eta_max: float,
+        epsilon: float = 0.0,
+        theta_d: float = 0.0,
+        entropy_theta: float = 0.0,
+        w_min: float = 0.05,
+        rate_bounds: tuple[float, float] = (0.0, 1.0),
+    ) -> None:
+        if mode not in self.NEEDS_TEACHER:
+            raise ValueError(f"unknown IntensityGate mode {mode!r}")
+        if not (0.0 <= epsilon < 0.5):
+            raise ValueError(f"epsilon must be in [0, 0.5), got {epsilon}")
+        if not (0.0 < eta_max < 1.0):
+            raise ValueError(f"eta_max must be in (0,1), got {eta_max}")
+        if mode in ("adaptive", "d_var", "soft_or") and theta_d <= 0:
+            raise ValueError(f"mode {mode!r} requires theta_d > 0, got {theta_d}")
+        if mode in ("entropy", "soft_or") and entropy_theta <= 0:
+            raise ValueError(
+                f"mode {mode!r} requires entropy_theta > 0, got {entropy_theta}"
+            )
+        self.mode = mode
+        self.eta_max = float(eta_max)
+        self.epsilon = float(epsilon)
+        self.theta_d = float(theta_d)
+        self.entropy_theta = float(entropy_theta)
+        self.w_min = float(w_min)
+        self.rate_bounds = rate_bounds
+        self._decisions = 0
+        self._opens = 0
+
+    @property
+    def needs_teacher(self) -> bool:
+        return self.NEEDS_TEACHER[self.mode]
+
+    def base_w(self, *, entropy: float = 0.0, d_value: float = 0.0) -> float:
+        """探针前的确定性强度(纯函数;entropy 档不读 d_value,可在
+        verify 之前调用——段级 bypass 判定的依据)。"""
+        if self.mode == "always_on":
+            return 1.0
+        if self.mode == "adaptive":
+            return 1.0 if d_value >= self.theta_d else 0.0
+        w_e = min(1.0, max(0.0, entropy) / self.entropy_theta) \
+            if self.entropy_theta > 0 else 0.0
+        if self.mode == "entropy":
+            return w_e
+        w_d = min(1.0, max(0.0, d_value) / self.theta_d)
+        if self.mode == "d_var":
+            return w_d
+        return 1.0 - (1.0 - w_e) * (1.0 - w_d)   # soft_or
+
+    def decide(
+        self, *, entropy: float, d_value: float, rng: np.random.Generator
+    ) -> GateDecision:
+        """终判(含探针)。签名红线沿 SteeringGate:只接受观测信号与独立
+        随机数,无 token / 后缀入口。"""
+        w0 = self.base_w(entropy=entropy, d_value=d_value)
+        if self.mode == "adaptive":
+            # v3.0 硬门等价:双向翻转,propensity 按 base_open 分派。
+            base_open = w0 >= 1.0
+            flipped = bool(rng.random() < self.epsilon)
+            open_now = base_open ^ flipped
+            w = 1.0 if open_now else 0.0
+            propensity = (1.0 - self.epsilon) if base_open else self.epsilon
+        else:
+            base_open = w0 >= self.w_min
+            effective = w0 if base_open else 0.0
+            flipped = bool(
+                effective > 0.0 and self.epsilon > 0.0
+                and rng.random() < self.epsilon
+            )
+            w = 0.0 if flipped else effective
+            propensity = (1.0 - self.epsilon) if effective > 0.0 else 0.0
+        self._decisions += 1
+        self._opens += int(w > 0.0)
+        return GateDecision(
+            eta=self.eta_max * w,
+            d_value=float(d_value),
+            base_open=base_open,
+            probe_flipped=flipped,
+            propensity=propensity,
+            intensity=w,
+        )
+
+    @property
+    def open_rate(self) -> float:
+        return self._opens / self._decisions if self._decisions else 0.0
+
+    def rate_alarm(self) -> str | None:
+        if self._decisions < 50:
+            return None
+        lo, hi = self.rate_bounds
+        r = self.open_rate
+        if r < lo:
+            return f"intensity open-rate {r:.3f} below floor {lo}"
+        if r > hi:
+            return f"intensity open-rate {r:.3f} above ceiling {hi}"
+        return None
+
+
 def robust_quantile_update(current_theta: float, d_samples: np.ndarray, q: float = 0.85, ema: float = 0.9) -> float:
     """训练步之间的 Θ_D 慢更新：robust-EMA 到本步 D 分布的 q 分位（NF07 修法）。
 
@@ -131,6 +255,7 @@ class GateThresholdTracker:
         d_hist_max: float,
         bins: int,
         min_obs: int = 500,
+        floor: float = 0.0,
     ) -> None:
         import threading
 
@@ -138,7 +263,10 @@ class GateThresholdTracker:
             raise ValueError(f"target_rate must be in (0,1), got {target_rate}")
         if not (0.0 < ema_beta <= 1.0):
             raise ValueError(f"ema_beta must be in (0,1], got {ema_beta}")
-        self.theta = float(theta_init)
+        # v3.3 M4:硬地板(熵门用;防阈值追着分布坍缩跑,MENTOR
+        # max(q80, 1.5) 先例)。D 门语境传 0 保持历史行为。
+        self.floor = float(floor)
+        self.theta = max(float(theta_init), self.floor)
         self.target_rate = float(target_rate)
         self.ema_beta = float(ema_beta)
         self.d_hist_max = float(d_hist_max)
@@ -175,7 +303,9 @@ class GateThresholdTracker:
             k = self._last_step - (self._last_update_step or self._last_step)
             beta_eff = 1.0 - (1.0 - self.ema_beta) ** max(k, 1)
             target = self._hist_quantile(1.0 - self.target_rate)
-            self.theta = (1.0 - beta_eff) * self.theta + beta_eff * target
+            self.theta = max(
+                (1.0 - beta_eff) * self.theta + beta_eff * target, self.floor
+            )
             self._acc = [0] * self.bins
             self._acc_count = 0
             self._last_update_step = self._last_step

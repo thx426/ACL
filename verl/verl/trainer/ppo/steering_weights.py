@@ -26,7 +26,7 @@ Guarantees inherited from the sampling side (trace_opd steering package):
 
 Modes (ablation switch, spec §2.6; PRECISE definitions per review max-IF-14 —
 the short names are configuration labels, not literature-faithful claims):
-  per_token     W_t = pi/b at steered positions, 1 elsewhere (default).
+  per_token     W_t = pi/b at steered positions, 1 elsewhere (v3.0 default).
   per_decision  PDIS prefix product: W_t = prod_{s<=t} pi/b — the product up
                 to position t applied to position t's score term ONLY. This
                 is per-decision importance sampling, NOT full-trajectory IS
@@ -36,6 +36,18 @@ the short names are configuration labels, not literature-faithful claims):
                 borrowed from V-trace. NOT the full V-trace estimator (no
                 value targets, no c-bar trace recursion); do not cite
                 V-trace bias/contraction results for runs using it.
+  shaped_reject v3.3 M3 (docs/pgs-v33-mixed-policy-design.md): rejection
+                positions (teacher actually replaced the draft) get
+                f(pi) = pi/(pi+gamma) — LUFFY's policy-shaping weight, which
+                RAISES the gradient share of low-probability taught tokens
+                instead of discounting them (the faithful pi/b weight
+                suppresses exactly the positions where the teacher carries
+                information — the s3 absorption bottleneck). Accepted
+                positions stay at 1. This is a gradient-shaping weight, NOT
+                an unbiased IS correction — do not cite unbiasedness for
+                runs using it.
+  ("off" never reaches this function: the caller skips the whole
+  rollout_is_weights channel, MENTOR form — ratio denominator stays pi_old.)
 """
 from __future__ import annotations
 
@@ -43,7 +55,7 @@ import numpy as np
 
 __all__ = ["expand_behavior_weights", "WBEH_MODES"]
 
-WBEH_MODES = ("per_token", "per_decision", "vtrace")
+WBEH_MODES = ("per_token", "per_decision", "vtrace", "shaped_reject")
 
 
 def expand_behavior_weights(
@@ -54,6 +66,8 @@ def expand_behavior_weights(
     response_len: int,
     mode: str = "per_token",
     log_ratio_cap: float | None = None,
+    rejected: list[int] | None = None,
+    shaped_gamma: float = 0.1,
 ) -> np.ndarray:
     """Sparse ledger rows -> dense per-token weights (float32, response_len).
 
@@ -93,6 +107,21 @@ def expand_behavior_weights(
         weights[pos] = np.exp(log_ratio).astype(np.float32)
     elif mode == "vtrace":
         weights[pos] = np.minimum(1.0, np.exp(log_ratio)).astype(np.float32)
+    elif mode == "shaped_reject":
+        if rejected is None or len(rejected) != len(positions):
+            raise ValueError(
+                "shaped_reject needs a rejected flag per ledger row "
+                f"(got {0 if rejected is None else len(rejected)} for "
+                f"{len(positions)} rows) — ledger accounting incomplete"
+            )
+        if shaped_gamma <= 0:
+            raise ValueError(f"shaped_gamma must be > 0, got {shaped_gamma}")
+        rej = np.asarray(rejected, dtype=bool)[keep]
+        # log_pi rows record the EXECUTED token's log pi — on a rejection row
+        # that is the resampled (taught) token, exactly the pi that LUFFY's
+        # f(pi) = pi/(pi+gamma) shaping wants.
+        p = np.exp(np.asarray(log_pi, dtype=np.float64)[keep][rej])
+        weights[pos[rej]] = (p / (p + shaped_gamma)).astype(np.float32)
     else:  # per_decision: prefix product carried forward to every later token
         running = np.zeros(response_len, dtype=np.float64)
         np.add.at(running, pos, log_ratio)

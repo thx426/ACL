@@ -20,7 +20,20 @@ session_id 允许缺失(兼容 V0 等不传 session_id 的调用路径)。
 """
 from __future__ import annotations
 
-__all__ = ["steered_arm_count", "is_steered_arm", "role_of"]
+__all__ = ["steered_arm_count", "is_steered_arm", "role_of", "steered_retired"]
+
+
+def steered_retired(adv_mode: str, decay_steps: int, global_step) -> bool:
+    """v3.3 M2:α 衰减到期后 steered 臂停产的判定(纯函数;rollout 端与
+    advantage 端各按同一 cosine 公式独立求值,此处只需到期布尔)。
+    global_step 未知(None/非整数)时保守不停。"""
+    if adv_mode != "asym" or int(decay_steps) <= 0:
+        return False
+    try:
+        gs = int(global_step)
+    except (TypeError, ValueError):
+        return False
+    return gs >= int(decay_steps)
 
 #: v4 行角色常量(docs/pgs-self-researcher-design.md §0)
 ROLE_BARE = "bare"

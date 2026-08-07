@@ -53,7 +53,15 @@ from ..research.versioning import (
     assert_rollout_policy_version,
     research_policy_version,
 )
-from ..steering.arms import ROLE_BARE, ROLE_RESEARCH, ROLE_STEERED, is_steered_arm, role_of, steered_arm_count
+from ..steering.arms import (
+    ROLE_BARE,
+    ROLE_RESEARCH,
+    ROLE_STEERED,
+    is_steered_arm,
+    role_of,
+    steered_arm_count,
+    steered_retired,
+)
 from .backends import EngineGenerate, EngineResearcherChat, engine_narrate_fn
 from .selfres import CoordRegistry, TaskCoord, run_research_row
 
@@ -138,6 +146,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         workers = int(os.environ.get("TRACE_AGENT_WORKERS", config.train.agent_num_workers))
         doc_table: dict[str, str] = {}
         gate_tracker = None
+        ent_tracker = None
         researcher_client = None
         if config.steering.enabled:
             if config.steering.doc_source == "static":
@@ -175,21 +184,39 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 )
             if config.steering.gate_adaptive:
                 from ..steering.gate import GateThresholdTracker
-                from ..steering.ledger import D_HIST_BINS
+                from ..steering.ledger import D_HIST_BINS, ENT_HIST_BINS, ENT_HIST_MAX
 
-                gate_tracker = GateThresholdTracker(
-                    theta_init=config.steering.theta_d,
-                    target_rate=config.steering.gate_target_rate,
-                    ema_beta=config.steering.gate_ema_beta,
-                    d_hist_max=config.steering.c * config.steering.c,
-                    bins=D_HIST_BINS,
-                )
-                logger.info(
-                    "gate adaptive tracking on: q=%.2f beta=%.2f theta_init=%.4f",
-                    config.steering.gate_target_rate,
-                    config.steering.gate_ema_beta,
-                    config.steering.theta_d,
-                )
+                if config.steering.gate_mode in ("adaptive", "d_var", "soft_or"):
+                    gate_tracker = GateThresholdTracker(
+                        theta_init=config.steering.theta_d,
+                        target_rate=config.steering.gate_target_rate,
+                        ema_beta=config.steering.gate_ema_beta,
+                        d_hist_max=config.steering.c * config.steering.c,
+                        bins=D_HIST_BINS,
+                    )
+                    logger.info(
+                        "gate adaptive tracking on: q=%.2f beta=%.2f theta_init=%.4f",
+                        config.steering.gate_target_rate,
+                        config.steering.gate_ema_beta,
+                        config.steering.theta_d,
+                    )
+                if config.steering.gate_mode in ("entropy", "soft_or"):
+                    # v3.3 M4:H_q 率控自适应(同一 tracker 基建换信号源;
+                    # floor = 硬地板,防阈值追熵坍缩)。
+                    ent_tracker = GateThresholdTracker(
+                        theta_init=config.steering.entropy_theta_init,
+                        target_rate=config.steering.entropy_target_rate,
+                        ema_beta=config.steering.gate_ema_beta,
+                        d_hist_max=ENT_HIST_MAX,
+                        bins=ENT_HIST_BINS,
+                        floor=config.steering.entropy_floor,
+                    )
+                    logger.info(
+                        "entropy gate tracking on: rate=%.2f init=%.3f floor=%.3f",
+                        config.steering.entropy_target_rate,
+                        config.steering.entropy_theta_init,
+                        config.steering.entropy_floor,
+                    )
         _STATE.update(
             {
                 "config": config,
@@ -198,6 +225,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 "factory": make_env_factory(config, workers=workers),
                 "doc_table": doc_table,
                 "gate_tracker": gate_tracker,
+                "ent_tracker": ent_tracker,
                 "archive": ResearchArchive(run_dir),
                 "researcher_client": researcher_client,
                 # 同一 worker/event loop 内按(step,task)共享一次 producer。
@@ -222,6 +250,7 @@ class TraceAgentLoop(AgentLoopBase):
         self.factory: EnvFactory = state["factory"]
         self.doc_table: dict[str, str] = state["doc_table"]
         self.gate_tracker = state["gate_tracker"]
+        self.ent_tracker = state["ent_tracker"]
         self.archive: ResearchArchive = state["archive"]
         self.researcher_client = state["researcher_client"]
         self.research_tasks: dict = state["research_tasks"]
@@ -526,8 +555,10 @@ class TraceAgentLoop(AgentLoopBase):
             "truncated": bool(rowres.fields.get("research_overlong")),
             **steer_zero,
             "steer_w_beh_mode": self.cfg.steering.w_beh_mode,
+            "steer_w_beh_gamma": self.cfg.steering.w_beh_shaped_gamma,
             "steer_log_ratio_cap": 2.0 * self.cfg.steering.eta_max * self.cfg.steering.c,
             "steer_theta_d": 0.0,
+            "steer_entropy_theta": 0.0,
             "doc_missing": 0,
             "doc_overflow": 0,
             "steer_arm": 0,
@@ -627,9 +658,16 @@ class TraceAgentLoop(AgentLoopBase):
                 self.cfg.steering.steered_fraction,
                 self.cfg.research_rl.research_n,
             )
+            # v3.3 M2 停产:α 到期后 steered 槽位全部转 bare(research 行照产;
+            # coord 的 bare_expected 随之取全额)。
+            _retired = self._steered_arm_retired(global_step)
+            if _retired and role == ROLE_STEERED:
+                role = ROLE_BARE
             rrl = self.cfg.research_rl
-            bare_expected = self.cfg.train.rollout_n - steered_arm_count(
-                self.cfg.train.rollout_n, self.cfg.steering.steered_fraction
+            bare_expected = self.cfg.train.rollout_n - (
+                0 if _retired else steered_arm_count(
+                    self.cfg.train.rollout_n, self.cfg.steering.steered_fraction
+                )
             )
             coord = await self._v4_registry.get(
                 int(global_step), adapter.task_id,
@@ -672,7 +710,11 @@ class TraceAgentLoop(AgentLoopBase):
             # 逐副本传入,round(n×fraction) 个副本走 steered 臂,其余为纯 π
             # 的 bare 臂——同组进 GRPO,恢复 bare 逐步读数与原生负梯度,
             # 混合组 baseline 把"教师能成/policy 失败"的差距转成对比信号。
-            steered_arm = is_steered_arm(
+            # v3.3 M2:α 衰减到期后 steered 臂停产(教师=有限期脚手架),
+            # 全部副本转 bare;advantage 端同步公式给 α=0,两处独立同源。
+            steered_arm = (
+                not self._steered_arm_retired(global_step)
+            ) and is_steered_arm(
                 _as_int(kwargs.get("session_id")),
                 self.cfg.train.rollout_n,
                 self.cfg.steering.steered_fraction,
@@ -681,6 +723,8 @@ class TraceAgentLoop(AgentLoopBase):
                 # 率控自适应:step 边界用上一 step 的 D 直方图 EMA 更新 θ_D
                 # (步内冻结;滞后一步)。
                 self.gate_tracker.maybe_step_update(global_step)
+            if self.ent_tracker is not None:
+                self.ent_tracker.maybe_step_update(global_step)
             if self.cfg.steering.doc_source == "researcher":
                 # student 启动前 await 文档;同 step 的 n=8 全部等待同一共享任务。
                 # bare 臂也 await:producer 按 (step,task) 只跑一次,bare 副本
@@ -764,12 +808,16 @@ class TraceAgentLoop(AgentLoopBase):
             )
             steer_fields.update(ledger.finalize())
             steer_fields["steer_w_beh_mode"] = self.cfg.steering.w_beh_mode
+            steer_fields["steer_w_beh_gamma"] = self.cfg.steering.w_beh_shaped_gamma
             steer_fields["steer_log_ratio_cap"] = (
                 2.0 * self.cfg.steering.eta_max * self.cfg.steering.c
             )
             if state is not None and self.gate_tracker is not None:
                 # 本轨迹的 D 观测并入 worker 级追踪器(下一 step 边界生效)
                 self.gate_tracker.observe(state.ledger.d_hist, state.ledger.d_count)
+            if state is not None and self.ent_tracker is not None:
+                # v3.3 M4:熵观测并入 H_q 追踪器(G-E/SOR 的率控自适应)
+                self.ent_tracker.observe(state.ledger.ent_hist, state.ledger.ent_count)
             # 本轨迹实际使用的 θ_D(自适应轨迹审计;swanlab 曲线自动收)。
             # always_on 档 θ=−inf 无语义,写 0.0 哨兵防 inf 污染数值曲线。
             theta_used = (
@@ -779,6 +827,13 @@ class TraceAgentLoop(AgentLoopBase):
             )
             steer_fields["steer_theta_d"] = (
                 theta_used if math.isfinite(theta_used) else 0.0
+            )
+            # v3.3 M4:本轨迹实际使用的 H_q(熵档快照;非熵档 0.0 哨兵)
+            steer_fields["steer_entropy_theta"] = (
+                state.gate.entropy_theta
+                if state is not None
+                and self.cfg.steering.gate_mode in ("entropy", "soft_or")
+                else 0.0
             )
             if state is not None:
                 alarm = state.gate.rate_alarm()
@@ -858,6 +913,10 @@ class TraceAgentLoop(AgentLoopBase):
 
     # ---------------------------------------------------------------- rollout
 
+    def _steered_arm_retired(self, global_step) -> bool:
+        st = self.cfg.steering
+        return steered_retired(st.adv_mode, st.steered_adv_decay_steps, global_step)
+
     def _make_generate(self, adapter, epi_route: str, steer_ctx: dict[str, Any] | None):
         """学生 episode 的生成通道:纯 EngineGenerate,或(有 doc 时)SPS 包装。
 
@@ -868,7 +927,7 @@ class TraceAgentLoop(AgentLoopBase):
         if not steer_ctx or not steer_ctx.get("doc"):
             return engine
         from ..core import protocol
-        from ..steering import SteeringGate, TrajectoryBudget, TurnRejectCap
+        from ..steering import IntensityGate, TrajectoryBudget, TurnRejectCap
         from ..steering.hook import SpsGenerate, TrajectorySteerState
 
         # 与 episode 内部的构造逐字节同参(episode 会断言 env 初始观察与
@@ -891,23 +950,30 @@ class TraceAgentLoop(AgentLoopBase):
         st_cfg = self.cfg.steering
         from ..steering import SteeringLedger
 
-        if st_cfg.gate_mode == "always_on":
-            # maxopen 档(v3.2):无门判定——θ_D=−inf 使 decide 恒 base_open,
-            # 探针已被校验强制 ε=0,率告警带置 (0,1) 关闭语义。gate 代码零改动,
-            # θ 标定/率控自适应子系统对该档整体退役(tracker 经 gate_adaptive=
-            # false 已不构造)。
-            theta_now = float("-inf")
-            rate_bounds = (0.0, 1.0)
-        else:
-            theta_now = (
-                self.gate_tracker.theta if self.gate_tracker is not None else st_cfg.theta_d
-            )
-            rate_bounds = tuple(st_cfg.gate_rate_bounds)
+        # v3.3 M4:统一强度门(五档;always_on/adaptive 为 v3.2/v3.0 的
+        # 等价适配,decide 产出与旧 SteeringGate 逐字段一致——等价性由
+        # tests/steering/test_intensity_gate.py 锁定)。阈值一条轨迹内冻结:
+        # 自适应经 worker 级 tracker 跨 step 慢更,构造时取当前快照。
+        theta_now = (
+            self.gate_tracker.theta if self.gate_tracker is not None
+            else st_cfg.theta_d
+        )
+        ent_theta_now = (
+            self.ent_tracker.theta if self.ent_tracker is not None
+            else st_cfg.entropy_theta_init
+        )
+        rate_bounds = (
+            (0.0, 1.0) if st_cfg.gate_mode == "always_on"
+            else tuple(st_cfg.gate_rate_bounds)
+        )
         state = TrajectorySteerState(
-            gate=SteeringGate(
-                theta_d=theta_now,
+            gate=IntensityGate(
+                mode=st_cfg.gate_mode,
                 eta_max=st_cfg.eta_max,
                 epsilon=st_cfg.epsilon,
+                theta_d=theta_now,
+                entropy_theta=ent_theta_now,
+                w_min=st_cfg.intensity_w_min,
                 rate_bounds=rate_bounds,
             ),
             budget=TrajectoryBudget(

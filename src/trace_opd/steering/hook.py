@@ -123,6 +123,16 @@ def candidate_d(log_pi: np.ndarray, ell: np.ndarray) -> float:
     return float(np.dot(w, (ell - mean) ** 2))
 
 
+def truncated_entropy(topk_logprobs) -> float:
+    """学生截断熵 h = −Σ_{topK} p·logp(观测窗内口径,尾部质量忽略——
+    G-E 门信号与标定同口径即自洽;draft 侧免费,任何门档都观察)。"""
+    lp = np.asarray(topk_logprobs, dtype=np.float64)
+    if lp.size == 0:
+        return 0.0
+    p = np.exp(lp)
+    return float(-(p * lp).sum())
+
+
 class SpsGenerate:
     """steering 版 GenerateFn(episode 的生成通道,机制入口)。
 
@@ -253,6 +263,27 @@ class SpsGenerate:
                 finished = draft_finished
                 continue
 
+            # v3.3 M4:逐位学生截断熵(draft 侧免费;所有门档都观察——
+            # 直方图是任何后续熵门标定的数据面)。
+            seg_entropy = [
+                truncated_entropy(pi_topk_lps[g]) for g in range(len(gen_ids))
+            ]
+            for h in seg_entropy:
+                st.ledger.observe_entropy(h)
+            if not st.gate.needs_teacher:
+                # G-E(entropy)档:强度只依赖学生熵,verify 前即可判——
+                # 段内全部 w<w_min 时整段直通,教师 verify 请求归零
+                # (工程红利;D 门做不到:为判「问不问老师」必须先问老师)。
+                # always_on 档 base_w≡1 ≥ w_min,恒不满足,自然照旧 verify。
+                if max(
+                    st.gate.base_w(entropy=h) for h in seg_entropy
+                ) < st.gate.w_min:
+                    st.ledger.n_gate_bypassed += len(gen_ids)
+                    executed += gen_ids
+                    executed_logpi += [float(x) for x in pi_lp]
+                    finished = draft_finished
+                    continue
+
             pt_rows = await self._verify_rows(
                 prompt_ids,
                 executed,
@@ -286,7 +317,9 @@ class SpsGenerate:
                 st.ledger.observe_ell(raw_ell)
                 d_value = candidate_d(s_log_pi, s_ell)
                 st.ledger.observe_d(d_value, position=position)
-                decision = st.gate.decide(d_value, st.rng)
+                decision = st.gate.decide(
+                    entropy=seg_entropy[g], d_value=d_value, rng=st.rng
+                )
                 st.ledger.n_base_open += int(decision.base_open)
                 st.ledger.n_probe_flipped += int(decision.probe_flipped)
                 eta = st.budget.admissible_eta(decision.eta)
@@ -305,6 +338,8 @@ class SpsGenerate:
                             budget_after=st.budget.remaining,
                             unlocked_at=st.budget.unlocked,
                             draft_token=y, final_token=y,
+                            intensity=decision.intensity,
+                            entropy=seg_entropy[g],
                         ))
                     executed.append(y)
                     executed_logpi.append(log_pi_y)
@@ -362,6 +397,8 @@ class SpsGenerate:
                     final_token_pi_rank=final_rank,
                     pi_top16=pi_top16,
                     pt_top16=pt_top16,
+                    intensity=decision.intensity,
+                    entropy=seg_entropy[g],
                 ))
                 executed.append(int(outcome.token_id))
                 executed_logpi.append(float(outcome.log_pi))

@@ -24,6 +24,8 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
 
+import math
+
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -699,6 +701,104 @@ def compute_grpo_loo_outcome_advantage(
                 out[i] = centred[k]
         out = out.unsqueeze(-1) * response_mask
 
+    return out, out
+
+
+def pgs_steered_alpha(global_step: int, *, alpha0: float, decay_steps: int) -> float:
+    """trace-opd PGS v3.3 M2: cosine schedule for the steered-arm advantage
+    weight. decay_steps<=0 disables the schedule (alpha == alpha0 forever);
+    otherwise alpha follows alpha0 * 0.5*(1+cos(pi*t/T)) and is exactly 0 from
+    step T on — past that point the rollout side also stops producing the
+    steered arm (teacher scaffold with an expiry date, MENTOR form)."""
+    if decay_steps <= 0:
+        return float(alpha0)
+    t = max(0, int(global_step))
+    if t >= decay_steps:
+        return 0.0
+    return float(alpha0) * 0.5 * (1.0 + math.cos(math.pi * t / decay_steps))
+
+
+def compute_pgs_asym_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    steer_arm: np.ndarray,
+    alpha: float,
+    steered_cap: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """trace-opd PGS v3.3 M1: asymmetric two-arm advantage
+    (docs/pgs-v33-mixed-policy-design.md; MENTOR ICLR'26 Eq.12/13 form).
+
+    Per uid group:
+      * bare rows (arm==0): strict leave-one-out baseline over the BARE rows
+        only, no std normalisation (Dr.GRPO form, same scale convention as
+        grpo_loo's primary profile) — the guided arm can no longer inflate
+        the baseline that punishes bare failures (the s3 mode-erosion root).
+      * steered rows (arm==1): clamp_min(r - mean(bare rows), 0) * alpha —
+        positive excess over the bare mean only; a failed guided rollout gets
+        exactly zero advantage (its failure may be caused by the intervention,
+        attribution is unclear, so it must not push gradients).
+      * unknown rows (arm<0, e.g. v4 research rows whose uid carries the
+        ":research" suffix and therefore forms its own group): plain LOO,
+        byte-equivalent to grpo_loo's no-std branch.
+      * steered_cap>0: if the group's steered advantages sum above the cap,
+        scale them down proportionally (MENTOR expert_cap guard; off by
+        default).
+
+    NOT registered in the estimator registry on purpose: the extra inputs
+    (steer_arm, alpha) come from the trainer's tag channel and step schedule,
+    so the call site is the v1 trainer's explicit branch, not the generic
+    dispatch.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    id2rows = defaultdict(list)
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2rows[index[i]].append(i)
+        out = scores.clone()
+        for rows in id2rows.values():
+            bare = [i for i in rows if steer_arm[i] == 0]
+            steered = [i for i in rows if steer_arm[i] == 1]
+            unknown = [i for i in rows if steer_arm[i] < 0]
+            if steered and not bare:
+                raise ValueError(
+                    "pgs_asym_grpo: a group contains steered rows but no bare "
+                    "rows — the steered baseline (bare mean) is undefined. "
+                    "Arm assignment / uid grouping is corrupted; failing loud."
+                )
+            # bare rows: LOO over the bare arm only (no-std).
+            if len(bare) >= 2:
+                r = torch.stack([scores[i] for i in bare])
+                total = r.sum()
+                mean_loo = (total - r) / (len(bare) - 1)
+                for k, i in enumerate(bare):
+                    out[i] = r[k] - mean_loo[k]
+            elif len(bare) == 1:
+                out[bare[0]] = torch.zeros_like(scores[bare[0]])
+            # steered rows: positive excess over the bare mean, scaled by alpha.
+            if steered:
+                bare_mean = torch.stack([scores[i] for i in bare]).mean()
+                adv = [torch.clamp_min(scores[i] - bare_mean, 0.0) * alpha
+                       for i in steered]
+                if steered_cap > 0.0:
+                    total_adv = torch.stack(adv).sum()
+                    if float(total_adv) > steered_cap:
+                        adv = [a * (steered_cap / total_adv) for a in adv]
+                for k, i in enumerate(steered):
+                    out[i] = adv[k]
+            # unknown rows (research groups etc.): plain LOO, grpo_loo no-std.
+            if len(unknown) >= 2:
+                r = torch.stack([scores[i] for i in unknown])
+                total = r.sum()
+                mean_loo = (total - r) / (len(unknown) - 1)
+                for k, i in enumerate(unknown):
+                    out[i] = r[k] - mean_loo[k]
+            elif len(unknown) == 1:
+                # plain-GRPO single-row convention (raw score through),
+                # matching grpo_loo's n==1 branch.
+                pass
+        out = out.unsqueeze(-1) * response_mask
     return out, out
 
 

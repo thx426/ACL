@@ -370,11 +370,16 @@ class SteeringCfg:
     enabled: bool = False
     # 缺省 static 保持历史配置/指纹语义；researcher 每 step 在线产文档。
     doc_source: str = "static"       # static | researcher
-    gate_mode: str = "adaptive"    # 门控模式(机制 v3.2,用户裁定 2026-08-06):
-                                   # adaptive = D 门 + ε 探针 + θ_D 率控自适应(历史行为);
-                                   # always_on = 无门判定,每个候选位置恒 η=η_max
-                                   # (maxopen 档:outcome reward + bare 臂锚的语境下
-                                   # 允许最大程度干预;θ 标定/探针/率告警整体退役)。
+    gate_mode: str = "adaptive"    # 门控模式(v3.2 硬门档 + v3.3 软强度档,
+                                   # docs/pgs-v33-mixed-policy-design.md M4):
+                                   # adaptive = D 硬门 + ε 探针 + θ_D 率控自适应(历史行为);
+                                   # always_on = 无门判定,每个候选位置恒 η=η_max(maxopen);
+                                   # entropy = G-E 软强度 w=min(1, h/H_q)(h=学生截断熵,
+                                   #   draft 侧免费;w<w_min 的整段跳过教师 verify);
+                                   # d_var = G-D 软化 w=min(1, D/θ_D)(保教师异议信息,
+                                   #   verify 先行,阈值自适应复用 D 门基建);
+                                   # soft_or = G-SOR w=1−(1−w_E)(1−w_D)(两盲区互补,
+                                   #   需两侧信号,无 bypass 红利)。
                                    # 进 objective_fingerprint(改变行为分布 b)
     doc_table: str = ""            # static:task_id→doc 的 jsonl 表；researcher 可空
     eta_max: float = 0.5           # 倾斜强度上限
@@ -397,7 +402,14 @@ class SteeringCfg:
     r_max: int = 0                 # 每轮拒绝上限;0=无上限(v3.2 默认,用户裁定
                                    # 2026-08-06:干预不受轮内拒绝数限制,bare 臂+
                                    # outcome reward 锚定);≥1=历史 cap 行为态
-    w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace(消融开关,规范 §2.6)
+    w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace | off |
+                                   # shaped_reject(v3.3 M3,spec §2.6 版本演进):
+                                   # off = steered 行为分布免 IS(MENTOR 口径,ratio
+                                   #   分母统一 π_old;偏差由 asym advantage 的 [·]₊
+                                   #   与 α 承接)——v3.3 推荐默认;
+                                   # shaped_reject = 仅拒绝位乘 f(π)=π/(π+γ)(LUFFY
+                                   #   反向加权:低概率教学位拿更大梯度),接受位=1
+    w_beh_shaped_gamma: float = 0.1  # shaped_reject 的 γ(LUFFY 实证默认 0.1)
     budget_pacing: bool = False    # 预算解锁曲线(2026-08-05 用户裁定,修 s1 头部坍缩;
                                    # docs/pgs-budget-pacing-design.md):false=旧行为
                                    # (t=0 全解锁)。S2 起 true
@@ -410,14 +422,46 @@ class SteeringCfg:
                                    # GRPO。1.0=历史全臂行为(不进指纹);<1 时
                                    # round(n×fraction) 为 steered 数,按
                                    # session_id 确定性分配(steering/arms.py)
+    # ---- v3.3 M1/M2:不对称 advantage 与 α 有限期调度(用户裁定 2026-08-07;
+    # docs/pgs-v33-mixed-policy-design.md)----
+    adv_mode: str = "legacy_shared"  # legacy_shared = v3.1 口径(两臂同组共享
+                                   # LOO 基线;既有 run 语义,指纹不变);
+                                   # asym = bare 组内 LOO(no-std 不变)+
+                                   # steered=[R−mean_bare]₊×α_t(失败零梯度
+                                   # 不惩罚;MENTOR Eq.13 口径,s3 弥散化病根
+                                   # 的结构性修复)。进 objective_fingerprint;
+                                   # asym 要求 train.adv_estimator=pgs_asym_grpo
+    steered_adv_weight: float = 1.0    # α_0(asym 档 steered 超额的权重初值)
+    steered_adv_decay_steps: int = 0   # T_decay:α_t=α_0·½(1+cos(π·t/T)),
+                                   # t≥T 后恒 0 **且 steered 臂停产**(教师=
+                                   # 有限期脚手架,MENTOR 同款;建议取总步数
+                                   # 2/3 给副动作族慢热留窗)。0=不衰减
+                                   # (α 恒 α_0,steered 不停产)
+    steered_adv_cap: float = 0.0   # 组内 steered advantage 总额上限(>0 激活;
+                                   # MENTOR expert_cap 同款防御闸,默认关)
+    # ---- v3.3 M4:软强度门控参数(gate_mode=entropy|d_var|soft_or)----
+    entropy_target_rate: float = 0.05  # 满强度位置的目标占比(阈值 H_q 追踪
+                                   # 熵分布的 P_{1−rate};MENTOR entropy_p=0.95
+                                   # 即 rate=0.05)
+    entropy_theta_init: float = 0.0    # H_q 的 EMA 初值(目标语境标定回填;
+                                   # entropy/soft_or 档校验拒 0——标定纪律
+                                   # 与 theta_d 同款)
+    entropy_floor: float = 0.0     # H_q 硬地板(防阈值追着熵坍缩跑,MENTOR
+                                   # max(q80,1.5) 先例;entropy/soft_or 档须 >0)
+    intensity_w_min: float = 0.05  # w<w_min 的位置视为关门(bypass;entropy 档
+                                   # 整段全 bypass 时跳过教师 verify——工程红利)
 
     def __post_init__(self) -> None:
         # yaml 1.1 把 1.0e9(无符号指数)解析成字符串——数值字段一律强转,
         # 转不动就在这里死,而不是在校验/运行期比较时抛 TypeError。
         for f in ("eta_max", "c", "b_max", "theta_d", "epsilon",
                   "gate_target_rate", "gate_ema_beta",
-                  "budget_u0", "budget_profile_power", "steered_fraction"):
+                  "budget_u0", "budget_profile_power", "steered_fraction",
+                  "steered_adv_weight", "steered_adv_cap", "w_beh_shaped_gamma",
+                  "entropy_target_rate", "entropy_theta_init", "entropy_floor",
+                  "intensity_w_min"):
             setattr(self, f, float(getattr(self, f)))
+        self.steered_adv_decay_steps = int(self.steered_adv_decay_steps)
         self.topk = int(self.topk)
         self.obs_topk = int(self.obs_topk)
         self.r_max = int(self.r_max)
@@ -493,10 +537,33 @@ def _validate(cfg: "Config") -> None:
                 "steering.b_max=inf 与 budget_pacing=true 不相容(解锁曲线无定义)"
                 "——maxopen 档请显式 budget_pacing: false"
             )
-        if st.gate_mode not in ("adaptive", "always_on"):
+        if st.gate_mode not in ("adaptive", "always_on", "entropy", "d_var", "soft_or"):
             raise ValueError(
-                f"steering.gate_mode 必须是 adaptive|always_on,得到 {st.gate_mode!r}"
+                "steering.gate_mode 必须是 adaptive|always_on|entropy|d_var|soft_or,"
+                f"得到 {st.gate_mode!r}"
             )
+        if st.gate_mode in ("entropy", "soft_or"):
+            # 软强度档标定纪律(theta_d 同款):熵阈值初值与硬地板必须显式
+            # 用目标语境标定回填,拒绝未标定占位。
+            if st.entropy_theta_init <= 0:
+                raise ValueError(
+                    "steering.entropy_theta_init 未标定(<=0)——先用目标语境"
+                    "dump 的 pi_topk 熵分布定 P_{1−rate} 初值"
+                )
+            if st.entropy_floor <= 0:
+                raise ValueError(
+                    "steering.entropy_floor 必须 > 0(防阈值追熵坍缩的硬地板,"
+                    "MENTOR max(q80,1.5) 先例)"
+                )
+            if not (0.0 < st.entropy_target_rate < 1.0):
+                raise ValueError(
+                    f"steering.entropy_target_rate 必须在 (0,1),得到 {st.entropy_target_rate}"
+                )
+        if st.gate_mode in ("entropy", "d_var", "soft_or"):
+            if not (0.0 <= st.intensity_w_min < 1.0):
+                raise ValueError(
+                    f"steering.intensity_w_min 必须在 [0,1),得到 {st.intensity_w_min}"
+                )
         if st.gate_mode == "always_on":
             # maxopen 档参数纪律(参数真值必须显式可见,不做静默忽略):
             # 门语义整体退役 ⇒ 探针/率控自适应必须显式关闭,θ_D 免标定。
@@ -538,13 +605,45 @@ def _validate(cfg: "Config") -> None:
             raise ValueError(
                 f"steering.gate_rate_bounds 必须是 [lo, hi] 且 0<=lo<hi<=1,得到 {rb!r}"
             )
-        if st.gate_mode == "adaptive" and st.theta_d <= 0:
+        if st.gate_mode in ("adaptive", "d_var", "soft_or") and st.theta_d <= 0:
             raise ValueError(
                 "steering.theta_d 未标定(<=0)——先用目标文档语境预扫描 D 分布定 P85"
-                "(gate_mode=always_on 免标定)"
+                "(gate_mode=always_on/entropy 免标定)"
             )
-        if st.w_beh_mode not in ("per_token", "per_decision", "vtrace"):
+        if st.w_beh_mode not in ("per_token", "per_decision", "vtrace",
+                                 "off", "shaped_reject"):
             raise ValueError(f"未知 w_beh_mode {st.w_beh_mode!r}")
+        if st.w_beh_mode == "shaped_reject" and st.w_beh_shaped_gamma <= 0:
+            raise ValueError(
+                f"steering.w_beh_shaped_gamma 必须 > 0,得到 {st.w_beh_shaped_gamma}"
+            )
+        # ---- v3.3 M1/M2 校验(asym advantage 与 α 调度)----
+        if st.adv_mode not in ("legacy_shared", "asym"):
+            raise ValueError(
+                f"steering.adv_mode 必须是 legacy_shared|asym,得到 {st.adv_mode!r}"
+            )
+        if st.adv_mode == "asym":
+            if t.adv_estimator != "pgs_asym_grpo":
+                raise ValueError(
+                    "steering.adv_mode=asym 要求 train.adv_estimator=pgs_asym_grpo"
+                    f"(得到 {t.adv_estimator!r})——两处必须联动,防半配置"
+                )
+            if st.steered_fraction >= 1.0:
+                raise ValueError(
+                    "steering.adv_mode=asym 需要分臂(steered_fraction<1)——"
+                    "steered 超额的基线是同组 bare 均值,全臂无 bare 可比"
+                )
+            if st.steered_adv_weight <= 0:
+                raise ValueError(
+                    f"steering.steered_adv_weight 必须 > 0,得到 {st.steered_adv_weight}"
+                )
+        elif t.adv_estimator == "pgs_asym_grpo":
+            raise ValueError(
+                "train.adv_estimator=pgs_asym_grpo 要求 steering.adv_mode=asym"
+                "(estimator 需要臂标签与 α,legacy 口径不产)"
+            )
+        if st.steered_adv_decay_steps < 0 or st.steered_adv_cap < 0:
+            raise ValueError("steered_adv_decay_steps/steered_adv_cap 必须 >= 0")
         # 分臂采样(v3.1):fraction ∈ (0,1];取整后 steered 臂至少 1 个副本
         # (=0 等价关 steering,应直接用 base 配置,拒绝歧义形态)。
         if not (0.0 < st.steered_fraction <= 1.0):
@@ -812,6 +911,26 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 条件追加:adaptive(历史行为)不改 material。
     if st.enabled and st.gate_mode != "adaptive":
         material += f"|gate_mode={st.gate_mode}"
+    # v3.3 M4 软强度门参数改变行为分布 b;条件追加(entropy/soft_or 档才有语义)。
+    if st.enabled and st.gate_mode in ("entropy", "soft_or"):
+        material += (
+            f"|entropy_gate={st.entropy_target_rate}:{st.entropy_theta_init}"
+            f":{st.entropy_floor}"
+        )
+    if st.enabled and st.gate_mode in ("entropy", "d_var", "soft_or"):
+        material += f"|intensity_w_min={st.intensity_w_min}"
+    # v3.3 M1/M2 不对称 advantage 改变优化目标;条件追加(legacy_shared 不改
+    # material,既有 run 指纹逐字节不变)。α 三参数决定 steered 梯度权重与
+    # 停产点,同批进。
+    if st.enabled and st.adv_mode != "legacy_shared":
+        material += (
+            f"|adv_mode={st.adv_mode}"
+            f"|steered_adv={st.steered_adv_weight}"
+            f":{st.steered_adv_decay_steps}:{st.steered_adv_cap}"
+        )
+    # v3.3 M3 shaped_reject 的 γ 决定拒绝位梯度权重;条件追加。
+    if st.enabled and st.w_beh_mode == "shaped_reject":
+        material += f"|w_beh_gamma={st.w_beh_shaped_gamma}"
     # v4 自体研究员(research_rl)改变优化目标(双 RL 目标 + 教师文档来源
     # 从共享单会话换为组内 argmax),全套进指纹;条件追加保历史指纹。
     rrl = cfg.research_rl

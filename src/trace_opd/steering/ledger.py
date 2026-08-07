@@ -44,6 +44,9 @@ class TokenSteerRecord:
     # [[token_id, logprob]×16],两侧分布对比)
     pi_top16: list | None = None
     pt_top16: list | None = None
+    # v3.3 M4 软强度门观察面
+    intensity: float = 1.0       # w(η = η_max·w;硬门档恒 1/0)
+    entropy: float = -1.0        # 该位置的学生截断熵(-1 = 未计算,硬门档)
 
 
 #: D 直方图口径:D = Var_{π|S}[ℓ̃] ∈ [0, c²]。bins 数固定;上界随 run 的 c
@@ -59,6 +62,12 @@ D_HIST_BINS = 2048   # 2026-08-04 加密 64→256:实测 D 的 95% 质量 < 0.1,
 #: 异议方向观察(正半区=抬升/负半区=压制)。固定对称范围,双侧溢出计入端桶。
 ELL_HIST_BINS = 96
 ELL_HIST_RANGE = 12.0   # 覆盖 [-12, 12];分辨率 0.25/桶,c∈[2,3] 标定绰绰有余
+
+#: 学生截断熵直方图(v3.3 M4 G-E 门的阈值追踪数据源;h = −Σ_{topK} p·logp,
+#: 观测窗内截断口径——标定与运行同口径即自洽)。上界取 8.0:ln(256)≈5.55,
+#: 双侧留量;溢出计末桶。
+ENT_HIST_BINS = 1024
+ENT_HIST_MAX = 8.0
 
 
 @dataclass
@@ -81,6 +90,8 @@ class SteeringLedger:
     n_budget_blocked: int = 0         # 门开但预算不允许(η 缩到 0)
     n_bypassed: int = 0               # cap/预算耗尽后未判定直通的 token 数
     n_pacing_wait: int = 0            # pacing 额度暂未解锁而直通的 token 数(非耗尽)
+    n_gate_bypassed: int = 0          # v3.3 M4:强度不足(段内全部 w<w_min)未
+                                      # verify 直通的 token 数(G-E 工程红利面)
     n_pt_window_miss: int = 0         # S 内 p_T 窗外单侧鲁棒代入次数(max-IF-13)
     # ℓ 观测直方图(c 标定 + 方向观察;窗内逐 token 等权)
     ell_hist: list[int] = field(default_factory=lambda: [0] * ELL_HIST_BINS)
@@ -89,6 +100,10 @@ class SteeringLedger:
     # ~15KB/轨迹。直方图管分布,这里管逐位置定位。)
     cand_positions: list[int] = field(default_factory=list)
     d_all: list[float] = field(default_factory=list)
+    # 学生截断熵直方图(v3.3 M4:G-E 阈值 H_q 的 tracker 数据源;每个生成
+    # 位置一次 observe_entropy——含 bypass 段,熵在 draft 侧免费)
+    ent_hist: list[int] = field(default_factory=lambda: [0] * ENT_HIST_BINS)
+    ent_count: int = 0
 
     def observe_d(self, d_value: float, position: int = -1) -> None:
         b = int(d_value / self.d_hist_max * D_HIST_BINS)
@@ -99,6 +114,12 @@ class SteeringLedger:
         if position >= 0:
             self.cand_positions.append(int(position))
             self.d_all.append(round(float(d_value), 4))
+
+    def observe_entropy(self, h: float) -> None:
+        """每个生成位置一次(bypass 段也观察——熵来自 draft,免费)。"""
+        b = int(h / ENT_HIST_MAX * ENT_HIST_BINS)
+        self.ent_hist[min(max(b, 0), ENT_HIST_BINS - 1)] += 1
+        self.ent_count += 1
 
     def observe_ell(self, raw_ell_values) -> None:
         """S 内 p_T 观测窗内 token 的未截断 ℓ,逐 token 等权入直方图。"""
@@ -159,6 +180,7 @@ class SteeringLedger:
             "steer_n_budget_blocked": self.n_budget_blocked,
             "steer_n_bypassed": self.n_bypassed,
             "steer_n_pacing_wait": self.n_pacing_wait,
+            "steer_n_gate_bypassed": self.n_gate_bypassed,
             "steer_n_pt_window_miss": self.n_pt_window_miss,
             "steer_draft_token": [r.draft_token for r in self.records],
             "steer_final_token": [r.final_token for r in self.records],
@@ -170,6 +192,13 @@ class SteeringLedger:
             "steer_d_all": list(self.d_all),
             "steer_pi_top16": [r.pi_top16 or [] for r in self.records],
             "steer_pt_top16": [r.pt_top16 or [] for r in self.records],
+            # v3.3 M4 软强度观察面(行级 w/熵 + 全量熵直方图)
+            "steer_intensity": [round(r.intensity, 4) for r in self.records],
+            "steer_entropy": [round(r.entropy, 4) for r in self.records],
+            "steer_ent_hist": list(self.ent_hist),
+            "steer_ent_count": self.ent_count,
+            "steer_ent_hist_bins": len(self.ent_hist),
+            "steer_ent_hist_max": ENT_HIST_MAX,
             # 轨迹级实测门率(swanlab 单曲线;分子分母另有计数器可复核)
             "steer_gate_open_rate": (
                 self.n_base_open / self.n_candidates if self.n_candidates else 0.0

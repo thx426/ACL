@@ -377,3 +377,12 @@ def test_dry_run_still_rejects_objective_passthrough(tmp_path, monkeypatch):
     import pytest
     with pytest.raises(SystemExit, match="bypasses the fingerprint"):
         launch_train.main()
+
+
+def test_v33_alpha_schedule_params_always_forwarded(tmp_path):
+    # v3.3 M2:α 三参恒透传(legacy 默认值时 trainer 分支不读,行为零漂移;
+    # asym 档由同一通道生效——单一传参路径防"配置了但没送到")。
+    cmd = _cmd(tmp_path)
+    assert "+algorithm.steered_adv_weight=1.0" in cmd
+    assert "+algorithm.steered_adv_decay_steps=0" in cmd
+    assert "+algorithm.steered_adv_cap=0.0" in cmd

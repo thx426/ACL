@@ -258,3 +258,31 @@ def test_trainer_base_has_no_sample_role_machinery():
     assert "research_advantage" not in src
     tq = _read("trainer/ppo/v1/agent_loop_tq.py")
     assert "sft_mask" not in tq and "tg_mask" not in tq
+
+
+def test_v33_asym_advantage_on_v1_trainer_path():
+    """v3.3 M1/M2:asym 分支必须落在实际执行的 V1 trainer(f8f26d5 教训:
+    V0 是死路径),tags 必须携带 steer_arm,estimator 与 α 调度在 core_algos。"""
+    tb = _read("trainer/ppo/v1/trainer_base.py")
+    assert "pgs_asym_grpo" in tb
+    assert "compute_pgs_asym_outcome_advantage" in tb
+    assert "pgs_steered_alpha" in tb
+    v0 = _read("trainer/ppo/ray_trainer.py")
+    assert "pgs_asym_grpo" not in v0, "asym branch must not sit on the dead V0 path"
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert '"steer_arm": field["extra_fields"].get("steer_arm")' in tq
+    ca = _read("trainer/ppo/core_algos.py")
+    assert "def compute_pgs_asym_outcome_advantage" in ca
+    assert "def pgs_steered_alpha" in ca
+    assert "clamp_min" in ca
+
+
+def test_v33_wbeh_off_short_circuits_and_shaped_reject_exists():
+    """v3.3 M3:off 档在组装层短路(不写 rollout_is_weights);shaped_reject
+    进 WBEH_MODES 并消费 rejected 标志。"""
+    tq = _read("trainer/ppo/v1/agent_loop_tq.py")
+    assert 'wbeh_mode != "off"' in tq
+    assert 'extra.get("steer_rejected")' in tq
+    sw = _read("trainer/ppo/steering_weights.py")
+    assert '"shaped_reject"' in sw
+    assert "shaped_gamma" in sw
