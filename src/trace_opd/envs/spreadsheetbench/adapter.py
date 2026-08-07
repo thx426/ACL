@@ -29,6 +29,7 @@ from ...common.config import SpreadsheetbenchCfg
 from ...core import protocol
 from ...core.adapter import ActionOutcome
 from .evaluator import evaluate, find_test_cases, preview_workbook
+from .recalc import find_soffice, recalculated_for_grading
 
 #: 无合法 tool call 时的提醒(本环境习语;裸文本——assistant 未发起调用,
 #: 反馈不是 tool 响应)
@@ -52,30 +53,24 @@ For each function call, return a json object with function name and arguments wi
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
 
-# 公式陷阱三要素文案(因果机理 + MUST 规则 + 字面指令覆盖授权)来自旧项目
-# 48 探针实证收敛(skills_evolve explorer_trajectories_review/
-# 06_ss_global_residual_48probe_ledger.md,probe_046 generic 段):泛泛的
-# "写静态值"指令不足以让 agent 放弃写公式(53647 连败 23 探针,签名恒
-# pred=None),显式解释评估器行为后才翻转(49036 同款 8/8)。勿削弱措辞。
+# 评分前公式重算(官方 open_spreadsheet.py 语义;recalc.py)⇒ 写公式与写
+# 静态值都是合法解法。scaffold 只作中性说明(第二代同款口径,用户裁定
+# 2026-07-16「公式解法必须可判分」;48 探针台账的"禁公式"文案是第一代
+# 环境缺陷下的 workaround,勿回退)。
 SYSTEM_PROMPT = (
     "You are a spreadsheet expert who manipulates Excel workbooks with "
     "Python. Your goal is functional correctness: output.xlsx must contain "
-    "the correct final values in the specified cells.\n\n"
+    "the correct results in the specified cells.\n\n"
     "Work in the current working directory:\n"
     "- Read the input workbook from input.xlsx\n"
     "- Write the completed workbook to output.xlsx\n"
     "- Only modify cells within the answer position given in the task; keep "
-    "everything else unchanged.\n\n"
-    "CRITICAL CONSTRAINT: The evaluation harness does NOT re-evaluate Excel "
-    "formulas. It reads the static cell values as they exist in the file. "
-    "Writing a formula string (e.g. '=IF(...)') into a cell will result in "
-    "that cell being read back as empty/None by the evaluator, causing "
-    "failure.\n\n"
-    "RULE: For any cell that requires a calculation or conditional logic, "
-    "you MUST pre-compute the result in Python and write the STATIC VALUE "
-    "directly to the cell. Do NOT write Excel formulas for calculated "
-    "results — even when the task instruction mentions formulas, what is "
-    "graded is the final cell values.\n\n"
+    "everything else unchanged.\n"
+    "- Formulas ARE recalculated before grading: you may write Excel "
+    "formulas or pre-computed static values, whichever fits the task. Note "
+    "that openpyxl itself does not evaluate formulas — if you read a "
+    "formula cell back with openpyxl to check your work, you will see the "
+    "formula string, not its value.\n\n"
     + _TOOLS_BLOCK
 )
 
@@ -180,12 +175,12 @@ class SpreadsheetbenchTaskAdapter:
             f"[{self._item['answer_position']}] are compared against the "
             f"expected result on {n_cases} hidden test case(s); the score is "
             "the fraction passed (1.0 = success).\n"
-            "Evaluation mechanic (critical for any guidance you write): the "
-            "checker does NOT re-evaluate Excel formulas — it reads static "
-            "cell values, so a formula written to a cell is read back as "
-            "empty/None and fails. Correct solutions pre-compute results in "
-            "Python and write plain values, even when the task instruction "
-            "mentions formulas.\n"
+            "Evaluation mechanic: the produced workbook is opened and "
+            "formulas are recalculated before grading, so writing Excel "
+            "formulas and writing pre-computed static values are both valid "
+            "solution styles. Caveat worth teaching: openpyxl itself does "
+            "not evaluate formulas, so reading a formula cell back inside "
+            "the sandbox shows the formula string, not its value.\n"
             f"Task instruction ({self._item['instruction_type']}): "
             f"{self._item['instruction']}\n"
             f"Budget: the executor has {protocol.MAX_ENV_STEPS} tool calls "
@@ -305,15 +300,36 @@ class SpreadsheetbenchTaskAdapter:
         return out if out.strip() else "(no output)", proc.returncode
 
     def _score_output(self, output_path: str) -> float:
-        """单一 output 对全部 test case 评(旧实现语义);soft = 通过比例。"""
+        """单一 output 对全部 test case 评;soft = 通过比例。
+
+        评分前按官方语义重算公式(recalc.py;重算一次、全 case 复用——
+        重算与 case 无关)。重算 soffice 子进程共用 run_python 的并发门
+        (同为重 CPU 工作)。golden 不重算(官方发布件自带缓存值)。"""
+        with open(output_path, "rb") as f:
+            raw = f.read()
+        with self._gate:
+            graded = recalculated_for_grading(
+                raw,
+                soffice=find_soffice(),
+                timeout_s=self._cfg.recalc_timeout_s,
+                task_id=self.task_id,
+            )
         cases = self._test_cases()
         n_pass = 0
-        for _no, _ip, answer_path in cases:
-            try:
-                if evaluate(output_path, answer_path, self._item["answer_position"])["ok"]:
-                    n_pass += 1
-            except Exception:  # noqa: BLE001 — 单 case 评估崩溃计失败
-                pass
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(graded)
+            graded_path = tmp.name
+        try:
+            for _no, _ip, answer_path in cases:
+                try:
+                    if evaluate(
+                        graded_path, answer_path, self._item["answer_position"]
+                    )["ok"]:
+                        n_pass += 1
+                except Exception:  # noqa: BLE001 — 单 case 评估崩溃计失败
+                    pass
+        finally:
+            os.unlink(graded_path)
         return n_pass / len(cases)
 
     def _clip(self, text: str) -> str:
@@ -361,6 +377,16 @@ class SpreadsheetbenchEnvFactory:
             raise ValueError(
                 "spreadsheetbench config incomplete: data_root is required "
                 "(set SSB_DATA)"
+            )
+        if find_soffice() is None:
+            # 装配期 fail loud(比第二代运行时降级更严):没有重算后端,
+            # 公式解法会被静默判 0 —— 那是 reward 语义漂移,不是可降级
+            # 的小故障。装 LibreOffice 或设 SSB_SOFFICE 后再起。
+            raise ValueError(
+                "spreadsheetbench: no LibreOffice backend found for formula "
+                "recalculation — install libreoffice/soffice into PATH or "
+                "set SSB_SOFFICE (grading without recalc would silently "
+                "fail every formula answer)"
             )
         self._cfg = cfg
         self._gate = threading.Semaphore(cfg.exec_concurrency)

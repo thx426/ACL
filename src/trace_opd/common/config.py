@@ -155,6 +155,9 @@ class SpreadsheetbenchCfg:
                                     # 折算;CPU 饥饿教训:环境子进程抢光 CPU
                                     # 会饿死推理引擎)
     python_timeout_s: int = 120     # 单次 run_python 超时
+    recalc_timeout_s: float = 120.0  # 评分前 LibreOffice 公式重算超时
+                                    # (官方 open_spreadsheet.py 语义;
+                                    # soffice 路径走 SSB_SOFFICE/PATH)
     obs_max_chars: int = 3500       # 工具输出截断(< protocol 全局 4000,
                                     # 保 <tool_response> 包裹完整)
 

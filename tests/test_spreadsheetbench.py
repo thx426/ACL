@@ -38,6 +38,10 @@ from trace_opd.envs.spreadsheetbench.evaluator import (
     find_test_cases,
     preview_workbook,
 )
+from trace_opd.envs.spreadsheetbench.recalc import (
+    find_soffice,
+    workbook_has_formulas,
+)
 
 TOK = FakeTokenizer()
 DELTA = TemplateDelta(TOK)
@@ -211,9 +215,56 @@ def test_replay_action_deterministic_and_isolated(tmp_path):
     assert not Path(env.workdir).exists()                 # close 清理沙箱
 
 
+# ------------------------------------------ 公式重算(官方 open_spreadsheet 语义)
+
+def test_workbook_has_formulas_zip_scan(tmp_path):
+    plain = tmp_path / "plain.xlsx"
+    _wb(plain, {"A1": 1, "B1": 2})
+    assert workbook_has_formulas(plain.read_bytes()) is False
+    withf = tmp_path / "withf.xlsx"
+    _wb(withf, {"A1": 1, "B1": "=A1+1"})
+    assert workbook_has_formulas(withf.read_bytes()) is True
+    assert workbook_has_formulas(b"not a zip") is False
+
+
+FORMULA_CODE = (
+    "import openpyxl\n"
+    "wb = openpyxl.load_workbook('input.xlsx')\n"
+    "ws = wb.active\n"
+    "ws['B1'] = '=A1+A2'\n"
+    "wb.save('output.xlsx')\n"
+    "print('formula written')\n"
+)
+
+
+@pytest.mark.skipif(find_soffice() is None, reason="no LibreOffice backend")
+def test_formula_solution_passes_via_recalc(tmp_path):
+    """核心回归:写公式是合法解法——评分前 LibreOffice 重算,公式解法
+    与写值解法同分。(第一代移植漏掉重算 ⇒ 公式必挂,是历史环境缺陷。)"""
+    item = _make_task(tmp_path, answers=[{"B1": 3}])
+    result = _episode(item, tmp_path, [
+        _call("run_python", code=FORMULA_CODE),
+        _call("submit"),
+    ])
+    traj = result.trajectory
+    assert traj.won and traj.score == 1.0
+
+
 # ------------------------------------------------------------- 装配与配置
 
-def test_registry_dispatch_and_dataroot_required(tmp_path):
+@pytest.fixture
+def fake_soffice(monkeypatch, tmp_path):
+    """factory 装配护栏测试专用:注入假 soffice 路径(find_soffice 只查
+    文件存在;lru_cache 前后清空)。"""
+    exe = tmp_path / "soffice-fake"
+    exe.write_text("#!/bin/sh\n")
+    find_soffice.cache_clear()
+    monkeypatch.setenv("SSB_SOFFICE", str(exe))
+    yield str(exe)
+    find_soffice.cache_clear()
+
+
+def test_registry_dispatch_and_dataroot_required(tmp_path, fake_soffice):
     cfg = SimpleNamespace(
         environment=SimpleNamespace(name="spreadsheetbench"),
         spreadsheetbench=SpreadsheetbenchCfg(data_root=str(tmp_path)),
@@ -226,6 +277,17 @@ def test_registry_dispatch_and_dataroot_required(tmp_path):
     )
     with pytest.raises(ValueError, match="data_root"):
         registry.make_env_factory(bad)
+
+
+def test_factory_fails_loud_without_soffice(monkeypatch, tmp_path):
+    """无重算后端 = 公式解法静默判 0 = reward 语义漂移 ⇒ 装配期即死。"""
+    find_soffice.cache_clear()
+    monkeypatch.setenv("SSB_SOFFICE", str(tmp_path / "nonexistent"))
+    try:
+        with pytest.raises(ValueError, match="LibreOffice"):
+            SpreadsheetbenchEnvFactory(SpreadsheetbenchCfg(data_root=str(tmp_path)))
+    finally:
+        find_soffice.cache_clear()
 
 
 @pytest.fixture

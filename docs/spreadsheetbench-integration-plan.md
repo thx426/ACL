@@ -110,25 +110,36 @@
 5. 交 CD-006 清单:数据在位与 case 分布、openpyxl 进训练环境(走 env
    入口纪律)、真 tokenizer 的 tool 模板对拍冒烟、35B/4B bare 探针。
 
-## 5.5 公式陷阱(旧项目 48 探针实证;用户确认的历史细节点)
+## 5.5 公式重算设施(用户确认的历史细节点;2026-08-07 二次修正定稿)
 
-评估口径(官方 evaluation.py 语义)用 openpyxl `data_only=True` 读**缓存
-值**,而 agent 用 openpyxl 写入的公式没有缓存值 ⇒ 公式单元格被读成
-None,**写公式的解法结构性必挂**。旧项目实证(skills_evolve
-`explorer_trajectories_review/06_ss_global_residual_48probe_ledger.md`):
+**真相链**:官方评估管线在比对前有「打开-重算-另存」步骤
+(``evaluation/open_spreadsheet.py``:Linux/macOS 用 LibreOffice headless
+``--convert-to "xlsx:Calc MS Excel 2007 XML"``,Windows 用 Excel COM),公式
+在打开时被计算、值写入缓存,然后才 ``data_only=True`` 比对。**第一代
+(skills_evolve)移植漏掉了这一步** ⇒ 公式解法结构性必挂(48 探针台账的
+「禁公式/写静态值」提示词是该环境缺陷下的 workaround 考古,不是应继承的
+机理);第二代(experience_internalization_claude)按用户裁定 2026-07-16
+「对齐官方;公式解法必须可判分」补齐 ``recalc.py``。
 
-- 任务 53647(指令字面要求 create formulas)连败 23 探针,失败签名恒
-  `pred=None`(agent 坚持写公式);
-- 泛泛的"写静态值"指令**不够**(多个 static-value 探针仍 0/2);
-- 翻转要素 = 显式因果解释("harness 不重算公式 → 公式被读 empty/None →
-  失败")+ MUST 静态值规则 + 字面指令覆盖授权 —— probe_046 generic 段
-  (49036 同款 8/8 稳定)。
+**本环境落地**(自第二代移植适配,``envs/spreadsheetbench/recalc.py``):
 
-落地:上述三要素文案已进 `executor_scaffold`(勿削弱措辞,源注释标注
-台账出处);**task_brief 同步告知 researcher 该评估机理**(否则 researcher
-可能产出教 executor 写公式的有害文档)。口径声明:此为评估语义设计事实
-(与旧 +14.5pp 实证同口径),非缺陷;若未来需对齐官方论文数字,须另核
-官方管线是否含 Excel/WPS 重算步骤,报告口径分开。
+- 评分前对**产出 workbook 字节**重算(golden 不重算——官方发布件自带
+  缓存值);重算一次、全 case 复用;临时拷贝,沙箱权威文件不动;
+- 便宜预检(zip 扫 worksheet XML ``<f`` 标签),无公式输出不付 soffice
+  往返;每次调用独立 UserInstallation profile(并发不抢锁);
+  ``SAL_DISABLE_OPENCL/SKIA=1`` 强制纯 CPU(第二代实测 LibreOffice 默认
+  抓 ~412MiB 显存,推理引擎吃满的机器上是 OOM 隐患);
+- 重算失败降级按原字节评 + 响亮日志;**soffice 完全缺失 ⇒ 装配期 fail
+  loud**(比第二代运行时降级更严:无后端时公式解法被静默判 0 是 reward
+  语义漂移,不是可降级小故障);
+- scaffold 与 task_brief 中性声明「公式会被重算,公式与静态值都是合法
+  解法」,并教一个真实 caveat:openpyxl 读公式格返回公式串非值(agent
+  自检时会看到)。
+
+回归锁:``test_formula_solution_passes_via_recalc``(真 soffice:agent 写
+``=A1+A2`` → 重算 → 评分 1.0)。**部署前置:训练机必须装 LibreOffice**
+(PATH 或 ``SSB_SOFFICE``)。可比性口径:旧 +14.5pp 实证产生于第一代
+「无重算」口径,与本环境非同口径,只作粗参考。
 
 ## 6. 科学定位与已知风险
 

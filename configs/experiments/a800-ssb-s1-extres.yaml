@@ -64,6 +64,8 @@ spreadsheetbench:
   exec_concurrency: 32      # run_python 子进程全局并发门(按 worker 折算;
                             # CPU 饥饿纪律:环境子进程不得饿死推理引擎)
   python_timeout_s: 120
+  recalc_timeout_s: 120   # 评分前 LibreOffice 公式重算(官方语义;需装
+                          # libreoffice 或设 SSB_SOFFICE,缺失装配期即死)
   obs_max_chars: 3500       # 工具输出截断(保 <tool_response> 包裹完整)
 
 train:
