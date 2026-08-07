@@ -16,6 +16,10 @@ code/ 为浅 clone(`git clone --depth 1`,commit 已钉)。
 | 2509.24203_GRPO_secretly_offpolicy.pdf | ICLR 2026 | 组相对 REINFORCE 的原生 off-policy 解释(理论) | 混合训练的理论基础,论文引用用 |
 | 2507.18071_GSPO.pdf | 2025(Qwen) | 序列级 IS 替代 token 级(token 级 IS 噪声大) | λ± 块级校正的同方向大厂实证 |
 | 2601.18795_ReuseYourFLOPs.pdf | 2026 | 极端 off-policy 前缀条件化做难题 RL | prefix 条件化通道参照(与 v4 前缀续写远亲) |
+| 2605.15155_SDAR.pdf | 2026 | **agentic 多轮 + 自条件化教师(π+特权上下文)**;OPSD 作 gated 辅助 loss(λ=0.01,β=5),三式 sigmoid 门:entropy σ(βh)/gap σ(βΔ)/soft-OR;Δ=sg(logπ⁺(y)−logπ(y)) detached | **门控设计的直接参照**(用户点名);教师结构与 PGS 相同;"平均 gap 恒负、无门控蒸馏有害"的结构发现;ALFWorld +9.4%,Skill-GRPO 表面依赖 vs SDAR 内化的实证 |
+| 2606.29476_CRAFT.pdf | 2026 | sibling rollouts 反事实信用分配(SDAR 族) | 信用集中方向的参照,未细读 |
+| 2606.26790_OPID.pdf | 2026 | on-policy skill distillation(SDAR 族) | 同族竞品,论文引用用 |
+| 2608.03223_SD_RewardShaping.pdf | 2026 | 自蒸馏 reward shaping(SDAR 族) | 同族竞品,论文引用用 |
 
 ## 代码库(code/)
 
