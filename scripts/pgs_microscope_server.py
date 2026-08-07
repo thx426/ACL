@@ -123,6 +123,22 @@ def _meta_cached(path: str) -> dict:
 def _meta_of(d: dict) -> dict:
     s = d.get("steering") or {}
     arm = s.get("steer_arm")
+    # v3.3 吸收进度(dump 已整读,增量 O(拒绝数)):拒绝位上 π 的
+    # draft−final logp 差 + final=π-top1(rank 0-based==0)计数。
+    ab_dlogp, ab_top1 = [], 0
+    tops = s.get("steer_pi_top16") or []
+    rejs = s.get("steer_rejected") or []
+    for i, isrej in enumerate(rejs):
+        if not isrej or i >= len(tops) or not tops[i]:
+            continue
+        dr = s["steer_draft_token"][i]
+        fi = s["steer_final_token"][i]
+        lut = {int(t): float(lp) for t, lp in tops[i]}
+        if dr in lut and fi in lut:
+            ab_dlogp.append(M.r(lut[dr] - lut[fi], 3))
+        if int(tops[i][0][0]) == fi:
+            ab_top1 += 1
+    fork = M.fork_hits(d.get("trajectory") or {})
     return dict(
         task=d.get("task_id", "?"),
         won=bool(d.get("won")),
@@ -138,8 +154,15 @@ def _meta_of(d: dict) -> dict:
             rej=s.get("steer_reject_count", 0),
             spent=M.r(s.get("steer_budget_spent", 0), 2),
             bypass=s.get("steer_n_bypassed", 0),
+            gbypass=s.get("steer_n_gate_bypassed", 0),
         ),
         theta=M.r(s.get("steer_theta_d", 0.0)),
+        enttheta=M.r(s.get("steer_entropy_theta", 0.0), 3),
+        entmean=M.r(s.get("steer_entropy_mean", 0.0), 3),
+        wmean=M.r(s.get("steer_intensity_mean", 0.0), 3),
+        absorb=dict(dlogp=ab_dlogp, top1=ab_top1,
+                    nrej=int(s.get("steer_reject_count", 0))),
+        fork=fork,
     )
 
 
@@ -173,39 +196,12 @@ def api_run() -> dict:
                 vals.append(_cached("val:" + d.name, d, vb))
             else:
                 def sb(fs, name=d.name):
-                    agg = dict(won=0, cand=0, open=0, tilt=0.0, rej=0.0, spent=0.0, theta=0.0, bypass=0.0)
-                    # 分臂 run 的能力读数必须分开:混合 won 是 E_b[R] 与 E_π[R] 的
-                    # 平均,既不是能力也不是教师上限(v3.1 裁定的核心动机)。
-                    arms = {0: [0, 0], 1: [0, 0]}   # arm -> [n, won]
-                    for f in fs:
-                        t = _meta_cached(f)
-                        agg["won"] += t["won"]
-                        agg["cand"] += t["m"]["cand"]
-                        agg["open"] += t["m"]["open"]
-                        agg["tilt"] += t["m"]["tilt"]
-                        agg["rej"] += t["m"]["rej"]
-                        agg["spent"] += t["m"]["spent"]
-                        agg["theta"] += t["theta"]
-                        agg["bypass"] += t["m"]["bypass"]
-                        if t["arm"] in arms:
-                            arms[t["arm"]][0] += 1
-                            arms[t["arm"]][1] += t["won"]
-                    n = max(len(fs), 1)
-                    out = dict(
-                        id=int(name.split("_")[1]), dir=name, n=len(fs),
-                        won=M.r(agg["won"] / n, 4),
-                        gate=M.r(agg["open"] / max(agg["cand"], 1), 4),
-                        tilt=M.r(agg["tilt"] / n, 2), rej=M.r(agg["rej"] / n, 2),
-                        rejrate=M.r(agg["rej"] / max(agg["open"], 1), 4),
-                        spent=M.r(agg["spent"] / n, 2), theta=M.r(agg["theta"] / n, 4),
-                        bypass=M.r(agg["bypass"] / n, 1),
+                    # 聚合口径唯一定义在 M.build_step_entry(导出器同源);
+                    # _meta_of 的轻量 dict 覆盖它消费的全部键。
+                    metas = [_meta_cached(f) for f in fs]
+                    return M.build_step_entry(
+                        int(name.split("_")[1]), name, metas, CONFIG
                     )
-                    if arms[0][0] and arms[1][0]:
-                        out["wonBare"] = M.r(arms[0][1] / arms[0][0], 4)
-                        out["wonSteered"] = M.r(arms[1][1] / arms[1][0], 4)
-                        out["armGap"] = M.r(out["wonSteered"] - out["wonBare"], 4)
-                        out["nBare"], out["nSteered"] = arms[0][0], arms[1][0]
-                    return out
                 steps.append(_cached("step:" + d.name, d, sb))
     # 完成态必须由实收batch合同判定。旧逻辑用历史最大n推断full，首个partial
     # step会把自己的64条当成“历史最大”而误标完成。只有旧run缺配置时才回退历史值。

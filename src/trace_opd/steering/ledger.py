@@ -104,6 +104,7 @@ class SteeringLedger:
     # 位置一次 observe_entropy——含 bypass 段,熵在 draft 侧免费)
     ent_hist: list[int] = field(default_factory=lambda: [0] * ENT_HIST_BINS)
     ent_count: int = 0
+    ent_sum: float = 0.0
 
     def observe_d(self, d_value: float, position: int = -1) -> None:
         b = int(d_value / self.d_hist_max * D_HIST_BINS)
@@ -120,6 +121,7 @@ class SteeringLedger:
         b = int(h / ENT_HIST_MAX * ENT_HIST_BINS)
         self.ent_hist[min(max(b, 0), ENT_HIST_BINS - 1)] += 1
         self.ent_count += 1
+        self.ent_sum += float(h)
 
     def observe_ell(self, raw_ell_values) -> None:
         """S 内 p_T 观测窗内 token 的未截断 ℓ,逐 token 等权入直方图。"""
@@ -192,13 +194,21 @@ class SteeringLedger:
             "steer_d_all": list(self.d_all),
             "steer_pi_top16": [r.pi_top16 or [] for r in self.records],
             "steer_pt_top16": [r.pt_top16 or [] for r in self.records],
-            # v3.3 M4 软强度观察面(行级 w/熵 + 全量熵直方图)
+            # v3.3 M4 软强度观察面(行级 w/熵 + 全量熵直方图 + 曲线标量:
+            # 标量键自动进 rollout_extra 曲线——倾斜位平均强度与全位置平均熵)
             "steer_intensity": [round(r.intensity, 4) for r in self.records],
             "steer_entropy": [round(r.entropy, 4) for r in self.records],
             "steer_ent_hist": list(self.ent_hist),
             "steer_ent_count": self.ent_count,
             "steer_ent_hist_bins": len(self.ent_hist),
             "steer_ent_hist_max": ENT_HIST_MAX,
+            "steer_intensity_mean": (
+                sum(r.intensity for r in self.records) / len(self.records)
+                if self.records else 0.0
+            ),
+            "steer_entropy_mean": (
+                self.ent_sum / self.ent_count if self.ent_count else 0.0
+            ),
             # 轨迹级实测门率(swanlab 单曲线;分子分母另有计数器可复核)
             "steer_gate_open_rate": (
                 self.n_base_open / self.n_candidates if self.n_candidates else 0.0

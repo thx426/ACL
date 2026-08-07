@@ -97,7 +97,9 @@ def test_dynamic_archive_and_budget_flow_into_trajectory(tmp_path):
     config = M.load_run_config(run)
     traj = M.build_traj(row, FakeDec(), run=run, bmax=config["bmax"])
 
-    assert config == {
+    # 子集断言:v3.3 起 config 还带 advMode/entropy* 等新键(取默认值),
+    # 全等断言会随每次键面演进碎一次——只锁本用例关心的键。
+    assert {
         "bmax": 400.0,
         "bmaxUnbounded": False,
         "gateMode": "",
@@ -106,7 +108,7 @@ def test_dynamic_archive_and_budget_flow_into_trajectory(tmp_path):
         "trainBatchSize": 0,
         "rolloutN": 0,
         "expectedTrainTrajs": 0,
-    }
+    }.items() <= config.items()
     assert traj["m"]["bmax"] == 400.0
     assert traj["doc"] == "dynamic guidance"
     assert traj["privilege"]["state"] == "dynamic_researcher"
@@ -190,7 +192,9 @@ def test_api_run_omits_arm_fields_for_non_split_runs(tmp_path):
     S.CONFIG = {"bmax": 0.0, "expectedTrainTrajs": 4}
     S._cache.clear()
     row = S.api_run()["steps"][0]
-    assert "wonBare" not in row and "armGap" not in row
+    # v3.3 契约演进:step 条目 schema 恒齐(build_step_entry 单一口径),
+    # 非分臂 run 的臂字段以 None 表缺席(前端 `!=null` 判有臂)。
+    assert row["wonBare"] is None and row["armGap"] is None
 
 
 def test_static_gt_validation_and_true_bare_states(tmp_path):
@@ -750,3 +754,97 @@ def test_frontend_uses_structured_privilege_and_dynamic_budget():
     assert "const runBmax" in html
     assert "EXPECT_TILT" not in html
     assert "const BMAX=20" not in html
+
+
+# ------------------------------------------------- v3.3 监控/可视化观察面
+
+def _v33_steering(arm, *, rej=False):
+    return {
+        "steer_arm": arm, "steer_positions": [1], "steer_d": [0.5],
+        "steer_eta": [0.25], "steer_delta": [0.6], "steer_log_pi": [-1.2],
+        "steer_log_b": [-0.9], "steer_propensity": [1.0],
+        "steer_rejected": [int(rej)], "steer_probe": [0],
+        "steer_cap_active": [0], "steer_base_open": [1],
+        "steer_budget_after": [5.0], "steer_draft_token": [7],
+        "steer_final_token": [9 if rej else 7],
+        "steer_pi_top16": [[[9, -0.3], [7, -1.2]]],
+        "steer_pt_top16": [[[9, -0.1]]],
+        "steer_intensity": [0.5], "steer_entropy": [1.1],
+        "steer_n_candidates": 4, "steer_n_base_open": 2, "steer_count": 1,
+        "steer_reject_count": int(rej), "steer_budget_spent": 0.6,
+        "steer_n_bypassed": 0, "steer_n_pt_window_miss": 0,
+        "steer_n_probe_flipped": 0, "steer_n_gate_bypassed": 3,
+        "steer_theta_d": 0.03, "steer_entropy_theta": 1.28,
+        "steer_entropy_mean": 0.4, "steer_intensity_mean": 0.5,
+        "steer_cand_positions": [1], "steer_d_all": [0.5],
+    }
+
+
+def _v33_row(arm, won, *, rej=False):
+    return rollout(
+        won=won,
+        outcome="won" if won else "lost",
+        steering=_v33_steering(arm, rej=rej),
+        trajectory={
+            "initial_obs": "x",
+            "steps": [{"thought": "Wait, let me verify the plan",
+                       "action_raw": "go", "observation": "ok"}],
+        },
+    )
+
+
+_V33_CFG = {"bmax": 20.0, "advMode": "asym", "steeredAdvWeight": 1.0,
+            "steeredAdvDecay": 100, "responseLength": 32768,
+            "entropyFloor": 0.6, "entropyThetaInit": 1.28}
+
+
+def test_v33_step_entry_absorb_fork_alpha_and_soft_gate_fields():
+    t_bare = M.build_traj(_v33_row(0, True), FakeDec(), bmax=20.0)
+    t_st = M.build_traj(_v33_row(1, False, rej=True), FakeDec(), bmax=20.0)
+    # 行级观察面:软强度 w/h 进 rec;吸收中间量按 0-based rank(top1=首位)
+    assert t_st["recs"][0]["w"] == 0.5 and t_st["recs"][0]["h"] == 1.1
+    assert t_st["absorb"] == {"dlogp": [-0.9], "top1": 1, "nrej": 1}
+    assert t_bare["fork"] == {"redundancy": 1, "essence": 1}
+    e = M.build_step_entry(50, "step_00050", [t_bare, t_st], _V33_CFG)
+    assert e["alpha"] == 0.5                       # cosine(50/100)
+    assert e["entTheta"] == 1.28 and e["wMean"] == 0.5
+    assert e["gateBypassRate"] == round(6 / 4, 4)  # 2 条 ×3 bypass / 4 tok
+    assert e["absorbDlogpMed"] == -0.9 and e["absorbTop1Rate"] == 1.0
+    assert e["forkRed"] == 1.0 and e["forkEss"] == 1.0
+    assert e["armGap"] == -1.0 and e["lenMax"] == 2
+
+
+def test_v33_exporter_and_server_step_aggregation_identical():
+    """聚合口径单一定义红线:_meta_of 轻量路径与 build_traj 全量路径喂
+    build_step_entry 必须产出逐字段相同的 step 条目。"""
+    rows = [_v33_row(0, True), _v33_row(1, False, rej=True)]
+    full = [M.build_traj(r, FakeDec(), bmax=20.0) for r in rows]
+    lite = [S._meta_of(r) for r in rows]
+    e1 = M.build_step_entry(7, "step_00007", full, _V33_CFG)
+    e2 = M.build_step_entry(7, "step_00007", lite, _V33_CFG)
+    assert e1 == e2
+
+
+def test_v33_alpha_recompute_matches_schedule_edges():
+    assert M.pgs_alpha(0, _V33_CFG) == 1.0
+    assert M.pgs_alpha(100, _V33_CFG) == 0.0
+    assert M.pgs_alpha(500, _V33_CFG) == 0.0
+    assert M.pgs_alpha(10, {"advMode": "legacy_shared"}) is None
+    assert M.pgs_alpha(10, {"advMode": "asym", "steeredAdvWeight": 0.7,
+                            "steeredAdvDecay": 0}) == 0.7
+
+
+def test_v33_run_config_reads_new_keys(tmp_path):
+    run = tmp_path / "r"
+    run.mkdir()
+    (run / "effective_config.yaml").write_text(
+        "train:\n  response_length: 32768\n"
+        "steering:\n  b_max: .inf\n  gate_mode: entropy\n  adv_mode: asym\n"
+        "  steered_adv_weight: 1.0\n  steered_adv_decay_steps: 200\n"
+        "  entropy_floor: 0.6\n  entropy_theta_init: 1.28\n",
+        encoding="utf-8",
+    )
+    c = M.load_run_config(run)
+    assert c["advMode"] == "asym" and c["gateMode"] == "entropy"
+    assert c["steeredAdvDecay"] == 200 and c["responseLength"] == 32768
+    assert c["entropyFloor"] == 0.6 and c["entropyThetaInit"] == 1.28

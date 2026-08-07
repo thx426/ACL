@@ -60,6 +60,22 @@ _ROLLOUT_N_LINE = re.compile(
 _TOP_LEVEL_LINE = re.compile(r"^[^ \t#][^:]*\s*:")
 
 
+def _kv_line(key: str, *, word: bool = False) -> re.Pattern:
+    """段内 `key: value` 行的通用正则(v3.3 新键统一走这里,勿再手写常量)。"""
+    val = r"[A-Za-z_]+" if word else r"[^#\s]+"
+    return re.compile(rf"^(?P<indent>[ \t]*){key}\s*:\s*(?P<value>{val})\s*(?:#.*)?$")
+
+
+#: v3.3 M6 fork-token 双带(MENTOR Fig.3 度量的移植;occurrence = 该词出现
+#: 于轨迹 thought 的轨迹占比)。初始词表为通用英文推理分叉词;数据驱动重标
+#: 用 --fork-lexicon 传 json {"redundancy": [...], "essence": [...]} 覆盖。
+FORK_LEXICON = {
+    "redundancy": ("wait", "however", "but ", "alternatively", "actually",
+                   "let me re", "hmm"),
+    "essence": ("check", "verify", "confirm", "double-check"),
+}
+
+
 def load_tok(path: str):
     from transformers import AutoTokenizer
 
@@ -128,6 +144,13 @@ def load_run_config(run: Path) -> dict:
         "trainBatchSize": 0,
         "rolloutN": 0,
         "expectedTrainTrajs": 0,
+        # v3.3:α 调度(重算曲线用)、熵门参考线、响应预算(lenmax 余量红条)
+        "advMode": "",
+        "steeredAdvWeight": 1.0,
+        "steeredAdvDecay": 0,
+        "entropyFloor": 0.0,
+        "entropyThetaInit": 0.0,
+        "responseLength": 0,
     }
     if not path.is_file():
         out["bmaxWarning"] = "effective_config.yaml 不存在，预算上限回退为 20"
@@ -140,8 +163,14 @@ def load_run_config(run: Path) -> dict:
         return out
 
     sections: dict[str, tuple[int, dict[str, re.Pattern]]] = {
-        "train": (-1, {"trainBatchSize": _TRAIN_BATCH_LINE, "rolloutN": _ROLLOUT_N_LINE}),
-        "steering": (-1, {"bmax": _BMAX_LINE, "gateMode": _GATE_MODE_LINE}),
+        "train": (-1, {"trainBatchSize": _TRAIN_BATCH_LINE, "rolloutN": _ROLLOUT_N_LINE,
+                       "responseLength": _kv_line("response_length")}),
+        "steering": (-1, {"bmax": _BMAX_LINE, "gateMode": _GATE_MODE_LINE,
+                          "advMode": _kv_line("adv_mode", word=True),
+                          "steeredAdvWeight": _kv_line("steered_adv_weight"),
+                          "steeredAdvDecay": _kv_line("steered_adv_decay_steps"),
+                          "entropyFloor": _kv_line("entropy_floor"),
+                          "entropyThetaInit": _kv_line("entropy_theta_init")}),
     }
     active = ""
     for line in lines:
@@ -168,11 +197,19 @@ def load_run_config(run: Path) -> dict:
             indent = len(match.group("indent").expandtabs(8))
             if indent <= section_indent:
                 continue
-            if key == "gateMode":
-                out["gateMode"] = match.group("value").strip()
+            if key in ("gateMode", "advMode"):
+                out[key] = match.group("value").strip()
                 continue
             value = _parse_yaml_float(match.group("value"))
             if value is None:
+                continue
+            if key in ("responseLength", "steeredAdvDecay"):
+                if value.is_integer() and value >= 0:
+                    out[key] = int(value)
+                continue
+            if key in ("steeredAdvWeight", "entropyFloor", "entropyThetaInit"):
+                if math.isfinite(value) and value >= 0:
+                    out[key] = value
                 continue
             if key == "bmax":
                 if value == math.inf:
@@ -403,6 +440,12 @@ def build_traj(
     recs = []
     pos2rec: dict[int, int] = {}
     n_rec = len(s.get("steer_positions", []))
+    intensities = s.get("steer_intensity") or []
+    entropies = s.get("steer_entropy") or []
+    # 吸收进度中间量(v3.3 M6:拒绝位上 π 给 draft/final 的 logp 差 =
+    # 「最后一公里」读数;final 是 π-top1(rank 0-based == 0)= 教师只在降噪)
+    ab_dlogp: list[float] = []
+    ab_top1 = 0
     for i in range(n_rec):
         p = s["steer_positions"][i]
         dr, fi = s["steer_draft_token"][i], s["steer_final_token"][i]
@@ -422,8 +465,19 @@ def build_traj(
             draft=dec.one(dr) if dr >= 0 else "",
             final=dec.one(fi) if fi >= 0 else "",
         )
+        if i < len(intensities):
+            rec["w"] = r(intensities[i], 3)
+        if i < len(entropies):
+            rec["h"] = r(entropies[i], 3)
+        top = s["steer_pi_top16"][i] if i < len(s.get("steer_pi_top16", [])) else []
+        if rec["rej"] and top:
+            lut = {int(t): float(l) for t, l in top}
+            if dr in lut and fi in lut:
+                ab_dlogp.append(lut[dr] - lut[fi])
+            if int(top[0][0]) == fi:
+                ab_top1 += 1
         if with_dists:
-            rec["pi"] = [[dec.one(t), r(l, 2)] for t, l in s["steer_pi_top16"][i]]
+            rec["pi"] = [[dec.one(t), r(l, 2)] for t, l in top]
             rec["pt"] = [[dec.one(t), r(l, 2)] for t, l in s["steer_pt_top16"][i]]
         recs.append(rec)
         pos2rec[p] = i
@@ -500,12 +554,103 @@ def build_traj(
             bypass=s.get("steer_n_bypassed", 0),
             miss=s.get("steer_n_pt_window_miss", 0),
             probe=s.get("steer_n_probe_flipped", 0),
+            gbypass=s.get("steer_n_gate_bypassed", 0),
         ),
+        arm=s.get("steer_arm"),
+        enttheta=r(s.get("steer_entropy_theta", 0.0), 3),
+        entmean=r(s.get("steer_entropy_mean", 0.0), 3),
+        wmean=r(s.get("steer_intensity_mean", 0.0), 3),
+        absorb=dict(
+            dlogp=[r(x, 3) for x in ab_dlogp],
+            top1=ab_top1,
+            nrej=int(s.get("steer_reject_count", 0)),
+        ),
+        fork=fork_hits(traj_meta),
         turns=turns,
         tail=tail,
         recs=recs,
         cands=cands,
     )
+
+
+def fork_hits(traj_meta: dict) -> dict:
+    """fork-token 双带命中(v3.3 M6;MENTOR Fig.3 occurrence 口径:该词是否
+    出现在轨迹的 thought 文本里)。"""
+    text = " ".join(
+        (st.get("thought") or "") for st in traj_meta.get("steps") or []
+    ).lower()
+    return {
+        band: int(any(w in text for w in words))
+        for band, words in FORK_LEXICON.items()
+    }
+
+
+def pgs_alpha(step_id: int, config: dict) -> float | None:
+    """α_t 重算(与 verl 侧 pgs_steered_alpha 同公式;dump 不带 α,由实收
+    配置确定性重建)。非 asym 档返回 None(前端不画)。"""
+    if config.get("advMode") != "asym":
+        return None
+    a0 = float(config.get("steeredAdvWeight", 1.0))
+    decay = int(config.get("steeredAdvDecay", 0))
+    if decay <= 0:
+        return a0
+    if step_id >= decay:
+        return 0.0
+    return a0 * 0.5 * (1.0 + math.cos(math.pi * step_id / decay))
+
+
+def build_step_entry(sid: int, dirname: str, trajs: list[dict], config: dict) -> dict:
+    """step 级序列条目(导出器与实时服务共用——两处聚合口径由本函数唯一
+    定义,防双头漂移)。"""
+    n = max(len(trajs), 1)
+    def tot(fn):
+        return sum(fn(t) for t in trajs)
+    cand = tot(lambda t: t["m"]["cand"])
+    opened = tot(lambda t: t["m"]["open"])
+    rej = tot(lambda t: t["m"]["rej"])
+    bare = [t for t in trajs if t.get("arm") == 0]
+    steered = [t for t in trajs if t.get("arm") == 1]
+    dlogp = sorted(x for t in trajs for x in t.get("absorb", {}).get("dlogp", []))
+    top1 = tot(lambda t: t.get("absorb", {}).get("top1", 0))
+    nrej_ab = tot(lambda t: t.get("absorb", {}).get("nrej", 0))
+    toks = tot(lambda t: t["len"])
+    entry = dict(
+        id=sid,
+        dir=dirname,
+        n=len(trajs),
+        won=r(tot(lambda t: t["won"]) / n, 4),
+        gate=r(opened / max(cand, 1), 4),
+        tilt=r(tot(lambda t: t["m"]["tilt"]) / n, 2),
+        rej=r(rej / n, 2),
+        rejrate=r(rej / max(opened, 1), 4),
+        spent=r(tot(lambda t: t["m"]["spent"]) / n, 2),
+        theta=r(tot(lambda t: t["theta"]) / n, 4),
+        bypass=r(tot(lambda t: t["m"]["bypass"]) / n, 1),
+        # ---- v3.3 观察面 ----
+        wonBare=r(sum(t["won"] for t in bare) / len(bare), 4) if bare else None,
+        wonSteered=(r(sum(t["won"] for t in steered) / len(steered), 4)
+                    if steered else None),
+        nBare=len(bare) or None,
+        nSteered=len(steered) or None,
+        armGap=(r(sum(t["won"] for t in steered) / len(steered)
+                  - sum(t["won"] for t in bare) / len(bare), 4)
+                if bare and steered else None),
+        entTheta=r(tot(lambda t: t.get("enttheta", 0.0)) / n, 3),
+        entMean=r(tot(lambda t: t.get("entmean", 0.0)) / n, 3),
+        wMean=r(tot(lambda t: t.get("wmean", 0.0)) / n, 3),
+        gateBypassRate=r(tot(lambda t: t["m"].get("gbypass", 0)) / max(toks, 1), 4),
+        alpha=pgs_alpha(sid, config),
+        lenMean=r(toks / n, 0),
+        lenMax=max((t["len"] for t in trajs), default=0),
+        # 吸收进度三曲线(docs/pgs-v33-mixed-policy-design.md M6)
+        absorbDlogpMed=(r(dlogp[len(dlogp) // 2], 3) if dlogp else None),
+        absorbTop1Rate=(r(top1 / nrej_ab, 4) if nrej_ab else None),
+        rejDensity=r(rej / max(toks, 1), 5),
+        # fork-token 双带 occurrence(轨迹占比)
+        forkRed=r(tot(lambda t: t.get("fork", {}).get("redundancy", 0)) / n, 4),
+        forkEss=r(tot(lambda t: t.get("fork", {}).get("essence", 0)) / n, 4),
+    )
+    return entry
 
 
 def step_files(run: Path, steps_arg: str | None, last: int | None) -> list[Path]:
@@ -526,7 +671,15 @@ def main() -> int:
     ap.add_argument("--steps", default=None)
     ap.add_argument("--last", type=int, default=None)
     ap.add_argument("--doc-table", default=None, help="task_id→特权文档 jsonl(s1 臂)")
+    ap.add_argument("--fork-lexicon", default=None,
+                    help='fork 词表 json {"redundancy": [...], "essence": [...]}'
+                         "(数据驱动重标后覆盖内置词表)")
     a = ap.parse_args()
+    if a.fork_lexicon:
+        FORK_LEXICON.update({
+            k: tuple(str(w).lower() for w in v)
+            for k, v in json.load(open(a.fork_lexicon)).items()
+        })
 
     run = Path(a.run_dir)
     out = Path(a.out_dir) if a.out_dir else run / "microscope"
@@ -539,36 +692,11 @@ def main() -> int:
     for sd in step_files(run, a.steps, a.last):
         files = sorted(glob.glob(str(sd / "*.json")))
         trajs = []
-        agg = dict(won=0, cand=0, open=0, tilt=0.0, rej=0.0, spent=0.0, theta=0.0, bypass=0.0)
         for f in files:
             d = json.load(open(f))
-            t = build_traj(d, dec, docs, run=run, bmax=config["bmax"])
-            trajs.append(t)
-            agg["won"] += t["won"]
-            agg["cand"] += t["m"]["cand"]
-            agg["open"] += t["m"]["open"]
-            agg["tilt"] += t["m"]["tilt"]
-            agg["rej"] += t["m"]["rej"]
-            agg["spent"] += t["m"]["spent"]
-            agg["theta"] += t["theta"]
-            agg["bypass"] += t["m"]["bypass"]
-        n = max(len(trajs), 1)
+            trajs.append(build_traj(d, dec, docs, run=run, bmax=config["bmax"]))
         sid = int(sd.name.split("_")[1])
-        series.append(
-            dict(
-                id=sid,
-                dir=sd.name,
-                n=len(trajs),
-                won=r(agg["won"] / n, 4),
-                gate=r(agg["open"] / max(agg["cand"], 1), 4),
-                tilt=r(agg["tilt"] / n, 2),
-                rej=r(agg["rej"] / n, 2),
-                rejrate=r(agg["rej"] / max(agg["open"], 1), 4),
-                spent=r(agg["spent"] / n, 2),
-                theta=r(agg["theta"] / n, 4),
-                bypass=r(agg["bypass"] / n, 1),
-            )
-        )
+        series.append(build_step_entry(sid, sd.name, trajs, config))
         payload = json.dumps({"trajs": trajs}, ensure_ascii=False, separators=(",", ":"))
         (out / "data" / f"{sd.name}.js").write_text(
             f'window.PGS_STEP_DATA=window.PGS_STEP_DATA||{{}};window.PGS_STEP_DATA["{sd.name}"]={payload};',

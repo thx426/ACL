@@ -377,6 +377,13 @@ const GLOSS = {
   eta:["η 倾斜强度","该位置实际倾斜强度(≤η_max=0.5)。"],
   prop:["倾向得分","该位置走倾斜分支的概率记账(含 ε 探针),训练侧因果可辨识性用。"],
   probe:["探针翻转","ε=5% 概率强制翻转门决策(可辨识性设计),虚线框标注。"],
+  alpha:["α steered 超额权重","v3.3 asym 口径:steered 行 advantage=[R−mean(bare)]₊×α。cosine 衰减到 0 后教师臂停产(有限期脚手架)。往 0 走是设计行为不是异常。"],
+  hq:["H_q 熵阈值","G-E 熵门的强度标尺:w=min(1, h/H_q)。EMA 追踪学生熵分布的 P95;虚线=硬地板(防阈值追着熵坍缩跑)。贴地板走=分布已低于地板,只有绝对高熵位仍受干预。"],
+  wmean:["平均强度 w̄","倾斜位的平均强度(η=η_max·w)。软门下应显著低于 1(只有关键位拿满强度);贴 1=退化成 always_on,检查 H_q。"],
+  gbypass:["强度旁路率","w<w_min 而整段跳过教师 verify 的 token 占比——G-E 的墙钟红利读数。越高教师开销越省;骤降=熵分布整体抬升(检查是否弥散化复发)。"],
+  absorb:["吸收进度","「最后一公里」三读数:Δlogπ(draft−final)中位→0 =教师换上的 token 正被 π 内化;final=π-top1 率高=教师多在降噪;拒绝密度降=师生趋同。"],
+  fork:["fork-token 双带","MENTOR Fig.3 口径:该词至少出现一次的轨迹占比。红带(wait/however/but…)升+长度涨=冗余分叉膨胀(s3 病);essence 带(check/verify)升=有用校验被吸收(良性)。"],
+  lenmax:["响应长度","lenMean=均值;lenMax=最长轨迹。lenMax 逼近 response_length 上限(虚线)= 截断风险:截断按约定判输且会把能力上升伪装成下跌,红条即处置。"],
 };
 const tipHTML = k => { const g=GLOSS[k]; return g?`<div class="t">${g[0]}</div>${g[1]}`:""; };
 const tip = $("#tip");
@@ -413,6 +420,10 @@ function viewOverview(){
   // 分臂 run(v3.1):混合 won 是 E_b[R] 与 E_π[R] 的平均,既非能力也非教师上限。
   // 能力读数 = bare 臂;教师增益 = δ gap。两者必须分开呈现。
   const HAS_ARMS = S.some(s=>s.wonBare!=null);
+  const CFG = R.config||{};
+  const SOFT = ["entropy","d_var","soft_or"].includes(CFG.gateMode);
+  const HAS_ABS = S.some(s=>s.absorbDlogpMed!=null);
+  const lenWarn = CFG.responseLength>0 && L.lenMax>0.9*CFG.responseLength;
   const BMAX=runBmax();
   const Vp = Vall.find(v=>v.partial);
   const lastV = V[V.length-1];
@@ -436,6 +447,10 @@ function viewOverview(){
     ${kpi("预算消耗", L.spent!=null?(BMAX===null?`${L.spent}`:`${L.spent}/${fmtNum(BMAX)}`):"—",
           BMAX===null?"B∞=∞ · 预算不绑定,此值仅为观察量":(nearCap(L.spent,BMAX)?"接近上限 → 后续可能旁路":"有余量"),
           "spent", nearCap(L.spent,BMAX)?"warn":"")}
+    ${CFG.advMode==="asym"?kpi("α steered 权重", L.alpha!=null?L.alpha.toFixed(3):"—",
+          (L.alpha===0?"已停产(教师脚手架拆除,纯 bare)":`衰减期 T=${CFG.steeredAdvDecay||"∞"}`), "alpha", ""):""}
+    ${CFG.responseLength>0?kpi("长度余量", L.lenMax?`${L.lenMax}/${CFG.responseLength}`:"—",
+          lenWarn?"最长轨迹已达预算 90%+ —— 截断风险,须处置":"最长轨迹距 response_length 的余量", "lenmax", lenWarn?"warn":""):""}
   </div>
   <div class="grid charts" style="margin-bottom:16px">
     ${chart("val 成功率(每 10 步)","效果的最终裁判:总/seen/unseen 三线;进行中的 val 点不画(部分读数有偏)。", [
@@ -458,6 +473,22 @@ function viewOverview(){
       [{label:"消耗",color:"#4f46e5",pts:S.map(s=>[s.id,s.spent])}],
       {y0:0,y1:Math.max(BMAX===null?0:BMAX,...S.map(s=>s.spent||0))*1.03,fmt:v=>v.toFixed(1)})}
     ${chart("拒绝重采/轨迹","真正改 token 的干预密度。", [{label:"拒绝",color:"#e11d48",pts:S.map(s=>[s.id,s.rej])}], {y0:0,fmt:v=>v.toFixed(2)})}
+    ${CFG.advMode==="asym"?chart("α(steered 超额权重)","v3.3 调度:cosine 衰减,到 0 后教师臂停产——往 0 走是设计行为。衰减期 T="+(CFG.steeredAdvDecay||"∞")+"。", [{label:"α",color:"#7c3aed",pts:S.map(s=>[s.id,s.alpha]).filter(p=>p[1]!=null)}], {y0:0,y1:Math.max(1,CFG.steeredAdvWeight||1)*1.08,fmt:v=>v.toFixed(3)}):""}
+    ${SOFT?chart("H_q(熵阈值 EMA)","强度标尺 w=min(1,h/H_q);EMA 追学生熵 P95。虚线=硬地板"+(CFG.entropyFloor?`(${CFG.entropyFloor})`:"")+";贴地板=分布已低于地板。", [{label:"H_q",color:"#0891b2",pts:S.map(s=>[s.id,s.entTheta]).filter(p=>p[1]>0)}], {y0:0,fmt:v=>v.toFixed(2),target:CFG.entropyFloor||undefined}):""}
+    ${SOFT?chart("软门工作面","w̄=倾斜位平均强度(贴 1=退化 always_on);旁路率=跳过教师 verify 的 token 占比(墙钟红利)。", [
+      {label:"w̄ 强度",color:"#7c3aed",pts:S.map(s=>[s.id,s.wMean])},
+      {label:"旁路率",color:"#059669",pts:S.map(s=>[s.id,s.gateBypassRate])}], {y0:0,y1:1.08,fmt:pct}):""}
+    ${HAS_ABS?chart("吸收进度:Δlogπ(draft−final)中位","拒绝位上 π 给自己首选与教师换上 token 的 logp 差。→0 = 教师的选择正被内化(最后一公里收敛);持续走高=留存的都是远 rank 硬知识。", [{label:"Δlogπ 中位",color:"#4f46e5",pts:S.map(s=>[s.id,s.absorbDlogpMed]).filter(p=>p[1]!=null)}], {fmt:v=>v.toFixed(2)}):""}
+    ${HAS_ABS?chart("吸收进度:top1 率 与 拒绝密度","final=π-top1 率高=教师多在降噪(采样噪声拉回首选);拒绝密度降=师生分布趋同。", [
+      {label:"final=π-top1",color:"#059669",pts:S.map(s=>[s.id,s.absorbTop1Rate]).filter(p=>p[1]!=null)},
+      {label:"拒绝密度×10",color:"#e11d48",pts:S.map(s=>[s.id,s.rejDensity!=null?s.rejDensity*10:null]).filter(p=>p[1]!=null)}], {y0:0,fmt:pct}):""}
+    ${chart("fork-token 双带 occurrence","MENTOR Fig.3 口径(词至少出现一次的轨迹占比)。红带升+长度涨=冗余分叉膨胀(s3 病理指纹);essence 升=有用校验被吸收(良性)。", [
+      {label:"redundancy(wait/however/but…)",color:"#e11d48",pts:S.map(s=>[s.id,s.forkRed]).filter(p=>p[1]!=null)},
+      {label:"essence(check/verify…)",color:"#059669",pts:S.map(s=>[s.id,s.forkEss]).filter(p=>p[1]!=null)}], {y0:0,y1:1.08,fmt:pct})}
+    ${chart("响应长度","lenMax 逼近 response_length(虚线)= 截断风险(截断判输且伪装能力下跌),红条即处置。", [
+      {label:"均值",color:"#4f46e5",pts:S.map(s=>[s.id,s.lenMean]).filter(p=>p[1]!=null)},
+      {label:"最长",color:"#d97706",pts:S.map(s=>[s.id,s.lenMax]).filter(p=>p[1]!=null)}],
+      {y0:0,fmt:v=>Math.round(v),target:CFG.responseLength||undefined})}
   </div>
   <div class="card table-card"><div class="table-scroll"><table>
     <thead><tr><th>step</th><th>状态</th><th>轨迹</th>
@@ -800,8 +831,9 @@ function hcCand(e,ref){
 function hcRec(e,ref){
   const r=CUR.t.recs[ref], th=CUR.t.theta;
   const lab = r.rej?'<span class="bdg lose">拒绝重采</span>':r.eta>0?'<span class="bdg win">倾斜-接受</span>':'<span class="bdg dim">探针</span>';
+  const soft = r.w!=null?` · w=${r.w}${r.h!=null?` (h=${r.h}${CUR.t.enttheta?`/H_q=${CUR.t.enttheta}`:""})`:""}`:"";
   hcShow(e,`<div class="r1">${lab}<span style="color:var(--text3)">pos ${r.p}</span></div>
-    D=${r.d}${r.d>th?" &gt; ":" ≤ "}θ=${th} · η=${r.eta} · 扣费 ${r.delta}${minibar(r.d,th)}
+    D=${r.d}${r.d>th?" &gt; ":" ≤ "}θ=${th} · η=${r.eta}${soft} · 扣费 ${r.delta}${minibar(r.d,th)}
     <div style="margin-top:4px;color:var(--text3)">点击看完整决策链 →</div>`);
 }
 /* ═══ 抽屉 ═══ */
@@ -833,6 +865,7 @@ function openRec(ref){
     ${secD(r.d,th)}
     <div class="sec"><h5>本位置读数</h5><div class="kv">
       ${kv("η 倾斜强度","eta",r.eta)}${kv("扣费 δ","D",r.delta)}
+      ${r.w!=null?kv("强度 w","wmean",r.w):""}${r.h!=null?kv("学生熵 h","hq",`${r.h}${t.enttheta?` / H_q=${t.enttheta}`:""}`):""}
       ${kv("ln π(draft)","D",r.lp)}${kv("ln b(draft)","ell",r.lb)}
       ${kv("倾向得分","prop",r.prop)}${kv("ℓ̃ = ln b−ln π","ell",(r.lb-r.lp).toFixed(3))}
     </div></div>
