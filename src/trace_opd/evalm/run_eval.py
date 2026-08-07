@@ -159,12 +159,19 @@ async def main_async(args) -> int:
     )
 
     sem = asyncio.Semaphore(args.parallel)
-    sampling = {"temperature": config.eval.temperature}
+    # avg@K 口径(--n > 1;竞赛数学终局评测的文献口径):温度必须非 0,
+    # 未显式给 --temperature 时 fail loud——greedy 重复 K 次是伪多样。
+    if args.n > 1 and args.temperature is None:
+        raise SystemExit("FATAL: --n > 1 requires an explicit --temperature > 0")
+    temperature = (
+        args.temperature if args.temperature is not None else config.eval.temperature
+    )
+    sampling = {"temperature": temperature}
 
     async with httpx.AsyncClient() as http:
         gen = external_generate(http, args.api_base, args.served_model, tokenizer)
 
-        async def one(task: dict) -> dict:
+        async def one(task: dict, sample_idx: int = 0) -> dict:
             async with sem:
                 started = time.time()
                 guidance = _doc_for(task["task_id"], args) if args.arm == "doc" else ""
@@ -183,6 +190,8 @@ async def main_async(args) -> int:
                 record = {
                     "task_id": task["task_id"],
                     "split": task["split"],
+                    "sample_idx": sample_idx,
+                    "score": traj.score,
                     "arm": args.arm,
                     "outcome": traj.outcome,
                     "won": traj.won,
@@ -200,7 +209,9 @@ async def main_async(args) -> int:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 return record
 
-        results = list(await asyncio.gather(*[one(t) for t in tasks]))
+        results = list(await asyncio.gather(
+            *[one(t, k) for t in tasks for k in range(args.n)]
+        ))
 
     summary, incomplete = summarize(results, args.arm)
     for split, s in summary["splits"].items():
@@ -232,6 +243,10 @@ def main() -> int:
     parser.add_argument("--doc-file", default="")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--parallel", type=int, default=32)
+    parser.add_argument("--n", type=int, default=1,
+                        help="samples per task (avg@K 终局口径;>1 须显式 --temperature)")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="覆盖 eval.temperature(avg@K 用采样温度,如 0.6/1.0)")
     parser.add_argument("--force", action="store_true",
                         help="overwrite an existing episodes.jsonl")
     return asyncio.run(main_async(parser.parse_args()))

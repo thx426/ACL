@@ -1557,3 +1557,289 @@ B 中我未排查的六项(尤其 **doc 侧漂移** 与 **因果方向**),以及
 →5.84(s40)%;s40 的回落 z=1.89 p=0.058 未达显著,尚不能称"衰退")。注意 train 侧
 won 在 s41–48 均值 .186 vs s30–40 均值 .100,但该差(8.6pp)**远低于训练 rollout 的
 MDE(23.2pp)**,不可用于判断改善 —— 主终点仍只看 val。
+
+---
+
+## 2026-08-07 · [★★ 更正] 前条"v4 飞轮点着了"的数字是抽样偏差;全量复算后读数差很多
+
+**先说结论**:上面 `[实证] v4 自体飞轮在 1.7B 上点着了` 一条里的
+`research_r_raw 66% 非零 / 中位 0.350 / valid_continuations 中位 20/20 /
+research_overlong 13/32 / no_finalize 11/32` **全部作废**。那批数字取自
+128 条 research 行中按文件名排序的**前 32 条**,而该子集系统性偏乐观。
+**全量 128 条同口径复算**(脚本 `v4_smoke_accept.py`,两次冒烟各跑一遍):
+
+| 指标 | 原记(前 32 条) | 全量 128 条 · smoke1 | 全量 128 条 · smoke2 |
+|---|---|---|---|
+| r_raw 非零率 | 66% | **30%** | **28%** |
+| r_raw 中位 | 0.350 | **0.000** | **0.000** |
+| valid_continuations 中位 | 20/20 | **0/20** | **0/20** |
+| research_overlong | 41% | **84%** | **82%** |
+| research_no_finalize | 34% | **69%** | **71%** |
+| research_error | — | 61% | **65%** |
+
+两次独立冒烟的全量读数**互相吻合**(84/69/30 vs 82/71/28),所以这是稳定状态而非
+波动。**"飞轮点着了"这个判断在全量口径下不成立**,请勿据前条推进任何决策。
+
+未变的部分(这些原记是对的):`replay_drift/degraded/doc_overflow` 全零;
+每任务恰 8 条 bare;bare 臂 won 32.0%(smoke1)/39.1%(smoke2)。
+
+**教训(给自己也给 CD-010)**:rollout 目录按文件名排序不是随机序 ——
+session_id 与任务/时序相关,取前 N 条会系统性偏。抽样统计一律加 `random.sample`
+或直接全量。
+
+---
+
+## 2026-08-07 · [★★ P0 阻断·已修] `reward_extra_info` 锯齿字典致 `won[keep]` IndexError 崩整步
+
+**症状**:162 v4 冒烟 step1 的 rollout(384 行)与 actor update **全部正常完成**,
+崩在最后的指标聚合:
+
+```
+File ".../verl/trainer/ppo/metric_utils.py", line 465, in compute_rollout_extra_metrics
+    arm, won = arm[keep], won[keep]
+IndexError: boolean index did not match indexed array along axis 0;
+            size of axis is 256 but size of corresponding boolean axis is 384
+```
+
+**根因(两层,第二层更值得修)**
+
+层 1 · 字段类型不对称。`agent_loop.py` 两条路径构造 `reward_extra_info`:
+- executor 行显式 `"won": int(traj.won)`、`"truncated": int(result.truncated)` —— int;
+- research 行走 `{k: v for k, v in fields.items() if isinstance(v,(int,float)) and not isinstance(v,bool)}`,
+  而 fields 里是 `"won": False`、`"truncated": bool(...)` —— **bool 被过滤器吃掉**。
+
+层 2 · 组装方式无长度契约。`trainer_base.py:1696-1700` 是 **per-key append**:
+```python
+for key, value in extra_field.get("reward_extra_info", {}).items():
+    reward_extra_infos_dict[key].append(value)
+```
+某 key 在部分行缺席不报错,只让该 key 的列表短一截 ⇒ `steer_arm` 384 个值而
+`won` 只 256 个。`compute_rollout_extra_metrics` 的守卫只查了
+`keep.shape == arm.shape`((384,)==(384,) 通过),没查 `won` ⇒ 崩在 `won[keep]`。
+
+**注意这个 bug 的隐蔽面**:即使不崩,锯齿字典也会让 `rollout_extra/<key>/mean`
+**静默变成"部分行的均值"**。任何 key 部分缺席都会这样,且无任何提示。
+
+**已修(三处,均为最小可逆改动)**
+
+1. `agent_loop.py` research 路径改为与 executor **结构对称**:四个公共标量
+   (`won`/`env_steps`/`invalid_format`/`truncated`)显式 int 化后进 dict,
+   再展开其余数值键。不动 `fields` 本身,故 rollout JSON 与显微镜的消费方不受影响。
+2. `metric_utils.py` 守卫补齐:`keep.shape == arm.shape == won.shape`。
+   宁可少一条分臂曲线也不能崩整步。
+3. `metric_utils.py` 新增**锯齿检测**:各 key 长度不一致时打印
+   `[rollout_extra] WARNING ragged reward_extra_info: ...`,把静默降级变成可见事件。
+
+**测试**:新增 `tests/test_rollout_extra_metrics_ragged.py` 3 项 —— ① research 行
+不稀释 `won_bare_rate`(混入会让 2/4 变成 2/8);② 锯齿字典不崩且打 warning;
+③ 无 `role_research` 键的 v3.1 两段 batch 行为不变。162 上 12 项全过
+(本地缺 tensordict,该文件按路径加载绕开 `verl/__init__`);本地全量 313 passed。
+
+**建议(仅供参考)**:层 2 才是复发源。若在 `trainer_base.py` 组装处对
+`reward_extra_info` 做一次 key 集合一致性校验(首行的 key 集合作为契约,
+后续行缺键即 fail loud),这类问题就不会再走到下游。我没动那里 —— 它在
+CD-005/CD-010 的其他路径上也被使用,改动面超出实验分支的"小修"边界。
+
+---
+
+## 2026-08-07 · [★★ P0 设计] `research_max_sample_tokens=24576` 把 82% 的 research 行 mask 成零梯度
+
+**结论先行**:v4 的 research 目标在 1.7B/162 上**基本没生效**。λ_r=0.1 的实际
+有效权重 ≈ `0.1 × 18% = 0.018`。病因是阈值恰好切在长度分布的左尾外侧,
+不是模型不会做研究 —— **被砍掉的是有效信号而不是噪声**(见下方第 3 点)。
+
+**1. 阈值与实测分布错位**
+
+`selfres.py:197` `overlong = len(prompt_ids) + len(stream) > research_max_sample_tokens`,
+命中即 `mask = [0]*len(mask)`(零梯度,r 仍留组内做 baseline)。而 128 条 research
+行的实测 `response_token_len` 分布:
+
+| 分位 | p10 | **p50** | p90 | max |
+|---|---|---|---|---|
+| token | 17110 | **37185** | 39838 | 44507 |
+
+阈值 24576 落在 p10 与 p50 之间 ⇒ 只有 20% 的行存活。抬阈的救回曲线是**悬崖式**的:
+
+| cap | 未超限 | |
+|---|---|---|
+| 24576(原) | 25/128 (20%) | |
+| 32768 | 40/128 (31%) | |
+| **40960** | **123/128 (96%)** | ← 悬崖 |
+| 49152 | 128/128 (100%) | |
+
+**2. 因果链已坐实**(交叉表 + 分组对比)
+
+`(overlong, no_finalize, error) = (True,True,True)` 占 **64%**(82/128),是最大单元格。
+分组对比更干净:
+
+| | n | respLen 中位 | turns 中位 | doc_words 中位 | overlong |
+|---|---|---|---|---|---|
+| r_raw>0 | 36 | 21587 | 10.0 | **516** | 44% |
+| r_raw=0 | 92 | **37216** | 16.5 | **0** | **97%** |
+
+`valid_continuations` 是**严格双峰**:0(71%)或 20(29%),无中间值 —— 要么文档没产出
+(续写无从谈起),要么 20 次全有效。
+
+**3. 关键反证:被砍掉的不是噪声**
+
+只看**未 overlong 的 23 行**:`r_raw` 非零 **87%**、中位 **0.450**、
+`valid_continuations` 中位 **20**、`no_finalize` 仅 **13%**。
+也就是说 —— **只要会话没被长度切断,v4 飞轮的读数是好的**。
+这同时解释了上面那条"更正"里的抽样偏差:前 32 条恰好富集了未超长的行。
+
+**4. 抬阈的代价比直觉小**
+
+overlong 行**本就完整进 batch 参与 forward**(只是 `response_mask` 置 0),
+抬阈只是让**已经付出的 forward 产生梯度**,增量主要在 backward,不是"多跑一遍长序列"。
+旁证:本次冒烟里最长序列 **45176 token** 已经在训练(日志 `max_token_len=16384
+below longest sequence 45176 — 60 oversized sample(s) ride in their own micro-batch`),
+四卡 100% 利用、显存 62–63GB/80GB,没有 OOM。
+
+**5. 已按用户裁定调整(2026-08-07)**
+
+用户裁定:**模型最大上下文 256K;researcher 单轮输出 8K,任务执行 agent 单轮输出 4K**。
+落到配置(162 版,A800 版未动):
+
+| 参数 | 原 | 新 | 依据 |
+|---|---|---|---|
+| `train.rollout_max_model_len` | 40960 | **262144** | 用户裁定(256K) |
+| `episode.max_tokens_per_turn` | 2048 | **4096** | 用户裁定(executor 4K) |
+| `research.researcher_max_tokens` | 8192 | 8192 | 用户裁定(researcher 8K),已符合 |
+| `train.response_length` | 32768 | **65536** | 连带:executor 单轮翻倍 + research p90 已达 39838 |
+| `eval.response_budget` | 32768 | **65536** | 连带:训评同构口径必须一致 |
+| `train.max_token_len_per_gpu` | 34816 | **40960** | 连带:×sp2=81920 ≥ 2048+65536 |
+| `research_rl.research_max_sample_tokens` | 24576 | **65536** | 连带:本条的直接目标 |
+
+**两机对照性说明**:这次改动让 162 版与 A800 版的 objective_fingerprint **不再相同**
+(`research_max_sample_tokens` 在 research_rl 段内、进指纹)。测试
+`test_162_selfres_config.py` 已相应改为"把长度参数对齐回 A800 后指纹必须相等",
+即**除这一处长度裁定外机制仍零漂移**,并新增 `test_length_ruling_2026_08_07`
+锁住新值防回退。若 CD-010 认为 A800 版也该同步调整,请在 changelog 说明,
+我这边跟随。
+
+**验证中**:冒烟 `pgs_s4_smoke3`(PID 2832152)带新配置 + 上一条的 P0 修复重跑,
+盯三件事 —— ① 显存(response 上限翻倍后是否仍 <80GB);② `research_overlong`
+是否从 82% 降下来;③ 单步墙钟(rollout 变长会直接决定正式 run 的总天数)。
+
+---
+
+## 2026-08-07 · [★★ 硬约束更正 + 病因定位] 256K 上下文不可执行;40960 的 ctx 墙才是 research 失败的物理根因
+
+**先更正上一条**:上一条表格里写的 `rollout_max_model_len → 262144`、
+`response_length → 65536`、`response_budget → 65536`、
+`research_max_sample_tokens → 65536` **均未落地**,实际落地值见下。原因是
+用户裁定的 256K 在 Qwen3-1.7B 上物理不可执行 —— 起 SGLang 时直接:
+
+```
+ValueError: max_model_len (262144) should be less than or equal to
+            max_position_embeddings (40960)
+   verl/workers/rollout/sglang_rollout/async_sglang_server.py:245
+```
+
+模型 `config.json`:`max_position_embeddings=40960`、`rope_scaling=None`;
+verl 也未把 `json_model_override_args` 暴露到配置层(只在 fp8 量化路径内部用)。
+**要突破 40960 只能改模型 config 开 YaRN —— 那是改基座不是改配置**,
+会影响占绝大多数 token 的 executor 短轨迹,已升级用户裁定,我没有擅自实施。
+
+**更重要的收获:40960 这堵墙就是 research 会话失败的物理根因**
+
+按 `response_token_len` 分档看 finalize 成功率(smoke2 的 128 条 research 行):
+
+| respLen 区间 | n | finalize 成功率 | r_raw>0 |
+|---|---|---|---|
+| (8192, 16384] | 11 | 90.9% | 90.9% |
+| (16384, 24576] | 14 | 85.7% | 85.7% |
+| (24576, 32768] | 15 | **93.3%** | 86.7% |
+| (32768, 36864] | 5 | 20.0% | 20.0% |
+| **(36864, 40960]** | **78 (61%)** | **0.0%** | **0.0%** |
+| (40960, 49152] | 5 | 0.0% | 0.0% |
+
+**61% 的会话堆积在紧贴 ctx 上限的最后一格,且无一成功**。这是典型的
+**撞墙质量堆积**:会话不是自然收敛的,是被 context 截断的。分组中位数同向:
+
+| 组 | n | respLen 中位 | turns 中位 | msg 数中位 |
+|---|---|---|---|---|
+| 成功(error=F, no_finalize=F) | 37 | 21803 | 10.0 | 20 |
+| 撞轮数上限(error=F, no_finalize=T) | 8 | 35182 | **30.0**(=max_turns) | 63 |
+| 撞 ctx 墙(error=T, no_finalize=T) | 83 | **37221** | 16.0 | 30 |
+
+**成功的会话 10 轮内收敛;失败的会话在第 16 轮撞墙**。所以"给更多上下文"
+确实是对症的 —— 那 83 条会话不是不会做研究,是话没说完就被掐断。
+
+**实际落地(在物理上限内顶满)**
+
+| 参数 | 原 | 实际落地 | 说明 |
+|---|---|---|---|
+| `train.rollout_max_model_len` | 40960 | **40960** | = max_position_embeddings,已是上限 |
+| `episode.max_tokens_per_turn` | 2048 | **4096** | 用户裁定(executor 4K),已落地 |
+| `research.researcher_max_tokens` | 8192 | 8192 | 用户裁定(researcher 8K),已符合 |
+| `train.response_length` | 32768 | **38912** | = 40960 − 2048,物理上限内顶满 |
+| `eval.response_budget` | 32768 | **38912** | 训评同构 |
+| `train.max_token_len_per_gpu` | 34816 | **40960** | ×sp2=81920,2× 余量 |
+| `research_rl.research_max_sample_tokens` | 24576 | **40960** | = ctx 上限 ⇒ 本阈不再是绑定约束 |
+
+抬阈后仍会有 ~4% 的行超限(实测 max 44507 > 40960),那些正是撞墙的行 ——
+**只有扩 ctx 能救,本阈已退出成为限制因素**。
+
+**给 CD-010 的三个问题(仅供参考,不预设答案)**
+
+1. research 会话有没有**历史压缩/滑窗**的设计空间?成功组 10 轮收敛而失败组
+   16 轮撞墙,若能把前几轮的工具原文压成摘要,同样的 ctx 可能多撑 10 轮。
+   这比扩 ctx 更根本,也不会污染 executor。
+2. `max_turns=30` 与 ctx 40960 的组合本身不自洽:30 轮 × 实测 ~2.3K/轮 = 69K
+   远超 ctx。是否应让 `max_turns` 由 ctx 反推,而不是独立取值?
+3. 若确实要扩 ctx,YaRN 的静态缩放会作用到 **executor 轨迹**(中位仅 2–3K)。
+   有没有办法只给 research 会话用长 ctx(例如 research 单独起一个 rope_scaling
+   不同的副本)?若没有,扩 ctx 就必须权衡主实验被污染的风险。
+
+**验证中**:冒烟 `pgs_s4_smoke4`(PID 2880914)带上述落地值 + 两条 P0 修复重跑。
+
+---
+
+## 2026-08-07 · [环境事实 + 我的操作事故] 162 的 v4 树曾落后本地 HEAD 23 个文件;已整体对齐
+
+**给 CD-010 的事实**:162 上的 v4 工作树(`/data4/ws/PGS/trace_opd_selfres_v4/trace_opd`)
+是 **2026-08-06 22:22** 同步的,此后本地 HEAD 又前进了 —— 对齐前的差距:
+
+- **仅本地有 9 个文件**:`envs/registry.py`、`envs/_template/*`、
+  `envs/spreadsheetbench/*`(= CD-010 的环境抽象层与 SSB 接入)
+- **14 个文件内容不同**:`core/adapter.py`(2602 → 8934 字节,`EnvFactory` 协议是新增的)、
+  `core/{episode,protocol,template_delta,types}.py`、`common/config.py`、
+  `envs/alfworld/adapter.py`、`research/{continuation,prompts}.py`、
+  `narrate/*`、`evalm/run_eval.py`、`train/build_datasets.py`
+- **162 无独有文件**(纯落后,不存在被覆盖的生产改造)
+- `verl/` 树 347 个文件**逐字节一致**;`configs/` 只差 3 个无关文件
+
+也就是说:**之前四次冒烟(smoke1–4)跑的是环境抽象层落地之前的代码**。
+若 CD-010 以为 162 在验证最新链路,这个前提当时不成立。现已整体对齐,
+备份留在 `trace_opd/src.bak.20260807`(可回滚)。
+
+**我的操作事故(记录以免重演)**:我只同步了改动的 3 个文件
+(`agent_loop.py` / `metric_utils.py` / 配置),而本地 HEAD 的 `agent_loop.py`
+`from ..core.adapter import EnvFactory` —— 162 的旧 `adapter.py` 没有这个符号,
+于是 smoke4 起来后 **每个 AgentLoopWorker 都 ImportError**:
+
+```
+ImportError: cannot import name 'EnvFactory' from 'trace_opd.core.adapter'
+hydra.errors.InstantiationException: Error locating target
+    'trace_opd.train.agent_loop.TraceAgentLoop'
+```
+
+教训:**部分同步比全量同步更危险** —— 全量同步的风险(覆盖远端改造)有
+`comm`/`sha256` 对拍可以事先查清;部分同步的风险(依赖链断裂)在同步时完全
+不可见,只会在运行时炸。正确顺序是:先全树对拍分清"远端落后"还是"远端有独有
+改动",再决定全量同步还是逐文件打补丁。
+
+**162 测试环境的两个已知缺口(不阻断训练,但会让"跑测试"这个动作失真)**
+
+1. **缺 `pytest-asyncio`**:`asyncio_mode = "auto"` 被报 `Unknown config option`,
+   31 个 async 测试直接 FAILED(`async def functions are not natively supported`)。
+   在 162 上跑全量测试会看到一片红,与代码质量无关。
+2. **`from tests.fakes import ...` 收集失败**(pytest 9.1.1 的 namespace package
+   行为与本地版本不同),影响 `test_{selfres,continuation,engine_researcher_chat}.py`
+   与 `test_adapter_and_evalm.py` 的一个用例。在 `pyproject.toml` 的
+   `[tool.pytest.ini_options]` 加 `pythonpath = ["."]` 应可解;我没改 —— 那是
+   共用文件,且不阻断实验。
+
+排除这两类后,162 上 **20/20 通过**(含配置合同 4 项、锯齿字典 3 项、
+policy 版本证据 5 项、maxopen 合同 5 项)。

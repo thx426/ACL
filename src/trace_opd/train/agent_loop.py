@@ -544,9 +544,22 @@ class TraceAgentLoop(AgentLoopBase):
             metrics=metrics,
             extra_fields=dict(fields),
         )
+        # 与 executor 行(本文件下方 `"won": int(traj.won)` 那处)**结构对称**:
+        # 四个公共标量必须显式 int 化后进 reward_extra_info。
+        # 否则 bool 会被下面的 `not isinstance(v, bool)` 过滤掉,该 key 在
+        # research 行缺席 —— 而 trainer_base 的 reward_extra_infos_dict 是
+        # per-key append,缺席直接产生"锯齿字典"(steer_arm 384 个值而 won 只
+        # 256 个),compute_rollout_extra_metrics 里 won[keep] 布尔索引长度
+        # 不匹配 ⇒ IndexError 崩整步(2026-08-07 162 v4 冒烟 step1 实测)。
         output.extra_fields["reward_extra_info"] = {
-            k: v for k, v in fields.items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            "won": int(bool(fields.get("won", 0))),
+            "env_steps": int(fields.get("env_steps", 0) or 0),
+            "invalid_format": int(bool(fields.get("invalid_format", 0))),
+            "truncated": int(bool(fields.get("truncated", 0))),
+            **{
+                k: v for k, v in fields.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            },
         }
         sr = rowres.session_result
         try:

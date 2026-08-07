@@ -48,9 +48,18 @@ def _build_spreadsheetbench(config: "Config", workers: int) -> "EnvFactory":
     return SpreadsheetbenchEnvFactory(cfg)
 
 
+def _build_math(config: "Config", workers: int) -> "EnvFactory":
+    from .math.adapter import MathEnvFactory
+
+    cfg = config.math
+    cfg.exec_concurrency = _per_worker(cfg.exec_concurrency, workers)
+    return MathEnvFactory(cfg)
+
+
 _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "alfworld": _build_alfworld,
     "spreadsheetbench": _build_spreadsheetbench,
+    "math": _build_math,
 }
 
 

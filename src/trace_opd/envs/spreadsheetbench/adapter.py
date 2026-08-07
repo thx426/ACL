@@ -20,14 +20,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 import threading
 
 from ...common.config import SpreadsheetbenchCfg
 from ...core import protocol
 from ...core.adapter import ActionOutcome
+from ..pytool import clip_middle, run_python_script
 from .evaluator import evaluate, find_test_cases, preview_workbook
 from .recalc import find_soffice, recalculated_for_grading
 
@@ -327,27 +326,9 @@ class SpreadsheetbenchTaskAdapter:
         )
 
     def _run_python(self, workdir: str, code: str) -> tuple[str, int]:
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "HOME": workdir,
-            "LANG": "C.UTF-8",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONHASHSEED": "0",   # 重放确定性
-        }
-        with self._gate:
-            try:
-                proc = subprocess.run(
-                    [sys.executable, "-c", code],
-                    cwd=workdir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=self._cfg.python_timeout_s,
-                )
-            except subprocess.TimeoutExpired:
-                return f"[timeout after {self._cfg.python_timeout_s}s]", 124
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return out if out.strip() else "(no output)", proc.returncode
+        return run_python_script(
+            code, cwd=workdir, timeout_s=self._cfg.python_timeout_s, gate=self._gate
+        )
 
     def _score_output(self, output_path: str) -> float:
         """单一 output 对全部 test case 评;soft = 通过比例。
@@ -383,12 +364,7 @@ class SpreadsheetbenchTaskAdapter:
         return n_pass / len(cases)
 
     def _clip(self, text: str) -> str:
-        limit = self._cfg.obs_max_chars
-        if len(text) <= limit:
-            return text
-        head = limit // 2
-        tail = limit - head
-        return text[:head] + "\n[... output truncated ...]\n" + text[-tail:]
+        return clip_middle(text, self._cfg.obs_max_chars)
 
     # ---- 文本动作协议件(SSB 不经 text_action_react;平凡实现) ----------
 

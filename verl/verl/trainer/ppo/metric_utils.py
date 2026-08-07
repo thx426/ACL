@@ -438,6 +438,17 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
     (already covered by ``critic/score``) are skipped.
     """
     metrics: dict[str, Any] = {}
+    # 锯齿检测:reward_extra_infos_dict 由 trainer 侧 per-key append 组装,
+    # 某 key 在部分行缺席不会报错,只让该 key 的列表短一截 —— 它的 mean 于是
+    # 悄悄变成"部分行的均值"。这里把不等长的 key 显式打出来,不静默。
+    lengths = {k: len(v) for k, v in reward_extra_infos_dict.items()}
+    if lengths and len(set(lengths.values())) > 1:
+        n_max = max(lengths.values())
+        ragged = {k: n for k, n in lengths.items() if n != n_max}
+        print(
+            f"[rollout_extra] WARNING ragged reward_extra_info: 多数 key 长 {n_max},"
+            f" 短缺的是 {ragged} —— 这些 key 的 mean 只覆盖部分行"
+        )
     for key, values in reward_extra_infos_dict.items():
         if key == "reward":
             continue
@@ -461,7 +472,11 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
             keep = np.asarray(
                 reward_extra_infos_dict["role_research"], dtype=np.float64
             ) < 0.5
-            if keep.shape == arm.shape:
+            # 三者必须同长。只查 arm 会在 won 短一截时崩在 won[keep]:
+            # reward_extra_infos_dict 是 per-key append,任一 key 在部分行
+            # 缺席就产生锯齿字典(2026-08-07 实测 steer_arm 384 / won 256,
+            # 因 research 行的 bool 字段被数值过滤器吃掉)。
+            if keep.shape == arm.shape == won.shape:
                 arm, won = arm[keep], won[keep]
         if arm.shape == won.shape and arm.size:
             rates: dict[str, float] = {}

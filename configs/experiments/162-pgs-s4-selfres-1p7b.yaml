@@ -142,10 +142,15 @@ train:
   lr_scheduler_type: constant   # h3 的实际调度,显式钉死保可比
   lr_warmup_steps_ratio: 0.0
   # ---- 序列容量参数(容量声明,非机制上限;包络变大按打包预算/SP/多机伸缩)----
-  response_length: 32768    # episode 响应流预算(=评测预算,训评同构)| 用户裁定:
-                            # 永不因输出长就不训练
+  response_length: 38912    # episode 响应流预算(=评测预算,训评同构)| 用户裁定:
+                            # 永不因输出长就不训练。2026-08-07 由 32768 提到
+                            # 38912 = rollout_max_model_len(40960) − max_prompt_length(2048),
+                            # 即在 1.7B 位置编码物理上限内**顶到最大**。
+                            # 依据:research 会话实测 p90=39838、61% 的行堆在
+                            # (36864,40960] 且 finalize 成功率 0% —— 撞的是 ctx 墙。
   max_prompt_length: 2048   # 首轮 prompt 上限,超长 fail-loud(truncation=error)
-  max_token_len_per_gpu: 34816   # 单序列容量声明:本值 × ulysses_sp ≥ prompt+response
+  max_token_len_per_gpu: 40960   # 单序列容量声明:本值 × ulysses_sp ≥ prompt+response
+                            # (40960×2=81920 ≥ 2048+38912=40960,2× 余量)
   ppo_max_token_len_per_gpu: 8192      # actor 训练前反向微批打包预算/卡
                             # (logits 分量 = 本值 × vocab × 4B fp32;21.2GiB 事故后解耦)
   log_prob_max_token_len_per_gpu: 8192 # old_log_prob 推理打包预算/卡(同时产出熵曲线)
@@ -155,7 +160,18 @@ train:
                             # rmpad=True+FA2(已实测可用),序列切两卡;4B/SP2 是 162
                             # 历史成熟配置。执行档改动,不进指纹,两臂一致
                             # 需可用 flash-attn —— 仅 162 venv 有,A800-SXM 不可用)
-  rollout_max_model_len: 40960   # rollout 单序列 ctx ≥ 教师前缀(scaffold+doc+obs)+ response
+  rollout_max_model_len: 40960   # = Qwen3-1.7B 的 max_position_embeddings,物理上限。
+                            # 用户 2026-08-07 裁定"上下文 256K",但实测不可执行:
+                            #   ValueError: max_model_len (262144) should be less than
+                            #   or equal to max_position_embeddings (40960)
+                            # (verl async_sglang_server.py:245 硬校验;模型 config.json
+                            #  的 rope_scaling 为 None,且 verl 未暴露 json_model_override_args)。
+                            # 要真正超过 40960 只能改模型 config 开 YaRN —— 那是改基座
+                            # 而非改配置,会影响占绝大多数 token 的 executor 短轨迹,
+                            # 已升级用户裁定,未擅自实施。
+                            # ⚠ 这堵墙是 research 会话失败的物理根因:respLen 落在
+                            #   (36864, 40960] 的 78 条(61%)finalize 成功率 **0%**,
+                            #   而 ≤32768 的 40 条成功率 85–93%。
   rollout_max_num_batched_tokens: 8192  # vLLM chunked-prefill 预算 | 2026-07-28 用户裁定
                             # 模板级 8192(step-17 illegal-access 绕过 + 独占拓扑显存账);
                             # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048。
@@ -266,7 +282,8 @@ steering:
                             # 档,预算重心前移但全程非零);消融 p∈{1,2}(第二轮)
 
 eval:
-  response_budget: 32768    # 评测侧 episode token 预算 | h3 定版
+  response_budget: 38912    # 评测侧 episode token 预算 | 随 train.response_length
+                            # 同步上调(训评同构口径必须一致)| 原 h3 定版 32768
   temperature: 0.0          # greedy | 评测口径(与 pilot 可比)
 
 # ---------------------------------------------------------------------------
@@ -281,4 +298,18 @@ research_rl:
   researcher_temperature: 1.0 # 自体 researcher chat 采样温度(用户裁定默认 1.0)
   research_rl_weight: 0.1     # λ_r(reward 预乘实现;seq-mean 行等权口径)
   research_warmup_steps: 0
-  research_max_sample_tokens: 24576   # research 行超长 ⇒ mask 全 0(零梯度)
+  research_max_sample_tokens: 40960   # research 行超长 ⇒ mask 全 0(零梯度)
+                            # 2026-08-07 由 24576 提到 40960(= ctx 物理上限,
+                            # 即"不再由本阈额外砍任何行")。实测(162 冒烟 step1,
+                            # 128 条 research 行):respLen p50=37185、p90=39838、
+                            # max=44507 —— 旧阈 24576 恰好切在分布左尾外,把 82%
+                            # 的 research 行 mask 成零梯度,λ_r 的实际有效权重只剩
+                            # 0.1×18%≈0.018。且未超限的 23 行读数很好(r_raw 非零
+                            # 87%/中位 0.450/valid_conts 中位 20),证明砍掉的是
+                            # 有效信号而非噪声。
+                            # 代价小:overlong 行本就完整进 batch 参与 forward
+                            # (只是 mask 置 0),抬阈只是让已付出的 forward 产生
+                            # 梯度,显存增量主要在 backward。
+                            # ⚠ 抬到 40960 后仍会有 ~4% 的行超限 —— 那些是撞 ctx
+                            #   墙的行,真正的解法是扩 ctx(见 rollout_max_model_len
+                            #   的注释),本阈已不再是绑定约束。

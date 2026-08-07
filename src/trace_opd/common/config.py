@@ -163,6 +163,16 @@ class SpreadsheetbenchCfg:
 
 
 @dataclass
+class MathCfg:
+    """Math benchmark(DAPO-17k × 六竞赛评测源)。无文件资产——任务全
+    自足于 parquet extra_info,无 data_root。"""
+
+    exec_concurrency: int = 32      # run_python 子进程全局并发门(按 worker 折算)
+    python_timeout_s: int = 30      # 数学计算脚本超时(短;SSB 是 120)
+    obs_max_chars: int = 3500       # 工具输出截断(保 <tool_response> 包裹)
+
+
+@dataclass
 class EnvironmentCfg:
     """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
     benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
@@ -403,6 +413,7 @@ class Config:
     environment: EnvironmentCfg
     alfworld: AlfworldCfg
     spreadsheetbench: SpreadsheetbenchCfg
+    math: MathCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -428,7 +439,7 @@ def _build(dc, d: dict[str, Any]):
 
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
-    "train", "eval", "steering", "environment", "spreadsheetbench"
+    "train", "eval", "steering", "environment", "spreadsheetbench", "math"
 }
 
 
@@ -861,6 +872,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         spreadsheetbench=_build(
             SpreadsheetbenchCfg, data.get("spreadsheetbench") or {}
         ),
+        math=_build(MathCfg, data.get("math") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),

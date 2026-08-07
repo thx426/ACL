@@ -1,8 +1,11 @@
 """162/1.7B v4 self-researcher 配置合同。
 
-红线:相对 A800 版**只允许机器与身份差异**——机制参数(research_rl 全段、
-steering v3.2 全套、24 行布局)必须逐字一致,否则两机结果不可对照。
-判据用 objective_fingerprint:同一 model_path 下两配置指纹必须相同。
+红线:相对 A800 版只允许**机器与身份差异** + **2026-08-07 的长度裁定**——
+其余机制参数(research_rl 其余项、steering v3.2 全套、24 行布局)必须逐字一致,
+否则两机结果不可对照。
+
+长度裁定单独列白名单而不是把红线整条废掉:指纹比较时先把 162 的长度参数
+对齐回 A800 值,若仍相等即证明"除这一处外机制零漂移"。
 """
 from __future__ import annotations
 
@@ -36,9 +39,47 @@ def env(monkeypatch, tmp_path):
         monkeypatch.setenv(k, v)
 
 
-def test_mechanism_identical_to_a800(env):
-    """同 model_path 下指纹必须逐字相同 = 机制零漂移。"""
-    assert objective_fingerprint(load_config(C162)) == objective_fingerprint(load_config(A800))
+def test_mechanism_identical_to_a800_modulo_length_ruling(env):
+    """把长度参数对齐回 A800 后,指纹必须逐字相同 = 除长度外机制零漂移。"""
+    a, c = load_config(A800), load_config(C162)
+    c.research_rl.research_max_sample_tokens = a.research_rl.research_max_sample_tokens
+    assert objective_fingerprint(c) == objective_fingerprint(a)
+
+
+#: Qwen3-1.7B 的 max_position_embeddings。verl 的 async_sglang_server 硬校验
+#: max_model_len <= 该值,超出即 ValueError。用户 2026-08-07 裁定的 256K 因此
+#: 不可执行(要突破只能改模型 config 开 YaRN = 改基座,已升级用户裁定)。
+QWEN3_1P7B_MAX_POS = 40960
+
+
+def test_length_ruling_2026_08_07(env):
+    """用户裁定 2026-08-07:上下文尽量大、researcher 单轮 8K、executor 单轮 4K。
+
+    裁定中可执行的部分全部落到位;不可执行的部分(256K)锁住其物理原因,
+    防止后来者把 rollout_max_model_len 改大后在启动时才发现起不来。
+    """
+    c = load_config(C162)
+    assert c.episode.max_tokens_per_turn == 4096, "任务执行 agent 单轮输出 = 4K"
+    assert c.research.researcher_max_tokens == 8192, "researcher 单轮输出 = 8K"
+    assert c.role("researcher").max_tokens == 8192
+    # 上下文顶到物理上限,不多不少
+    assert c.train.rollout_max_model_len == QWEN3_1P7B_MAX_POS, (
+        "超过 max_position_embeddings 会在 SGLang 起服时 ValueError"
+    )
+    # response 预算 = ctx − prompt,即在物理上限内顶满
+    assert c.train.response_length == QWEN3_1P7B_MAX_POS - c.train.max_prompt_length
+    assert c.eval.response_budget == c.train.response_length, "训评同构"
+    # 本阈不再是绑定约束:等于 ctx 上限 ⇒ 只有撞 ctx 墙的行才会被 mask
+    assert c.research_rl.research_max_sample_tokens == QWEN3_1P7B_MAX_POS, (
+        "旧阈 24576 把 82% 的 research 行 mask 成零梯度(162 冒烟 step1 实测)"
+    )
+    assert (c.train.max_token_len_per_gpu * c.train.ulysses_sp
+            >= c.train.max_prompt_length + c.train.response_length), (
+        "单序列容量声明必须放得下 prompt+response,否则训练侧会 fail"
+    )
+    assert c.train.rollout_max_model_len >= (
+        c.train.max_prompt_length + c.train.response_length
+    ), "rollout ctx 必须 ≥ prompt+response"
 
 
 def test_only_machine_and_identity_differ(env):
