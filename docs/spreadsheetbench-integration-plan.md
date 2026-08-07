@@ -110,6 +110,26 @@
 5. 交 CD-006 清单:数据在位与 case 分布、openpyxl 进训练环境(走 env
    入口纪律)、真 tokenizer 的 tool 模板对拍冒烟、35B/4B bare 探针。
 
+## 5.5 公式陷阱(旧项目 48 探针实证;用户确认的历史细节点)
+
+评估口径(官方 evaluation.py 语义)用 openpyxl `data_only=True` 读**缓存
+值**,而 agent 用 openpyxl 写入的公式没有缓存值 ⇒ 公式单元格被读成
+None,**写公式的解法结构性必挂**。旧项目实证(skills_evolve
+`explorer_trajectories_review/06_ss_global_residual_48probe_ledger.md`):
+
+- 任务 53647(指令字面要求 create formulas)连败 23 探针,失败签名恒
+  `pred=None`(agent 坚持写公式);
+- 泛泛的"写静态值"指令**不够**(多个 static-value 探针仍 0/2);
+- 翻转要素 = 显式因果解释("harness 不重算公式 → 公式被读 empty/None →
+  失败")+ MUST 静态值规则 + 字面指令覆盖授权 —— probe_046 generic 段
+  (49036 同款 8/8 稳定)。
+
+落地:上述三要素文案已进 `executor_scaffold`(勿削弱措辞,源注释标注
+台账出处);**task_brief 同步告知 researcher 该评估机理**(否则 researcher
+可能产出教 executor 写公式的有害文档)。口径声明:此为评估语义设计事实
+(与旧 +14.5pp 实证同口径),非缺陷;若未来需对齐官方论文数字,须另核
+官方管线是否含 Excel/WPS 重算步骤,报告口径分开。
+
 ## 6. 科学定位与已知风险
 
 - 第二环境角色:机制跨环境泛化验证(探索型 vs 代码操作型);旧 +14.5pp

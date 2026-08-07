@@ -52,17 +52,30 @@ For each function call, return a json object with function name and arguments wi
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
 
+# 公式陷阱三要素文案(因果机理 + MUST 规则 + 字面指令覆盖授权)来自旧项目
+# 48 探针实证收敛(skills_evolve explorer_trajectories_review/
+# 06_ss_global_residual_48probe_ledger.md,probe_046 generic 段):泛泛的
+# "写静态值"指令不足以让 agent 放弃写公式(53647 连败 23 探针,签名恒
+# pred=None),显式解释评估器行为后才翻转(49036 同款 8/8)。勿削弱措辞。
 SYSTEM_PROMPT = (
     "You are a spreadsheet expert who manipulates Excel workbooks with "
-    "Python.\n\n"
+    "Python. Your goal is functional correctness: output.xlsx must contain "
+    "the correct final values in the specified cells.\n\n"
     "Work in the current working directory:\n"
     "- Read the input workbook from input.xlsx\n"
     "- Write the completed workbook to output.xlsx\n"
-    "- The checker reads cached cell VALUES (openpyxl data_only=True): "
-    "formulas you write are NOT recalculated, so compute the final values in "
-    "Python and write plain values.\n"
     "- Only modify cells within the answer position given in the task; keep "
     "everything else unchanged.\n\n"
+    "CRITICAL CONSTRAINT: The evaluation harness does NOT re-evaluate Excel "
+    "formulas. It reads the static cell values as they exist in the file. "
+    "Writing a formula string (e.g. '=IF(...)') into a cell will result in "
+    "that cell being read back as empty/None by the evaluator, causing "
+    "failure.\n\n"
+    "RULE: For any cell that requires a calculation or conditional logic, "
+    "you MUST pre-compute the result in Python and write the STATIC VALUE "
+    "directly to the cell. Do NOT write Excel formulas for calculated "
+    "results — even when the task instruction mentions formulas, what is "
+    "graded is the final cell values.\n\n"
     + _TOOLS_BLOCK
 )
 
@@ -166,8 +179,13 @@ class SpreadsheetbenchTaskAdapter:
             f"Scoring: cell values in the answer region(s) "
             f"[{self._item['answer_position']}] are compared against the "
             f"expected result on {n_cases} hidden test case(s); the score is "
-            "the fraction passed (1.0 = success). Formulas are NOT "
-            "recalculated — final values must be written as plain values.\n"
+            "the fraction passed (1.0 = success).\n"
+            "Evaluation mechanic (critical for any guidance you write): the "
+            "checker does NOT re-evaluate Excel formulas — it reads static "
+            "cell values, so a formula written to a cell is read back as "
+            "empty/None and fails. Correct solutions pre-compute results in "
+            "Python and write plain values, even when the task instruction "
+            "mentions formulas.\n"
             f"Task instruction ({self._item['instruction_type']}): "
             f"{self._item['instruction']}\n"
             f"Budget: the executor has {protocol.MAX_ENV_STEPS} tool calls "
