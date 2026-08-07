@@ -1,0 +1,188 @@
+# =============================================================================
+# A800 / 原始 Qwen3-4B(无 SFT 冷启动)/ n=16 分臂 8+8 / v3.3 全套修复主臂
+# 用户裁定 2026-08-07(六点全档):asym advantage + W off + 熵门(G-E)+
+# α cosine 358 步语境 decay=240 + ε=0.05 探针恢复 + 预算维持放开。
+# 科学定位:s3(v3.1 病态形态,双病诊断 docs/pgs-s3-diagnosis-cd010.md)的
+# 修复版同语境判决——"v3.3 全包 vs v3.1 全包"系统对照;单变量归因走 M6
+# 预注册消融矩阵后补。对照三角:s3(4B 病态基线)/162(1.7B 全臂健康参照)。
+# 机制真源:docs/pgs-v33-mixed-policy-design.md;实现:pgs-v33@1b4e053。
+# ⚠ TRACE_MODEL_PATH 必须指向原始 Qwen3-4B-Instruct-2507(HF 目录),
+#    不是任何 SFT/RL checkpoint —— 起跑前 preflight 首查项。
+# ⚠ 新指纹(asym/entropy/off 三开关全进 material)——不可续 s3 ckpt,从头起。
+# =============================================================================
+
+run:
+  name: pgs_v33_4braw_asym
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs
+  tape: true
+
+# ---------------------------------------------------------------------------
+# 在线 researcher 文档 producer(冻结当步 policy 做独立 ALFWorld 实验)
+# 预算 = 用户裁定 2026-08-07(16/4/8 → 8/2/4):researcher 墙钟约减半。
+# ---------------------------------------------------------------------------
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 8
+  k_default: 2
+  k_max: 4                   # tools.py 取 min(k_req, k_max),留大即绕过默认
+  max_turns: 30
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"
+  episode_temperature: 1.0
+  researcher_max_tokens: 8192
+  session_timeout_s: 3600
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+
+# ---------------------------------------------------------------------------
+# Episode 协议(训练/评测同构,PG-3;逐字沿 s3)
+# ---------------------------------------------------------------------------
+episode:
+  max_env_steps: 30
+  max_assistant_turns: 40
+  max_tokens_per_turn: 2048
+
+alfworld:
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  spawn_concurrency: 64
+  start_timeout_s: 300
+  step_timeout_s: 120
+  boot_concurrency: 32
+
+# ---------------------------------------------------------------------------
+# 训练:verl GRPO(除 adv_estimator/norm 两键外逐字沿 s3)
+# ---------------------------------------------------------------------------
+train:
+  model_path: "${TRACE_MODEL_PATH}"    # 原始 Qwen3-4B-Instruct-2507
+  train_file: "${TRACE_TRAIN_FILE}"
+  val_files:
+    - "${TRACE_VAL_SEEN_FILE}"
+    - "${TRACE_VAL_UNSEEN_FILE}"
+  experiment_name: pgs_v33_4braw_asym
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1
+  train_batch_size: 16
+  rollout_n: 16             # 分臂 8 bare + 8 steered(steered_fraction 0.5)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo   # v3.3 M1(与 steering.adv_mode: asym 联动,
+                            # 校验强制;bare 组内 LOO + steered=[R−mean_bare]₊×α)
+  norm_adv_by_std: false    # asym 档强制显式 false(estimator 不做 std 归一,
+                            # true 会被静默忽略且污染指纹——校验拒绝)
+  response_length: 32768
+  max_prompt_length: 2048
+  max_token_len_per_gpu: 34816
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  rollout_max_model_len: 40960
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 2           # 2875/16=179 步/epoch ×2 = 358 步(用户裁定档 A)
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16
+
+# ---------------------------------------------------------------------------
+# PGS steering —— v3.3 主臂档(docs/pgs-v33-mixed-policy-design.md)
+# ---------------------------------------------------------------------------
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf               # 用户裁定 D4:预算维持放开(强度控制已由熵门承担,
+                            # 相对 s3 少一个差异变量);spent 照记观察量
+  topk: 64
+  obs_topk: 256             # 熵口径 top-16 需 obs_topk>=16(校验强制)
+  theta_d: 0.0              # entropy 档免标定(D tracker 不建)
+  gate_mode: entropy        # v3.3 M4 G-E 首发:w=min(1, h/H_q),h=top-16 截断
+                            # 学生熵(draft 侧免费);段内全部 w<w_min 跳过教师
+                            # verify(steer_n_gate_bypassed=墙钟红利曲线)
+  gate_adaptive: true       # H_q 率控自适应(EMA 追熵分布 P95;v4 路径冻结
+                            # bug 已修 1b4e053)
+  gate_target_rate: 0.10    # 仅 D 门档消费;熵档率控用 entropy_target_rate
+  gate_ema_beta: 0.1
+  epsilon: 0.05             # 用户裁定 D5:软档探针恢复(5% 随机 w→0,保干预
+                            # 因果读数;代价=干预面 5% 折损)
+  gate_rate_bounds: [0.05, 0.25]  # 仅 adaptive 硬门消费;软档告警带自动关闭
+  r_max: 0                  # 维持放开(同 b_max 理由)
+  w_beh_mode: "off"         # v3.3 M3 推荐默认:steered 行免行为分布 IS,
+                            # ratio 分母统一 π_old(MENTOR 口径);偏差由
+                            # [·]₊ 与 α 承接。⚠ 必须带引号(YAML 1.1 裸 off
+                            # 是布尔;加载层已归一,引号是双保险)
+                            # ⚠ 监控注意:rollout_is_weights 通道整体停用,
+                            # W_beh off1 等旧曲线消失是预期不是故障
+  w_beh_shaped_gamma: 0.1   # off 档惰性(shaped_reject 消融臂才消费)
+  # ---- v3.3 M1/M2:不对称 advantage 与 α 有限期调度 ----
+  adv_mode: asym            # bare 组内 LOO;steered=[R−mean_bare]₊×α_t
+                            # (失败零梯度不惩罚);orphan 组(部分失败形态)
+                            # 零 advantage 降级 + actor/pgs_orphan_steered_groups
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 240   # 用户裁定档 A:≈总步数 2/3(358×2/3),给副
+                            # 动作族慢热留窗(162 实测该族 80-120 步起飞);
+                            # cosine 到 0 后 steered 臂停产、researcher producer
+                            # 同步停跑(教师=有限期脚手架)
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0      # 防御闸默认关(激活时对 α 前 RAW 超额和封顶)
+  # ---- v3.3 M4:熵门参数(4B raw + researcher doc 语境标定,s3 dump
+  # step25/47/51,n=1,433,050;脚本 analysis/s3-arm-split-diagnosis/ent_calib.py。
+  # 全量分位:P75=.014 / P90=.822 / P95=1.276 / P99=1.891)----
+  entropy_target_rate: 0.05 # 满强度位置目标占比(H_q 追 P95;MENTOR 同款)
+  entropy_theta_init: 1.28  # H_q EMA 初值 = 上述语境 P95
+  entropy_floor: 0.6        # 硬地板(≈「至少 78/22 犹豫」;防阈值追熵坍缩)
+  intensity_w_min: 0.05     # w<w_min 视为关门(整段全关跳教师 verify)
+  # ---- 分臂(v3.1 结构不变,advantage 口径已由 adv_mode 修复)----
+  steered_fraction: 0.5
+  budget_pacing: false      # b_max=inf 下解锁曲线无定义(校验拒绝组合)
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768
+  temperature: 0.0
