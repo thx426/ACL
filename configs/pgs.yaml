@@ -39,13 +39,26 @@ research:
   doc_max_words: 3000
   gt: "off"                 # 动态源强制 off，特权 GT 不得进入 producer
   episode_temperature: 1.0   # research 实验仍由当前 step 冻结 policy 采样
-  researcher_max_tokens: 8192
+  researcher_max_tokens: 8192  # 单轮生成峰值上限(弹性;典型轮远小于它)
   session_timeout_s: 3600
+  # §7.5 预算解耦(2026-08-08 用户裁定;research.enabled 时**必配**):
+  session_token_budget: 30720  # 会话流预算 = 实际控制器(生成+工具返回+结构,
+                               # 不含 prompt);允许 < max_turns×researcher_max_tokens
+                               # (那是峰值乘积非典型量);超即截断轨迹(length
+                               # 优雅终局,保训练梯度)。定值依据:4B 探针会话
+                               # 总量 p90=42k/max=58.8k——要吃满 p90 须同步提高
+                               # train.response_length(padding 维度,内存 ∝ 行数×它)。
+                               # 校验强制 ≤ response_length 且 +prompt ≤ model_len
+  max_prompt_tokens: 2048      # researcher 首调 prompt 上限(system+tools 块+
+                               # kickoff;4B 实测中位 1426/max 1598),超即 fail-loud
 
 narration:
   backend: engine            # 复用当前 SGLang rollout engine，不依赖 vLLM 私有面
-  max_words: 1000
+  max_words: 1000            # prompt 指令词数(叙述篇幅要求),非解码上限
   temperature: 0.3
+  max_tokens: 3000           # 单次叙述解码上限(独立配置;0=旧推导 3×max_words)
+  max_prompt_tokens: 6144    # 叙述 prompt(system+轨迹渲染)上限,超出截轨迹
+                             # 渲染段重渲(叙述本就是压缩,截输入不 fail)
 
 roles:
   researcher:

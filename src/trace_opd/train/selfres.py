@@ -194,7 +194,9 @@ async def run_research_row(
     coord.register_research(session_id, doc if not degraded else "", r, degraded)
 
     prompt_ids, stream, mask = chat.training_row()
-    overlong = len(prompt_ids) + len(stream) > research_max_sample_tokens
+    # 流口径(不含 prompt,与 session_token_budget/§7.4 联动阈同口径;
+    # §7.5 口径统一——旧式含 prompt 会让同数值阈实际紧 ~1.5k)。
+    overlong = len(stream) > research_max_sample_tokens
     if overlong:
         mask = [0] * len(mask)                         # 零梯度;r 留组内 baseline
     fields["research_overlong"] = int(overlong)

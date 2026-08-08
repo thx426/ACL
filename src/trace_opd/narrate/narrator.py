@@ -71,6 +71,7 @@ async def narrate_episode(
     temperature: float = 0.3,
     domain_notes: str = "",
     opts: RenderOpts | None = None,
+    max_tokens: int = 0,
 ) -> NarrationResult:
     skip = classify(traj)
     if skip is not None:
@@ -88,9 +89,10 @@ async def narrate_episode(
                 {"role": "user", "content": log_text},
             ],
             temperature,
-            # budget = narration itself (~1.3 tok/word) + headroom for models
-            # that reason before writing
-            max(1000, int(max_words * 3)),
+            # §7.5:解码上限独立配置(narration.max_tokens);0 = 旧推导
+            # (~1.3 tok/word 叙述本体 + 先想后写的余量)——max_words 回归
+            # 单一职责(prompt 里的篇幅指令),不再兼任解码预算。
+            max_tokens if max_tokens > 0 else max(1000, int(max_words * 3)),
         )
     except Exception as err:  # noqa: BLE001 — soft landing on the mechanical log
         return NarrationResult(text=None, error=f"{type(err).__name__}: {err}")

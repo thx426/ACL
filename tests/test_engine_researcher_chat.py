@@ -29,7 +29,9 @@ def _chat(texts, max_total=100_000, per_turn=512):
         delta=TemplateDelta(TOK),
         temperature=1.0,
         max_tokens_per_turn=per_turn,
-        max_total_tokens=max_total,
+        session_token_budget=max_total,
+        max_prompt_tokens=100000,
+        rollout_max_model_len=1000000,
     )
 
 
@@ -93,7 +95,8 @@ def test_token_ceiling_returns_length_and_abort_flags():
 
     chat2 = EngineResearcherChat(
         generate=AbortGen(), tokenizer=TOK, delta=TemplateDelta(TOK),
-        temperature=1.0, max_tokens_per_turn=64, max_total_tokens=10_000,
+        temperature=1.0, max_tokens_per_turn=64, session_token_budget=4096,
+        max_prompt_tokens=4096, rollout_max_model_len=1000000,
     )
     res2 = _run(chat2(messages, None))
     assert res2.finish_reason == "aborted" and chat2.aborted

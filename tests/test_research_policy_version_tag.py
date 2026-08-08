@@ -49,7 +49,8 @@ def _chat(extras):
 
     return EngineResearcherChat(
         generate=_Gen(extras), tokenizer=_Tok(), delta=_Delta(),
-        temperature=1.0, max_tokens_per_turn=64, max_total_tokens=4096,
+        temperature=1.0, max_tokens_per_turn=64, session_token_budget=4096,
+        max_prompt_tokens=4096, rollout_max_model_len=1000000,
     )
 
 

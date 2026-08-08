@@ -238,6 +238,7 @@ class ToolRouter:
                 self._narrate_fn,
                 max_words=self.narration_cfg.max_words,
                 temperature=self.narration_cfg.temperature,
+                max_tokens=self.narration_cfg.max_tokens,
                 domain_notes=self.adapter.domain_notes(),
             )
             if narration.text is None and narration.skip is None:

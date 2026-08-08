@@ -51,8 +51,8 @@ def test_v4_research_rows_extend_rollout_n(tmp_path):
     # v4:rollout.n = rollout_n + research_n(三段布局);关断时保持原值。
     steer = (
         "steering: {enabled: true, doc_source: researcher, theta_d: 0.8}\n"
-        "research: {enabled: true, backend: engine, tool_protocol: text, gt: \"off\"}\n"
-        "narration: {backend: engine}\n"
+        "research: {enabled: true, backend: engine, tool_protocol: text, gt: \"off\", session_token_budget: 24576, max_prompt_tokens: 1024}\n"
+        "narration: {backend: engine, max_prompt_tokens: 6144}\n"
         "research_rl: {enabled: true, research_n: 8}"
     )
     cmd = _cmd(tmp_path, ", rollout_n: 16, agent_task_timeout_s: 0", steer)
@@ -158,8 +158,8 @@ def _dynamic_cfg(tmp_path, monkeypatch=None):
         ", train_batch_size: 16, agent_num_workers: 16, agent_task_timeout_s: 5400",
         """
 steering: {enabled: true, doc_source: researcher, doc_table: '', theta_d: 0.8}
-research: {enabled: true, backend: external, tool_protocol: fncall, gt: 'off', session_timeout_s: 3600}
-narration: {backend: engine}
+research: {enabled: true, backend: external, tool_protocol: fncall, gt: 'off', session_timeout_s: 3600, session_token_budget: 24576, max_prompt_tokens: 1024}
+narration: {backend: engine, max_prompt_tokens: 6144}
 roles:
   researcher:
     endpoint: 'http://one/v1,http://two/v1'

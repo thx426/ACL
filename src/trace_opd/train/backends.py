@@ -89,9 +89,10 @@ class EngineResearcherChat:
         安全合并,messages 归档保持原分列结构,语义一致);
       * 会话结束由 training_row() 取 (prompt_ids, response_ids, mask)。
 
-    token 总量防线:流长逼近 max_total_tokens 时返回 finish_reason="length"
-    的空 tool 轮——会话靠轮数上限自然收敛;训练行超长降级由调用方按
-    research_max_sample_tokens 判(§1.6)。
+    token 预算(§7.5,用户裁定 2026-08-08):流预算 session_token_budget
+    (不含 prompt)耗尽或引擎保险丝逼近时返回 finish_reason="length",
+    session 层优雅终局(截断轨迹保训练梯度);首调 prompt 超
+    max_prompt_tokens 即 fail-loud。
     """
 
     def __init__(
@@ -102,14 +103,25 @@ class EngineResearcherChat:
         delta,                        # core.template_delta.TemplateDelta
         temperature: float,
         max_tokens_per_turn: int,
-        max_total_tokens: int,
+        session_token_budget: int,
+        max_prompt_tokens: int,
+        rollout_max_model_len: int,
     ) -> None:
         self._generate = generate
         self._tokenizer = tokenizer
         self._delta = delta
         self._temperature = float(temperature)
         self._max_tokens_per_turn = int(max_tokens_per_turn)
-        self._max_total_tokens = int(max_total_tokens)
+        # §7.5(用户裁定 2026-08-08)三量各司其职:
+        #   session_token_budget — 会话流预算(生成+工具返回+结构,不含
+        #     prompt)= 实际控制器;允许 < max_turns×per_turn(单轮上限是
+        #     峰值弹性),超即 length 优雅终局(截断轨迹,保训练梯度);
+        #   max_prompt_tokens — 首调 prompt 上限,超即 fail-loud(scaffold/
+        #     工具描述膨胀的暴露面);
+        #   rollout_max_model_len — 引擎上下文保险丝(一般达不到)。
+        self._session_token_budget = int(session_token_budget)
+        self._max_prompt_tokens = int(max_prompt_tokens)
+        self._rollout_max_model_len = int(rollout_max_model_len)
         self.prompt_ids: list[int] = []
         self._stream: list[int] = []          # response 流(prompt 之后)
         self._mask: list[int] = []
@@ -174,6 +186,13 @@ class EngineResearcherChat:
             # tools 交 chat template 原生渲染(TextProtocol 升级为客户端解析
             # FC 后 session 传入 schema;None 时与历史渲染逐字节等价)。
             self.prompt_ids = render_ids(self._tokenizer, list(messages), True, tools=tools)
+            if len(self.prompt_ids) > self._max_prompt_tokens:
+                raise RuntimeError(
+                    f"researcher prompt {len(self.prompt_ids)} tokens exceeds "
+                    f"research.max_prompt_tokens={self._max_prompt_tokens} — "
+                    "scaffold/tool descriptions have grown; raise the config "
+                    "deliberately or trim the prompt (fail-loud by design, §7.5)"
+                )
         else:
             user_texts: list[str] = []
             for m in new:
@@ -193,14 +212,19 @@ class EngineResearcherChat:
             self._append_user_block(user_texts)
         self._seen_messages = len(messages)
 
-        budget = self._max_total_tokens - len(self.prompt_ids) - len(self._stream)
-        if budget < 32:
+        # 流口径(不含 prompt,与 executor 的 response_budget 口径一致):
+        # budget 是实际控制器;fuse 是引擎上下文保险丝(动态用实测 prompt,
+        # 不再有 −2048 之类预留魔数)。
+        budget = self._session_token_budget - len(self._stream)
+        fuse = (self._rollout_max_model_len
+                - len(self.prompt_ids) - len(self._stream))
+        if min(budget, fuse) < 32:
             return ChatResult(content="", finish_reason="length")
         gen = await self._generate(
             self.prompt_ids + self._stream,
             {
                 "temperature": self._temperature,
-                "max_tokens": min(self._max_tokens_per_turn, budget),
+                "max_tokens": min(self._max_tokens_per_turn, budget, fuse),
             },
         )
         if gen.extra.get("stop_reason") == "aborted":
@@ -219,11 +243,25 @@ class EngineResearcherChat:
         )
 
 
-def engine_narrate_fn(server_manager, tokenizer, request_id: str | None = None):
-    """在当前 rollout engine 上做单轮轨迹叙述；不假设 vLLM 私有接口。"""
+def engine_narrate_fn(server_manager, tokenizer, request_id: str | None = None,
+                      max_prompt_tokens: int = 0):
+    """在当前 rollout engine 上做单轮轨迹叙述；不假设 vLLM 私有接口。
+
+    max_prompt_tokens > 0 时约束叙述 prompt(system+轨迹渲染):超出对轨迹
+    渲染段(末条 user)截中重渲——叙述本就是压缩,截输入优于 fail(§7.5)。"""
 
     async def narrate(messages: list[dict[str, Any]], temperature: float, max_tokens: int) -> str:
         prompt_ids = render_ids(tokenizer, messages, True)
+        if max_prompt_tokens > 0 and len(prompt_ids) > max_prompt_tokens:
+            from ..narrate.preprocess import truncate_middle
+            body = str(messages[-1].get("content") or "")
+            # 按 token 超额比例折算字符预算(×0.9 双重余量),截中保头尾
+            keep = max(512, int(len(body) * max_prompt_tokens
+                                / len(prompt_ids) * 0.9))
+            messages = list(messages[:-1]) + [
+                {"role": messages[-1]["role"], "content": truncate_middle(body, keep)}
+            ]
+            prompt_ids = render_ids(tokenizer, messages, True)
         out = await server_manager.generate(
             request_id=request_id or uuid4().hex,
             prompt_ids=prompt_ids,

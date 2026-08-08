@@ -44,7 +44,9 @@ research:
   episode_temperature: 1.0
   researcher_max_tokens: 8192
   session_timeout_s: 3600
-narration: {backend: engine, max_words: 1000, temperature: 0.3}
+  session_token_budget: 24576
+  max_prompt_tokens: 1024
+narration: {backend: engine, max_words: 1000, temperature: 0.3, max_prompt_tokens: 6144}
 roles:
   researcher:
     endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"

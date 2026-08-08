@@ -50,11 +50,16 @@ research:
   episode_temperature: 1.0
   researcher_max_tokens: 8192
   session_timeout_s: 3600
+  # §7.5 必配(2026-08-08):流预算控制器与 prompt 上限(定值依据:4B 探针
+  # 会话总量 p90=42k/max=58.8k;prompt 中位 1426/max 1598)
+  session_token_budget: 32768
+  max_prompt_tokens: 2048
 
 narration:
   backend: engine
   max_words: 1000
   temperature: 0.3
+  max_prompt_tokens: 6144   # §7.5 必配:叙述 prompt 上限(超出截轨迹渲染段)
 
 roles:
   researcher:

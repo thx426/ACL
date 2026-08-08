@@ -97,8 +97,21 @@ class ResearchCfg:
     doc_max_words: int = 3000
     gt: str = "off"
     episode_temperature: float = 1.0
-    researcher_max_tokens: int = 8192
+    researcher_max_tokens: int = 8192   # 单轮生成峰值上限(弹性,非典型量)
     session_timeout_s: float = 3600.0
+    # §7.5(用户裁定 2026-08-08):上限(保险丝)与控制器解耦,两键**必配**
+    # (research.enabled 时 >0,无默认推导)。
+    session_token_budget: int = 0  # 会话流预算(生成+工具返回+结构,**不含
+                                   # prompt**)= 实际控制器;超即截断轨迹
+                                   # (length 优雅终局)。允许 < max_turns ×
+                                   # researcher_max_tokens(单轮上限是峰值弹性,
+                                   # 典型轮远小于它;4B 探针会话总量 p90=42k/
+                                   # max=58.8k 是定值依据)
+    max_prompt_tokens: int = 0     # researcher 首调 prompt(system+模板 tools
+                                   # 块+kickoff)上限,超即 fail-loud——scaffold/
+                                   # 工具描述膨胀的暴露面(4B 实测中位 1426/
+                                   # max 1598);旧 model_len−2048 的 2048 是
+                                   # 无引用魔数,已废
 
 
 @dataclass
@@ -147,8 +160,13 @@ class NarrationCfg:
     """research 实验轨迹的叙述后端；engine 复用当前 SGLang rollout。"""
 
     backend: str = "engine"
-    max_words: int = 1000
+    max_words: int = 1000          # prompt 指令词数(叙述篇幅要求),非解码上限
     temperature: float = 0.3
+    max_tokens: int = 0            # 单次叙述解码上限;0 = 旧推导
+                                   # max(1000, 3×max_words)(兼容)
+    max_prompt_tokens: int = 0     # 叙述 prompt(system+轨迹渲染)上限,超出对
+                                   # 轨迹渲染段截中重渲(叙述本就是压缩,截输入
+                                   # 不 fail);research.enabled 时必配 >0
 
 
 @dataclass
@@ -523,15 +541,18 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
         )
-    # §7.1(用户需求 2026-08-08):轨迹长度的主导权应在「轮数 × 单轮上限」,
-    # train.response_length 保留为 verl 侧上限声明。二者关系只提示不阻断
-    # ——声明哪个先截断,避免"配了轮预算却被总长阈静默主导"的误读。
+    # §7.1/§7.5 预算关系陈述(信息,不评判):单轮上限的职责是允许个别轮
+    # 打到峰值(弹性),典型轮远小于它——总预算 < 轮×单轮乘积是常态设计。
+    # 此处只声明实际由哪个量兜底,便于起跑前核对。
     _turn_budget = cfg.episode.max_assistant_turns * cfg.episode.max_tokens_per_turn
-    if cfg.train.response_length and cfg.train.response_length < _turn_budget:
+    if cfg.train.response_length:
+        who = ("总预算 response_length 兜底"
+               if cfg.train.response_length < _turn_budget
+               else "轮×单轮乘积先到")
         print(
-            f"[config] note: train.response_length({cfg.train.response_length})"
-            f" < max_assistant_turns×max_tokens_per_turn({_turn_budget}) — "
-            "轨迹将由总长阈先行截断,轮×单轮预算不是实际主导(§7.1)。"
+            f"[config] budget: executor 流预算 response_length="
+            f"{cfg.train.response_length},轮×单轮乘积={_turn_budget}({who});"
+            f" padding 维度即 response_length,CPU 内存 ∝ 行数×该值。"
         )
     if t.rollout_backend not in ("vllm", "sglang"):
         raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")
@@ -762,6 +783,48 @@ def _validate(cfg: "Config") -> None:
                     problems.append("research.tool_protocol 必须为 fncall")
             if rcfg.gt != "off":
                 problems.append("research.gt 必须为 off")
+            # §7.5:预算三键必配(上限/控制器解耦,无默认推导——用户裁定)
+            if rcfg.session_token_budget <= 0:
+                problems.append(
+                    "research.session_token_budget 必配(>0;会话流预算,不含 "
+                    "prompt。定值依据:4B researcher 探针会话总量 p90=42122/"
+                    "max=58828)"
+                )
+            if rcfg.max_prompt_tokens <= 0:
+                problems.append(
+                    "research.max_prompt_tokens 必配(>0;researcher 首调 "
+                    "prompt 上限,4B 实测中位 1426/max 1598)"
+                )
+            if cfg.narration.max_prompt_tokens <= 0:
+                problems.append(
+                    "narration.max_prompt_tokens 必配(>0;叙述 prompt 上限,"
+                    "超出截轨迹渲染段)"
+                )
+            # 保险丝不等式(FAIL 级):
+            # ① prompt+流 ≤ 模型上下文(否则引擎必爆);
+            # ② research 行 stream 进 verl response padding 维度(只补不截),
+            #    budget 超维度 = 超长行不截静默进训练;
+            # ③ research 行 prompt 进 verl prompt padding 维度,同理。
+            if (rcfg.session_token_budget > 0 and rcfg.max_prompt_tokens > 0
+                    and rcfg.session_token_budget + rcfg.max_prompt_tokens
+                    > t.rollout_max_model_len):
+                problems.append(
+                    f"research.session_token_budget({rcfg.session_token_budget})"
+                    f" + max_prompt_tokens({rcfg.max_prompt_tokens}) 超过 "
+                    f"train.rollout_max_model_len({t.rollout_max_model_len})"
+                )
+            if rcfg.session_token_budget > t.response_length:
+                problems.append(
+                    f"research.session_token_budget({rcfg.session_token_budget})"
+                    f" 超过 train.response_length({t.response_length})——research "
+                    "行 stream 进该 padding 维度且 verl 只补不截"
+                )
+            if rcfg.max_prompt_tokens > t.max_prompt_length:
+                problems.append(
+                    f"research.max_prompt_tokens({rcfg.max_prompt_tokens}) 超过 "
+                    f"train.max_prompt_length({t.max_prompt_length})(research 行 "
+                    "prompt 的 padding 维度)"
+                )
             if cfg.narration.backend != "engine":
                 problems.append("narration.backend 必须为 engine")
             if t.train_batch_size != t.agent_num_workers:

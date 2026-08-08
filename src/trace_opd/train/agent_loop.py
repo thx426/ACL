@@ -281,7 +281,10 @@ class TraceAgentLoop(AgentLoopBase):
 
     def _narrate_fn(self, route: str):
         """叙述始终复用当前 rollout engine，兼容 SGLang EngineGenerate 面。"""
-        return engine_narrate_fn(self.server_manager, self.tokenizer, request_id=route)
+        return engine_narrate_fn(
+            self.server_manager, self.tokenizer, request_id=route,
+            max_prompt_tokens=self.cfg.narration.max_prompt_tokens,
+        )
 
     def _researcher_chat(self, task_id: str):
         client = self.researcher_client
@@ -480,9 +483,12 @@ class TraceAgentLoop(AgentLoopBase):
                 delta=self.delta,
                 temperature=rrl.researcher_temperature,
                 max_tokens_per_turn=rcfg.researcher_max_tokens,
-                max_total_tokens=max(
-                    4096, self.cfg.train.rollout_max_model_len - 2048
-                ),
+                # §7.5:控制器(session_token_budget,必配)与保险丝
+                # (rollout_max_model_len)解耦;旧 model_len−2048 派生式
+                # (2048 是无引用魔数)废除。
+                session_token_budget=rcfg.session_token_budget,
+                max_prompt_tokens=rcfg.max_prompt_tokens,
+                rollout_max_model_len=self.cfg.train.rollout_max_model_len,
             )
             router = ToolRouter(
                 adapter=adapter,
@@ -556,12 +562,12 @@ class TraceAgentLoop(AgentLoopBase):
             continuation_temperature=rrl.continuation_temperature,
             research_rl_weight=rrl.research_rl_weight,
             research_warmup_steps=rrl.research_warmup_steps,
-            # 0 = 联动会话 token 墙(与 EngineResearcherChat 的
-            # max_total_tokens 同式;需求 §7.4:会话预算内的正常轨迹恒有
-            # 梯度,零梯度降级只在显式配小阈时生效)。
+            # 0 = 联动会话流预算(§7.4×§7.5:预算内完成的正常轨迹恒有
+            # 梯度,零梯度降级只在显式配小阈时生效;阈与 budget 同为
+            # 不含 prompt 的流口径)。
             research_max_sample_tokens=(
                 rrl.research_max_sample_tokens
-                or max(4096, self.cfg.train.rollout_max_model_len - 2048)
+                or self.cfg.research.session_token_budget
             ),
         )
         metrics.generate_sequences += time.time() - t0

@@ -255,8 +255,8 @@ alfworld: {data_root: /d, worker_python: /p}
 train: {model_path: /m, train_file: /t.parquet, val_files: [/v1.parquet],
         agent_task_timeout_s: 0, rollout_n: 16%s}
 eval: {}
-research: {enabled: true, backend: external, tool_protocol: fncall, gt: "off"}
-narration: {backend: engine}
+research: {enabled: true, backend: external, tool_protocol: fncall, gt: "off", session_token_budget: 24576, max_prompt_tokens: 1024}
+narration: {backend: engine, max_prompt_tokens: 6144}
 roles:
   researcher:
     endpoint: "http://x/v1"
