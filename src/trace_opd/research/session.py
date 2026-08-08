@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from ..common.llm import ChatResult
 from ..common.tape import TAPE_CONTEXT
-from .prompts import KICKOFF_MESSAGE, TOOL_SCHEMAS, WRAPUP_REMINDER
+from .prompts import KICKOFF_MESSAGE, WRAPUP_REMINDER, tool_schemas_for
 from .toolproto import ToolProtocol
 from .tools import ToolRouter
 
@@ -66,7 +66,12 @@ class ResearchSession:
         self._router = router
         self._max_turns = max_turns
         self._wrapup_at = max(1, max_turns - 1 - wrapup_buffer)
-        prepared_system, self._tools = toolproto.prepare(system_prompt, TOOL_SCHEMAS)
+        # 工具描述按 router 的 ResearchCfg 生成:k 的 default/max 必须与配置一致,
+        # 否则模型照着写死的文案显式填 k,cfg.k_default 永远不生效(见
+        # prompts.tool_schemas_for 的注释与 2026-08-07 的实测)。
+        prepared_system, self._tools = toolproto.prepare(
+            system_prompt, tool_schemas_for(router.cfg)
+        )
         self._messages: list[dict[str, Any]] = [
             {"role": "system", "content": prepared_system}
         ]

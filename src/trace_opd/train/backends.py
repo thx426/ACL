@@ -171,7 +171,9 @@ class EngineResearcherChat:
         first_call = self._seen_messages == 0
         new = messages[self._seen_messages:]
         if first_call:
-            self.prompt_ids = render_ids(self._tokenizer, list(messages), True)
+            # tools 交 chat template 原生渲染(TextProtocol 升级为客户端解析
+            # FC 后 session 传入 schema;None 时与历史渲染逐字节等价)。
+            self.prompt_ids = render_ids(self._tokenizer, list(messages), True, tools=tools)
         else:
             user_texts: list[str] = []
             for m in new:

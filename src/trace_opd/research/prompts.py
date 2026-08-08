@@ -137,7 +137,11 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                     "k": {
                         "type": "integer",
-                        "description": "Number of parallel episodes (default 4).",
+                        # ⚠ 这里的字面量只是兜底文案。真正发给模型的描述由
+                        # tool_schemas_for(cfg) 按运行配置改写 —— 见该函数的注释:
+                        # 写死的 "default 4" 会被模型当成权威并显式填 4,
+                        # 使 tools.py 的 args.get("k", cfg.k_default) 永不生效。
+                        "description": "Number of parallel episodes.",
                     },
                 },
                 "required": ["guidance"],
@@ -210,3 +214,34 @@ def build_researcher_system(
         gt_block=gt_block,
         doc_rules=DOC_RULES_TEMPLATE.format(doc_max_words=doc_max_words),
     )
+
+
+def tool_schemas_for(cfg) -> list[dict]:
+    """按运行配置填充工具描述里的 k 默认值与上限。
+
+    为什么需要这个函数(2026-08-07 实测事故):
+    `TOOL_SCHEMAS` 里 k 的描述原本硬编码 "Number of parallel episodes
+    (default 4)."。模型把它当权威,于是**每次都显式填 k=4** —— 而
+    `tools.py` 是 `k_req = args.get("k", cfg.k_default)`,显式填了就永远
+    取不到 `cfg.k_default`。结果:把 `k_default` 从 4 改到 2 之后,
+    实测 episode/实验 仍恒为 **4.00**(s3 与 v33 两个 run 都是),
+    即该配置项完全失效,只有 `k_max`(clamp 上限)真正起作用。
+
+    修法是让描述跟着配置走,而不是让配置去追一个写死的文案。
+    """
+    import copy
+
+    out = copy.deepcopy(TOOL_SCHEMAS)
+    for tool in out:
+        props = (
+            tool.get("function", {})
+            .get("parameters", {})
+            .get("properties", {})
+        )
+        if "k" in props:
+            props["k"]["description"] = (
+                f"Number of parallel episodes (default {cfg.k_default}, "
+                f"maximum {cfg.k_max}). Prefer the default unless you have a "
+                f"specific reason to spend more of your episode budget."
+            )
+    return out
