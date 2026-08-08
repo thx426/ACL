@@ -123,8 +123,13 @@ class ResearchRLCfg:
     research_rl_weight: float = 0.1  # λ_r:research 行 advantage 标量乘(seq-mean
                                    # 行等权口径下即角色间权重比,无需分角色分母)
     research_warmup_steps: int = 0   # 该步数内 research 行 advantage 置 0(不反传)
-    research_max_sample_tokens: int = 24576  # research 行超长阈:超过 ⇒ mask 全 0
-                                   # (零梯度,r 留组内 baseline,doc 照用)
+    research_max_sample_tokens: int = 0  # research 行零梯度降级阈。**0(默认)=
+                                   # 联动会话 token 墙**(max(4096,
+                                   # rollout_max_model_len−2048)):凡在会话预算内
+                                   # 完成的正常轨迹恒有全梯度(需求 §7.4,用户裁定
+                                   # 2026-08-08——旧默认 24576 < 墙 38912,正常长
+                                   # 会话被静默零梯度)。显式配 >0 才作防御降级
+                                   # (超过 ⇒ mask 全 0,r 留组内 baseline,doc 照用)
 
     def __post_init__(self) -> None:
         for f in ("continuation_temperature", "researcher_temperature",
@@ -518,6 +523,16 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
         )
+    # §7.1(用户需求 2026-08-08):轨迹长度的主导权应在「轮数 × 单轮上限」,
+    # train.response_length 保留为 verl 侧上限声明。二者关系只提示不阻断
+    # ——声明哪个先截断,避免"配了轮预算却被总长阈静默主导"的误读。
+    _turn_budget = cfg.episode.max_assistant_turns * cfg.episode.max_tokens_per_turn
+    if cfg.train.response_length and cfg.train.response_length < _turn_budget:
+        print(
+            f"[config] note: train.response_length({cfg.train.response_length})"
+            f" < max_assistant_turns×max_tokens_per_turn({_turn_budget}) — "
+            "轨迹将由总长阈先行截断,轮×单轮预算不是实际主导(§7.1)。"
+        )
     if t.rollout_backend not in ("vllm", "sglang"):
         raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")
     if t.fused_kernels_backend not in ("torch", "triton"):
@@ -835,9 +850,10 @@ def _validate(cfg: "Config") -> None:
             raise ValueError(
                 f"research_rl.research_rl_weight 必须是非负有限数,得到 {rrl.research_rl_weight!r}"
             )
-        if rrl.research_warmup_steps < 0 or rrl.research_max_sample_tokens < 1:
+        if rrl.research_warmup_steps < 0 or rrl.research_max_sample_tokens < 0:
             raise ValueError(
-                "research_rl.research_warmup_steps 须 >=0 且 research_max_sample_tokens 须 >=1"
+                "research_rl.research_warmup_steps 须 >=0 且 research_max_sample_tokens 须 >=0"
+                "(0 = 联动会话 token 墙,§7.4)"
             )
 
 

@@ -556,7 +556,13 @@ class TraceAgentLoop(AgentLoopBase):
             continuation_temperature=rrl.continuation_temperature,
             research_rl_weight=rrl.research_rl_weight,
             research_warmup_steps=rrl.research_warmup_steps,
-            research_max_sample_tokens=rrl.research_max_sample_tokens,
+            # 0 = 联动会话 token 墙(与 EngineResearcherChat 的
+            # max_total_tokens 同式;需求 §7.4:会话预算内的正常轨迹恒有
+            # 梯度,零梯度降级只在显式配小阈时生效)。
+            research_max_sample_tokens=(
+                rrl.research_max_sample_tokens
+                or max(4096, self.cfg.train.rollout_max_model_len - 2048)
+            ),
         )
         metrics.generate_sequences += time.time() - t0
 
