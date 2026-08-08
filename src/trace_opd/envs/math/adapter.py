@@ -28,7 +28,10 @@ from ..pytool import clip_middle, run_python_script
 from .verifier import answers_equivalent, ensure_math_verify
 
 #: 无合法 tool call 时的提醒(裸文本;协议说明由模板渲染的工具块承担)
-FORMAT_REMINDER = protocol.fc_format_reminder("run_python", "submit")
+def _format_reminder() -> str:
+    # 调用时求值:措辞随运行时安装的 FC dialect(模块 import 早于
+    # configure_fc_dialect,常量会把 hermes 措辞固化进 qwen35_xml 语境)
+    return protocol.fc_format_reminder("run_python", "submit")
 
 # 工具 schema(OpenAI 格式单一真源,模板原生渲染;描述纪律:执行模型/
 # 前置条件/返回语义/失败与截断行为写全)。
@@ -200,14 +203,14 @@ class MathTaskAdapter:
     # ---- 交互面 ----------------------------------------------------------
 
     def react(self, env: MathEpisode, assistant_text: str) -> ActionOutcome:
-        calls = protocol.parse_tool_calls(assistant_text)
+        calls = protocol.parse_tool_calls(assistant_text, tools=self.tools())
         thought = protocol.strip_tool_calls(assistant_text)
         if not calls:
             return ActionOutcome(
                 thought=assistant_text.strip(),
                 action_raw="",
                 action_norm="",
-                feedback=FORMAT_REMINDER,
+                feedback=_format_reminder(),
                 done=False,
                 score=0.0,
                 acted=False,
@@ -287,7 +290,7 @@ class MathTaskAdapter:
         return False
 
     def format_reminder(self) -> str:
-        return FORMAT_REMINDER
+        return _format_reminder()
 
 
 def _tool_resp(content: str) -> str:

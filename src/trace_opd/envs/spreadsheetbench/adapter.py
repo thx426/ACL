@@ -32,7 +32,10 @@ from .recalc import find_soffice, recalculated_for_grading
 
 #: 无合法 tool call 时的提醒(裸文本——assistant 未发起调用,反馈不是
 #: tool 响应)
-FORMAT_REMINDER = protocol.fc_format_reminder("run_python", "submit")
+def _format_reminder() -> str:
+    # 调用时求值:措辞随运行时安装的 FC dialect(模块 import 早于
+    # configure_fc_dialect,常量会把 hermes 措辞固化进 qwen35_xml 语境)
+    return protocol.fc_format_reminder("run_python", "submit")
 
 # 工具 schema(OpenAI 通用 FC 格式,单一真源;用户裁定 2026-08-07):
 # 经 adapter.tools() 交 chat template 原生渲染进 prompt(分布内形态,
@@ -253,14 +256,14 @@ class SpreadsheetbenchTaskAdapter:
     # ---- 交互面(function-calling react) --------------------------------
 
     def react(self, env: SpreadsheetEpisode, assistant_text: str) -> ActionOutcome:
-        calls = protocol.parse_tool_calls(assistant_text)
+        calls = protocol.parse_tool_calls(assistant_text, tools=self.tools())
         thought = protocol.strip_tool_calls(assistant_text)
         if not calls:
             return ActionOutcome(
                 thought=assistant_text.strip(),
                 action_raw="",
                 action_norm="",
-                feedback=FORMAT_REMINDER,
+                feedback=_format_reminder(),
                 done=False,
                 score=0.0,
                 acted=False,
@@ -374,7 +377,7 @@ class SpreadsheetbenchTaskAdapter:
         return False
 
     def format_reminder(self) -> str:
-        return FORMAT_REMINDER
+        return _format_reminder()
 
 
 def _tool_resp(content: str) -> str:

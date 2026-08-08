@@ -206,6 +206,7 @@ async def cmd_sample(args) -> int:
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
+    protocol.configure_fc_dialect(delta.fc_dialect)
     factory = make_env_factory(cfg)   # environment.name 分派(registry)
 
     items = load_tasks([args.train_file])

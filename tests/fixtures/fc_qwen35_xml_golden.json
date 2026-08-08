@@ -1,0 +1,345 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "execute",
+    "description": "d",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "command"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "run_experiment",
+    "description": "d",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "plan": {
+       "type": "string"
+      },
+      "k": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "plan"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle",
+    "description": "d",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "flag": {
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "flag"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "scores",
+    "description": "d",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "vals": {
+       "type": "array"
+      },
+      "x": {
+       "type": "number"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "submit",
+    "description": "d",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  }
+ ],
+ "cases": [
+  {
+   "case": "std",
+   "text": "Reasoning first.\n\n<tool_call>\n<function=execute>\n<parameter=command>\ngo to desk 1\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "Reasoning first.\n\n",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go to desk 1\"}"
+    }
+   ]
+  },
+  {
+   "case": "multiline-value",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\nline1\nline2\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"line1\\nline2\"}"
+    }
+   ]
+  },
+  {
+   "case": "no-newline-wrap",
+   "text": "<tool_call><function=execute><parameter=command>go</parameter></function></tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\"}"
+    }
+   ]
+  },
+  {
+   "case": "inner-spaces-kept",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\n  indented \n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"  indented \"}"
+    }
+   ]
+  },
+  {
+   "case": "unclosed-param",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\ngo to desk 1\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go to desk 1\"}"
+    }
+   ]
+  },
+  {
+   "case": "unclosed-func",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\ngo\n</parameter>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\"}"
+    }
+   ]
+  },
+  {
+   "case": "unclosed-toolcall",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\ngo\n</parameter>\n</function>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\"}"
+    }
+   ]
+  },
+  {
+   "case": "int-param",
+   "text": "<tool_call>\n<function=run_experiment>\n<parameter=plan>\ntry things\n</parameter>\n<parameter=k>\n4\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "run_experiment",
+     "parameters": "{\"plan\": \"try things\", \"k\": 4}"
+    }
+   ]
+  },
+  {
+   "case": "bad-int",
+   "text": "<tool_call>\n<function=run_experiment>\n<parameter=plan>\np\n</parameter>\n<parameter=k>\nfour\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "run_experiment",
+     "parameters": "{\"plan\": \"p\", \"k\": \"four\"}"
+    }
+   ]
+  },
+  {
+   "case": "bool-true",
+   "text": "<tool_call>\n<function=toggle>\n<parameter=flag>\ntrue\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "toggle",
+     "parameters": "{\"flag\": true}"
+    }
+   ]
+  },
+  {
+   "case": "bool-mixed-case",
+   "text": "<tool_call>\n<function=toggle>\n<parameter=flag>\nTRUE\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "toggle",
+     "parameters": "{\"flag\": true}"
+    }
+   ]
+  },
+  {
+   "case": "bool-bad",
+   "text": "<tool_call>\n<function=toggle>\n<parameter=flag>\nyes\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "toggle",
+     "parameters": "{\"flag\": false}"
+    }
+   ]
+  },
+  {
+   "case": "null-value",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\nnull\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": null}"
+    }
+   ]
+  },
+  {
+   "case": "array-param",
+   "text": "<tool_call>\n<function=scores>\n<parameter=vals>\n[1, 2, 3]\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "scores",
+     "parameters": "{\"vals\": [1, 2, 3]}"
+    }
+   ]
+  },
+  {
+   "case": "number-float",
+   "text": "<tool_call>\n<function=scores>\n<parameter=x>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "scores",
+     "parameters": "{\"x\": 2.5}"
+    }
+   ]
+  },
+  {
+   "case": "number-intlike",
+   "text": "<tool_call>\n<function=scores>\n<parameter=x>\n3\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "scores",
+     "parameters": "{\"x\": 3}"
+    }
+   ]
+  },
+  {
+   "case": "unknown-param",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\ngo\n</parameter>\n<parameter=extra>\n1\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\", \"extra\": \"1\"}"
+    }
+   ]
+  },
+  {
+   "case": "unknown-tool",
+   "text": "<tool_call>\n<function=teleport>\n<parameter=dst>\nkitchen\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "teleport",
+     "parameters": "{\"dst\": \"kitchen\"}"
+    }
+   ]
+  },
+  {
+   "case": "two-calls",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\ngo\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=submit>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\"}"
+    },
+    {
+     "name": "submit",
+     "parameters": "{}"
+    }
+   ]
+  },
+  {
+   "case": "bare-function-no-shell",
+   "text": "<function=execute>\n<parameter=command>\ngo\n</parameter>\n</function>",
+   "normal_text": "<function=execute>\n<parameter=command>\ngo\n</parameter>\n</function>",
+   "calls": []
+  },
+  {
+   "case": "text-after-call",
+   "text": "<tool_call>\n<function=execute>\n<parameter=command>\ngo\n</parameter>\n</function>\n</tool_call>\nTrailing commentary.",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\"}"
+    }
+   ]
+  },
+  {
+   "case": "empty-args",
+   "text": "<tool_call>\n<function=submit>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "submit",
+     "parameters": "{}"
+    }
+   ]
+  },
+  {
+   "case": "no-call-plain-text",
+   "text": "Just an answer, no tools.",
+   "normal_text": "Just an answer, no tools.",
+   "calls": []
+  },
+  {
+   "case": "empty-string",
+   "text": "",
+   "normal_text": "",
+   "calls": []
+  }
+ ]
+}

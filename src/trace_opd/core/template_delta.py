@@ -73,6 +73,96 @@ def turn_stop_token_ids(tokenizer) -> list[int]:
     return sorted(t for t in ids if isinstance(t, int) and t >= 0)
 
 
+_FC_PROBE_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "fcprobe771",
+        "description": "probe",
+        "parameters": {
+            "type": "object",
+            "properties": {"arg": {"type": "string"}},
+            "required": ["arg"],
+        },
+    },
+}]
+
+
+def fc_dialect(tokenizer) -> str:
+    """行为探测模板家族的 function-calling wire 形态(单一真源=模板对
+    assistant tool_calls 历史轮的实际渲染,不看模板源文本、不查模型名)。
+
+    返回 protocol.FC_DIALECTS 之一:
+      qwen35_xml — 渲染出 ``<function=fcprobe771>``(Qwen3.5 系,A800 实测
+                   2026-08-08:外壳 <tool_call> + XML 参数体);
+      hermes     — 渲染出 ``"name": "fcprobe771"`` 的 JSON 块(Qwen3 系);
+      none       — 模板不渲染 tool_calls(或不支持 tools kwarg)。FC
+                   benchmark 跑在 none 上必须由 preflight 拦截。
+    """
+    msgs = [
+        {"role": "user", "content": "UPROBE551"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"type": "function",
+                         "function": {"name": "fcprobe771",
+                                      "arguments": {"arg": "VPROBE882"}}}]},
+    ]
+    try:
+        rendered = tokenizer.apply_chat_template(
+            msgs, tools=_FC_PROBE_TOOL, tokenize=False,
+            add_generation_prompt=False, **_CHAT_KWARGS,
+        )
+    except Exception:
+        logger.warning("fc_dialect probe: template rejected tools/tool_calls", exc_info=True)
+        return "none"
+    if "<function=fcprobe771>" in rendered:
+        return "qwen35_xml"
+    if '"name": "fcprobe771"' in rendered or '"name":"fcprobe771"' in rendered:
+        return "hermes"
+    return "none"
+
+
+def fc_roundtrip_probe(tokenizer, dialect: str) -> None:
+    """硬门:模板渲染出的 tool_call 必须能被我方文本层解析器逐值还原。
+
+    这是「训练通道自解析 == 模板所教形态」的两端等价断言(EOS 事故的
+    姊妹防线:那次是停止符,这次是 FC wire 形态)。失败即 raise,由
+    preflight 转 FAIL;dialect="none" 时调用方不应进来。"""
+    from . import protocol  # 函数内 import,避免 core 模块级依赖环
+
+    msgs = [
+        {"role": "user", "content": "UPROBE551"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"type": "function",
+                         "function": {"name": "fcprobe771",
+                                      "arguments": {"arg": "VPROBE882"}}}]},
+    ]
+
+    def render(m):
+        return tokenizer.apply_chat_template(
+            m, tools=_FC_PROBE_TOOL, tokenize=False,
+            add_generation_prompt=False, **_CHAT_KWARGS,
+        )
+
+    # 差分取 assistant 段:生产语境 parser 只吃 assistant 生成文本,而全量
+    # 渲染产物含 system Tools 块里的格式示例调用(Qwen3.5 实测
+    # <function=example_function_name>),整段喂 parser 会把示例当首个调用。
+    base, full = render(msgs[:-1]), render(msgs)
+    if not full.startswith(base):
+        raise RuntimeError(
+            "FC roundtrip probe: rendering the assistant turn does not extend "
+            "the prior render as a prefix — cannot isolate the assistant segment"
+        )
+    assistant_seg = full[len(base):]
+    schema = [_FC_PROBE_TOOL[0]]
+    calls = protocol.parse_tool_calls(assistant_seg, tools=schema, dialect=dialect)
+    if not (calls and calls[0]["name"] == "fcprobe771"
+            and calls[0]["arguments"].get("arg") == "VPROBE882"):
+        raise RuntimeError(
+            f"FC roundtrip failed for dialect={dialect!r}: template renders a "
+            f"tool call our text-side parser cannot recover (parsed={calls!r}). "
+            f"Assistant segment: {assistant_seg[-400:]!r}"
+        )
+
+
 def _find_subseq(haystack: list[int], needle: list[int]) -> int:
     n, m = len(haystack), len(needle)
     for i in range(n - m + 1):
@@ -130,11 +220,16 @@ class TemplateDelta:
             "post_obs does not end with the generation prefix"
         )
 
+        #: 模板家族的 FC wire 形态("none" 合法——纯文本协议 benchmark 不用;
+        #: FC benchmark 跑在 none 上由 preflight/入口拦截,不在此硬断)。
+        self.fc_dialect: str = fc_dialect(t)
+
         logger.info(
-            "TemplateDelta ready: gen_prefix=%r glue=%r post_obs=%r",
+            "TemplateDelta ready: gen_prefix=%r glue=%r post_obs=%r fc_dialect=%s",
             t.decode(self.gen_prefix),
             t.decode(self.glue_full),
             t.decode(self.post_obs),
+            self.fc_dialect,
         )
 
     def after_generation(self, gen_ids: list[int]) -> list[int]:

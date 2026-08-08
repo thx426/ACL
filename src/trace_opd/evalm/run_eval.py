@@ -119,6 +119,7 @@ async def main_async(args) -> int:
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
+    protocol.configure_fc_dialect(delta.fc_dialect)
     factory = make_env_factory(config)
     tasks = load_tasks(args.parquet)
     if not tasks:

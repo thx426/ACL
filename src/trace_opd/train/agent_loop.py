@@ -217,11 +217,15 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                         config.steering.entropy_theta_init,
                         config.steering.entropy_floor,
                     )
+        delta = TemplateDelta(tokenizer)
+        # FC dialect 随模板家族注入(qwen35_xml/hermes;文本层解析与服务端
+        # parser 等价的前提)。none 时 FC benchmark 由 preflight 拦截。
+        protocol.configure_fc_dialect(delta.fc_dialect)
         _STATE.update(
             {
                 "config": config,
                 "run_dir": run_dir,
-                "delta": TemplateDelta(tokenizer),
+                "delta": delta,
                 "factory": make_env_factory(config, workers=workers),
                 "doc_table": doc_table,
                 "gate_tracker": gate_tracker,

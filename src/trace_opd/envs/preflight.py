@@ -59,6 +59,9 @@ def main() -> int:
     # 2. model assets -------------------------------------------------------
     # 2026-08-08 Qwen3.5 EOS 事故的固化:eos 三处一致性 + 模板差分断言前置。
     # 目录不在本机时跳过(config-only 核对场景);部署机上目录必在 ⇒ 必查。
+    # FC 协议环境登记表(react 走 protocol.parse_tool_calls 的环境;新 FC
+    # 环境接入必须在此登记,M1 后 alfworld 加入)——FC 门只对它们启用。
+    _FC_ENVIRONMENTS = {"spreadsheetbench", "math"}
     mp = Path(cfg.train.model_path)
     if not mp.is_dir():
         print(f"[preflight] note: model_path {mp} absent on this host — asset "
@@ -69,7 +72,11 @@ def main() -> int:
 
             from transformers import AutoTokenizer
 
-            from ..core.template_delta import TemplateDelta, turn_stop_token_ids
+            from ..core.template_delta import (
+                TemplateDelta,
+                fc_roundtrip_probe,
+                turn_stop_token_ids,
+            )
 
             tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=True)
             stop_ids = turn_stop_token_ids(tok)
@@ -79,8 +86,22 @@ def main() -> int:
                     "nor <|im_end|>; rollout requests would carry no turn-final "
                     "stop and every turn would overrun"
                 )
-            TemplateDelta(tok)  # glue/gen_prefix 差分硬断言,起跑前即暴露模板漂移
-            _ok("model", f"stop_ids={stop_ids}; template delta probes pass")
+            delta = TemplateDelta(tok)  # glue/gen_prefix 差分硬断言,起跑前即暴露模板漂移
+
+            # FC 门(2026-08-08 家族化):FC 协议环境要求模板可渲染 tool_calls
+            # 且我方文本层解析器能逐值还原(训练通道无服务端 parser,两端形态
+            # 必须同族——Qwen3 hermes 与 Qwen3.5 qwen35_xml 互不可解)。
+            if cfg.environment.name in _FC_ENVIRONMENTS:
+                if delta.fc_dialect == "none":
+                    raise RuntimeError(
+                        f"environment {cfg.environment.name!r} uses the FC protocol "
+                        "but this chat template does not render tool_calls "
+                        "(fc_dialect=none) — the executor could never emit a "
+                        "parseable call"
+                    )
+                fc_roundtrip_probe(tok, delta.fc_dialect)
+            _ok("model", f"stop_ids={stop_ids}; fc_dialect={delta.fc_dialect}; "
+                         "template delta probes pass")
 
             # 引擎默认停止集(镜像 sglang ModelConfig._get_hf_eos_token_id 语义:
             # generation_config 优先,缺则 config/text_config)与轮末符对拍。

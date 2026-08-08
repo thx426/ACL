@@ -27,7 +27,7 @@ from trace_opd.core.episode import run_episode
 from trace_opd.core.template_delta import TemplateDelta
 from trace_opd.envs import registry
 from trace_opd.envs.spreadsheetbench.adapter import (
-    FORMAT_REMINDER,
+    _format_reminder,
     SYSTEM_PROMPT,
     TOOLS,
     SpreadsheetbenchEnvFactory,
@@ -215,7 +215,7 @@ def test_episode_format_failure_and_premature_submit(tmp_path):
     ])
     traj = result.trajectory
     assert traj.steps[0].acted is False
-    assert traj.steps[0].observation == FORMAT_REMINDER
+    assert traj.steps[0].observation == _format_reminder()
     assert traj.steps[1].acted and not traj.steps[1].valid
     assert "not found" in traj.steps[1].observation
     assert traj.won and traj.score == 1.0

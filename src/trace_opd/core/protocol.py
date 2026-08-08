@@ -28,6 +28,7 @@ prefix is byte-identical with research-time guidance injection (PG-7).
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 
@@ -107,15 +108,57 @@ def parse_action(assistant_text: str) -> str | None:
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
+# FC dialect(模板家族的 function-calling wire 形态)---------------------
+# 训练通道是 token-in-token-out,拿不到服务端 tool-call parser,解析必须在
+# 文本层完成且与服务端逐语义等价(用户裁定 2026-08-08:SSB 模式)。dialect
+# 由 template_delta.fc_dialect(tokenizer) 行为探测,入口经
+# configure_fc_dialect() 安装;缺省 hermes 保持 Qwen3 语境的历史行为。
+#   hermes      — Qwen3 系:<tool_call>{"name":..., "arguments":{...}}</tool_call>
+#   qwen35_xml  — Qwen3.5 系:<tool_call><function=名><parameter=键>值…
+#   none        — 模板不渲染 tool_calls(FC 环境下由 preflight 拦截)
+FC_DIALECTS = ("hermes", "qwen35_xml", "none")
+_FC_DIALECT = "hermes"
 
-def parse_tool_calls(assistant_text: str) -> list[dict]:
-    """Extract hermes-style tool calls: ``<tool_call>{json}</tool_call>``.
 
-    模板家族级协议件(Qwen3 系 chat template 的原生 function-calling 输出
-    形态),与 parse_action 平级——用哪一个由各 benchmark 的 react 决定。
-    返回按出现顺序的合法调用列表,每项形如
-    ``{"name": str, "arguments": dict}``;JSON 不合法或缺 name 的块跳过
-    (坏输出交由 react 以 acted=False 处理,不在这里 raise)。"""
+def configure_fc_dialect(dialect: str) -> None:
+    """Install the probed FC dialect (single source: the live chat template
+    via template_delta.fc_dialect). Idempotent; call at process entry next to
+    configure_episode_caps."""
+    global _FC_DIALECT
+    if dialect not in FC_DIALECTS:
+        raise ValueError(f"unknown FC dialect: {dialect!r} (known: {FC_DIALECTS})")
+    _FC_DIALECT = dialect
+
+
+def fc_dialect_configured() -> str:
+    return _FC_DIALECT
+
+
+def parse_tool_calls(
+    assistant_text: str,
+    tools: list[dict] | None = None,
+    dialect: str | None = None,
+) -> list[dict]:
+    """Extract tool calls in the configured template-family dialect.
+
+    模板家族级协议件,与 parse_action 平级——用哪一个由各 benchmark 的
+    react 决定。返回按出现顺序的调用列表,每项 ``{"name": str,
+    "arguments": dict}``;坏输出跳过(交由 react 以 acted=False 处理,
+    不在这里 raise)。
+
+    ``tools``(OpenAI schema,来自 adapter.tools())仅 qwen35_xml 用:XML
+    参数值是无类型文本,按 schema 还原 int/float/bool/null/object——语义与
+    sglang 0.5.10 Qwen3CoderDetector 逐条对拍(tests/fixtures/
+    fc_qwen35_xml_golden.json 为真 detector 生成的 golden)。hermes 的 JSON
+    自带类型,忽略该参数。"""
+    d = dialect or _FC_DIALECT
+    if d == "qwen35_xml":
+        return _parse_qwen35_xml(assistant_text or "", tools)[0]
+    if d == "none":
+        raise RuntimeError(
+            "parse_tool_calls called with FC dialect 'none' — the chat template "
+            "does not render tool calls; an FC benchmark cannot run on it"
+        )
     calls: list[dict] = []
     for raw in _TOOL_CALL_RE.findall(assistant_text or ""):
         try:
@@ -132,9 +175,19 @@ def parse_tool_calls(assistant_text: str) -> list[dict]:
     return calls
 
 
-def fc_format_reminder(*tool_names: str) -> str:
+def fc_format_reminder(*tool_names: str, dialect: str | None = None) -> str:
     """FC 协议 benchmark 的标准格式提醒(parse_tool_calls 的配套件;
-    单一维护点,各 benchmark 传自己的工具名列表)。"""
+    单一维护点,各 benchmark 传自己的工具名列表)。措辞随 dialect——提醒
+    必须教模型它的模板所教的那种形态,不能跨家族串。"""
+    d = dialect or _FC_DIALECT
+    if d == "qwen35_xml":
+        return (
+            "(Your reply contained no valid tool call. End your message with "
+            "exactly one block of the form <tool_call>\n"
+            "<function=function-name>\n<parameter=param-name>\nvalue\n"
+            "</parameter>\n</function>\n</tool_call>. "
+            f"Available functions: {', '.join(tool_names)}.)"
+        )
     return (
         "(Your reply contained no valid tool call. End your message with "
         "exactly one block of the form "
@@ -143,10 +196,120 @@ def fc_format_reminder(*tool_names: str) -> str:
     )
 
 
-def strip_tool_calls(assistant_text: str) -> str:
-    """去除全部 tool_call 块后的剩余文本(react 的 thought 记账用;
-    parse_tool_calls 的配套公共件——各 benchmark 勿引私有正则)。"""
+def strip_tool_calls(assistant_text: str, dialect: str | None = None) -> str:
+    """react 的 thought 记账文本(parse_tool_calls 的配套公共件——各
+    benchmark 勿引私有正则)。
+
+    hermes:删除全部 tool_call 块,保留其余文本(历史语义不变)。
+    qwen35_xml:首个调用块之前的文本——与服务端 parser 的 normal_text
+    语义一致(该模板家族要求 reasoning 在调用之前,调用之后的文本不属于
+    协议内容,与 sglang 同样丢弃)。"""
+    d = dialect or _FC_DIALECT
+    if d == "qwen35_xml":
+        return _parse_qwen35_xml(assistant_text or "", None)[1].strip()
     return _TOOL_CALL_RE.sub("", assistant_text or "").strip()
+
+
+# qwen35_xml 解析(语义单一真源 = sglang 0.5.10 Qwen3CoderDetector.
+# detect_and_parse;逐条对齐,勿"顺手改进"——任何偏差都是训练/推理两条
+# 通道的解析分歧)-------------------------------------------------------
+
+_Q35_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_Q35_FUNC_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+_Q35_PARAM_RE = re.compile(
+    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
+)
+_Q35_START = "<tool_call>"
+_Q35_FUNC_PREFIX = "<function="
+
+
+def _q35_props(func_name: str, tools: list[dict] | None) -> dict:
+    if not tools:
+        return {}
+    for t in tools:
+        fn = t.get("function", {}) if isinstance(t, dict) else {}
+        if t.get("type") == "function" and fn.get("name") == func_name:
+            params = fn.get("parameters")
+            if isinstance(params, dict) and "properties" in params:
+                return params["properties"]
+            return params if isinstance(params, dict) else {}
+    return {}
+
+
+def _q35_convert(value: str, name: str, props: dict) -> object:
+    if value.lower() == "null":
+        return None
+    if name not in props:
+        return value
+    spec = props[name]
+    ptype = str(spec["type"]).strip().lower() if isinstance(spec, dict) and "type" in spec else "string"
+    if ptype in ("string", "str", "text", "varchar", "char", "enum"):
+        return value
+    if ptype.startswith(("int", "uint", "long", "short", "unsigned")):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return value
+    if ptype.startswith(("num", "float")):
+        try:
+            keep_int = not ("." in value or "e" in value.lower())
+            f = float(value)
+            return int(f) if keep_int and f.is_integer() else f
+        except (ValueError, TypeError):
+            return value
+    if ptype in ("boolean", "bool", "binary"):
+        return value.lower() == "true"
+    if ptype in ("object", "array", "arr") or ptype.startswith(("dict", "list")):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return value
+
+
+def _parse_qwen35_xml(
+    text: str, tools: list[dict] | None
+) -> tuple[list[dict], str]:
+    """(calls, normal_text) — sglang Qwen3CoderDetector.detect_and_parse 等价。
+
+    容忍三级未闭合(</parameter>/</function>/</tool_call> 缺失均可解析);
+    裸 ``<function=`` 无 ``<tool_call>`` 开标签时不解析(与服务端一致);
+    参数值仅剥恰好一个前导与一个尾随换行(不是 strip);normal_text =
+    首个调用块之前的文本(块后文本丢弃)。"""
+    if _Q35_START not in text:
+        return [], text
+    blocks = _Q35_BLOCK_RE.findall(text)
+    if not blocks and _Q35_FUNC_PREFIX in text:
+        blocks = [text]
+    calls: list[dict] = []
+    for content in blocks:
+        for m in _Q35_FUNC_RE.findall(content):
+            body = m[0] or m[1]
+            if ">" not in body:
+                continue
+            cut = body.index(">")
+            func_name = body[:cut]
+            props = _q35_props(func_name, tools)
+            args: dict = {}
+            for p in _Q35_PARAM_RE.findall(body[cut + 1:]):
+                if ">" not in p:
+                    continue
+                pcut = p.index(">")
+                pname, pval = p[:pcut], p[pcut + 1:]
+                if pval.startswith("\n"):
+                    pval = pval[1:]
+                if pval.endswith("\n"):
+                    pval = pval[:-1]
+                args[pname] = _q35_convert(pval, pname, props)
+            calls.append({"name": func_name, "arguments": args})
+    start = text.find(_Q35_START)
+    if start == -1:
+        start = text.find(_Q35_FUNC_PREFIX)
+    normal_text = text[:start] if start > 0 else ""
+    return calls, normal_text
 
 
 def parse_reasoning(assistant_text: str) -> str | None:
