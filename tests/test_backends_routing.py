@@ -24,6 +24,11 @@ class _FakeServer:
 
 
 class _FakeTokenizer:
+    eos_token_id = 9
+
+    def convert_tokens_to_ids(self, token):
+        return 9 if token == "<|im_end|>" else None
+
     def decode(self, ids, skip_special_tokens=True):
         return "x"
 

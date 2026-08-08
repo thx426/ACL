@@ -57,6 +57,22 @@ def render_ids(
     return [int(x) for x in out]
 
 
+def turn_stop_token_ids(tokenizer) -> list[int]:
+    """轮末停止符全集:tokenizer eos + 模板轮闭合符 ``<|im_end|>``(去重排序)。
+
+    停止条件是对话协议的一部分,必须随每个生成请求显式下发,绝不依赖
+    模型资产的隐式默认——Qwen3.5-9B 官方 repo 无 generation_config.json,
+    config.json 只声明 <|endoftext|>(248044);而 verl 语境 skip_tokenizer_init
+    下引擎拿不到 tokenizer 的 eos,停止集里没有轮末符 <|im_end|>(248046),
+    每轮生成越过轮末续写伪多轮对话(2026-08-08 9B step1 实测 5265/5268 轮
+    中段含 im_end 未停、86.5% response token 是越界垃圾)。Qwen3 系
+    generation_config 自带 [im_end, endoftext] 掩盖了这个假设,9B 是首个
+    暴露它的模型。
+    """
+    ids = {tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|im_end|>")}
+    return sorted(t for t in ids if isinstance(t, int) and t >= 0)
+
+
 def _find_subseq(haystack: list[int], needle: list[int]) -> int:
     n, m = len(haystack), len(needle)
     for i in range(n - m + 1):
@@ -106,9 +122,7 @@ class TemplateDelta:
         self.glue_full: list[int] = tail[i + len(b_ids) : j]
         self.post_obs: list[int] = tail[j + len(o_ids) :]
 
-        eos = t.eos_token_id
-        im_end = t.convert_tokens_to_ids("<|im_end|>")
-        self.stop_ids = {x for x in (eos, im_end) if x is not None}
+        self.stop_ids = set(turn_stop_token_ids(t))
         assert self.glue_full and self.glue_full[0] in self.stop_ids, (
             "glue does not start with a stop token"
         )

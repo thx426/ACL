@@ -3,6 +3,13 @@
 > 2026-08-07 调研起草。目标:在**尽量不动现有生产环境**的前提下,让 v3.3
 > 方案机制(asym advantage + 熵门 + PGS 采样端干预)在 Qwen3.5-9B 上可跑。
 > 状态:调研完成、方案待用户裁定;实施与冒烟在裁定后执行。
+>
+> **⚠ 2026-08-08 P0 增补**:首跑暴露引擎停止集缺 `<|im_end|>`(9B 无
+> generation_config.json × verl skip_tokenizer_init),step1 全部 rollout 的
+> 86.5% response token 是越界垃圾,首批读数(截断率/熵标定/门率/val)全废。
+> 根因诊断与修复见 **`docs/qwen35-9b-eos-stop-bug.md`**;修复=EngineGenerate
+> 显式下发 `stop_token_ids`(对 4B/1.7B 线 no-op)。本文 §3.3/§3.5 的冒烟
+> 判据以该文档 §6 的轮末体检为准补充。
 
 ## 0. 结论先行
 

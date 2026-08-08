@@ -136,7 +136,14 @@ def stage3_logprobs(base: str, top: int, tail: int, target_tokens: int) -> bool:
 
 
 def stage_thinking(base: str, model: str) -> None:
-    """三组对照判别 enable_thinking 是否真实生效(静默忽略是最危险形态)。"""
+    """三组对照判别 enable_thinking 是否真实生效(静默忽略是最危险形态)。
+
+    判据两维(CD-006 2026-08-08 实测教训:Qwen3.5 把思考写成纯文本
+    "Thinking Process:",<think> 标签与 reasoning_content 双双不命中):
+    ① 标记维:<think> 标签 / reasoning_content;
+    ② 长度维:off/default 输出长度比 < 0.3 即判 kwarg 生效——不依赖模型
+      用哪种思考标记形式(实测 off=13 字符 vs default=1361,比值 0.01)。
+    """
     url = f"{base}/v1/chat/completions"
     msgs = [{"role": "user", "content": "9.11 和 9.9 哪个大?一句话回答。"}]
     outs = {}
@@ -157,25 +164,88 @@ def stage_thinking(base: str, model: str) -> None:
               f"reasoning_content={'yes' if reasoning else 'no'} len={len(txt)} "
               f"head={txt[:80]!r}")
     off, on = outs.get("think_off", ("", None)), outs.get("think_on", ("", None))
+    default = outs.get("default", ("", None))
     off_th = ("<think>" in off[0]) or bool(off[1])
     on_th = ("<think>" in on[0]) or bool(on[1])
+    len_ratio = (len(off[0]) / len(default[0])) if default[0] else float("nan")
+    print(f"[think] len ratio off/default = {len(off[0])}/{len(default[0])} = {len_ratio:.3f}")
     if off_th:
-        print("[think] VERDICT: FAIL — enable_thinking:false 未生效(输出仍含 thinking)。")
-    elif not on_th:
-        print("[think] VERDICT: INFO — 两档均无 thinking(模型可能无 thinking 模式,"
-              "或 kwarg 被静默忽略且默认即无 thinking;对训练语境是安全形态)。")
+        print("[think] VERDICT: FAIL — enable_thinking:false 未生效(输出仍含 thinking 标记)。")
+    elif len_ratio < 0.3:
+        print("[think] VERDICT: PASS — kwarg 生效(长度维:off/default < 0.3;"
+              "思考可能是无标记纯文本形态)。")
+    elif on_th:
+        print("[think] VERDICT: PASS — kwarg 真实生效(标记维:off 无/on 有)。")
     else:
-        print("[think] VERDICT: PASS — kwarg 真实生效(off 无/on 有)。")
+        print("[think] VERDICT: WARN — 两维均不可判(off≈default 且无标记差异):"
+              "kwarg 可能被静默忽略,人工比对三档原文再定。")
+
+
+def stage_stop(base: str, model_path: str, max_new: int) -> bool:
+    """轮末停止符验收(2026-08-08 P0:越界续写伪多轮的回归门)。
+
+    ⚠ 必须对 **--skip-tokenizer-init** 起服跑(verl token-in-token-out 同构
+    语境):普通起服时引擎持有 tokenizer,check_finished 会用 tokenizer.eos
+    兜底停在 <|im_end|>,复现不出训练语境的缺陷(门 1-4 全绿而训练全崩的
+    教训——探针语境必须与生产语境同构)。
+
+      python -m sglang.launch_server --model-path $Q35_MODEL --tp 1 \\
+          --skip-tokenizer-init --port 30000
+
+    A 组(不带 stop_token_ids)= 语境探察:输出中段出现 <|im_end|> 而不停
+      ⇒ 缺陷在场(修复前形态);若 A 组已停在 im_end,说明引擎/资产已修。
+    B 组(带 stop_token_ids=[im_end])= 硬门:末 token == im_end、且中段无
+      im_start/im_end ⇒ PASS(EngineGenerate 修复所依赖的引擎行为成立)。
+    """
+    from transformers import AutoTokenizer  # 探针依赖起服机自带 transformers
+
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    im_end = tok.convert_tokens_to_ids("<|im_end|>")
+    im_start = tok.convert_tokens_to_ids("<|im_start|>")
+    prompt_ids = tok.apply_chat_template(
+        [{"role": "user", "content": "Reply with the single word: ready"}],
+        add_generation_prompt=True, tokenize=True, enable_thinking=False,
+    )
+    if not isinstance(prompt_ids, list):
+        prompt_ids = prompt_ids["input_ids"]
+    if prompt_ids and isinstance(prompt_ids[0], list):
+        prompt_ids = prompt_ids[0]
+
+    def gen(stop_ids):
+        sp = {"max_new_tokens": max_new, "temperature": 0.0}
+        if stop_ids is not None:
+            sp["stop_token_ids"] = stop_ids
+        out = _gen(base, {"input_ids": prompt_ids, "sampling_params": sp})
+        ids = out.get("output_ids") or out["meta_info"].get("output_token_ids") or []
+        return [int(x) for x in ids]
+
+    a = gen(None)
+    a_first = a.index(im_end) if im_end in a else -1
+    a_overrun = a_first >= 0 and len(a) > a_first + 1
+    print(f"[stop] A(no stop_token_ids): len={len(a)} first_im_end={a_first} "
+          f"overrun={'YES(缺陷在场,修复前形态)' if a_overrun else 'no(引擎已认 im_end)'}")
+
+    b = gen([im_end])
+    b_ok = bool(b) and b[-1] == im_end and im_start not in b and b.count(im_end) == 1
+    print(f"[stop] B(stop_token_ids=[{im_end}]): len={len(b)} last={b[-1] if b else None} "
+          f"im_start_inside={im_start in b} n_im_end={b.count(im_end)} "
+          f"-> {'PASS' if b_ok else 'FAIL'}")
+    if not b_ok:
+        print("[stop] FAIL detail: tail ids =", b[-12:],
+              "decoded:", repr(tok.decode(b[-24:], skip_special_tokens=False))[:200])
+    return b_ok
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:30000")
     ap.add_argument("--model", default="qwen3.5-9b", help="served model name(仅 chat 层用)")
-    ap.add_argument("--stage", default="all", choices=["2", "3", "thinking", "all"])
+    ap.add_argument("--stage", default="all", choices=["2", "3", "thinking", "stop", "all"])
+    ap.add_argument("--model-path", default="", help="stop stage:本地模型目录(读 tokenizer)")
     ap.add_argument("--top", type=int, default=256)
     ap.add_argument("--tail", type=int, default=8)
     ap.add_argument("--prompt-tokens", type=int, default=2000)
+    ap.add_argument("--stop-max-new", type=int, default=256)
     args = ap.parse_args()
 
     ok = True
@@ -185,6 +255,12 @@ def main() -> int:
         ok &= stage3_logprobs(args.base, args.top, args.tail, args.prompt_tokens)
     if args.stage in ("thinking", "all"):
         stage_thinking(args.base, args.model)
+    if args.stage == "stop":
+        # 单独跑:对 --skip-tokenizer-init 起服(2/3/thinking 需普通起服,
+        # 两种服务的停止行为不同构——这正是本 stage 存在的原因)。
+        if not args.model_path:
+            ap.error("--stage stop 需要 --model-path(读 tokenizer 渲染 input_ids)")
+        ok &= stage_stop(args.base, args.model_path, args.stop_max_new)
     print(f"[probe] hard gates -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

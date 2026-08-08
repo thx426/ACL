@@ -394,10 +394,12 @@ def test_fused_kernels_default_off_and_flows_through(tmp_path):
     assert not any("use_fused_kernels" in c for c in cmd)
     assert not any("fused_kernel_options" in c for c in cmd)
     # 开:两参成对出现,backend 走 fused_kernel_options.impl_backend(verl
-    # transformer_impl.py:295-298 的实际消费路径)。
+    # transformer_impl.py:295-298 的实际消费路径)。前缀必须是 ++(覆盖或
+    # 添加):该键在 verl 默认配置里已存在,单 + 让 hydra 组装期即崩
+    # (CD-006 2026-08-08 实测 ConfigCompositionException)。
     cmd = _cmd(tmp_path, train_extra=", use_fused_kernels: true")
     assert "actor_rollout_ref.model.use_fused_kernels=True" in cmd
-    assert "+actor_rollout_ref.model.fused_kernel_options.impl_backend=torch" in cmd
+    assert "++actor_rollout_ref.model.fused_kernel_options.impl_backend=torch" in cmd
     # backend 枚举校验在加载期失败(不是起跑后)。
     import pytest
     with pytest.raises(ValueError, match="fused_kernels_backend"):

@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..core.episode import GenResult
-from ..core.template_delta import render_ids
+from ..core.template_delta import render_ids, turn_stop_token_ids
 
 
 class EngineGenerate:
@@ -27,12 +27,21 @@ class EngineGenerate:
         self._server = server_manager
         self._tokenizer = tokenizer
         self._request_id = request_id or uuid4().hex
+        # 轮末停止符必须随请求显式下发(见 turn_stop_token_ids docstring):
+        # verl 起引擎用 skip_tokenizer_init,引擎侧停止集只剩模型资产推导
+        # (Qwen3.5 无 generation_config ⇒ 只认 <|endoftext|>,轮末 <|im_end|>
+        # 失守 ⇒ 越界续写伪多轮)。这里是所有引擎生成的唯一通道,单点兜底;
+        # 调用方显式传入的 stop_token_ids 优先。
+        self._stop_token_ids = turn_stop_token_ids(tokenizer)
 
     async def __call__(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> GenResult:
+        params = dict(sampling_params)
+        if self._stop_token_ids:
+            params.setdefault("stop_token_ids", self._stop_token_ids)
         out = await self._server.generate(
             request_id=self._request_id,
             prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
+            sampling_params=params,
         )
         ids = list(out.token_ids)
         extra: dict[str, Any] = {}
