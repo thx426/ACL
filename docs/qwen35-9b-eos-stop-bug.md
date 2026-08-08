@@ -139,6 +139,22 @@ skip_tokenizer_init 语境的停止行为不同构**(教训:探针必须与生�
 **不做资产补丁**(不给模型目录自造 generation_config.json):官方无此文件,
 自造=资产漂移,重下模型即复发;代码层显式下发才是不依赖资产的根修。
 
+**防复发固化(2026-08-08 追加,用户裁定"整理成代码的一部分")**——三层:
+
+5. **起跑前**:`envs/preflight.py` 升四级,新增 model 步(model_path 在本机
+   即必查):tokenizer 可载 + `turn_stop_token_ids` 非空(空即 FAIL)+
+   `TemplateDelta` 模板差分硬断言前置;并按 sglang `_get_hf_eos_token_id`
+   同语义推导引擎默认停止集,与轮末符对拍——缺口打 WARN(不拦:训练通道
+   已由运行时修复防住,告警的是"这份权重在仓库通道之外的部署会越界")。
+   真机验证:9B/4B 均 `WARN … misses turn-final ids [248046] (no
+   generation_config.json)`,Qwen3-4B 静默通过。
+6. **运行中**:`core/episode.py` 轮末停止形态哨兵——每轮生成计入
+   `turns_stop_clean`(停在下发的轮末符)/`turns_len_capped`(满额)/
+   `turns_stop_other`(停止集外符号,engine 后端上升高即 EOS 回归指纹;
+   事故批次口径下 82.7% 的轮会落此计数),随 `trajectory.meta` 进每条
+   rollout dump——监控与体检直接读字段,无需再手写分析脚本。
+   单测 `tests/test_episode_edges.py` 两例锁形态。
+
 ## 6. 验收判据(CD-006 执行)
 
 1. **探针**(30 秒,重启训练前):

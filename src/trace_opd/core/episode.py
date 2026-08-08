@@ -139,6 +139,13 @@ async def run_episode(
     truncated = False
     won = False
     gen_extra: dict[str, Any] = {}
+    # 轮末停止形态哨兵(2026-08-08 Qwen3.5 EOS 事故固化):clean=停在我们
+    # 下发的轮末符;capped=满额截断;other=引擎用了停止集之外的符号停下
+    # ——engine 后端(生产 rollout,停止 token 保留在输出)上 other 升高
+    # 即 EOS 家族回归指纹(事故批次 82.7% 的轮停在 <|endoftext|>,该口径
+    # 下全记 other);external 风格后端(completions API 剥停符再重
+    # tokenize)天然落 other,无判别力。三计数随 traj.meta 进 dump。
+    stop_clean = stop_capped = stop_other = 0
 
     try:
         initial_obs = env.initial_obs
@@ -172,11 +179,12 @@ async def run_episode(
             if budget < 32:
                 truncated = True
                 break
+            turn_max = min(protocol.GEN_MAX_TOKENS_PER_TURN, budget)
             out = await generate(
                 prompt_ids + stream,
                 {
                     **sampling_params,
-                    "max_tokens": min(protocol.GEN_MAX_TOKENS_PER_TURN, budget),
+                    "max_tokens": turn_max,
                 },
             )
             if out.extra.get("stop_reason") == "aborted":
@@ -191,6 +199,12 @@ async def run_episode(
                 truncated = True
                 break
             assistant_turns += 1
+            if len(gen_ids) >= turn_max:
+                stop_capped += 1
+            elif gen_ids[-1] in delta.stop_ids:
+                stop_clean += 1
+            else:
+                stop_other += 1
             turn_spans.append([len(stream), len(stream) + len(gen_ids)])
             stream += gen_ids
             mask += [1] * len(gen_ids)
@@ -304,6 +318,9 @@ async def run_episode(
     finally:
         traj.meta.setdefault("wall_s", round(time.time() - t0, 2))
         traj.meta.setdefault("guidance_chars", len(guidance or ""))
+        traj.meta.setdefault("turns_stop_clean", stop_clean)
+        traj.meta.setdefault("turns_len_capped", stop_capped)
+        traj.meta.setdefault("turns_stop_other", stop_other)
         # Close must survive cancellation: shield keeps the close thread
         # running even when this task is already being cancelled.
         try:
