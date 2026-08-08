@@ -190,10 +190,13 @@ def fc_format_reminder(*tool_names: str, dialect: str | None = None) -> str:
     必须教模型它的模板所教的那种形态,不能跨家族串。"""
     d = dialect or _FC_DIALECT
     if d == "qwen35_xml":
+        # 示例用第一个真实工具名:占位符 "function-name" 会被模型照抄成
+        # unknown-tool 循环(2026-08-08 审阅)。
+        example = tool_names[0] if tool_names else "tool-name"
         return (
             "(Your reply contained no valid tool call. End your message with "
             "exactly one block of the form <tool_call>\n"
-            "<function=function-name>\n<parameter=param-name>\nvalue\n"
+            f"<function={example}>\n<parameter=param-name>\nvalue\n"
             "</parameter>\n</function>\n</tool_call>. "
             f"Available functions: {', '.join(tool_names)}.)"
         )
@@ -217,6 +220,17 @@ def strip_tool_calls(assistant_text: str, dialect: str | None = None) -> str:
     if d == "qwen35_xml":
         return _parse_qwen35_xml(assistant_text or "", None)[1].strip()
     return _TOOL_CALL_RE.sub("", assistant_text or "").strip()
+
+
+_TOOL_RESP_RE = re.compile(r"\A\s*<tool_response>\n(.*)\n</tool_response>\s*\Z", re.DOTALL)
+
+
+def strip_tool_response(text: str) -> str:
+    """tool_response_wrap 的逆(不是包裹形态时原样返回)。协议无关比较用
+    ——如 continuation 重放:录制侧 observation 是回注进流的包裹文本,
+    重放侧 env 返回裸观察,两侧归一化后才可比(text 协议下双侧 no-op)。"""
+    m = _TOOL_RESP_RE.match(text or "")
+    return m.group(1) if m else (text or "")
 
 
 def tool_response_wrap(content: str, dialect: str | None = None) -> str:
@@ -270,29 +284,40 @@ def _q35_convert(value: str, name: str, props: dict) -> object:
     if ptype.startswith(("int", "uint", "long", "short", "unsigned")):
         try:
             return int(value)
-        except (ValueError, TypeError):
+        except Exception:  # noqa: BLE001 — sglang 同款宽度
             return value
     if ptype.startswith(("num", "float")):
         try:
             keep_int = not ("." in value or "e" in value.lower())
             f = float(value)
             return int(f) if keep_int and f.is_integer() else f
-        except (ValueError, TypeError):
+        except Exception:  # noqa: BLE001
             return value
     if ptype in ("boolean", "bool", "binary"):
         return value.lower() == "true"
     if ptype in ("object", "array", "arr") or ptype.startswith(("dict", "list")):
         try:
             return json.loads(value)
-        except (json.JSONDecodeError, ValueError):
+        except Exception:  # noqa: BLE001 — 深嵌套 RecursionError 等也须降级
             pass
     try:
         return ast.literal_eval(value)
-    except (ValueError, SyntaxError):
+    except Exception:  # noqa: BLE001
         return value
 
 
 def _parse_qwen35_xml(
+    text: str, tools: list[dict] | None
+) -> tuple[list[dict], str]:
+    try:
+        calls, normal = _parse_qwen35_xml_inner(text, tools)
+        json.dumps([c["arguments"] for c in calls])  # 下游可序列化防线
+        return calls, normal
+    except Exception:  # noqa: BLE001 — sglang detect_and_parse 同款整体降级
+        return [], text
+
+
+def _parse_qwen35_xml_inner(
     text: str, tools: list[dict] | None
 ) -> tuple[list[dict], str]:
     """(calls, normal_text) — sglang Qwen3CoderDetector.detect_and_parse 等价。

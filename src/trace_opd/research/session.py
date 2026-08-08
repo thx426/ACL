@@ -136,14 +136,28 @@ class ResearchSession:
                 self._prompt_tokens += result.prompt_tokens
                 self._completion_tokens += result.completion_tokens
 
-                self._messages.append(self._proto.canonicalize_assistant(result))
+                if result.text:
+                    self._messages.append(self._proto.canonicalize_assistant(result))
+
+                if result.finish_reason in ("length", "aborted"):
+                    # 预算耗尽/引擎中止:本轮内容不可信(截断可能产出半个
+                    # 调用——qwen35_xml 解析容忍未闭合标签,半篇 doc 会被
+                    # 当合法 finalize),不解析、不续轮,优雅收敛为 snapshot
+                    # (2026-08-08 审阅:engine 后端 length 后继续轮转还会
+                    # 触发 assistant 对拍 raise,把正常终态变 error)。
+                    break
 
                 tool_calls = self._proto.extract(result)
                 if not tool_calls:
                     hint = self._proto.malformed_hint(result)
-                    if hint:
-                        self._messages.append({"role": "user", "content": hint})
-                    # else: plain thinking-aloud; the turn counter bounds it.
+                    if hint is None:
+                        # 纯思考轮也必须回一个 user 轮:engine 后端的
+                        # append-only 流假设每个 assistant 轮后跟 user 结构段,
+                        # 不回则下一轮生成紧贴 <|im_end|> 无轮头,训练行破
+                        # 轮边界(2026-08-08 审阅)。
+                        hint = ("(no tool call detected — continue; make a "
+                                "tool call when you need an instrument.)")
+                    self._messages.append({"role": "user", "content": hint})
                     continue
                 # One call per message: execute the FIRST, tell the model the
                 # rest were ignored (it must see feedback before spending more).

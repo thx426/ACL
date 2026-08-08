@@ -38,6 +38,7 @@ from ..envs.alfworld import gt as gt_mod
 from ..envs.alfworld.adapter import (
     GT_SENTINEL,
     SYSTEM_PROMPT_BARE,
+    SYSTEM_PROMPT_FC,
     WorkerFailure,
     _Worker,
 )
@@ -121,6 +122,12 @@ def build_rows(
 
     rows = []
     gt_missing = 0
+    # prompt 列的 scaffold 随协议(2026-08-08 审阅):verl 的
+    # max_prompt_length/truncation=error 门量的是这一列,硬编码 BARE 会让
+    # FC run 的门校验一个不再发送的提示词。tools 块由 chat template 在
+    # rollout 期渲染、不在此列(约数百 token),须由 max_prompt_length 的
+    # 余量吸收——预算收紧时以真实 render_ids 长度为准,勿只看本列。
+    scaffold = SYSTEM_PROMPT_FC if env_cfg.protocol == "fncall" else SYSTEM_PROMPT_BARE
     for cap in captured:
         gamefile = cap["gamefile"]
         tid = task_id_of(data_root, gamefile)
@@ -129,7 +136,7 @@ def build_rows(
         rows.append(
             {
                 "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT_BARE},
+                    {"role": "system", "content": scaffold},
                     {"role": "user", "content": protocol.truncate_obs(cap["initial_obs"])},
                 ],
                 # verl groups val metrics by data_source: per-split values give

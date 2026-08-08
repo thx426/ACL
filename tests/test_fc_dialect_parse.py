@@ -78,9 +78,10 @@ def test_strip_tool_calls_dialect_semantics():
 def test_fc_format_reminder_follows_dialect():
     assert '{"name"' in protocol.fc_format_reminder("a", "b", dialect="hermes")
     xml_reminder = protocol.fc_format_reminder("a", "b", dialect="qwen35_xml")
-    assert "<function=function-name>" in xml_reminder and "<parameter=param-name>" in xml_reminder
+    # 示例必须用真实工具名(占位符会被模型照抄成 unknown-tool 循环)
+    assert "<function=a>" in xml_reminder and "<parameter=param-name>" in xml_reminder
     protocol.configure_fc_dialect("qwen35_xml")
-    assert "<function=function-name>" in protocol.fc_format_reminder("a")
+    assert "<function=a>" in protocol.fc_format_reminder("a")
 
 
 # ---- fc_dialect 行为探测 + roundtrip 门 -------------------------------

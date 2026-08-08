@@ -167,7 +167,9 @@ class TextProtocol:
                 "Your message contains a <tool_call> marker but no well-formed "
                 "call could be parsed. Emit exactly:\n<tool_call>\n"
                 '{"name": "<tool_name>", "arguments": {...}}\n</tool_call>\n'
-                "with the JSON object on its own lines and the closing tag present."
+                "with the JSON object on its own lines and the closing tag "
+                "present. If argument values contain quotes or newlines, "
+                "escape them as valid JSON."
             )
         return None
 

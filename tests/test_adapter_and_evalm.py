@@ -120,10 +120,12 @@ def test_alfworld_fncall_react_paths():
     assert ok.acted and ok.consumed_env_step and env.stepped == ["go to desk 1"]
     assert ok.feedback == proto.tool_response_wrap("You arrive at desk 1.")
     assert ok.thought == "Reasoning."
+    # unknown/空调用与 math/SSB 一致:发起调用即耗步(2026-08-08 审阅——
+    # 不耗步 + acted=True 重置 breaker 会让坏调用零成本烧满 40 轮)
     bad_tool = a.react(env, '<tool_call>{"name": "teleport", "arguments": {}}</tool_call>')
-    assert bad_tool.acted and not bad_tool.consumed_env_step and "unknown tool" in bad_tool.feedback
+    assert bad_tool.acted and bad_tool.consumed_env_step and "unknown tool" in bad_tool.feedback
     empty = a.react(env, '<tool_call>{"name": "execute", "arguments": {"command": "  "}}</tool_call>')
-    assert empty.acted and not empty.consumed_env_step and "empty command" in empty.feedback
+    assert empty.acted and empty.consumed_env_step and "empty command" in empty.feedback
     none = a.react(env, "no call at all")
     assert not none.acted and none.feedback.startswith("Nothing happens. ")
     assert len(env.stepped) == 1

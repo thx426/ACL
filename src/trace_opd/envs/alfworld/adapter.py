@@ -422,7 +422,10 @@ class AlfworldTaskAdapter:
                 score=0.0,
                 acted=True,
                 valid=False,
-                consumed_env_step=False,
+                # 与 math/SSB 语义一致:发起了调用即消耗环境步——否则
+                # acted=True 重置 DEGENERATE breaker 且步数不涨,unknown/空
+                # 调用可零成本烧满 40 轮(2026-08-08 审阅)。
+                consumed_env_step=True,
             )
         raw = str(call["arguments"].get("command", "") or "")
         norm = normalize_command(raw)
@@ -438,7 +441,7 @@ class AlfworldTaskAdapter:
                 score=0.0,
                 acted=True,
                 valid=False,
-                consumed_env_step=False,
+                consumed_env_step=True,
             )
         obs, done, won = env.step(norm)
         return ActionOutcome(

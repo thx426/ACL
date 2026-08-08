@@ -195,6 +195,16 @@ async def continue_from_prefix(
     except Exception as err:  # noqa: BLE001 — 基建故障,作废由调用方重试
         out.error = f"open_episode: {type(err).__name__}: {err}"
         return out
+    def _env_obs(text: str) -> str:
+        # 录制侧 observation 是回注进流的形态:FC 协议下带 tool_response
+        # 包裹、多调用时还带 "(note: …)" 附加;重放侧 env 返回裸观察。
+        # 环境确定性校验只比环境部分,两侧归一化(text 协议下 no-op)
+        # ——不归一化则 FC 下首步必假 drift、续写 reward 全零
+        # (2026-08-08 审阅 P0)。
+        t = protocol.strip_tool_response(text)
+        cut = t.find("\n(note: ")
+        return (t[:cut] if cut >= 0 else t).strip()
+
     try:
         live0 = env.initial_obs
         expected0 = adapter.initial_obs
@@ -207,7 +217,7 @@ async def continue_from_prefix(
             if ended:
                 out.error = "replay_drift: episode ended during replay"
                 return out
-            if obs.strip() != expected.strip():
+            if _env_obs(obs) != _env_obs(expected):
                 out.error = "replay_drift: observation mismatch"
                 return out
         # ---- 续写循环 ----
