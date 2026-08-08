@@ -59,10 +59,15 @@ def main() -> int:
     # 2. model assets -------------------------------------------------------
     # 2026-08-08 Qwen3.5 EOS 事故的固化:eos 三处一致性 + 模板差分断言前置。
     # 目录不在本机时跳过(config-only 核对场景);部署机上目录必在 ⇒ 必查。
-    # FC 协议判定(react 走 protocol.parse_tool_calls 的环境;新 FC 环境
-    # 接入必须在此登记)——FC 门只对它们启用。alfworld 随 protocol 开关。
-    _fc_active = cfg.environment.name in {"spreadsheetbench", "math"} or (
-        cfg.environment.name == "alfworld" and cfg.alfworld.protocol == "fncall"
+    # FC 协议判定:文本层解析 FC 的全部消费方——①FC 环境(react 走
+    # parse_tool_calls;新 FC 环境接入必须在此登记,alfworld 随 protocol
+    # 开关);②client-parsed researcher 通道(research.tool_protocol=text,
+    # 即 v4 自体研究员/sftgen——2026-08-08 审阅补缺:两条 selfres 配置
+    # 都是 text 环境 + text researcher,曾整体漏过 FC 门)。
+    _fc_active = (
+        cfg.environment.name in {"spreadsheetbench", "math"}
+        or (cfg.environment.name == "alfworld" and cfg.alfworld.protocol == "fncall")
+        or (cfg.research.enabled and cfg.research.tool_protocol == "text")
     )
     mp = Path(cfg.train.model_path)
     if not mp.is_dir():
@@ -107,6 +112,14 @@ def main() -> int:
                 # 必须与推理引擎的整体渲染逐 token 一致(tool 轮全模板必查;
                 # 完整流在 think-strip 模板上结构性不可全等,降级注明)。
                 stream_report = fc_stream_equivalence_probe(tok)
+                if any("SKIPPED" in str(v) for v in stream_report.values()):
+                    # think-strip 模板家族:流等价结构性不可判——不是绿灯,
+                    # 是"未验证",FC 语境上线该模板须人工专项核过再放行
+                    # (2026-08-08 审阅:勿把 SKIPPED 藏进 OK 行)。
+                    print(f"[preflight] WARN model — FC stream equivalence "
+                          f"UNVERIFIED on this template: {stream_report}; "
+                          "tool_response_wrap consistency needs manual sign-off "
+                          "before an FC run on this family.")
             else:
                 stream_report = None
             _ok("model", f"stop_ids={stop_ids}; fc_dialect={delta.fc_dialect}; "

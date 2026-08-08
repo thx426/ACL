@@ -219,7 +219,21 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                     )
         delta = TemplateDelta(tokenizer)
         # FC dialect 随模板家族注入(qwen35_xml/hermes;文本层解析与服务端
-        # parser 等价的前提)。none 时 FC benchmark 由 preflight 拦截。
+        # parser 等价的前提)。运行时兜底与 preflight 同判(2026-08-08
+        # 审阅:训练进程绕过 preflight 起跑时 'none' 曾被静默安装,首个
+        # 解析在 worker 深处才炸成 ENV_ERROR 假象)。
+        _fc_needed = (
+            config.environment.name in {"spreadsheetbench", "math"}
+            or (config.environment.name == "alfworld"
+                and config.alfworld.protocol == "fncall")
+            or (config.research.enabled and config.research.tool_protocol == "text")
+        )
+        if _fc_needed and delta.fc_dialect == "none":
+            raise RuntimeError(
+                "chat template does not render tool_calls (fc_dialect=none) "
+                "but this run's FC channels require text-level call parsing — "
+                "refusing to start; run envs/preflight for details"
+            )
         protocol.configure_fc_dialect(delta.fc_dialect)
         _STATE.update(
             {

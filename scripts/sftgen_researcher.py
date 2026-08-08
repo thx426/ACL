@@ -206,7 +206,21 @@ async def cmd_sample(args) -> int:
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
-    protocol.configure_fc_dialect(delta.fc_dialect)
+    if cfg.research.tool_protocol == "text":
+        # text 协议经外部 API 采样时,调用文本出自 **researcher 模型**的模板
+        # 家族,不是 SFT 目标模型的——按目标 tokenizer 配 dialect 会让
+        # 35B(qwen35_xml)的调用被 hermes 解析全数落空,整轮 sweep
+        # "finalize 0/N" 无一声报错(2026-08-08 审阅)。必须显式声明。
+        if not args.researcher_dialect:
+            raise SystemExit(
+                "FATAL: research.tool_protocol=text requires "
+                "--researcher-dialect {hermes,qwen35_xml} — the wire dialect "
+                "follows the RESEARCHER model's template family, which this "
+                "script cannot probe from an API endpoint."
+            )
+        protocol.configure_fc_dialect(args.researcher_dialect)
+    else:
+        protocol.configure_fc_dialect(delta.fc_dialect)
     factory = make_env_factory(cfg)   # environment.name 分派(registry)
 
     items = load_tasks([args.train_file])
@@ -343,6 +357,10 @@ def main() -> int:
     ps.add_argument("--executor-model", required=True, help="server 侧 served 模型名")
     ps.add_argument("--researcher-api-base", required=True, help="35B 端点 /v1(可逗号分隔)")
     ps.add_argument("--researcher-model", required=True)
+    ps.add_argument("--researcher-dialect", default="",
+                    choices=["", "hermes", "qwen35_xml"],
+                    help="text 协议必填:researcher 模型模板家族的 FC 形态"
+                         "(Qwen3 系=hermes,Qwen3.5/3.6 系=qwen35_xml)")
     ps.add_argument("--out-dir", required=True, help="会话落盘目录(续跑判据)")
     ps.add_argument("--n-tasks", type=int, default=100)
     ps.add_argument("--sessions-per-task", type=int, default=8)

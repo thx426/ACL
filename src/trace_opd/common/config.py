@@ -1007,6 +1007,12 @@ def objective_fingerprint(cfg: "Config") -> str:
         rcfg, ncfg, role = cfg.research, cfg.narration, cfg.role("researcher")
         research_material = {
             "source": "researcher",
+            # M2(2026-08-08)重写了 text 通道的 researcher 表面:schema 块
+            # 移出 system prompt、tools 交模板渲染、wire 解析家族化——
+            # tool_protocol 字符串没变而分布变了。哨兵使新代码指纹必与旧
+            # 不同:v4 在跑 run(researcher token 在 loss 里)用新代码
+            # resume 会被守卫拦下,而不是静默换优化目标(审阅 2026-08-08)。
+            "researcher_wire": "fc_native_v2",
             "research": {
                 "enabled": rcfg.enabled,
                 "backend": rcfg.backend,
