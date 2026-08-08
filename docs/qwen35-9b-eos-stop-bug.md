@@ -76,6 +76,31 @@ check_finished 的 tokenizer.eos 兜底会停在 im_end——**探针语境与 v
 skip_tokenizer_init 语境的停止行为不同构**(教训:探针必须与生产语境同构,
 已在 sgl_probe_q35.py 新增 stop stage 修补)。
 
+## 2.1 系列适用边界(2026-08-08 A800 全系实测;用户裁定记录为系列级规则)
+
+| 模型 | generation_config.json | config_eos | tok_eos | 修复前是否踩坑 |
+|---|---|---|---|---|
+| **Qwen3.5-4B** | **缺失** | 248044 | im_end(248046) | **会踩,与 9B 完全同病** |
+| **Qwen3.5-9B** | **缺失** | 248044 | im_end(248046) | 已实证踩坑 |
+| Qwen3.6-27B | 有,[248046, 248044] | 248044 | im_end(248046) | 不踩(引擎集含 im_end) |
+| Qwen3.6-35B-A3B | 有,[248046, 248044] | 248044 | im_end(248046) | 不踩(researcher 普通起服双保险) |
+| Qwen3-4B-2507 / 1.7B | 有,[151645, 151643] | — | im_end(151645) | 不踩 |
+
+坑恰好圈住 **Qwen3.5 系全体**(官方唯一不发 generation_config 的系列,
+3.6 又带回)。三点推论:
+
+1. **Qwen3.5-4B 未来上线零额外动作**:§5 的代码修复是模型无关通防
+   (`turn_stop_token_ids` 从 tokenizer 推导,任何经 `EngineGenerate` 的
+   rollout 自动带 stop)——只要跑在含 b2f62e1 的代码上即安全;per-model
+   剩余动作只有首跑前的 `--stage stop` 探针验收 + 冒烟轮末体检。
+2. **修复只覆盖本仓库训练 rollout 通道**:在 Qwen3.5 系权重上任何绕过
+   tokenizer 的 token-in-token-out 部署(独立评测服务、其它推理框架)
+   资产坑仍在,须各自显式配 stop;普通起服(tokenizer 在场)有 sglang
+   兜底,风险低。
+3. **新模型接入 checklist 固化**(任何家族):查 generation_config.json
+   是否存在 + eos 三处(config/tokenizer/generation_config)是否一致;
+   不一致或缺失即预期引擎停止集不完整,首跑必须过 stop 探针。
+
 ## 3. 对已报读数的重定性(全废)
 
 | 读数 | 原判 | 重定性 |
