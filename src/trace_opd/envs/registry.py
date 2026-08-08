@@ -56,10 +56,19 @@ def _build_math(config: "Config", workers: int) -> "EnvFactory":
     return MathEnvFactory(cfg)
 
 
+def _build_scienceworld(config: "Config", workers: int) -> "EnvFactory":
+    from .scienceworld.adapter import SciworldEnvFactory
+
+    cfg = config.scienceworld
+    cfg.spawn_concurrency = _per_worker(cfg.spawn_concurrency, workers)
+    return SciworldEnvFactory(cfg)
+
+
 _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "alfworld": _build_alfworld,
     "spreadsheetbench": _build_spreadsheetbench,
     "math": _build_math,
+    "scienceworld": _build_scienceworld,
 }
 
 

@@ -99,6 +99,18 @@ alfworld:
   step_timeout_s: 120       # 单步执行超时 | h1 定版
   boot_concurrency: 32      # 数据构建期(build_datasets)引擎 boot 并发 | h3 定版
 
+scienceworld:
+  # ETO 口径 24 任务(train 1483/seen 194/unseen 211,变体级;vendored
+  # envs/scienceworld/data/eto_indices.json)。裁定 2026-08-08:easy 全开/
+  # 全局步预算(episode 段,RLVMR 口径 30)/终局二元 reward/不注入动作表。
+  worker_python: "${SCIWORLD_WORKER_PYTHON}"  # 装 scienceworld+py4j 的 venv;PATH 需 java>=1.8
+  simplifications: easy     # 社区两谱系一致(ETO/PGPO 硬编码、RLVMR 默认)
+  env_step_limit: 100       # 引擎侧兜底(episode.max_env_steps 主导)
+  spawn_concurrency: 64     # JVM boot 并发门(本地实测 boot+load ≈1.2s)
+  start_timeout_s: 120
+  step_timeout_s: 60
+  boot_concurrency: 16      # build_dataset 期引擎 boot 并发
+
 # ---------------------------------------------------------------------------
 # 训练:verl GRPO —— launcher 由此生成完整命令行
 # ---------------------------------------------------------------------------

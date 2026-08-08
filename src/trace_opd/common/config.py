@@ -198,6 +198,26 @@ class MathCfg:
 
 
 @dataclass
+class SciworldCfg:
+    """ScienceWorld(ETO 口径 24 任务;引入裁定 2026-08-08 见
+    envs/scienceworld/adapter.py)。引擎 JAR 随 pip 包内置,无 data_root;
+    每 episode 一个 JVM worker 子进程(本地实测 boot+load ≈1.2s,冷启)。"""
+
+    worker_python: str = ""         # SCIWORLD_WORKER_PYTHON(装 scienceworld+
+                                    # py4j 的 venv;PATH 需有 java>=1.8)
+    simplifications: str = "easy"   # 社区两谱系一致口径(ETO/PGPO 硬编码、
+                                    # RLVMR 默认;用户裁定跟随)。electrical
+                                    # 任务引擎自动豁免 noElectricalAction
+    env_step_limit: int = 100       # 引擎侧步数兜底(episode 预算仍由
+                                    # episode.max_env_steps 主导,RLVMR 同款)
+    spawn_concurrency: int = 64     # JVM boot 并发门(按 worker 折算;
+                                    # CPU 饥饿教训同 alfworld)
+    start_timeout_s: float = 120.0  # JVM boot+load(本地 1.2s,服务器留余量)
+    step_timeout_s: float = 60.0
+    boot_concurrency: int = 16      # build_dataset 期引擎 boot 并发
+
+
+@dataclass
 class EnvironmentCfg:
     """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
     benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
@@ -504,6 +524,7 @@ class Config:
     alfworld: AlfworldCfg
     spreadsheetbench: SpreadsheetbenchCfg
     math: MathCfg
+    scienceworld: SciworldCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -530,6 +551,7 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
+    "scienceworld",
 }
 
 
@@ -1160,6 +1182,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
             SpreadsheetbenchCfg, data.get("spreadsheetbench") or {}
         ),
         math=_build(MathCfg, data.get("math") or {}),
+        scienceworld=_build(SciworldCfg, data.get("scienceworld") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),

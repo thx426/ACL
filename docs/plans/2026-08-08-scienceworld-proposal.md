@@ -172,3 +172,27 @@ benchmark 章节;ETO/IPR/PGPO/RLVMR/官方引擎五库 + 五篇 PDF 已归档
   与我们 4B SFT 冷启动先例同构,若 SciWorld 上需要冷启动可参照其构成。
 - ETO 步数口径"计对话步含格式失败步"≈ 我们的 max_assistant_turns 语义
   (而非 max_env_steps);实施映射时对齐这一层。
+
+---
+
+# 最终裁定与实施(2026-08-08 三轮,用户五项裁定后落码)
+
+**用户裁定**:①simplifications = easy 全开;②步预算 = **全局**(RLVMR 口径,
+episode 段配置,30;不采 ETO per-task 表);③reward = **终局二元**
+(won = engine completed 且 score≥100,严格版;RLVMR 宽松版 score>0 不采,
+对照披露);④数据 = ETO 口径全量(train 1483 / seen 194 / unseen 211);
+⑤不注入 admissible-action 表(对照 RLVMR 时披露该差异)。
+
+**已实施**(`envs/scienceworld/`):worker.py(JVM 子进程,line 协议,
+lineage alfworld;本地实测 boot+load 1.6s → 每 episode 冷启定案,池化不做)
+/ adapter.py(FC 单工具 execute;动作表引擎逐字捕获,electrical 任务自动
+附加 connect/disconnect 两行——easy 下引擎自动豁免 noElectricalAction,
+实测;focus 计分警示进工具描述与 scaffold)/ build_dataset.py(vendored
+ETO indices,引擎原生 gold path 预提取,gold 不随 easy 含冗余步 harmless)
+/ SciworldCfg + registry + preflight/agent_loop FC 门 + pgs.yaml 段。
+本地真引擎端到端冒烟通过(GT 39 步/teleport/invalid/reminder 全链)。
+
+**部署前置**(CD-006):worker venv 装 `scienceworld`+`py4j`(pip),PATH 有
+java≥1.8(162 系统 OpenJDK 11 ✓;A800 无 java——独立 conda 前缀装
+conda-forge openjdk,入口 export PATH);数据构建
+`python -m trace_opd.envs.scienceworld.build_dataset --worker-python ... --out-dir ...`。
