@@ -302,14 +302,14 @@ class SpreadsheetbenchTaskAdapter:
         if name == "run_python":
             code = str(call.get("arguments", {}).get("code", "") or "")
             if not code.strip():
-                return _tool_resp("run_python: empty code." + extra_note), False, 0.0, False
+                return protocol.tool_response_wrap("run_python: empty code." + extra_note), False, 0.0, False
             out_text, rc = self._run_python(env.workdir, code)
             body = out_text if rc == 0 else f"[exit {rc}]\n{out_text}"
-            return _tool_resp(self._clip(body) + extra_note), False, 0.0, rc == 0
+            return protocol.tool_response_wrap(self._clip(body) + extra_note), False, 0.0, rc == 0
         if name == "submit":
             if not os.path.exists(env.output_path):
                 return (
-                    _tool_resp(
+                    protocol.tool_response_wrap(
                         "submit: output.xlsx not found in the working "
                         "directory — write it first, then submit." + extra_note
                     ),
@@ -317,9 +317,9 @@ class SpreadsheetbenchTaskAdapter:
                 )
             score = self._score_output(env.output_path)
             # 信息状态红线:评估结果不反馈(轨迹终态另行记账)。
-            return _tool_resp("Submitted." + extra_note), True, score, True
+            return protocol.tool_response_wrap("Submitted." + extra_note), True, score, True
         return (
-            _tool_resp(
+            protocol.tool_response_wrap(
                 f"unknown tool: {name!r}. Available: run_python, submit."
                 + extra_note
             ),
@@ -380,11 +380,6 @@ class SpreadsheetbenchTaskAdapter:
         return _format_reminder()
 
 
-def _tool_resp(content: str) -> str:
-    """反馈按 Qwen3 chat template 对 tool role 消息的渲染形态包裹,使
-    文本流与原生 function-calling 分布对齐(服务器侧真 tokenizer 对拍
-    冒烟见 GO 清单;不等价则升级 TemplateDelta 变体)。"""
-    return f"<tool_response>\n{content}\n</tool_response>"
 
 
 def _norm_call(call: dict) -> str:

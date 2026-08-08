@@ -330,6 +330,28 @@
    ]
   },
   {
+   "case": "bool-python-style",
+   "text": "<tool_call>\n<function=toggle>\n<parameter=flag>\nTrue\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "",
+   "calls": [
+    {
+     "name": "toggle",
+     "parameters": "{\"flag\": true}"
+    }
+   ]
+  },
+  {
+   "case": "mention-then-call",
+   "text": "Discussing <tool_call> syntax in prose.\n<tool_call>\n<function=execute>\n<parameter=command>\ngo\n</parameter>\n</function>\n</tool_call>",
+   "normal_text": "Discussing ",
+   "calls": [
+    {
+     "name": "execute",
+     "parameters": "{\"command\": \"go\"}"
+    }
+   ]
+  },
+  {
    "case": "no-call-plain-text",
    "text": "Just an answer, no tools.",
    "normal_text": "Just an answer, no tools.",

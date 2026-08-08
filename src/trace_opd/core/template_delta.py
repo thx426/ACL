@@ -163,6 +163,127 @@ def fc_roundtrip_probe(tokenizer, dialect: str) -> None:
         )
 
 
+def fc_stream_equivalence_probe(tokenizer) -> dict:
+    """渲染方向的正确性硬门(用户要求 2026-08-08):训练通道把 OpenAI 格式
+    的 FC 交互转成原始 token 流(append-only:首轮 prompt + 生成段 + glue +
+    tool_response_wrap(obs) + post_obs …),必须与推理引擎对同一 OpenAI
+    messages 数组的 chat-template 整体渲染**逐 token 一致**——两条通道的
+    上下文同分布是机制正确性的前提。
+
+    两层断言,FAIL 即 raise(preflight 转 FAIL):
+
+    A. tool 轮渲染一致性(全模板硬断言):模板渲染 ``role="tool"`` 消息的
+       完整轮 == 我方 [user-open] + encode(tool_response_wrap(obs)) +
+       [user-close] 拼接——守护 tool_response_wrap 字面量与模板不漂移。
+    B. 完整两轮 FC 会话流等价:append-only 拼接 == 整体渲染(带下一轮
+       generation prompt)。历史 assistant 轮渲染与 gen_prefix 不同头的
+       模板(Qwen3 thinking 系剥 think 块,TemplateDelta docstring 记录的
+       已知性质)结构上不可全等,该层降级 SKIPPED 并在返回值注明——运行
+       正确性不受影响(训练/评测都走 append-only,从不重渲染)。
+
+    返回 {"tool_turn": "PASS", "full_stream": "PASS"|"SKIPPED:think-strip"}。
+    """
+    from . import protocol  # 函数内 import,避免 core 模块级依赖环
+
+    t = tokenizer
+    delta = TemplateDelta(t)
+    tools = _FC_PROBE_TOOL
+
+    def call(n):
+        return {"type": "function",
+                "function": {"name": "fcprobe771",
+                             "arguments": {"arg": f"VPROBE88{n}"}}}
+
+    obs1 = "OPROBE313 first tool result."
+    obs2 = "OPROBE314 second tool result."
+    msgs = [
+        {"role": "system", "content": "SPROBE224"},
+        {"role": "user", "content": "UPROBE551"},
+        {"role": "assistant", "content": "Reasoning one.", "tool_calls": [call(1)]},
+        {"role": "tool", "content": obs1},
+        {"role": "assistant", "content": "Reasoning two.", "tool_calls": [call(2)]},
+        {"role": "tool", "content": obs2},
+    ]
+
+    def rids(m, gen):
+        return render_ids(t, m, gen, tools=tools)
+
+    # prefixes[j] = render(msgs[:j+2]) — j=0 是 sys+user,此后每级 +1 轮。
+    prefixes = [rids(msgs[:k], False) for k in range(2, len(msgs) + 1)]
+    for a, b in zip(prefixes, prefixes[1:]):
+        if b[: len(a)] != a:
+            # Qwen3 thinking 系指纹:末轮 assistant 带空 think、变历史轮后
+            # 被剥 ⇒ 逐级渲染非前缀扩展,差分法不可用(实测 Qwen3-1.7B,
+            # 2026-08-08)。该家族当前只跑 text 协议;FC 环境若要上此类
+            # 模板,preflight 会报 SKIPPED,需人工专项验证后放行。
+            logger.info(
+                "FC stream probe: incremental renders are not prefix-extending "
+                "(think-stripping template family) — equivalence checks skipped."
+            )
+            return {"tool_turn": "SKIPPED:think-strip",
+                    "full_stream": "SKIPPED:think-strip"}
+
+    # ---- A. tool 轮渲染一致性 ----------------------------------------
+    # 模板对 tool 轮的增量 vs 我方注入形态。glue_full=[stop, …user-open…];
+    # post_obs=[…user-close…]+gen_prefix(TemplateDelta 差分定义)。
+    tool_seg = prefixes[2][len(prefixes[1]):]
+    user_close = delta.post_obs[: len(delta.post_obs) - len(delta.gen_prefix)]
+    ours_tool = (
+        delta.glue_full[2:]
+        + t.encode(protocol.tool_response_wrap(obs1), add_special_tokens=False)
+        + user_close
+    )
+    if ours_tool != tool_seg:
+        raise RuntimeError(
+            "FC stream probe FAILED (tool turn): our injected tool feedback "
+            "does not match the template's rendering of a role=tool message.\n"
+            f"  template: {t.decode(tool_seg)!r}\n"
+            f"  ours:     {t.decode(ours_tool)!r}\n"
+            "tool_response_wrap (core/protocol.py) has drifted from the chat "
+            "template — fix the wrap, never the template."
+        )
+
+    # ---- B. 完整流等价 ------------------------------------------------
+    a_seg = prefixes[1][len(prefixes[0]):]
+    if a_seg[: len(delta.gen_prefix)] != delta.gen_prefix:
+        logger.info(
+            "FC stream probe: history-assistant rendering differs from the "
+            "generation prefix (think-stripping template family) — full-stream "
+            "equality is structurally inapplicable; tool-turn check passed."
+        )
+        return {"tool_turn": "PASS", "full_stream": "SKIPPED:think-strip"}
+
+    stream = list(rids(msgs[:2], True))
+    # assistant 轮增量:msgs[2] → prefixes[1]−prefixes[0];msgs[4] →
+    # prefixes[3]−prefixes[2](prefixes 下标与 msgs 下标差 2)。
+    for a_idx, obs in ((1, obs1), (3, obs2)):
+        seg = prefixes[a_idx][len(prefixes[a_idx - 1]):]
+        if seg[: len(delta.gen_prefix)] != delta.gen_prefix:
+            raise RuntimeError("FC stream probe: assistant turn head drifted mid-probe")
+        body = seg[len(delta.gen_prefix):]
+        stops = [i for i, tok_id in enumerate(body) if tok_id in delta.stop_ids]
+        if not stops:
+            raise RuntimeError("FC stream probe: assistant turn carries no stop token")
+        gen = body[: stops[-1] + 1]  # 引擎语义:停止符保留在生成段尾
+        stream += gen
+        stream += delta.after_generation(gen)
+        stream += t.encode(protocol.tool_response_wrap(obs), add_special_tokens=False)
+        stream += delta.post_obs
+    truth = rids(msgs, True)
+    if stream != truth:
+        cut = next(
+            (i for i, (x, y) in enumerate(zip(stream, truth)) if x != y),
+            min(len(stream), len(truth)),
+        )
+        raise RuntimeError(
+            "FC stream probe FAILED (full stream): append-only assembly diverges "
+            f"from the engine-side whole render at token {cut}.\n"
+            f"  ours:  …{t.decode(stream[max(0, cut - 20): cut + 20])!r}\n"
+            f"  truth: …{t.decode(truth[max(0, cut - 20): cut + 20])!r}"
+        )
+    return {"tool_turn": "PASS", "full_stream": "PASS"}
+
+
 def _find_subseq(haystack: list[int], needle: list[int]) -> int:
     n, m = len(haystack), len(needle)
     for i in range(n - m + 1):

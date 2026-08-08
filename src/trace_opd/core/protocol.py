@@ -119,6 +119,15 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 FC_DIALECTS = ("hermes", "qwen35_xml", "none")
 _FC_DIALECT = "hermes"
 
+#: dialect → 起 OpenAI 兼容服务时唯一合法的 ``--tool-call-parser``。
+#: 我方文本层解析器与该服务端 parser 逐语义对拍(golden fixture);换 parser
+#: 名(例如未来 sglang 引入 qwen3_xml,或换 vLLM 后端——vLLM 的 qwen3_xml
+#: 是 Expat 路径、与 qwen3_coder 有已知语义差异,如 Python 风格 ``True``
+#: 的接受性)= 训练/推理两条通道解析分歧,必须先重新生成 golden 重新对拍,
+#: 再改这里(调研定案 2026-08-08:sglang 0.5.8/0.5.10 均只有 qwen3_coder,
+#: 官方文档对 Qwen3.5 的推荐亦是它)。
+SERVER_TOOL_CALL_PARSER = {"qwen35_xml": "qwen3_coder", "hermes": "hermes"}
+
 
 def configure_fc_dialect(dialect: str) -> None:
     """Install the probed FC dialect (single source: the live chat template
@@ -208,6 +217,19 @@ def strip_tool_calls(assistant_text: str, dialect: str | None = None) -> str:
     if d == "qwen35_xml":
         return _parse_qwen35_xml(assistant_text or "", None)[1].strip()
     return _TOOL_CALL_RE.sub("", assistant_text or "").strip()
+
+
+def tool_response_wrap(content: str, dialect: str | None = None) -> str:
+    """工具执行结果的回注包裹(react 的 feedback 单一公共件)。
+
+    必须与推理引擎对 ``role="tool"`` 消息的 chat-template 渲染**逐字一致**
+    ——训练通道以 user 轮文本注入该反馈,两条通道的上下文才 byte 级同分布。
+    Qwen3 与 Qwen3.5 实测同形态(``<tool_response>\\n内容\\n</tool_response>``,
+    A800 2026-08-08);形态一致性由 template_delta.fc_stream_equivalence_probe
+    对真模板差分守护,漂移在 preflight 即 FAIL,勿手改此处再"顺手适配"。
+    dialect 参数为未来家族差异预留,当前两家族共用一个形态。"""
+    del dialect  # 当前无家族差异;探针守护该假设
+    return f"<tool_response>\n{content}\n</tool_response>"
 
 
 # qwen35_xml 解析(语义单一真源 = sglang 0.5.10 Qwen3CoderDetector.

@@ -248,21 +248,21 @@ class MathTaskAdapter:
         if name == "run_python":
             code = str(call.get("arguments", {}).get("code", "") or "")
             if not code.strip():
-                return _tool_resp("run_python: empty code." + extra_note), False, 0.0, False
+                return protocol.tool_response_wrap("run_python: empty code." + extra_note), False, 0.0, False
             out, rc = run_python_script(
                 code, cwd=env.workdir,
                 timeout_s=self._cfg.python_timeout_s, gate=self._gate,
             )
             body = out if rc == 0 else f"[exit {rc}]\n{out}"
             return (
-                _tool_resp(clip_middle(body, self._cfg.obs_max_chars) + extra_note),
+                protocol.tool_response_wrap(clip_middle(body, self._cfg.obs_max_chars) + extra_note),
                 False, 0.0, rc == 0,
             )
         if name == "submit":
             answer = str(call.get("arguments", {}).get("answer", "") or "")
             if not answer.strip():
                 return (
-                    _tool_resp(
+                    protocol.tool_response_wrap(
                         "submit: empty answer — pass the final answer as "
                         "the 'answer' argument." + extra_note
                     ),
@@ -272,9 +272,9 @@ class MathTaskAdapter:
                 str(self._item["ground_truth"]), answer
             ) else 0.0
             # 信息状态红线:评分结果不反馈。
-            return _tool_resp("Submitted." + extra_note), True, score, True
+            return protocol.tool_response_wrap("Submitted." + extra_note), True, score, True
         return (
-            _tool_resp(
+            protocol.tool_response_wrap(
                 f"unknown tool: {name!r}. Available: run_python, submit."
                 + extra_note
             ),
@@ -293,10 +293,6 @@ class MathTaskAdapter:
         return _format_reminder()
 
 
-def _tool_resp(content: str) -> str:
-    """与 Qwen3 模板 tool role 渲染形态对齐的包裹(SSB 同款;服务器真
-    tokenizer 对拍见 GO 清单反馈侧一项)。"""
-    return f"<tool_response>\n{content}\n</tool_response>"
 
 
 class MathEnvFactory:

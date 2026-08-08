@@ -75,6 +75,7 @@ def main() -> int:
             from ..core.template_delta import (
                 TemplateDelta,
                 fc_roundtrip_probe,
+                fc_stream_equivalence_probe,
                 turn_stop_token_ids,
             )
 
@@ -100,8 +101,14 @@ def main() -> int:
                         "parseable call"
                     )
                 fc_roundtrip_probe(tok, delta.fc_dialect)
+                # 渲染方向硬门(用户要求 2026-08-08):append-only 训练流
+                # 必须与推理引擎的整体渲染逐 token 一致(tool 轮全模板必查;
+                # 完整流在 think-strip 模板上结构性不可全等,降级注明)。
+                stream_report = fc_stream_equivalence_probe(tok)
+            else:
+                stream_report = None
             _ok("model", f"stop_ids={stop_ids}; fc_dialect={delta.fc_dialect}; "
-                         "template delta probes pass")
+                         f"fc_stream={stream_report}; template delta probes pass")
 
             # 引擎默认停止集(镜像 sglang ModelConfig._get_hf_eos_token_id 语义:
             # generation_config 优先,缺则 config/text_config)与轮末符对拍。
