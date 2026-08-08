@@ -34,7 +34,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
 )
 
-from ..common.aio import shared_task
+from ..common.aio import shared_task, shared_task_handle
 from ..common.config import Config, load_config
 from ..common.hashing import response_token_hash
 from ..common.llm import make_client
@@ -695,6 +695,7 @@ class TraceAgentLoop(AgentLoopBase):
 
         steer_ctx = None
         research_fields: dict[str, Any] = {}
+        research_join: asyncio.Task | None = None   # bare-first:rollout 后 join
         v4_coord = kwargs.get("_v4_coord")
         if v4_coord is not None:
             # v4 executor 行:bare 立即起跑(零依赖),steered 等 argmax doc;
@@ -728,29 +729,43 @@ class TraceAgentLoop(AgentLoopBase):
                 self.cfg.steering.steered_fraction,
             )
             if self.cfg.steering.doc_source == "researcher":
-                # student 启动前 await 文档;同 step 的 n=8 全部等待同一共享任务。
-                # bare 臂也 await:producer 按 (step,task) 只跑一次,bare 副本
-                # 等它只为携带同一份 research_fields(IF-09 批内 schema 恒齐),
-                # 文档本身不注入。
-                t_research = time.time()
+                # steered 臂:student 启动前 await 文档;同 step 的副本共享
+                # 同一 producer(shared_task 按 (step,task) 去重)。
+                # bare 臂:文档不注入,只需 research_fields 进账(IF-09 批内
+                # schema 恒齐)——改为 bare-first:此处只触发 producer,
+                # rollout 之后再 join fields。依据 2026-08-08 step1 时序实测
+                # (9B formal):research P50=226s/max=493s 前置阻塞全部 128
+                # 条 bare(episode P50=50s),造成步首 2.3min 引擎零 student
+                # 负载 + 步尾 4.7min 并发<10;bare 生成与 research 零数据
+                # 依赖,提前起跑是纯调度改动(分布/记账/断言语义均不变,
+                # 与 v4 路径的 bare 立即起跑同构)。
                 if self._steered_arm_retired(global_step):
                     # M2 停产后 doc 无消费者(steered 槽位已全转 bare,文档
                     # 永不注入)——跳过 producer,researcher 墙钟(整步大头)
                     # 在退火尾程归零(审阅 L7)。
                     doc = ""
-                else:
+                elif steered_arm:
+                    t_research = time.time()
                     doc, research_fields = await shared_task(
                         self.research_tasks,
                         (global_step, adapter.task_id),
                         lambda: self._research(adapter, global_step, route),
                     )
                     metrics.tool_calls += time.time() - t_research
+                else:
+                    research_join = shared_task_handle(
+                        self.research_tasks,
+                        (global_step, adapter.task_id),
+                        lambda: self._research(adapter, global_step, route),
+                    )
+                    doc = ""
             else:
                 doc = self.doc_table.get(adapter.task_id, "")
             steer_ctx = {
                 # bare 臂强制空 doc ⇒ _make_generate 走纯 EngineGenerate,
                 # 零 verify、零倾斜、空账(W≡1)。doc_missing 保持任务级观测
-                # 语义(两臂同值),臂身份走独立字段。
+                # 语义(两臂同值),臂身份走独立字段;bare-first 路径下先以
+                # 占位值 1 进 ctx,join 后回填真值(消费点全在 join 之后)。
                 "doc": doc if steered_arm else "",
                 "doc_missing": int(not doc),
                 "steered_arm": int(steered_arm),
@@ -760,6 +775,14 @@ class TraceAgentLoop(AgentLoopBase):
         result = await self._student_rollout(
             adapter, sampling_params, response_length, route, steer_ctx
         )
+        metrics.generate_sequences += time.time() - t0
+        if research_join is not None:
+            # bare-first join:fields 只进账与断言,不进生成;tool_calls 记
+            # 真实阻塞时长(rollout 已并行消化 research 的大部分墙钟)。
+            t_join = time.time()
+            _doc_joined, research_fields = await asyncio.shield(research_join)
+            metrics.tool_calls += time.time() - t_join
+            steer_ctx["doc_missing"] = int(not _doc_joined)
         if v4_coord is not None and kwargs["_v4_role"] == ROLE_BARE:
             # v4:bare 行终态登记进前缀池(第 bare_expected 条 resolve)。
             traj = result.trajectory
@@ -790,7 +813,6 @@ class TraceAgentLoop(AgentLoopBase):
             assert_rollout_policy_version(
                 result.gen_extra, version, label="student rollout"
             )
-        metrics.generate_sequences += time.time() - t0
 
         traj = result.trajectory
         env_steps = sum(1 for s in traj.steps if s.acted)

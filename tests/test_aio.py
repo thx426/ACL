@@ -79,3 +79,58 @@ def test_cancelling_one_awaiter_spares_the_shared_job():
         assert await second == "survived"  # sibling still gets the result
 
     _run(main())
+
+
+def test_handle_triggers_without_awaiting_and_shares_producer():
+    """bare-first 调度原语(2026-08-08):handle 触发 producer 但不等待;
+    先跑完自己的工作再 join,与 steered 侧的 shared_task 共享同一 factory。"""
+    from trace_opd.common.aio import shared_task_handle
+
+    async def main():
+        cache: dict = {}
+        calls = []
+        gate = asyncio.Event()
+
+        async def factory():
+            calls.append(1)
+            await gate.wait()          # producer 慢:模拟 research 长会话
+            return ("doc", {"research_experiments": 8})
+
+        # bare 副本:触发后立即返回(producer 未完成),期间干自己的 rollout。
+        handle = shared_task_handle(cache, (3, "task/A"), factory)
+        assert not handle.done()
+        rollout_done = []
+
+        async def bare_rollout():
+            await asyncio.sleep(0.01)  # bare episode 与 research 并行推进
+            rollout_done.append(1)
+
+        async def steered():
+            return await shared_task(cache, (3, "task/A"), factory)
+
+        st = asyncio.ensure_future(steered())
+        await bare_rollout()
+        assert rollout_done and not handle.done()  # rollout 先完成,producer 仍在跑
+        gate.set()
+        doc, fields = await asyncio.shield(handle)  # bare join
+        assert (doc, fields) == await st            # steered 拿到同一结果
+        assert len(calls) == 1                      # producer 只跑一次
+
+    _run(main())
+
+
+def test_handle_drops_stale_step_entries():
+    from trace_opd.common.aio import shared_task_handle
+
+    async def main():
+        cache: dict = {}
+
+        async def factory():
+            return "x"
+
+        old = shared_task_handle(cache, (1, "t"), factory)
+        await asyncio.shield(old)
+        shared_task_handle(cache, (2, "t"), factory)
+        assert (1, "t") not in cache and (2, "t") in cache
+
+    _run(main())

@@ -6,7 +6,27 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable
 
-__all__ = ["shared_task"]
+__all__ = ["shared_task", "shared_task_handle"]
+
+
+def shared_task_handle(
+    cache: dict[tuple, asyncio.Task],
+    key: tuple,
+    factory: Callable[[], Awaitable[Any]],
+) -> asyncio.Task:
+    """Get-or-create the shared job WITHOUT awaiting it.
+
+    Bare-first 调度用(2026-08-08 时序实测):bare 副本先触发 producer 再
+    立即起跑自己的 rollout,rollout 结束后才 ``await asyncio.shield(task)``
+    取 fields。函数体无 await 点,免锁不变式与 shared_task 相同。
+    """
+    for stale in [k for k in cache if k[0] != key[0]]:
+        cache.pop(stale)
+    task = cache.get(key)
+    if task is None:
+        task = asyncio.create_task(factory())
+        cache[key] = task
+    return task
 
 
 async def shared_task(
@@ -32,10 +52,4 @@ async def shared_task(
     ``asyncio.shield`` keeps one cancelled copy from killing the shared job
     for its siblings; the cancellation still propagates to the caller.
     """
-    for stale in [k for k in cache if k[0] != key[0]]:
-        cache.pop(stale)
-    task = cache.get(key)
-    if task is None:
-        task = asyncio.create_task(factory())
-        cache[key] = task
-    return await asyncio.shield(task)
+    return await asyncio.shield(shared_task_handle(cache, key, factory))
