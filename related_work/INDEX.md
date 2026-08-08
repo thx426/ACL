@@ -73,3 +73,36 @@ s3 两病灶 ↔ 文献答案:①混合组共享 LOO 基线(bare 被系统性压
 LUFFY 反向 shaping。我们保留的独有点:教师=π 自身+特权文档条件化(无词表
 约束、steered 轨迹文本层信息状态干净、doc 可 researcher 自进化)、agentic
 多轮语境(死锁截断、常驻引擎 tail-only verify)。
+
+---
+
+# Benchmark 资产(benchmarks/<name>/;需求 §4 逐环境引入的调研与 baseline 对照物)
+
+每个 benchmark 一个子目录:`papers/`(arXiv PDF)+ `code/`(浅 clone,commit 钉此)。
+用途:①引入前读社区**代码实现**定关键抉择(不是只读论文);②实验/论文期
+baseline 对照与口径核对。
+
+## scienceworld(2026-08-08)
+
+**papers/**:2203.07540(ScienceWorld 本体,EMNLP22)/ 2403.02502(ETO,ACL24)/
+2405.11930(IPR,EMNLP24)/ 2506.01475(PGPO,ACL25F)/ 2507.22844(RLVMR,Tencent)
+
+**code/**(commit·日期):ETO `a2fc5da·2024-10-30` / IPR `93335a3·2024-10-18` /
+PGPO `db0d74e·2025-08-07` / ScienceWorld 官方 `c6edd47·2026-08-04` /
+DigitalHuman(RLVMR 子目录,sparse)`59ff469·2026-01-29`
+
+**四抉择的社区实测答案(读码结论,两谱系对照)**:
+
+| 抉择 | ETO 谱系(ETO/IPR/PGPO,SFT+DPO) | RLVMR(verl GRPO) |
+|---|---|---|
+| 数据/划分 | **24 任务**(非 30);train 1483 / dev 194 / test 211,seen/unseen 均**变体级**(`eval_agent/data/sciworld/*_indices.json`) | 29 任务;L0 同分布 / L1 变体级 / **L2 任务级 held-out**(train 19 任务 vs test 10 任务不相交;`variations_idx/L*_idx.json`) |
+| reward | `raw_score`∈[0,1] 取**轨迹峰值**(`sciworld_env.py: if reward > self.state.reward` 只增不减)→ 天然免负分 | **二元 10×won**,won=isCompleted∧score>0(宽松:超步限带正分也算;`envs.py:compute_reward`);dense 信号来自 meta-reasoning 标签非环境分 |
+| simplifications | **"easy" 硬编码**(ETO/PGPO `reset()` 源码) | **默认 "easy"**(`env_manager.py:563`) |
+| 步预算 | **per-task 表** `max_steps.json`:10(lifespan)–120(melting-point),均值≈40;计对话步含格式失败步 | **全局 30**(`run_sciworld.sh: env.max_steps=30`)+ 引擎 envStepLimit=100 兜底 |
+| 观察增强 | 无 admissible list(代码里注释掉了) | **每步注入 valid_actions 全表+对象表+示例** |
+| 架构 | 对话式 ReAct(`Action:` 正则)+ ICL few-shot | verl-agent step-level(每步独立 prompt,max_response 1024/步) |
+
+另:RLVMR 带 SciWorld **专家轨迹 SFT 冷启动**(`data/sciworld_expert_traj` +
+`examples/sft/cold_start/`)——与我们 4B SFT 冷启动先例同构,可比对照。
+ETO 的 `replace_sciworld_score.py` 是对官方包 step 的 monkey-patch(加
+raw_score 字段),IPR 同款。

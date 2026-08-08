@@ -118,3 +118,57 @@ build_datasets 时预生成入 parquet(gt 防火墙沿用:只进 researcher/teac
 | Q4 | max_env_steps | build 期按 gold path 分布定(预计 50) |
 | Q5 | A800 java:conda-forge openjdk 装入哪个 env | 随 q35 生产环境 |
 | Q6 | JVM 池化 vs 每 episode 冷启 | 池化 + 定期回收 |
+
+---
+
+# 增补(2026-08-08 二轮):社区代码实测答案与修订后的裁定项
+
+按用户要求逐仓读了社区实现(资产与 commit 见 `related_work/INDEX.md`
+benchmark 章节;ETO/IPR/PGPO/RLVMR/官方引擎五库 + 五篇 PDF 已归档
+`related_work/benchmarks/scienceworld/`)。四个原裁定项中两个被社区实测
+**直接定案**,一个被**改写**,并新增一个此前未识别的抉择:
+
+## 已定案(社区口径一致,不再作为裁定项)
+
+- **Q3 simplifications → "easy" 全开**:ETO/PGPO 在 `reset()` 里硬编码
+  `simplificationStr="easy"`,RLVMR `env_manager` 默认同值——两个谱系
+  (SFT+DPO 系与 GRPO 系)完全一致,跟随即可,无可比性歧义。
+- **Q4 步预算 → per-task 表**(修订原"全局 P95"设想):ETO 的
+  `max_steps.json` 按任务给 10–120(lifespan 10 vs melting-point 120,
+  差 12 倍)——全局单值要么截断长任务要么让短任务失败轨迹烧 12 倍预算。
+  实施采用 ETO 表(24 任务全覆盖);机制侧小增量:adapter 提供 per-task
+  `max_env_steps` 覆盖(默认回落全局)。RLVMR 的全局 30 作为对照口径披露。
+
+## 修订后的裁定项
+
+- **Q2 reward:新增 R4「轨迹峰值分」为推荐项**。社区两家都不用"终局
+  score":ETO 系取 **max-over-time raw_score**(只增不减——天然免负分、
+  对进度回退鲁棒);RLVMR 用**二元 10×won**(其 dense 信号来自
+  meta-reasoning 标签,非环境分)。R4 = `max_t score_t / 100`:既是 ETO 系
+  语义(可比),又天然解决负分(峰值恒 ≥0),又保留部分分的组内梯度密度
+  (我们没有 RLVMR 那种 meta-reward 补密度,部分分对 GRPO 价值更大)。
+  val 双指标:avg peak score(对 ETO 系)+ won 率(对 RLVMR;won 定义
+  采严格版 = engine completed,与其宽松版差异披露)。
+- **Q1 数据:ETO 口径构成已实锤为「24 任务」**(taskname2id 29 但
+  indices 只用 24;train/dev/test 同任务集,seen/unseen 纯变体级)。
+  推荐不变(主 ETO 口径,数字直接进其对照表);RLVMR 的 **L2 任务级
+  held-out**(19/10 任务不相交)是更强的泛化口径,列为后续可选第二评测
+  (泛化叙事用),首轮不做。
+
+## 新增裁定项
+
+- **Q7 观察增强(admissible actions 注入)**:RLVMR 每步把 valid_actions
+  全表+对象表+示例注入观察;ETO 系不注入(代码里注释掉了)。**推荐:不
+  注入**——动作知识正是 researcher 文档要填的信息面(与 ALFWorld 的
+  "No admissible-command list" 纪律同源);与 RLVMR 比数字时披露该差异
+  (它有动作先验、我们没有,方向对我们有利)。
+
+## 其它读码收获
+
+- RLVMR 是 verl-agent step-level 架构(每步独立 prompt、
+  max_response=1024/步),与我们整轨迹 token 流不同型——数字可比、
+  训练形态不可比,论文里如对照需注明。
+- RLVMR 附 SciWorld 专家轨迹 SFT 冷启动资产(`sciworld_expert_traj`),
+  与我们 4B SFT 冷启动先例同构,若 SciWorld 上需要冷启动可参照其构成。
+- ETO 步数口径"计对话步含格式失败步"≈ 我们的 max_assistant_turns 语义
+  (而非 max_env_steps);实施映射时对齐这一层。
