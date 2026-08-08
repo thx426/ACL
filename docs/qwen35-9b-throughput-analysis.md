@@ -52,7 +52,11 @@ research 完成后 16 条同时涌入 ⇒ 122 并发峰与排队;最慢任务(re
   rollout 计时(原含 research 等待,口径变化,跨 run 比较注意)。
   估算净省 **2–3.5 min/step**。
 
-## 4. P2(裁定项):research 跨步预取(off-by-one)
+## 4. P2(~~裁定项~~ **已否决**,2026-08-08 用户裁定):research 跨步预取(off-by-one)
+
+> **否决理由**:后续将切换同 policy researcher(v4 自体研究员)——research 行
+> 本身是训练数据且 doc 必须出自当前 policy,off-by-one 在机制上不成立。
+> 本节仅留痕。v4 语境的吞吐分析另见 `docs/v4-selfres-throughput-analysis.md`。
 
 训练段 ~7 min 完全能藏下 research(P50 226s/max 493s):在 step t 训练期间
 预跑 step t+1 的 research ⇒ 生成段只剩 episodes,整步 20.3→≈13 min(−35%)。
