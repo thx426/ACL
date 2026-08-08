@@ -76,6 +76,9 @@ episode:
                             # 不进 objective_fingerprint(采样协议非优化目标)
 
 alfworld:
+  protocol: fncall          # 统一 FC(2026-08-08 用户裁定,默认)。在跑的
+                            # text 协议 run 续跑/对照必须显式改 "text"
+                            # (协议进 objective_fingerprint,resume 守卫会拦)
   data_root: "${ALFWORLD_DATA}"              # json_2.1.1 数据根
   worker_python: "${ALFWORLD_WORKER_PYTHON}" # 引擎 venv 解释器(worker 子进程用)
   spawn_concurrency: 128    # 用户裁定 2026-08-04:并发拉满(80 核)
