@@ -8,7 +8,8 @@ from trace_opd.envs.alfworld.adapter import AlfworldTaskAdapter
 from trace_opd.evalm.run_eval import summarize
 
 
-def _adapter(task_id: str) -> AlfworldTaskAdapter:
+def _adapter(task_id: str, protocol: str = "text") -> AlfworldTaskAdapter:
+    # 既有断言守护 text 协议路径(迁移前行为锁);FC 路径的断言显式传 "fncall"。
     return AlfworldTaskAdapter(
         {
             "task_id": task_id,
@@ -16,7 +17,7 @@ def _adapter(task_id: str) -> AlfworldTaskAdapter:
             "initial_obs": "You are in a kitchen. Your task is to: heat some egg.",
             "gt_text": "1. GotoLocation(fridge)",
         },
-        AlfworldCfg(data_root="/d", worker_python="/p"),
+        AlfworldCfg(protocol=protocol, data_root="/d", worker_python="/p"),
         spawn_gate=threading.Semaphore(1),
     )
 
@@ -84,3 +85,45 @@ def test_summarize_clean_run_is_complete():
     summary, incomplete = summarize(rows, "bare")
     assert not incomplete
     assert summary["splits"]["valid_unseen"]["success_rate"] == 0.0
+
+
+def test_alfworld_fncall_surface():
+    """FC 协议面(2026-08-08 用户裁定的默认):单工具 execute、FC 提醒、
+    scaffold 不再教 <reasoning>/<action>,而命令语法照旧在场。"""
+    a = _adapter("train/pick-Egg-1/trial_T1", protocol="fncall")
+    tools = a.tools()
+    assert [t["function"]["name"] for t in tools] == ["execute"]
+    assert "command" in tools[0]["function"]["parameters"]["properties"]
+    scaffold = a.executor_scaffold()
+    assert "<action>" not in scaffold and "execute" in scaffold
+    assert "Available commands:" in scaffold
+    rem = a.format_reminder()
+    assert rem.startswith("Nothing happens. ") and "execute" in rem
+    assert "via the execute(command) tool" in a.task_brief()
+
+
+def test_alfworld_fncall_react_paths():
+    """FC react:合法调用执行并以 tool 响应包裹观察;unknown tool/空命令
+    不消耗 env step;无调用走格式提醒(裸文本)。"""
+    from trace_opd.core import protocol as proto
+
+    class _Env:
+        def __init__(self):
+            self.stepped = []
+        def step(self, cmd):
+            self.stepped.append(cmd)
+            return "You arrive at desk 1.", False, False
+
+    a = _adapter("train/pick-Egg-1/trial_T1", protocol="fncall")
+    env = _Env()
+    ok = a.react(env, 'Reasoning.\n<tool_call>{"name": "execute", "arguments": {"command": "Go to desk 1"}}</tool_call>')
+    assert ok.acted and ok.consumed_env_step and env.stepped == ["go to desk 1"]
+    assert ok.feedback == proto.tool_response_wrap("You arrive at desk 1.")
+    assert ok.thought == "Reasoning."
+    bad_tool = a.react(env, '<tool_call>{"name": "teleport", "arguments": {}}</tool_call>')
+    assert bad_tool.acted and not bad_tool.consumed_env_step and "unknown tool" in bad_tool.feedback
+    empty = a.react(env, '<tool_call>{"name": "execute", "arguments": {"command": "  "}}</tool_call>')
+    assert empty.acted and not empty.consumed_env_step and "empty command" in empty.feedback
+    none = a.react(env, "no call at all")
+    assert not none.acted and none.feedback.startswith("Nothing happens. ")
+    assert len(env.stepped) == 1

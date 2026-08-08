@@ -4,9 +4,9 @@ One adapter instance per task, minted from a dataset row (the same
 ``extra_info`` dict that rides the training parquet — docs/design.md §5):
     {task_id, gamefile (relative to data_root), split, initial_obs, gt_text}
 
-The executor scaffold IS ``core.protocol.SYSTEM_PROMPT_BARE`` — research
-experiments, the training rollout, and the evaluator share one contract by
-construction.
+The executor scaffold lives in this module (SYSTEM_PROMPT_FC / _BARE, picked
+by ``alfworld.protocol``) — research experiments, the training rollout, and
+the evaluator share one contract by construction.
 
 GT firewall: gt_text is pre-extracted at dataset build time and rides the
 row; it is routed ONLY to the researcher prompt when the GT switch is on —
@@ -209,6 +209,64 @@ SYSTEM_PROMPT_BARE = (
 INVALID_ACTION_OBS = "Nothing happens."
 
 
+# --- Function-Call 协议面(2026-08-08 用户裁定:全环境统一 OpenAI 格式 FC,
+#     ALFWorld 用单工具 execute(command)——动作空间与 text 协议逐字相同,
+#     GT walkthrough / researcher 资产零改动)。schema 经 adapter.tools() 交
+#     chat template 原生渲染;解析在文本层(parse_tool_calls),生成的原始
+#     token 原样留在训练流。描述纪律同 SSB:写全执行模型/步预算语义/失败
+#     行为/终局语义——agent 依赖的行为契约,不是摆设。 -------------------
+TOOLS_FC: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute",
+            "description": (
+                "Execute exactly one ALFWorld text command and return the "
+                "environment's observation. Each call consumes one step of "
+                "the episode budget. An invalid or currently impossible "
+                "command returns 'Nothing happens.' and still consumes the "
+                "step. The episode ends automatically the moment the task "
+                "goal is satisfied — there is no submit command and no "
+                "partial credit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "One command following the 'Available commands' "
+                            "grammar in the system prompt, lowercase, using "
+                            "exact entity names with their numbers as "
+                            "observed (e.g. 'take bread 1 from countertop 2')."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+#: FC 语境系统提示:role / 命令语法 / 实体命名规则 / 终局语义与 BARE 版
+#: 逐点对齐,仅输出协议段不同(工具调用形态由 chat template 按 TOOLS_FC
+#: 原生渲染,此处绝不手写调用格式)。
+SYSTEM_PROMPT_FC = (
+    "You are an agent in the ALFRED text-based household environment. "
+    "Complete the task stated after 'Your task is to:' by issuing "
+    "environment commands through the execute tool, one command per turn.\n\n"
+    + COMMAND_REFERENCE
+    + "\n\n"
+    "Use exact entity names with their numbers as observed (e.g. 'bread 1', "
+    "'countertop 2'). An invalid or currently impossible command returns "
+    "'Nothing happens.'.\n\n"
+    "Each turn, reason briefly about the current situation in plain text, "
+    "then make exactly one execute call. The episode ends automatically "
+    "when the task goal is reached; there is no submit command and no "
+    "partial credit."
+)
+
+
 class AlfworldTaskAdapter:
     """TaskAdapter implementation bound to one dataset row."""
 
@@ -245,10 +303,15 @@ class AlfworldTaskAdapter:
     # ------------------------------------------------------------- protocol
 
     def task_brief(self) -> str:
+        via = (
+            "via the execute(command) tool, one command per turn"
+            if self._cfg.protocol == "fncall"
+            else "via text commands"
+        )
         return (
             "Environment: ALFWorld — the ALFRED household simulator as a "
             "text game. The executor moves through rooms and manipulates "
-            "objects/receptacles via text commands; state changes only "
+            f"objects/receptacles {via}; state changes only "
             "through valid commands.\n"
             f"Task type: {self.task_type}\n\n"
             "Exactly what the executor sees at episode start (scene + goal):\n"
@@ -262,6 +325,8 @@ class AlfworldTaskAdapter:
         )
 
     def executor_scaffold(self) -> str:
+        if self._cfg.protocol == "fncall":
+            return SYSTEM_PROMPT_FC
         return SYSTEM_PROMPT_BARE
 
     def open_episode(self) -> AlfworldEnvHandle:
@@ -298,20 +363,95 @@ class AlfworldTaskAdapter:
         return observation.strip() == INVALID_ACTION_OBS
 
     def format_reminder(self) -> str:
-        """格式失败提醒:以 ALFWorld 习语开头(与 core 迁移前逐字节一致,
-        提示词行为零变化)。"""
-        return (
-            "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
-        )
+        """格式失败提醒:以 ALFWorld 习语开头,读起来像一次正常环境响应
+        (裸文本——assistant 未发起合法动作,反馈不是 tool 响应)。"""
+        if self._cfg.protocol == "fncall":
+            return "Nothing happens. " + protocol.fc_format_reminder("execute")
+        return "Nothing happens. " + protocol.DEFAULT_FORMAT_REMINDER
 
     def tools(self) -> list[dict] | None:
-        """文本动作协议(<reasoning>/<action>),非工具调用型:无 tools。"""
-        return None
+        """fncall 协议:单工具 execute;text 协议:无 tools(<reasoning>/
+        <action> 文本动作)。"""
+        return TOOLS_FC if self._cfg.protocol == "fncall" else None
 
     def react(self, env, assistant_text: str):
-        """ALFWorld 是字符串单命令环境:react 一行委托标准文本动作协议
-        (协议件 normalize/invalid/reminder 即本类上面三个方法)。"""
+        """协议分派:fncall 走 FC react(parse_tool_calls + tool 响应包裹);
+        text 委托标准文本动作协议件。"""
+        if self._cfg.protocol == "fncall":
+            return self._react_fncall(env, assistant_text)
         return protocol.text_action_react(self, env, assistant_text)
+
+    def _react_fncall(self, env, assistant_text: str):
+        """FC react(与 SSB/Math 同框架):每回复恰一个 execute 调用;
+        unknown tool / 空 command 以 tool 响应报错且不消耗 env step;真执行
+        的观察经 tool_response_wrap 包裹回注(与推理引擎对 role=tool 消息的
+        渲染同形态,fc_stream_equivalence_probe 守护)。"""
+        from ...core.adapter import ActionOutcome
+
+        calls = protocol.parse_tool_calls(assistant_text, tools=self.tools())
+        thought = protocol.strip_tool_calls(assistant_text)
+        if not calls:
+            return ActionOutcome(
+                thought=assistant_text.strip(),
+                action_raw="",
+                action_norm="",
+                feedback=self.format_reminder(),
+                done=False,
+                score=0.0,
+                acted=False,
+                valid=False,
+                consumed_env_step=False,
+            )
+        extra_note = ""
+        if len(calls) > 1:
+            extra_note = (
+                f"\n(note: {len(calls) - 1} extra tool call(s) in the same reply "
+                "were ignored — make exactly one call per turn.)"
+            )
+        call = calls[0]
+        if call["name"] != "execute":
+            return ActionOutcome(
+                thought=thought,
+                action_raw=call["name"],
+                action_norm="",
+                feedback=protocol.tool_response_wrap(
+                    f"unknown tool: {call['name']!r}. Available: execute."
+                    + extra_note
+                ),
+                done=False,
+                score=0.0,
+                acted=True,
+                valid=False,
+                consumed_env_step=False,
+            )
+        raw = str(call["arguments"].get("command", "") or "")
+        norm = normalize_command(raw)
+        if not norm:
+            return ActionOutcome(
+                thought=thought,
+                action_raw=raw,
+                action_norm="",
+                feedback=protocol.tool_response_wrap(
+                    "execute: empty command." + extra_note
+                ),
+                done=False,
+                score=0.0,
+                acted=True,
+                valid=False,
+                consumed_env_step=False,
+            )
+        obs, done, won = env.step(norm)
+        return ActionOutcome(
+            thought=thought,
+            action_raw=raw,
+            action_norm=norm,
+            feedback=protocol.tool_response_wrap(obs + extra_note),
+            done=done,
+            score=float(won),
+            acted=True,
+            valid=not self.observation_indicates_invalid(obs),
+            consumed_env_step=True,
+        )
 
     def replay_action(self, env, action_norm: str) -> tuple[str, bool]:
         obs, done, _won = env.step(action_norm)

@@ -205,11 +205,17 @@ class TemplateTaskAdapter:
         """本 benchmark 是文本单动作协议 ⇒ 一行委托 core 的标准实现件
         (它组合下面三个协议件:normalize / invalid 判定 / 格式提醒)。
 
-        非文本协议的 benchmark 在这里自写解析与执行,不经该实现件。例如
-        JSON 工具调用型大致是::
+        ⚠️ 正式方向是统一 Function Call(2026-08-08 用户裁定):新 benchmark
+        一律 FC——tools() 返回 OpenAI schema、react 自写,解析用
+        ``protocol.parse_tool_calls(text, tools=self.tools())``(家族分派 +
+        schema 类型还原)、观察经 ``protocol.tool_response_wrap`` 包裹、提醒
+        用 ``protocol.fc_format_reminder``,并在 envs/preflight.py 的 FC 判定
+        里登记环境名。范本:envs/alfworld(单工具)、envs/spreadsheetbench 与
+        envs/math(多工具)。FC react 骨架::
 
             def react(self, env, assistant_text):
-                calls = parse_tool_calls(assistant_text)   # 自定义解析
+                calls = protocol.parse_tool_calls(assistant_text,
+                                                  tools=self.tools())
                 if not calls:
                     return ActionOutcome(thought=assistant_text.strip(),
                                          action_raw="", action_norm="",

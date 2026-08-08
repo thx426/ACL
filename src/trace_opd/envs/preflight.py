@@ -12,7 +12,7 @@
               text_config)做 eos 一致性告警——Qwen3.5 系资产坑的固化
               (docs/qwen35-9b-eos-stop-bug.md §2.1);
   3. factory  make_env_factory(各环境装配检查:data_root 在位、soffice、
-              math-verify、appworld worker 配置……全部 fail-loud 构造项);
+              math-verify……全部 fail-loud 构造项);
   4. probe    (给了 --parquet 时)取首行任务开一个真实 episode:引擎
               boot / worker 往返 / preview 渲染真实发生,并执行 initial_obs
               漂移比对——这就是最小真冒烟。
@@ -59,9 +59,11 @@ def main() -> int:
     # 2. model assets -------------------------------------------------------
     # 2026-08-08 Qwen3.5 EOS 事故的固化:eos 三处一致性 + 模板差分断言前置。
     # 目录不在本机时跳过(config-only 核对场景);部署机上目录必在 ⇒ 必查。
-    # FC 协议环境登记表(react 走 protocol.parse_tool_calls 的环境;新 FC
-    # 环境接入必须在此登记,M1 后 alfworld 加入)——FC 门只对它们启用。
-    _FC_ENVIRONMENTS = {"spreadsheetbench", "math"}
+    # FC 协议判定(react 走 protocol.parse_tool_calls 的环境;新 FC 环境
+    # 接入必须在此登记)——FC 门只对它们启用。alfworld 随 protocol 开关。
+    _fc_active = cfg.environment.name in {"spreadsheetbench", "math"} or (
+        cfg.environment.name == "alfworld" and cfg.alfworld.protocol == "fncall"
+    )
     mp = Path(cfg.train.model_path)
     if not mp.is_dir():
         print(f"[preflight] note: model_path {mp} absent on this host — asset "
@@ -92,7 +94,7 @@ def main() -> int:
             # FC 门(2026-08-08 家族化):FC 协议环境要求模板可渲染 tool_calls
             # 且我方文本层解析器能逐值还原(训练通道无服务端 parser,两端形态
             # 必须同族——Qwen3 hermes 与 Qwen3.5 qwen35_xml 互不可解)。
-            if cfg.environment.name in _FC_ENVIRONMENTS:
+            if _fc_active:
                 if delta.fc_dialect == "none":
                     raise RuntimeError(
                         f"environment {cfg.environment.name!r} uses the FC protocol "

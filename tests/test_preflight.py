@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 
 from trace_opd.core import protocol
-from trace_opd.envs.appworld.adapter import _partial_score
 from trace_opd.envs.preflight import main as preflight_main
 
 
@@ -19,16 +18,6 @@ def _restore_episode_caps():
     saved = (protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS)
     yield
     protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS = saved
-
-
-def test_partial_score_nested_detail_forms():
-    """审阅改进:requirement 列表藏在 to_dict() 的 detail 嵌套里也要提取
-    (真机 TestTracker 形态不定;顶层/嵌套两形态都吃,兜底二元)。"""
-    assert _partial_score(False, {"passes": [1, 2], "failures": [3, 4]}) == 0.5
-    nested = {"detail": {"tracker": {"passed_tests": [1, 2, 3], "failed_tests": [9]}}}
-    assert _partial_score(False, nested) == 0.75
-    assert _partial_score(True, {"detail": "opaque string"}) == 1.0
-    assert _partial_score(False, {}) == 0.0
 
 
 @pytest.fixture

@@ -163,26 +163,6 @@ class SpreadsheetbenchCfg:
                                     # 保 <tool_response> 包裹完整)
 
 
-@dataclass
-class AppworldCfg:
-    """AppWorld:每 episode 一个 worker 子进程(官方单 world/进程硬约束;
-    RAM ~300-500MB/world ⇒ engine_slots 是内存账,slot 覆盖 episode 全
-    生命期)。worker 解释器须为装有 appworld 的 py>=3.11 venv。"""
-
-    appworld_root: str = ""         # $APPWORLD_ROOT 数据 checkout(含 data/)
-    worker_python: str = ""         # APPWORLD_WORKER_PYTHON(py3.11 venv)
-    worker_script: str = ""         # 空 = 包内 envs/appworld/worker.py(测试注入用)
-    engine_slots: int = 64          # 全局 live worker 上限(RAM-bound;按 worker 折算)
-    max_interactions: int = 50      # 传给引擎的交互硬上限(episode 步预算仍由
-                                    # episode.max_env_steps 主导,此为引擎侧兜底)
-    start_timeout_s: float = 180.0  # worker boot(载 world)超时
-    exec_timeout_s: float = 90.0    # 单次 execute 超时
-    eval_timeout_s: float = 300.0   # 终局 evaluate 超时(unit-test 走查可能
-                                    # 远慢于单步 execute;一次性,宽松无害)
-    obs_max_chars: int = 3000       # worker 侧输出截断(token 流预算适配;
-                                    # 旧引入"不截断"裁定在 API 客户端形态,
-                                    # 硬预算形态下不可持续——方案 §1.4)
-
 
 @dataclass
 class MathCfg:
@@ -225,6 +205,12 @@ class EpisodeCfg:
 
 @dataclass
 class AlfworldCfg:
+    #: 输出协议:"fncall"(统一 Function Call,2026-08-08 用户裁定的正式
+    #: 方向,默认)| "text"(历史 <reasoning>/<action> 协议——仅供在跑
+    #: text run 续跑与 text-vs-FC A/B 对照,新 run 勿用)。协议改变任务
+    #: 表面(system prompt/输出格式/观察包裹),进 objective_fingerprint
+    #: (条件追加,text 保历史指纹)。
+    protocol: str = "fncall"
     data_root: str = ""
     worker_python: str = ""
     spawn_concurrency: int = 128    # 全局 ALFWorld 引擎并发 boot 上限(按 worker 数折算);
@@ -495,7 +481,6 @@ class Config:
     alfworld: AlfworldCfg
     spreadsheetbench: SpreadsheetbenchCfg
     math: MathCfg
-    appworld: AppworldCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -522,7 +507,6 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
-    "appworld"
 }
 
 
@@ -530,6 +514,10 @@ def _validate(cfg: "Config") -> None:
     t = cfg.train
     if not t.model_path:
         raise ValueError("train.model_path is required")
+    if cfg.alfworld.protocol not in ("fncall", "text"):
+        raise ValueError(
+            f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
+        )
     if t.rollout_backend not in ("vllm", "sglang"):
         raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")
     if t.fused_kernels_backend not in ("torch", "triton"):
@@ -968,6 +956,11 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 不改 material,既有 run 指纹逐字节不变。
     if cfg.environment.name != "alfworld":
         material += f"|environment={cfg.environment.name}"
+    # FC 协议统一(2026-08-08 用户裁定)改变任务表面(system prompt/输出
+    # 协议/观察包裹)= 换优化目标;条件追加:text(历史行为)不改 material,
+    # 在跑 text run 的指纹逐字节不变,误用新代码续跑旧 run 会被 resume 守卫拦下。
+    if cfg.environment.name == "alfworld" and cfg.alfworld.protocol != "text":
+        material += f"|alfworld_protocol={cfg.alfworld.protocol}"
     # 分臂采样(v3.1)改变优化目标(组内一半样本换回 π 采样),必须进指纹;
     # 条件追加:fraction=1.0(历史全臂)不改 material,既有 run 指纹逐字节不变
     # (researcher source 哨兵同款先例)。
@@ -1082,7 +1075,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
             SpreadsheetbenchCfg, data.get("spreadsheetbench") or {}
         ),
         math=_build(MathCfg, data.get("math") or {}),
-        appworld=_build(AppworldCfg, data.get("appworld") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),
