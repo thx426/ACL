@@ -254,7 +254,9 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
     fused_args = (
         [
             "actor_rollout_ref.model.use_fused_kernels=True",
-            "+actor_rollout_ref.model.fused_kernel_options.impl_backend="
+            # 必须用 ++(覆盖或添加):该键在 verl 默认配置里已存在,单 + 会让
+            # hydra 抛 ConfigCompositionException("An item is already at ...")。
+            "++actor_rollout_ref.model.fused_kernel_options.impl_backend="
             f"{t.fused_kernels_backend}",
         ]
         if t.use_fused_kernels

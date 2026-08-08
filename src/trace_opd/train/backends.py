@@ -227,7 +227,15 @@ def engine_narrate_fn(server_manager, tokenizer, request_id: str | None = None):
         out = await server_manager.generate(
             request_id=request_id or uuid4().hex,
             prompt_ids=prompt_ids,
-            sampling_params={"temperature": temperature, "max_tokens": max_tokens},
+            # 停止符必须显式下发:本函数绕过 EngineGenerate,skip_tokenizer_init
+            # 语境下引擎默认停止集缺轮末符,narration 会越界满额伪多轮且
+            # skip_special_tokens 把痕迹剥干净(2026-08-08 审阅 P0——EOS
+            # 修复曾漏掉该通道)。
+            sampling_params={
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stop_token_ids": turn_stop_token_ids(tokenizer),
+            },
         )
         return tokenizer.decode(list(out.token_ids), skip_special_tokens=True)
 

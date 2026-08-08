@@ -40,7 +40,7 @@ from ..common.hashing import response_token_hash
 from ..common.llm import make_client
 from ..common.tape import TapeWriter
 from ..core.episode import EpisodeResult, run_episode
-from ..core.template_delta import TemplateDelta, render_ids
+from ..core.template_delta import TemplateDelta, render_ids, turn_stop_token_ids
 from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
 from ..docstore.archive import ResearchArchive
 from ..core.adapter import EnvFactory
@@ -806,6 +806,10 @@ class TraceAgentLoop(AgentLoopBase):
             and self.cfg.steering.enabled
             and self.cfg.steering.doc_source == "researcher"
             and not validate
+            # M2 停产后 producer 被跳过,research_fields 恒空——没有版本
+            # 证据可核是设计而非缺陷;不排除会让退役期(如 v3.3 的
+            # step>=240)每一行都 raise(2026-08-08 审阅 P0)。
+            and not self._steered_arm_retired(global_step)
             and not research_fields.get("research_error")
             and not research_fields.get("research_doc_missing")
         ):
@@ -1036,11 +1040,11 @@ class TraceAgentLoop(AgentLoopBase):
             topk=st_cfg.topk,
             c=st_cfg.c,
             obs_topk=st_cfg.obs_topk,
-            # IF-06:引擎的自然停止口径(qwen 系 eos = <|im_end|>);重采出
-            # 停止符时钩子按同一口径终止本轮。
-            stop_token_ids=frozenset(
-                t for t in (self.tokenizer.eos_token_id,) if t is not None
-            ),
+            # IF-06:轮末停止口径与引擎请求同源(turn_stop_token_ids 单一
+            # 真源)。只拿 tokenizer.eos 在 Qwen3.5 上恰好等价(eos==im_end),
+            # 但对 eos=<|endoftext|> 的资产会漏认轮末,重采路径跨轮拼接
+            # ——EOS 病灶经 resample 复活且只偏 steered 臂(2026-08-08 审阅)。
+            stop_token_ids=frozenset(turn_stop_token_ids(self.tokenizer)),
         )
 
     async def _student_rollout(
