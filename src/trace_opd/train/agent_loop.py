@@ -141,8 +141,10 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         from ..core import protocol
 
         protocol.configure_episode_caps(
-            config.episode.max_env_steps, config.episode.max_assistant_turns
-        )
+        config.episode.max_env_steps,
+        config.episode.max_assistant_turns,
+        config.episode.max_tokens_per_turn,
+    )
         workers = int(os.environ.get("TRACE_AGENT_WORKERS", config.train.agent_num_workers))
         doc_table: dict[str, str] = {}
         gate_tracker = None

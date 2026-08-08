@@ -115,7 +115,9 @@ async def main_async(args) -> int:
     from ..core import protocol
 
     protocol.configure_episode_caps(
-        config.episode.max_env_steps, config.episode.max_assistant_turns
+        config.episode.max_env_steps,
+        config.episode.max_assistant_turns,
+        config.episode.max_tokens_per_turn,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)

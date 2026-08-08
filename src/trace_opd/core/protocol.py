@@ -55,17 +55,29 @@ OBS_TRUNCATE_CHARS = 4000   # defensive cap, engine observations are short
 MAX_CONSECUTIVE_FORMAT_FAILURES = 3  # break the reminder->longer-context spiral
 
 
-def configure_episode_caps(max_env_steps: int, max_assistant_turns: int) -> None:
+def configure_episode_caps(
+    max_env_steps: int, max_assistant_turns: int, max_tokens_per_turn: int
+) -> None:
     """Install the yaml-configured caps (single source: configs/trace.yaml
-    episode: section). Idempotent; must run before any adapter/runner use."""
-    global MAX_ENV_STEPS, MAX_ASSISTANT_TURNS
+    episode: section). Idempotent; must run before any adapter/runner use.
+
+    第三参强制传(2026-08-08 CD-006 P0:`episode.max_tokens_per_turn` 曾是
+    dead config——键读得到、无注入点,消费方一直用硬编码 2048,用户
+    2026-08-07「2048→4096」裁定从未生效。可选参数会重演同型事故,故不设
+    默认值,新调用点必须显式给全三项)。"""
+    global MAX_ENV_STEPS, MAX_ASSISTANT_TURNS, GEN_MAX_TOKENS_PER_TURN
     if max_env_steps < 1 or max_assistant_turns <= max_env_steps:
         raise ValueError(
             f"episode caps invalid: max_env_steps={max_env_steps}, "
             f"max_assistant_turns={max_assistant_turns} (need >=1 and turns > steps)"
         )
+    if max_tokens_per_turn < 1:
+        raise ValueError(
+            f"episode caps invalid: max_tokens_per_turn={max_tokens_per_turn}"
+        )
     MAX_ENV_STEPS = max_env_steps
     MAX_ASSISTANT_TURNS = max_assistant_turns
+    GEN_MAX_TOKENS_PER_TURN = max_tokens_per_turn
 
 # Benchmark prompt material -------------------------------------------------
 # (v4 通用性整改,用户裁定 2026-08-06)ALFWorld 的 COMMAND_REFERENCE 与

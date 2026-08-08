@@ -202,7 +202,9 @@ async def cmd_sample(args) -> int:
 
     cfg = load_config(args.config)
     protocol.configure_episode_caps(
-        cfg.episode.max_env_steps, cfg.episode.max_assistant_turns
+        cfg.episode.max_env_steps,
+        cfg.episode.max_assistant_turns,
+        cfg.episode.max_tokens_per_turn,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)

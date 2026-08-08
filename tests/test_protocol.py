@@ -78,16 +78,22 @@ def test_truncate_obs_marks_omission():
 
 
 def test_configure_episode_caps_installs_and_validates():
-    orig = (protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS)
+    orig = (protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS,
+            protocol.GEN_MAX_TOKENS_PER_TURN)
     try:
-        protocol.configure_episode_caps(50, 60)  # the 30/50-comparison path
+        protocol.configure_episode_caps(50, 60, 4096)  # the 30/50-comparison path
         assert (protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS) == (50, 60)
+        # 行为级断言(CD-006 P0 教训:只断言 cfg 读到值是语义层空测——
+        # 必须断言注入后消费方读的模块常量真的变了)
+        assert protocol.GEN_MAX_TOKENS_PER_TURN == 4096
         import pytest as _pytest
 
         with _pytest.raises(ValueError, match="episode caps"):
-            protocol.configure_episode_caps(30, 30)  # turns must exceed steps
+            protocol.configure_episode_caps(30, 30, 2048)  # turns must exceed steps
         with _pytest.raises(ValueError, match="episode caps"):
-            protocol.configure_episode_caps(0, 10)
+            protocol.configure_episode_caps(0, 10, 2048)
+        with _pytest.raises(ValueError, match="max_tokens_per_turn"):
+            protocol.configure_episode_caps(30, 40, 0)
     finally:
         protocol.configure_episode_caps(*orig)
 

@@ -181,8 +181,10 @@ def main() -> int:
         cfg = load_config(args.config)
         env_cfg = cfg.alfworld
         protocol.configure_episode_caps(
-            cfg.episode.max_env_steps, cfg.episode.max_assistant_turns
-        )
+        cfg.episode.max_env_steps,
+        cfg.episode.max_assistant_turns,
+        cfg.episode.max_tokens_per_turn,
+    )
     else:
         env_cfg = AlfworldCfg()
 

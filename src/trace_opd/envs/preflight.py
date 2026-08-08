@@ -50,7 +50,9 @@ def main() -> int:
         from ..core import protocol
 
         protocol.configure_episode_caps(
-            cfg.episode.max_env_steps, cfg.episode.max_assistant_turns
+            cfg.episode.max_env_steps,
+            cfg.episode.max_assistant_turns,
+            cfg.episode.max_tokens_per_turn,
         )
     except BaseException as err:  # noqa: BLE001
         return _fail("config load (check env vars referenced by the yaml)", err)
