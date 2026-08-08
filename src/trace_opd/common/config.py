@@ -243,6 +243,12 @@ class EpisodeCfg:
     #    改的是采样协议不是优化目标,故跨值 resume 是允许的。要还原历史 run 的采样
     #    行为,在其配置里显式写回 2048。
     # ⚠️ 总预算 train.response_length 不变,单轮放宽会更快耗尽它 ⇒ 轮数可能减少。
+    #: §7.6(用户裁定 2026-08-08):executor 流预算独立于 verl padding 维度
+    #: ——train.response_length 回归单一职责(容量/padding 维度,须 ≥ 各角色
+    #: 流预算的 max)。0 = 跟随 train.response_length(历史等值行为的显式化,
+    #: 非魔数推导);>0 = 显式 executor 流预算(如 executor 16K + researcher
+    #: 48K 时此键 16384、response_length 49152)。
+    session_token_budget: int = 0
     max_tokens_per_turn: int = 2048
 
 
@@ -563,18 +569,29 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
         )
-    # §7.1/§7.5 预算关系陈述(信息,不评判):单轮上限的职责是允许个别轮
-    # 打到峰值(弹性),典型轮远小于它——总预算 < 轮×单轮乘积是常态设计。
-    # 此处只声明实际由哪个量兜底,便于起跑前核对。
+    # §7.6:executor 流预算(episode.session_token_budget,0=跟随维度)必须
+    # 被 padding 维度容下(verl 只补不截)——与 research 侧同款不变式。
+    _exec_budget = cfg.episode.session_token_budget or cfg.train.response_length
+    if _exec_budget > cfg.train.response_length:
+        raise ValueError(
+            f"episode.session_token_budget({cfg.episode.session_token_budget})"
+            f" 超过 train.response_length({cfg.train.response_length})——"
+            "executor 行进该 padding 维度且 verl 只补不截;维度应配为各角色"
+            "流预算的 max"
+        )
+    # §7.1/§7.5/§7.6 预算关系陈述(信息,不评判):单轮上限的职责是允许个别
+    # 轮打到峰值(弹性),典型轮远小于它——总预算 < 轮×单轮乘积是常态设计。
     _turn_budget = cfg.episode.max_assistant_turns * cfg.episode.max_tokens_per_turn
     if cfg.train.response_length:
-        who = ("总预算 response_length 兜底"
-               if cfg.train.response_length < _turn_budget
+        who = ("executor 流预算兜底" if _exec_budget < _turn_budget
                else "轮×单轮乘积先到")
         print(
-            f"[config] budget: executor 流预算 response_length="
-            f"{cfg.train.response_length},轮×单轮乘积={_turn_budget}({who});"
-            f" padding 维度即 response_length,CPU 内存 ∝ 行数×该值。"
+            f"[config] budget: executor 流预算={_exec_budget}"
+            f"(episode.session_token_budget"
+            f"{'=0→跟随维度' if not cfg.episode.session_token_budget else ''}),"
+            f"轮×单轮乘积={_turn_budget}({who});padding 维度="
+            f"train.response_length={cfg.train.response_length},"
+            f"CPU 内存 ∝ 行数×维度。"
         )
     if t.rollout_backend not in ("vllm", "sglang"):
         raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")

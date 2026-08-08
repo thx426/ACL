@@ -279,6 +279,12 @@ class TraceAgentLoop(AgentLoopBase):
 
     # -------------------------------------------------------------- research
 
+    def _episode_budget(self) -> int:
+        """executor 流预算(§7.6):episode.session_token_budget 显式值,
+        0 = 跟随 train.response_length(padding 维度,历史等值行为)。"""
+        return (self.cfg.episode.session_token_budget
+                or self.rollout_config.response_length)
+
     def _narrate_fn(self, route: str):
         """叙述始终复用当前 rollout engine，兼容 SGLang EngineGenerate 面。"""
         return engine_narrate_fn(
@@ -322,7 +328,7 @@ class TraceAgentLoop(AgentLoopBase):
                 ),
                 tokenizer=self.tokenizer,
                 delta=self.delta,
-                episode_response_budget=self.rollout_config.response_length,
+                episode_response_budget=self._episode_budget(),
                 narrate_fn=self._narrate_fn(route),
             )
             session = ResearchSession(
@@ -445,7 +451,7 @@ class TraceAgentLoop(AgentLoopBase):
             tools=adapter.tools(),
         )
         max_len = self.cfg.train.rollout_max_model_len
-        if len(teacher_prompt_ids) + self.rollout_config.response_length + 8 > max_len:
+        if len(teacher_prompt_ids) + self._episode_budget() + 8 > max_len:
             logger.warning(
                 "doc for %s overflows teacher context (%d prompt tokens) — bare fallback",
                 adapter.task_id,
@@ -472,7 +478,7 @@ class TraceAgentLoop(AgentLoopBase):
         rcfg = self.cfg.research
         sid = _as_int(kwargs.get("session_id"))
         tag = f"{route}:res{sid}"
-        response_length = self.rollout_config.response_length
+        response_length = self._episode_budget()
 
         async def run_session():
             chat = EngineResearcherChat(
@@ -670,7 +676,7 @@ class TraceAgentLoop(AgentLoopBase):
                 self.ent_tracker.maybe_step_update(global_step)
         extra_info = dict(kwargs["extra_info"])
         adapter = self.factory.adapter_from_item(extra_info)
-        response_length = self.rollout_config.response_length
+        response_length = self._episode_budget()
         if (
             self.cfg.steering.enabled
             and self.cfg.steering.doc_source == "researcher"

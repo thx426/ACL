@@ -84,6 +84,10 @@ episode:
                             # cap=30 保住 h3 训后 94.2% 的成功(中位 11 步),
                             # 失败 episode 不再烧满预算
   max_assistant_turns: 40   # 会话轮上限 = 步预算 + 格式失败余量(加载强校验 turns > steps)
+  session_token_budget: 0   # §7.6 executor 流预算:0=跟随 train.response_length
+                            # (历史等值);显式配则独立于 padding 维度(如
+                            # executor 16384 + researcher 49152 时 response_length
+                            # 配 49152、此键配 16384)
   max_tokens_per_turn: 2048 # 单轮生成上限(reasoning+action)| 2026-07-30 用户裁定改配置项;
                             # 打满该上限的轮 won 率只剩 10.5%(CD-008 实测)。
                             # 不进 objective_fingerprint(采样协议非优化目标)
@@ -133,8 +137,11 @@ train:
   lr_scheduler_type: constant   # h3 的实际调度,显式钉死保可比
   lr_warmup_steps_ratio: 0.0
   # ---- 序列容量参数(容量声明,非机制上限;包络变大按打包预算/SP/多机伸缩)----
-  response_length: 32768    # episode 响应流预算(=评测预算,训评同构)| 用户裁定:
-                            # 永不因输出长就不训练
+  response_length: 32768    # §7.6 重定义:**容量/padding 维度**(verl
+                            # data.max_response_length,只补不截,内存 ∝ 行数×它)
+                            # ——须 ≥ max(episode.session_token_budget,
+                            # research.session_token_budget);executor 流预算由
+                            # episode.session_token_budget 独立控制(0=跟随本值)
   max_prompt_length: 2048   # 首轮 prompt 上限,超长 fail-loud(truncation=error)
   max_token_len_per_gpu: 34816   # 单序列容量声明:本值 × ulysses_sp ≥ prompt+response
   ppo_max_token_len_per_gpu: 8192      # actor 训练前反向微批打包预算/卡

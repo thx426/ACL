@@ -78,3 +78,31 @@ def test_fuse_inequalities(tmp_path, monkeypatch):
                     " rollout_max_model_len: 40960",
               research=", session_token_budget: 40000, max_prompt_tokens: 4096",
               narration=GOOD["narration"])
+
+
+def test_executor_budget_decoupled_from_padding_dimension(tmp_path, monkeypatch):
+    """§7.6(CD-006 复现的反向验证):executor 16K + researcher 48K 必须可
+    表达——response_length 作维度配 49152,executor 流预算独立 16384。"""
+    cfg = _load(
+        tmp_path, monkeypatch,
+        train=", response_length: 49152, rollout_max_model_len: 65536",
+        research=", session_token_budget: 49152, max_prompt_tokens: 1024",
+        narration=GOOD["narration"],
+    )
+    # episode 键缺省 0 = 跟随维度
+    assert cfg.episode.session_token_budget == 0
+
+    p = tmp_path / "b2.yaml"
+    p.write_text((_BASE % (", response_length: 49152, rollout_max_model_len: 65536",
+                           ", session_token_budget: 49152, max_prompt_tokens: 1024",
+                           GOOD["narration"]))
+                 + "episode: {session_token_budget: 16384}\n")
+    cfg2 = load_config(str(p))
+    assert cfg2.episode.session_token_budget == 16384
+
+    # executor 预算超维度 → FAIL(与 research 侧同款不变式)
+    p3 = tmp_path / "b3.yaml"
+    p3.write_text((_BASE % ("", GOOD["research"], GOOD["narration"]))
+                  + "episode: {session_token_budget: 40000}\n")
+    with pytest.raises(ValueError, match="episode.session_token_budget"):
+        load_config(str(p3))
