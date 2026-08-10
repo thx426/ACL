@@ -248,6 +248,32 @@ class TerminalCfg:
 
 
 @dataclass
+class WebArenaCfg:
+    """WebArena 域(WebArena-Verified 812 × 站点池;envs/webarena/,引入
+    裁定 2026-08-10 webarena-env-proposal.md §9)。评测桥钉死
+    webarena-verified==1.2.3(evalbridge.PINNED_VERSION);交互面 = WebServ
+    step_browser 语义 + terminate 结构化终局(FinalAgentResponse)。"""
+
+    protocol: str = "fncall"        # 单工具 step_browser,无 text 档
+    pool: str = "static"            # static(固定 URL,冒烟/只读)| acs
+                                    # (Checkpoint/Restore SandboxSet 池,隔离)
+    #: pool=static:site → base URL(如 {"shopping": "http://localhost:7770"})
+    static_base_urls: dict[str, str] = field(default_factory=dict)
+    #: pool=acs:site → SandboxSet 名(每站点一池,RUNBOOK §12.5 配方)
+    sandboxsets: dict[str, str] = field(default_factory=dict)
+    kubeconfig: str = ""            # WEBARENA_KUBECONFIG(pool=acs 必填)
+    namespace: str = "default"
+    work_dir: str = ""              # episode 产物根(HAR/agent_response/eval)
+    run_label: str = ""             # 领用注解标识 + 产物归属
+    headless: bool = True
+    spawn_concurrency: int = 16     # 并发浏览器会话门(chromium ~200MB/个)
+    acquire_timeout_s: float = 300.0  # 站点池领用等待上限(池竭即 fail)
+    #: 单条观测字符上限(head 60% + tail 40%)。WebServ 不截断、靠 16k ctx
+    #: 硬约束;此值影响效果,默认 40000 为工程保底——正式训练值待用户裁定。
+    max_obs_chars: int = 40_000
+
+
+@dataclass
 class EnvironmentCfg:
     """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
     benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
@@ -574,6 +600,7 @@ class Config:
     math: MathCfg
     scienceworld: SciworldCfg
     terminal: TerminalCfg
+    webarena: WebArenaCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -600,7 +627,7 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
-    "scienceworld", "terminal",
+    "scienceworld", "terminal", "webarena",
 }
 
 
@@ -626,6 +653,22 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"terminal.test_grace_s({cfg.terminal.test_grace_s}) 必须 >= 60"
             "(外层墙钟必须显著大于沙箱内判分 timeout,修 TMax 倒挂)"
+        )
+    if cfg.webarena.protocol != "fncall":
+        raise ValueError(
+            f"webarena.protocol 仅支持 fncall(单工具 step_browser,无 text "
+            f"档),得到 {cfg.webarena.protocol!r}"
+        )
+    if cfg.webarena.pool not in ("static", "acs"):
+        raise ValueError(
+            f"webarena.pool 必须是 static|acs,得到 {cfg.webarena.pool!r}"
+        )
+    if cfg.environment.name == "webarena" and cfg.webarena.pool == "static":
+        # 静态池无 episode 间状态隔离:mutate 任务并发互踩。只拦作为训练
+        # 环境的使用;冒烟脚本直构工厂不经此路径。
+        raise ValueError(
+            "webarena.pool='static' 不可用于训练(无状态隔离,mutate 任务"
+            "互踩);训练用 pool='acs'(Checkpoint/Restore 池)"
         )
     # §7.6:executor 流预算(episode.session_token_budget,0=跟随维度)必须
     # 被 padding 维度容下(verl 只补不截)——与 research 侧同款不变式。
@@ -1273,6 +1316,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         math=_build(MathCfg, data.get("math") or {}),
         scienceworld=_build(SciworldCfg, data.get("scienceworld") or {}),
         terminal=_build(TerminalCfg, data.get("terminal") or {}),
+        webarena=_build(WebArenaCfg, data.get("webarena") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),

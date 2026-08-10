@@ -72,12 +72,21 @@ def _build_terminal(config: "Config", workers: int) -> "EnvFactory":
     return TerminalEnvFactory(cfg)
 
 
+def _build_webarena(config: "Config", workers: int) -> "EnvFactory":
+    from .webarena.adapter import WebArenaEnvFactory
+
+    cfg = config.webarena
+    cfg.spawn_concurrency = _per_worker(cfg.spawn_concurrency, workers)
+    return WebArenaEnvFactory(cfg)
+
+
 _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "alfworld": _build_alfworld,
     "spreadsheetbench": _build_spreadsheetbench,
     "math": _build_math,
     "scienceworld": _build_scienceworld,
     "terminal": _build_terminal,
+    "webarena": _build_webarena,
 }
 
 
