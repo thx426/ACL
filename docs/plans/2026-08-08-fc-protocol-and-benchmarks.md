@@ -86,6 +86,16 @@ Search-R1 风格检索 QA)在其调研轮首先与用户对齐。SWE-bench 以�
 
 **测试**:442 passed / 3 skipped(起点 395)。
 
+## 2026-08-10 追记:CD-006 8/9 反馈批次处置(五 commit,458 tests)
+
+`8f2e0c8` policy-version step-1 必崩修(三 backend global_steps 初始 0;
+162 4B selfres 解锁重起)· `359aa2c` 超时/失败组不入训(purge+同版本重试
+一次+ReplayBuffer fail-loud;timeout 不进指纹)· `abeb3d8` SSB
+answer_position 引号感知切分+裸列展开(130-9/283-32 可回收)· `54fc9b3`
+零正例文档双出口(模板条件化+`_check_doc` 程序化 enforce+会话累计量透出;
+落盘接线等 CD-006 批次)· `ce5b8b5` gate 两口径/sample_role 落盘契约注释。
+**SSB 吞吐(CD-006 §8)按用户裁定整体暂缓,专题探讨后再定**(含计数器)。
+
 ## 挂账(勿丢)
 
 1. **FC 真实生成端到端探针**(卡窗口):ALFWorld FC zero-shot vs text 基线
