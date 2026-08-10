@@ -50,6 +50,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+        # trace-opd (2026-08-10): rows each prompt's sessions have written to
+        # TransferQueue, keyed (partition_id, uid) — the purge-on-retry path
+        # (_purge_prompt_rows) needs them to clear residual groups.
+        self._written_rows: dict[tuple[str, str], list[str]] = {}
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
@@ -103,43 +107,89 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
-        try:
-            # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
-            config = self.config.actor_rollout_ref.rollout
-            n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
-            do_sample = prompt.pop("__do_sample__", True)
+        # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
+        config = self.config.actor_rollout_ref.rollout
+        n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
+        do_sample = prompt.pop("__do_sample__", True)
 
-            run_sampling_params = dict(sampling_params)
-            if not trajectory["validate"] and not do_sample:
-                apply_greedy_sampling_params(run_sampling_params)
+        run_sampling_params = dict(sampling_params)
+        if not trajectory["validate"] and not do_sample:
+            apply_greedy_sampling_params(run_sampling_params)
 
-            tasks = []
-            for i in range(n):
-                task = asyncio.create_task(
-                    self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+        # CD-006 R3 (2026-07-25, user-approved): wall-clock timeout per prompt.
+        # The `except Exception` below catches raised errors but NOT a permanent
+        # hang — e.g. awaiting a vLLM instance whose EngineCore died: the await
+        # never returns, `running` never drains, and the whole training loop
+        # deadlocks silently (observed 2026-07-25, second A800 incident).
+        # On timeout the pending agent loops are cancelled (asyncio.TimeoutError
+        # is builtins TimeoutError on py3.11+, an Exception subclass).
+        # Default 2700s >> per-task wall p100;
+        # set TRACE_AGENT_TASK_TIMEOUT_S=0 to disable.
+        _timeout_s = float(os.environ.get("TRACE_AGENT_TASK_TIMEOUT_S", "2700"))
+
+        # trace-opd (2026-08-10, user ruling): a timed-out/failed prompt group
+        # must NEVER be trained on as a residual group. Completed sessions have
+        # already written their rows to TransferQueue independently, and the
+        # rows still missing are systematically the SLOWEST trajectories
+        # (long/hard tasks) — training on the remainder is non-random
+        # right-censoring of the sampling distribution (observed 2026-08-09,
+        # SSB step-1: 191/192 rows, the lost row was task 42515's slowest
+        # steered sample). Policy: purge the group's rows and retry the whole
+        # group ONCE under the same frozen weights (rollout weights do not move
+        # mid-step, so the retry is distributionally identical); on a second
+        # failure mark `failure` and let ReplayBuffer.sample fail loud
+        # (replay_buffer.py) instead of silently training on a biased batch.
+        for attempt in range(2):
+            tasks: list[asyncio.Task] = []
+            try:
+                for i in range(n):
+                    task = asyncio.create_task(
+                        self._run_agent_loop(
+                            run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                        )
                     )
-                )
-                tasks.append(task)
-            # CD-006 R3 (2026-07-25, user-approved): wall-clock timeout per prompt.
-            # The `except Exception` below catches raised errors but NOT a permanent
-            # hang — e.g. awaiting a vLLM instance whose EngineCore died: the await
-            # never returns, `running` never drains, and the whole training loop
-            # deadlocks silently (observed 2026-07-25, second A800 incident).
-            # On timeout the pending agent loops are cancelled and the prompt falls
-            # into the existing failure path (asyncio.TimeoutError is builtins
-            # TimeoutError on py3.11+, an Exception subclass), releasing the batch.
-            # Default 2700s >> per-task wall p100;
-            # set TRACE_AGENT_TASK_TIMEOUT_S=0 to disable.
-            _timeout_s = float(os.environ.get("TRACE_AGENT_TASK_TIMEOUT_S", "2700"))
-            if _timeout_s > 0:
-                await asyncio.wait_for(asyncio.gather(*tasks), timeout=_timeout_s)
-            else:
-                await asyncio.gather(*tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
-        except Exception as e:
-            logger.exception(f"Error in _run_prompt: {e}")
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+                    tasks.append(task)
+                if _timeout_s > 0:
+                    await asyncio.wait_for(asyncio.gather(*tasks), timeout=_timeout_s)
+                else:
+                    await asyncio.gather(*tasks)
+                await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+                self._written_rows.pop((partition_id, uid), None)  # bookkeeping no longer needed
+                return
+            except Exception as e:
+                logger.exception(f"Error in _run_prompt (attempt {attempt + 1}/2, uid={uid}): {e}")
+                # Let the cancelled loops actually terminate before purging —
+                # a straggler still unwinding could re-write rows after the
+                # purge and resurrect the residual group.
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._purge_prompt_rows(uid, partition_id)
+        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+
+    def _purge_prompt_rows(self, uid: str, partition_id: str) -> None:
+        """Drop every trajectory row this prompt's sessions have written so a
+        retry starts from a clean slate (and a final failure leaves nothing
+        sampleable). Bookkept keys are the primary source; ``tq.kv_list()``
+        (the same interface ReplayBuffer syncs from) backstops rows whose
+        bookkeeping was lost to a cancellation landing inside the batch put.
+        Prompt-row keys are ``{uid}_{session_id}_{index}`` — the split-prefix
+        match mirrors ReplayBuffer._drop_stale_finished's assumption that uids
+        contain no underscore."""
+        rows = set(self._written_rows.pop((partition_id, uid), []))
+        try:
+            listing = tq.kv_list() or {}
+            for key, tag in (listing.get(partition_id) or {}).items():
+                if tag.get("is_prompt", False) or key == uid:
+                    continue
+                if key.split("_")[0] == uid:
+                    rows.add(key)
+        except Exception:
+            logger.exception("kv_list backstop failed during purge; proceeding with bookkept keys only")
+        if rows:
+            tq.kv_clear(partition_id=partition_id, keys=sorted(rows))
+            logger.warning(
+                f"Purged {len(rows)} residual trajectory row(s) of prompt {uid} "
+                f"(partition={partition_id}) before retry/failure"
+            )
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
@@ -256,12 +306,19 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 }
             )
 
+        put_partition = "train" if not validate else "val"
         await tq.async_kv_batch_put(
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
-            partition_id="train" if not validate else "val",
+            partition_id=put_partition,
         )
+        # trace-opd (2026-08-10): record the written keys for the
+        # purge-on-retry path. Synchronous append right after the awaited put:
+        # a cancellation can only land on an await point, so put-then-record
+        # is atomic; a cancel inside the put itself is covered by the
+        # kv_list() backstop in _purge_prompt_rows.
+        self._written_rows.setdefault((put_partition, uid), []).extend(keys)
 
 
 class AgentLoopManagerTQ(AgentLoopManager):

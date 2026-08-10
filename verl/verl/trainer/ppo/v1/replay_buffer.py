@@ -77,8 +77,12 @@ class ReplayBuffer:
     - pending: the prompt is sampled from dataset but its sessions are not yet started.
     - running: all sessions of the prompt are running.
     - finished: all sessions of the prompt are finished without error.
-    - failure: all sessions of the prompt are finished, but at least one session failed.
-    Only prompt with status `finished` or `failure`, its trajectories can be sampled by replay buffer.
+    - failure: the prompt's group failed twice (timeout/exception) upstream; its residual
+      rows were purged (agent_loop_tq._purge_prompt_rows).
+    Only `finished` prompts are sampleable. trace-opd (2026-08-10, user ruling): a `failure`
+    prompt makes sample() FAIL LOUD — the rows a failed group is missing are systematically
+    the slowest (long/hard) trajectories, so training on the remainder would silently
+    right-censor the sampling distribution.
 
     Args:
         trainer_mode (str): Trainer mode.
@@ -162,8 +166,12 @@ class ReplayBuffer:
                     partition[key].update(tag)
 
     def _sampleable_terminal_keys(self, global_steps: int, partition_id: str) -> set[str]:
-        """Terminal prompts eligible for selection in the current metadata snapshot."""
-        terminal_keys = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        """Terminal prompts eligible for selection in the current metadata snapshot.
+
+        trace-opd (2026-08-10): `failure` prompts are NOT sampleable — their rows
+        were purged upstream and sample() fails loud on them before this is used
+        (residual groups must never be trained on)."""
+        terminal_keys = set(self.finished_keys[partition_id])
         if self.max_off_policy_strategy != "drop":
             return terminal_keys
 
@@ -191,7 +199,9 @@ class ReplayBuffer:
             return 0, {}
 
         prompt_global_steps = self.prompt_global_steps[partition_id]
-        terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        # trace-opd (2026-08-10): finished only — `failure` prompts fail loud in
+        # sample() before this runs and must never be silently dropped/refilled.
+        terminal_uids = set(self.finished_keys[partition_id])
         stale_uids = terminal_uids - self._sampleable_terminal_keys(global_steps, partition_id)
 
         if not stale_uids:
@@ -240,7 +250,6 @@ class ReplayBuffer:
             KVBatchMeta: A batch of data.
             dict: Auxiliary metrics.
         """
-        # TODO: failure samples dropping and refilling
         last_debug_time = time.time()
         drop_metrics: dict = {}
         selected_prompt_uids: list[str] = []
@@ -250,6 +259,24 @@ class ReplayBuffer:
         while True:
             # Drop, gating, and selection below must all use this snapshot.
             self._sync_metadata_from_transfer_queue()
+
+            # trace-opd (2026-08-10, user ruling): a `failure` prompt means its
+            # group already failed twice (timeout/exception) in agent_loop_tq
+            # and its residual rows were purged. Training on the remaining
+            # groups would silently right-censor slow/hard tasks out of the
+            # batch — stop the step instead of biasing it.
+            failed = self.failure_keys[partition_id]
+            if failed:
+                raise RuntimeError(
+                    f"ReplayBuffer: {len(failed)} prompt group(s) in partition "
+                    f"{partition_id!r} failed twice during rollout (timeout or "
+                    f"exception): {sorted(failed)[:8]}. Residual groups must "
+                    "never be trained on (non-random right-censoring of the "
+                    "slowest trajectories) — failing loud instead. Check the "
+                    "agent_loop_tq worker logs for the per-attempt errors; if "
+                    "healthy tasks are genuinely slower than the wall, raise "
+                    "TRACE_AGENT_TASK_TIMEOUT_S and restart the step."
+                )
 
             dropped, metrics = self._drop_stale_finished(global_steps, partition_id)
             if dropped > 0:
