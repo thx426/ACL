@@ -436,6 +436,9 @@ class SpsGenerate:
                 executed.append(int(outcome.token_id))
                 executed_logpi.append(float(outcome.log_pi))
                 if outcome.rejected:
+                    # P0b 归因读数:本次拒绝丢弃的 draft 尾段(已生成、已打分、
+                    # 未执行)。整段 draft 下平均 ~半段,bounded K 下 ≤K−1。
+                    st.ledger.n_draft_discarded += len(gen_ids) - (g + 1)
                     if int(outcome.token_id) in self._stop_ids:
                         finished = True  # IF-06:重采出停止 token,本轮生成结束
                     rejected = True

@@ -82,14 +82,15 @@ def test_engine_executor_two_turns_bitequal_with_python_executor():
     a2 = asyncio.run(hook(list(PROMPT) + list(a1.token_ids),
                           {"max_tokens": 16, "temperature": 1.0}))
 
-    # 路径 B:engine executor(薄客户端 + fake server,含 pickle 序列化边界;
-    # draft_horizon=3 一并覆盖 bounded K 在 RPC 链上的恒等)
+    # 路径 B:engine executor(薄客户端 + fake server,含 pickle 序列化边界)。
+    # 同 horizon=0 ⇒ 全账本(含 n_draft_discarded 等覆盖面字段)必须全等;
+    # bounded K 在 RPC 链上的恒等由下一个用例覆盖(那里丢弃量合法地不同)。
     st_b = _mk_state(seed=11)
     mgr = _FakeServerManager(world)
     client = EngineSteeredGenerate(
         server_manager=mgr, tokenizer=_Tok(), request_id="route-1",
         teacher_prefix_ids=PREFIX, student_prompt_ids=PROMPT, state=st_b,
-        topk=8, c=2.5, obs_topk=16, stop_token_ids={EOS}, draft_horizon=3,
+        topk=8, c=2.5, obs_topk=16, stop_token_ids={EOS}, draft_horizon=0,
     )
     b1 = asyncio.run(client(list(PROMPT), {"max_tokens": 8, "temperature": 1.0}))
     b2 = asyncio.run(client(list(PROMPT) + list(b1.token_ids),
@@ -110,6 +111,33 @@ def test_engine_executor_two_turns_bitequal_with_python_executor():
     assert st_a.gate._opens == st_b.gate._opens
     assert any(r.rejected for r in st_b.ledger.records)   # 非平凡世界
     assert st_b.budget.spent > 0
+
+
+def test_engine_executor_bounded_k_over_rpc_stream_identical():
+    """bounded K 走完整 RPC 链:token 流与倾斜记录逐字节同(分布面);
+    n_draft_discarded 在 K 档必须更小(bounded K 的直接效果读数)。"""
+    world = _PositionalWorld(_SPEC)
+    st_ref = _mk_state(seed=5)
+    hook = SpsGenerate(
+        draft=_PositionalDraft(world), verify=_PositionalVerify(world),
+        teacher_prefix_ids=PREFIX, student_prompt_ids=PROMPT,
+        state=st_ref, tokenizer=_Tok(), topk=8, c=2.5, obs_topk=16,
+        stop_token_ids={EOS},
+    )
+    ref = asyncio.run(hook(list(PROMPT), {"max_tokens": 12, "temperature": 1.0}))
+
+    st_k = _mk_state(seed=5)
+    client = EngineSteeredGenerate(
+        server_manager=_FakeServerManager(world), tokenizer=_Tok(),
+        request_id="r2", teacher_prefix_ids=PREFIX, student_prompt_ids=PROMPT,
+        state=st_k, topk=8, c=2.5, obs_topk=16, stop_token_ids={EOS},
+        draft_horizon=3,
+    )
+    got = asyncio.run(client(list(PROMPT), {"max_tokens": 12, "temperature": 1.0}))
+    assert list(ref.token_ids) == list(got.token_ids)
+    assert st_ref.ledger.records == st_k.ledger.records
+    assert any(r.rejected for r in st_k.ledger.records)
+    assert 0 < st_k.ledger.n_draft_discarded < st_ref.ledger.n_draft_discarded
 
 
 def test_engine_executor_abort_passthrough():

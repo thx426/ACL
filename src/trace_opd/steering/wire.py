@@ -77,6 +77,7 @@ _MERGE_ADD = {
     "turns_capped", "d_hist", "d_count", "d_sum",
     "n_candidates", "n_base_open", "n_probe_flipped", "n_budget_blocked",
     "n_bypassed", "n_pacing_wait", "n_gate_bypassed", "n_pt_window_miss",
+    "n_draft_discarded",
     "ell_hist", "ell_count", "ent_hist", "ent_count", "ent_sum",
 }
 _MERGE_LATEST = {"budget_spent"}      # 全轨迹累计值,后段覆盖前段

@@ -93,6 +93,10 @@ class SteeringLedger:
     n_gate_bypassed: int = 0          # v3.3 M4:强度不足(段内全部 w<w_min)未
                                       # verify 直通的 token 数(G-E 工程红利面)
     n_pt_window_miss: int = 0         # S 内 p_T 窗外单侧鲁棒代入次数(max-IF-13)
+    n_draft_discarded: int = 0        # 拒绝丢弃的 draft 尾段 token 数(P0b 归因
+                                      # 分解:steer_n_candidates 不含此段,GPU
+                                      # 功按它估会低估 ~3.69×;bounded K 的直接
+                                      # 效果读数——CD-006 吞吐分析 §2.3)
     # ℓ 观测直方图(c 标定 + 方向观察;窗内逐 token 等权)
     ell_hist: list[int] = field(default_factory=lambda: [0] * ELL_HIST_BINS)
     ell_count: int = 0
@@ -171,6 +175,7 @@ class SteeringLedger:
             "steer_count": sum(1 for r in self.records if r.eta > 0),
             "steer_record_rows": len(self.records),
             "steer_reject_count": sum(1 for r in self.records if r.rejected),
+            "steer_n_draft_discarded": self.n_draft_discarded,
             "steer_d_hist": list(self.d_hist),
             "steer_d_hist_max": self.d_hist_max,
             "steer_d_hist_bins": len(self.d_hist),

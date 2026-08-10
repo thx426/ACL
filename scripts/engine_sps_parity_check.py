@@ -71,7 +71,15 @@ def _summarize(rows: list[dict]) -> dict:
     total_rows = sum(s.get("steer_record_rows", 0) for s in st_all)
     return {
         "n_trajs": len(rows),
+        # 各率的分母(自适应容差用:率差按两比例 2σ 下界豁免统计噪声——
+        # won 的分母是轨迹数(百级,2σ 可达 4pp),开门/干预率分母是候选
+        # token 数(十万级,2σ≈0,tol 捕捉的就是系统性偏移)
+        "_denoms": {"won_rate": len(rows), "open_rate": n_cand,
+                    "intervene_rate": n_cand, "reject_rate": total_rows},
         "won_rate": (sum(1 for r in rows if r.get("won")) / len(rows)) if rows else 0.0,
+        "draft_discarded_per_traj": (
+            sum(s.get("steer_n_draft_discarded", 0) for s in st_all) / len(rows)
+        ) if rows else 0.0,
         "resp_len_p50": _pct([r.get("response_token_len", 0) for r in rows], 0.50),
         "resp_len_p90": _pct([r.get("response_token_len", 0) for r in rows], 0.90),
         "open_rate": (sum(s.get("steer_n_base_open", 0) for s in st_all) / n_cand) if n_cand else 0.0,
@@ -103,8 +111,19 @@ def compare(sum_a: dict, sum_b: dict, *, tol_rate: float, tol_hist: float) -> li
                          "violations (|log_b - log_pi| > 2*eta*c) — kernel broken")
     for key in ("open_rate", "intervene_rate", "reject_rate", "won_rate"):
         d = abs(sum_a[key] - sum_b[key])
-        if d > tol_rate:
-            fails.append(f"{key}: |{sum_a[key]:.4f} - {sum_b[key]:.4f}| = {d:.4f} > {tol_rate}")
+        # 两路径是独立采样:率差的容差 = max(tol_rate, 两比例合并 2σ)——
+        # 小分母率(won:轨迹数百级)豁免二项噪声,大分母率(开门/干预:
+        # 十万级 token)2σ≈0,tol_rate 捕捉的就是系统性偏移。
+        na = max(sum_a.get("_denoms", {}).get(key, 0), 1)
+        nb = max(sum_b.get("_denoms", {}).get(key, 0), 1)
+        p = (sum_a[key] * na + sum_b[key] * nb) / (na + nb)
+        two_sigma = 2.0 * (max(p * (1 - p), 1e-12) * (1 / na + 1 / nb)) ** 0.5
+        tol = max(tol_rate, two_sigma)
+        if d > tol:
+            fails.append(
+                f"{key}: |{sum_a[key]:.4f} - {sum_b[key]:.4f}| = {d:.4f} > "
+                f"{tol:.4f} (tol_rate={tol_rate}, 2sigma={two_sigma:.4f})"
+            )
     # 预算相对差(量纲随 run,相对口径)
     ma = max(abs(sum_a["budget_spent_mean"]), abs(sum_b["budget_spent_mean"]), 1e-9)
     d = abs(sum_a["budget_spent_mean"] - sum_b["budget_spent_mean"]) / ma
@@ -131,7 +150,7 @@ def main() -> int:
     print(f"{'metric':<24}{'A(python)':>14}{'B(engine)':>14}")
     for key in ("n_trajs", "won_rate", "resp_len_p50", "resp_len_p90", "open_rate",
                 "intervene_rate", "reject_rate", "gate_bypassed_per_traj",
-                "budget_spent_mean", "bound_violations"):
+                "draft_discarded_per_traj", "budget_spent_mean", "bound_violations"):
         va, vb = sum_a[key], sum_b[key]
         fmt = ".4f" if isinstance(va, float) else "d"
         print(f"{key:<24}{va:>14{fmt}}{vb:>14{fmt}}")
