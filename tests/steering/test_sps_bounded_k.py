@@ -217,6 +217,26 @@ def test_eos_inside_a_window_ends_identically():
     assert list(ref[0].token_ids)[-1] == EOS
 
 
+@pytest.mark.parametrize("mode", ["d_var", "soft_or"])
+@pytest.mark.parametrize("epsilon", [0.0, 0.25])
+def test_teacher_gated_soft_modes_bitequal(mode, epsilon):
+    """needs_teacher=True 的软强度档(d_var/soft_or):无 G-E 段级 bypass,
+    每段必 verify——与 entropy 档走的是不同分支组合(rescue 前置核对
+    2026-08-10 指出的覆盖缺口)。强异议世界(D 大 ⇒ w_d>0,干预+拒绝),
+    含 ε>0 探针 draw 路径,任意 K 与整段 bit-equal。"""
+    kw = dict(mode=mode, eta_max=0.4, epsilon=epsilon, theta_d=0.01)
+    if mode == "soft_or":
+        kw["entropy_theta"] = 1.0
+    spec = [{"y": 5, "alt": 6, "teacher": "objects", "entropy": "high"}] * 18 \
+        + [{"y": EOS, "entropy": "high"}]
+    world = _PositionalWorld(spec)
+    ref = _run_hook(world, IntensityGate(**kw), horizon=0)
+    got = _run_hook(world, IntensityGate(**kw), horizon=4)
+    _assert_bitequal(ref, got)
+    # 非平凡性:该档确实干预过(w_d = min(1, D/θ_D) 在小 θ_D 下达满强度)
+    assert any(r.eta > 0 for r in got[1].ledger.records)
+
+
 def test_horizon_zero_equals_huge_horizon():
     """退化等价:0(不分段)与 K≥max_tokens 完全同构。"""
     spec = [{"y": 5, "alt": 6, "teacher": "objects", "entropy": "high"}] * 12 \

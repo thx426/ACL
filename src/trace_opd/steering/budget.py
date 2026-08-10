@@ -29,6 +29,11 @@ class TrajectoryBudget:
     行为(t=0 全解锁)。
     """
 
+    #: 跨 turn 可变状态注册表(单一真源)——Engine-Resident SPS 的 wire
+    #: 往返按它驱动(steering/wire.py);其余属性是构造参数,两端各自从
+    #: run 配置重建。新增可变状态字段必须同步登记,否则 engine 档静默丢态。
+    _WIRE_MUTABLE = ("spent", "turn")
+
     def __init__(
         self,
         b_max: float,
@@ -111,6 +116,9 @@ class TurnRejectCap:
     重采并**前进位置**,每位置至多判定一次,循环数自然 ≤ 轨迹长度;计数
     照记(观察量),尾部墙钟由监控而非机制截断兜底。r_max≥1 保留历史行为。
     """
+
+    #: 跨 turn 可变状态注册表(wire 往返;r_max 是构造参数)
+    _WIRE_MUTABLE = ("count",)
 
     def __init__(self, r_max: int = 4) -> None:
         if r_max < 0:

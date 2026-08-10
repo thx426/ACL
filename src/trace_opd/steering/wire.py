@@ -30,28 +30,41 @@ __all__ = [
 ]
 
 
+def _wire_parts(state: TrajectorySteerState) -> list[tuple[str, Any]]:
+    return [("budget", state.budget), ("cap", state.reject_cap), ("gate", state.gate)]
+
+
 def steer_state_to_wire(state: TrajectorySteerState) -> dict[str, Any]:
-    """轨迹级可变状态快照(不含 ledger——账本走增量通道)。"""
-    return {
-        "budget": {"spent": float(state.budget.spent),
-                   "turn": int(state.budget.turn)},
-        "cap": {"count": int(state.reject_cap.count)},
-        "gate": {"decisions": int(state.gate._decisions),
-                 "opens": int(state.gate._opens)},
+    """轨迹级可变状态快照(不含 ledger——账本走增量通道)。
+
+    字段清单的单一真源 = 各状态类自己的 ``_WIRE_MUTABLE`` 注册表(可变态
+    定义在哪、清单就在哪;缺注册表的门类进 engine 档会在此 fail-loud,
+    而不是静默丢态)。"""
+    wire: dict[str, Any] = {
         # numpy Generator 完整状态:恢复后 draw 流与原对象逐位一致
         "rng": state.rng.bit_generator.state,
     }
+    for key, obj in _wire_parts(state):
+        try:
+            names = type(obj)._WIRE_MUTABLE
+        except AttributeError as err:
+            raise RuntimeError(
+                f"{type(obj).__name__} has no _WIRE_MUTABLE registry — this "
+                "state class cannot ride the engine-executor wire; register "
+                "its cross-turn mutable fields (see TrajectoryBudget)"
+            ) from err
+        wire[key] = {name: getattr(obj, name) for name in names}
+    return wire
 
 
 def steer_state_apply_wire(state: TrajectorySteerState, wire: dict[str, Any]) -> None:
     """把线协议快照回写进(通常是新构造的)state。构造参数(b_max/c/
     r_max/门配置)不在 wire 里——两端各自从同一份 run 配置构造,漂移由
-    对拍门兜底。"""
-    state.budget.spent = float(wire["budget"]["spent"])
-    state.budget.turn = int(wire["budget"]["turn"])
-    state.reject_cap.count = int(wire["cap"]["count"])
-    state.gate._decisions = int(wire["gate"]["decisions"])
-    state.gate._opens = int(wire["gate"]["opens"])
+    对拍门兜底。快照键与注册表逐一对应,任何缺键即协议损坏,fail loud。"""
+    for key, obj in _wire_parts(state):
+        part = wire[key]
+        for name in type(obj)._WIRE_MUTABLE:
+            setattr(obj, name, part[name])
     state.rng.bit_generator.state = wire["rng"]
 
 

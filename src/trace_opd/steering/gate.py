@@ -42,6 +42,10 @@ class GateDecision:
 class SteeringGate:
     """一条轨迹内可复用的门控器（阈值/参数冻结；随机数流独立）。"""
 
+    #: 跨 turn 可变状态注册表(Engine-Resident SPS 的 wire 往返按它驱动,
+    #: steering/wire.py;其余属性是构造参数)。两个门类同名同义。
+    _WIRE_MUTABLE = ("_decisions", "_opens")
+
     def __init__(
         self,
         *,
@@ -120,6 +124,9 @@ class IntensityGate:
     H ≥ w_min·H_q —— **非零干预率**是另一个(远松的)口径,观测 35–46%
     并非失标。段级 bypass 依赖的是后者(整段全部 w0 < w_min 才跳)。
     """
+
+    #: 跨 turn 可变状态注册表(wire 往返;见 SteeringGate 同名注释)
+    _WIRE_MUTABLE = ("_decisions", "_opens")
 
     NEEDS_TEACHER = {"adaptive": True, "always_on": False, "entropy": False,
                      "d_var": True, "soft_or": True}
