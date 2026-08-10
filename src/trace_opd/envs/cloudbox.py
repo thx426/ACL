@@ -210,20 +210,31 @@ class CloudSandbox:
     def _exec(self, bash_command: str, *, deadline_s: float) -> ExecResult:
         from kubernetes.stream import stream
 
-        try:
-            ws = stream(
-                self._api.connect_get_namespaced_pod_exec,
-                self._name, self._ns,
-                command=["bash", "-c", bash_command],
-                container="main",
-                stderr=True, stdin=False, stdout=True, tty=False,
-                _preload_content=False,
-                _request_timeout=deadline_s + 30.0,
-            )
-        except Exception as err:  # noqa: BLE001
+        # 连接期重试:公网 API server 的 websocket 握手会偶发掉线(实测
+        # "Connection to remote host was lost")。握手失败 = 命令未开始执行,
+        # 重试安全;流中途失败(下方 no-exit-status 路径)绝不重试——非幂等
+        # 命令可能已产生副作用。
+        last_err: Exception | None = None
+        ws = None
+        for attempt in range(3):
+            try:
+                ws = stream(
+                    self._api.connect_get_namespaced_pod_exec,
+                    self._name, self._ns,
+                    command=["bash", "-c", bash_command],
+                    container="main",
+                    stderr=True, stdin=False, stdout=True, tty=False,
+                    _preload_content=False,
+                    _request_timeout=deadline_s + 30.0,
+                )
+                break
+            except Exception as err:  # noqa: BLE001
+                last_err = err
+                time.sleep(1.0 * (attempt + 1))
+        if ws is None:
             raise CloudboxError(
-                f"exec connect failed on {self._name}: {err}"
-            ) from err
+                f"exec connect failed on {self._name} after 3 attempts: {last_err}"
+            ) from last_err
         try:
             ws.run_forever(timeout=deadline_s)
             stdout = ws.read_stdout()
