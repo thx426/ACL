@@ -501,6 +501,11 @@ def compute_rollout_extra_metrics(reward_extra_infos_dict: dict[str, Any]) -> di
         # trace-opd v4: research rows carry steer_arm=0/won=0 placeholders —
         # exclude them from the per-arm executor rates or won_bare_rate is
         # silently diluted by rows that never faced the task.
+        # ⚠ IN-MEMORY ONLY (2026-08-09 CD-006 误判共源订正): the 0 placeholder
+        # is an aggregation artifact of THIS metric path. On-disk rollout json
+        # stores research rows with an EMPTY `steering` dict (steer_arm reads
+        # None, not 0); offline consumers must classify rows by the top-level
+        # `sample_role` field, never by this comment's in-memory convention.
         if "role_research" in reward_extra_infos_dict:
             keep = np.asarray(
                 reward_extra_infos_dict["role_research"], dtype=np.float64

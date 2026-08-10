@@ -113,6 +113,12 @@ class IntensityGate:
     位置以 ε 概率 w→0;连续强度下「翻开」无定义),propensity = 1−ε
     (base_w>0)/ 0(base_w=0)。硬门档保留 v3.0 双向翻转语义。
     阈值(θ_D / H_q)一条轨迹内冻结(因果性;自适应经 tracker 跨 step 慢更)。
+
+    ⚠ 两个开门率口径勿混(2026-08-09 CD-006 曾据此误判"熵门未标定"):
+    ``entropy_target_rate``(默认 0.05)标定的是 **w=1 满强度位置**的占比
+    (H_q 追踪 H 分布的对应分位);而 base_open 的条件是 w0 ≥ w_min,即
+    H ≥ w_min·H_q —— **非零干预率**是另一个(远松的)口径,观测 35–46%
+    并非失标。段级 bypass 依赖的是后者(整段全部 w0 < w_min 才跳)。
     """
 
     NEEDS_TEACHER = {"adaptive": True, "always_on": False, "entropy": False,
