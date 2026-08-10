@@ -142,8 +142,10 @@ class TerminalEnvHandle:
 
     step() → (obs, done, score);score∈{0.0,1.0} 且仅在提交(或
     score_at_budget 的末步)时经 verifier 产生。沙箱基建故障(Pod 死/exec
-    通道丢)映射为 done + score 0 + 文本说明——TMax 对 OOM 的同款语义,
-    训练侧把它当负例;infra 失败率单列监控(评测协议的 exception 双报口径)。
+    通道丢)**抛 CloudboxError**,由 core 统一归 OUTCOME_ENV_ERROR(训练侧
+    重试/丢弃)——不返回 done+0,否则基建压力会被当模型失败入训(2026-08-11
+    审阅 P0-5 修正;此前的 done+0 语义废弃)。infra 失败率经 infra_failure
+    记账单列监控。
     """
 
     def __init__(
@@ -175,7 +177,8 @@ class TerminalEnvHandle:
                 self._cfg.command_timeout_s,
             )
         except CloudboxError as err:
-            return self._infra_failure(err)
+            self.infra_failure = str(err)[:500]
+            raise
         output = r.stdout or ""
         if r.stderr:
             output += f"\n{r.stderr}" if output else r.stderr
@@ -219,7 +222,8 @@ class TerminalEnvHandle:
             )
             reward = self._parse_reward()
         except CloudboxError as err:
-            return self._infra_failure(err)
+            self.infra_failure = str(err)[:500]
+            raise
         stdout = truncate_observation(result.stdout) if result.stdout else ""
         stderr = truncate_observation(result.stderr) if result.stderr else ""
         obs = (
@@ -239,16 +243,6 @@ class TerminalEnvHandle:
         except (ValueError, TypeError, CloudboxError):
             pass
         return 0.0
-
-    def _infra_failure(self, err: Exception) -> tuple[str, bool, float]:
-        self.infra_failure = str(err)[:500]
-        logger.warning("[%s] sandbox infra failure: %s", self._sbx.name, err)
-        return (
-            "Sandbox infrastructure failure; the episode cannot continue. "
-            "Ending episode with reward 0.",
-            True,
-            0.0,
-        )
 
     def close(self) -> None:
         self._sbx.kill()

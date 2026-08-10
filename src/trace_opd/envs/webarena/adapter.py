@@ -242,8 +242,11 @@ class WebArenaEnvHandle:
     """One live WebArena episode: pooled site instances + one browser session.
 
     ``step(action_dict)`` → (obs, done, score)。score 仅在 terminate 时经
-    verified 终局评测产生;预算耗尽 = 0。浏览器/站点池基建故障映射为
-    done + score 0 + 文本说明(infra_failure 单列监控,评测协议双报口径)。
+    verified 终局评测产生;预算耗尽 = 0。
+
+    基建故障(浏览器死/站点池丢/HAR 冲不出/评测器崩)**抛异常**,由 core
+    的 episode 兜底统一归 OUTCOME_ENV_ERROR(训练侧重试/丢弃)——绝不
+    返回 done+0,否则基建压力会被当成模型失败入训(审阅 P0-5)。
     """
 
     def __init__(
@@ -256,6 +259,7 @@ class WebArenaEnvHandle:
         episode_dir: Path,
         cfg: WebArenaCfg,
         max_env_steps: int,
+        gate_release=None,
     ) -> None:
         self._session = session
         self._alloc = alloc
@@ -263,16 +267,23 @@ class WebArenaEnvHandle:
         self._episode_dir = episode_dir
         self._cfg = cfg
         self._max_env_steps = max_env_steps
+        self._gate_release = gate_release   # 并发门 permit,close 时归还
         self._steps = 0
         self._closed = False
         self.task_text = task_text
         self.first_obs = ""              # set by adapter right after start
-        self.infra_failure = ""          # 非空 = 因基建故障终局(可观测)
+        self.infra_failure = ""          # 记账镜像(异常已抛给 core)
         self.eval_detail: dict = {}      # TaskEvalResult dump(轨迹记账)
 
     @property
     def initial_obs(self) -> str:
         return f"{self.task_text}\n\n{self.first_obs}"
+
+    @property
+    def base_urls(self) -> dict[str, str]:
+        """本 episode 的站点 base URL 映射(含入口路径后缀;轨迹记账/
+        调试用——评测端在 terminate 支路内部自取)。"""
+        return dict(self._alloc.base_urls)
 
     def observe(self) -> str:
         obs = self._session.observation()
@@ -282,6 +293,8 @@ class WebArenaEnvHandle:
             format_llm_observation(obs), self._cfg.max_obs_chars)
 
     def step(self, action: dict, *, replay: bool = False) -> tuple[str, bool, float]:
+        """基建异常(BrowserError/SitePoolError)直接向上抛——core 统一归
+        OUTCOME_ENV_ERROR;这里只捕获并文本化模型级失败。"""
         self._steps += 1
         name = str(action.get("action", ""))
         try:
@@ -293,7 +306,8 @@ class WebArenaEnvHandle:
             else:
                 obs = self.observe()
         except (BrowserError, SitePoolError) as infra:
-            return self._infra_failure(infra)
+            self.infra_failure = str(infra)[:500]
+            raise
         if self._steps >= self._max_env_steps:
             return (
                 f"{obs}\n\nStep budget exhausted; the episode ends now. "
@@ -302,28 +316,49 @@ class WebArenaEnvHandle:
             )
         return obs, False, 0.0
 
+    #: 必需参数表(审阅 P1-7:缺参必须格式反馈,绝不静默补空执行——
+    #: `type` 缺 text 会真实清空字段)。
+    _REQUIRED_PARAMS = {
+        "click": ("target",), "type": ("target", "text"),
+        "hover": ("target",), "select": ("target", "value"),
+        "clear": ("target",), "key_press": ("key",),
+        "goto_url": ("url",), "switch_tab": ("tab_id",),
+        "close_tab": ("tab_id",),
+    }
+    #: Playwright 异常里的"浏览器已死"指纹 → 基建口径,不是模型反馈
+    #: (审阅 P0-5:Chromium OOM 后的 TargetClosedError 不能当动作失败)。
+    _DEAD_BROWSER_MARKERS = (
+        "TargetClosedError", "has been closed", "browser has disconnected",
+        "Connection closed", "Browser closed",
+    )
+
     def _dispatch(self, name: str, a: dict) -> str | None:
         """Run one browser action; returns an error string for MODEL-level
         failures (bad target, malformed params — feedback, not exceptions);
         infra failures propagate as BrowserError."""
+        missing = [p for p in self._REQUIRED_PARAMS.get(name, ())
+                   if a.get(p) in (None, "")]
+        if missing:
+            return (f"Missing required parameter(s) {missing} for "
+                    f"'{name}'. Nothing was executed.")
         s = self._session
         try:
             if name == "click":
                 s.act("click", str(a["target"]))
             elif name == "type":
-                s.act("type_text", str(a["target"]), str(a.get("text", "")),
+                s.act("type_text", str(a["target"]), str(a["text"]),
                       bool(a.get("enter", False)))
             elif name == "hover":
                 s.act("hover", str(a["target"]))
             elif name == "select":
-                s.act("select", str(a["target"]), str(a.get("value", "")))
+                s.act("select", str(a["target"]), str(a["value"]))
             elif name == "clear":
                 s.act("clear", str(a["target"]))
             elif name == "key_press":
-                s.act("key_press", str(a.get("key", "")),
+                s.act("key_press", str(a["key"]),
                       str(a["target"]) if a.get("target") else None)
             elif name == "goto_url":
-                s.act("goto_url", str(a.get("url", "")))
+                s.act("goto_url", str(a["url"]))
             elif name == "back":
                 s.act("back")
             elif name == "forward":
@@ -342,46 +377,51 @@ class WebArenaEnvHandle:
             return None
         except BrowserError:
             raise
-        except KeyError as err:
-            return f"Missing required parameter for '{name}': {err}"
-        except Exception as err:  # noqa: BLE001 — playwright 动作失败是环境反馈
-            return f"{type(err).__name__}: {str(err).splitlines()[0][:300]}"
+        except Exception as err:  # noqa: BLE001
+            msg = f"{type(err).__name__}: {str(err).splitlines()[0][:300]}"
+            if any(m in msg for m in self._DEAD_BROWSER_MARKERS):
+                raise BrowserError(f"browser dead during '{name}': {msg}") from err
+            return msg              # 模型级失败(元素不存在等)= 环境反馈
+
+    def _validate_final(self, a: dict) -> tuple[dict | None, str]:
+        """Build + validate the FinalAgentResponse via the pinned package's
+        own model(审阅 P1-7:公开 schema 拒绝的报文——嵌套 list、深层
+        结构——不得写盘终局;一切校验失败都是可修正的格式反馈)。"""
+        candidate = {
+            "task_type": a.get("task_type"),
+            "status": a.get("status"),
+            "retrieved_data": a.get("retrieved_data"),
+            "error_details": (str(a["error_details"])
+                              if a.get("error_details") else None),
+        }
+        try:
+            json.dumps(candidate)          # 深度/循环防线(先于 pydantic)
+            from webarena_verified.types.agent_response import (
+                FinalAgentResponse,
+            )
+
+            model = FinalAgentResponse.model_validate(candidate)
+            return model.model_dump(mode="json"), ""
+        except ImportError:
+            raise                          # 环境残破是基建问题,不给模型
+        except Exception as err:  # noqa: BLE001 — 模型报文非法=格式反馈
+            return None, str(err).splitlines()[0][:400]
 
     def _terminate(self, a: dict, *, replay: bool) -> tuple[str, bool, float]:
-        problems = []
-        task_type = str(a.get("task_type", "") or "").upper()
-        status = str(a.get("status", "") or "").upper()
-        if task_type not in _TASK_TYPE_VALUES:
-            problems.append(
-                f"'task_type' must be one of {_TASK_TYPE_VALUES}")
-        if status not in _STATUS_VALUES:
-            problems.append(f"'status' must be one of {_STATUS_VALUES}")
-        retrieved = a.get("retrieved_data")
-        if retrieved is not None and not isinstance(retrieved, list):
-            problems.append("'retrieved_data' must be an array (or omitted)")
-        if problems:
+        final_response, problem = self._validate_final(a)
+        if final_response is None:
             # 终局报文残缺:反馈格式错误,episode 继续(模型可修正重提)。
-            msg = ("Format error in terminate call: " + "; ".join(problems)
-                   + ". The episode continues — fix the terminate call.")
+            msg = (f"Format error in terminate call: {problem}. "
+                   "The episode continues — fix the terminate call.")
             if self._steps >= self._max_env_steps:
                 return (msg + "\nStep budget exhausted; episode ends with no "
                         "valid final response.", True, 0.0)
             return msg, False, 0.0
-        final_response = {
-            "task_type": task_type,
-            "status": status,
-            "retrieved_data": retrieved,
-            "error_details": (str(a["error_details"])
-                              if a.get("error_details") else None),
-        }
         (self._episode_dir / "agent_response.json").write_text(
             json.dumps(final_response, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        try:
-            self._session.finalize()      # flush HAR
-        except BrowserError as infra:
-            return self._infra_failure(infra)
+        self._session.finalize()           # flush HAR;失败=BrowserError 上抛
         if replay:
             return "Final response recorded (replay; not evaluated).", True, 0.0
         from . import evalbridge
@@ -391,8 +431,6 @@ class WebArenaEnvHandle:
             self._episode_dir / "network.har", self._alloc.base_urls,
         )
         self.eval_detail = outcome.detail
-        if outcome.status == "error":
-            self.infra_failure = f"evaluator error: {outcome.error_msg}"
         (self._episode_dir / "eval_result.json").write_text(
             json.dumps({"score": outcome.score, "status": outcome.status,
                         "error_msg": outcome.error_msg,
@@ -400,18 +438,17 @@ class WebArenaEnvHandle:
                        ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
+        if outcome.status == "error":
+            # 评测器崩溃/HAR 缺失是基建口径:抛给 core → ENV_ERROR,
+            # 不得作为 0 分模型失败入训。
+            self.infra_failure = f"evaluator error: {outcome.error_msg}"
+            raise SitePoolError(
+                f"verified evaluator error for task {self._task_id}: "
+                f"{outcome.error_msg}"
+            )
         return (
             f"Final response submitted. Evaluation: {outcome.status}.",
             True, outcome.score,
-        )
-
-    def _infra_failure(self, err: Exception) -> tuple[str, bool, float]:
-        self.infra_failure = str(err)[:500]
-        logger.warning("[task %s] infra failure: %s", self._task_id, err)
-        return (
-            "Browser/site infrastructure failure; the episode cannot "
-            "continue. Ending episode with reward 0.",
-            True, 0.0,
         )
 
     def close(self) -> None:
@@ -421,7 +458,19 @@ class WebArenaEnvHandle:
         try:
             self._session.close()
         finally:
-            self._alloc.release()
+            try:
+                self._alloc.release()
+            finally:
+                if self._gate_release is not None:
+                    self._gate_release()
+                if not self._cfg.keep_har:
+                    # HAR 量大(实测 4-8MB/episode);默认评测后即弃,
+                    # 保留 agent_response/eval_result 小件(审阅 P1-9)。
+                    try:
+                        (self._episode_dir / "network.har").unlink(
+                            missing_ok=True)
+                    except OSError:
+                        pass
 
 
 # ----------------------------------------------------------------- adapter
@@ -487,36 +536,60 @@ class WebArenaTaskAdapter:
         return TOOLS_FC
 
     def open_episode(self) -> WebArenaEnvHandle:
+        """并发门 permit 覆盖**整个 episode 生命周期**(审阅 P0-3:浏览器
+        活到 close,门只罩启动波次会让存活 Chromium 无上界);permit 移交
+        EnvHandle,close/失败清理归还。alloc 领用后立刻进入保护块(审阅
+        P1-1:mkdir/构造失败不得泄漏站点租约)。"""
         sites = list(self._item["sites"])
-        with self._gate:
+        self._gate.acquire()
+        released = [False]
+
+        def _release_gate() -> None:
+            if not released[0]:
+                released[0] = True
+                self._gate.release()
+
+        alloc = None
+        session = None
+        try:
             alloc = self._pool.acquire(sites)
             episode_dir = (Path(self._cfg.work_dir)
-                           / f"{self.task_id}-{uuid.uuid4().hex[:8]}")
-            episode_dir.mkdir(parents=True, exist_ok=True)
+                           / f"{self.task_id}-{uuid.uuid4().hex}")
+            episode_dir.mkdir(parents=True, exist_ok=False)
             session = BrowserSession(
                 base_urls=alloc.base_urls,
                 har_path=episode_dir / "network.har",
                 headless=self._cfg.headless,
             )
-            try:
-                start_urls = render_start_urls(
-                    list(self._item["start_urls"]), alloc.base_urls)
-                session.start(sites, start_urls)
-                env = WebArenaEnvHandle(
-                    session=session,
-                    alloc=alloc,
-                    task_id=int(self._item["task_id"]),
-                    task_text=self.initial_obs,
-                    episode_dir=episode_dir,
-                    cfg=self._cfg,
-                    max_env_steps=protocol.MAX_ENV_STEPS,
-                )
-                env.first_obs = env.observe()
-                return env
-            except Exception:
+            start_urls = render_start_urls(
+                list(self._item["start_urls"]), alloc.base_urls)
+            session.start(sites, start_urls)
+            env = WebArenaEnvHandle(
+                session=session,
+                alloc=alloc,
+                task_id=int(self._item["task_id"]),
+                task_text=self.initial_obs,
+                episode_dir=episode_dir,
+                cfg=self._cfg,
+                max_env_steps=protocol.MAX_ENV_STEPS,
+                gate_release=_release_gate,
+            )
+            env.first_obs = env.observe()
+            return env
+        except Exception:
+            if session is not None:
                 session.close()
+            if alloc is not None:
                 alloc.release()
-                raise
+            _release_gate()
+            raise
+
+    def validate_initial_obs(self, live: str) -> bool:
+        """core 开局校验 hook(审阅 P0-2):任务指令部分必须逐字复现,
+        页面观测部分是 episode 级动态内容,只要求非空。"""
+        task = self.initial_obs.strip()
+        live = live.strip()
+        return live.startswith(task) and len(live) > len(task)
 
     def gt_text(self) -> str | None:
         return None      # Verified 无逐步 oracle;特权文档走 steering 通道
@@ -535,7 +608,9 @@ class WebArenaTaskAdapter:
         return raw
 
     def observation_indicates_invalid(self, observation: str) -> bool:
-        return observation.startswith(("Action failed:", "Unknown action"))
+        return observation.startswith(
+            ("Action failed:", "Unknown action",
+             "Format error in terminate call"))
 
     def format_reminder(self) -> str:
         return (
@@ -615,6 +690,27 @@ class WebArenaEnvFactory:
     """Mints per-task adapters sharing one site pool + spawn gate."""
 
     def __init__(self, cfg: WebArenaCfg) -> None:
+        import math
+
+        # 底层自保校验(load_config._validate 之外的直构入口同样受protect,
+        # 审阅 P2-5:spawn=0 会永久卡 semaphore、NaN timeout 永不超时)。
+        if cfg.spawn_concurrency < 1:
+            raise ValueError("webarena.spawn_concurrency must be >= 1")
+        if (not math.isfinite(cfg.acquire_timeout_s)
+                or cfg.acquire_timeout_s <= 0):
+            raise ValueError("webarena.acquire_timeout_s must be finite > 0")
+        if not cfg.work_dir:
+            raise ValueError("webarena.work_dir required (HAR/eval artifacts)")
+        work = Path(cfg.work_dir)
+        work.mkdir(parents=True, exist_ok=True)
+        probe = work / f".writable-{uuid.uuid4().hex[:6]}"
+        try:
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError as err:
+            raise ValueError(
+                f"webarena.work_dir not writable: {cfg.work_dir!r} ({err})"
+            ) from err
         if cfg.pool == "static":
             from .sites import StaticSitePool
 
@@ -640,12 +736,20 @@ class WebArenaEnvFactory:
             )
         else:
             raise ValueError(f"unknown webarena.pool {cfg.pool!r}")
-        if not cfg.work_dir:
-            raise ValueError("webarena.work_dir required (HAR/eval artifacts)")
         self._cfg = cfg
         self._gate = threading.Semaphore(cfg.spawn_concurrency)
 
     def adapter_from_item(self, item: dict) -> WebArenaTaskAdapter:
+        # static 池无状态隔离:MUTATE 任务默认拒绝(审阅 P1-11——安全不能
+        # 依赖某个调用脚本记得筛 task_type;串行调试经显式开关放行)。
+        if (self._cfg.pool == "static"
+                and not self._cfg.allow_static_mutate
+                and str(item.get("expected_task_type", "")).upper() == "MUTATE"):
+            raise ValueError(
+                f"task {item.get('task_id')} is MUTATE but pool='static' has "
+                "no state isolation; use pool='acs' or set "
+                "webarena.allow_static_mutate=true for serial debugging"
+            )
         return WebArenaTaskAdapter(
             item, self._cfg, pool=self._pool, spawn_gate=self._gate,
         )

@@ -155,7 +155,16 @@ async def run_episode(
         # researcher would study one scene while the student runs another.
         # Fail loud as an infrastructure fault.
         expected_obs = adapter.initial_obs
-        if expected_obs and initial_obs.strip() != expected_obs.strip():
+        # 非确定环境(WebArena:任务指令静态、页面观测动态)经可选 hook
+        # 自定义校验;无 hook 时保持逐字比较(确定性引擎的漂移检测)。
+        validator = getattr(adapter, "validate_initial_obs", None)
+        if validator is not None:
+            if not validator(initial_obs):
+                traj.outcome = OUTCOME_ENV_ERROR
+                traj.error = ("initial_obs rejected by adapter validator "
+                              "(environment drift?)")
+                return EpisodeResult(traj, empty_tokens, 0, 0, False, {})
+        elif expected_obs and initial_obs.strip() != expected_obs.strip():
             traj.outcome = OUTCOME_ENV_ERROR
             traj.error = "initial_obs mismatch vs dataset (environment drift?)"
             return EpisodeResult(traj, empty_tokens, 0, 0, False, {})

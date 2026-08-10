@@ -271,6 +271,13 @@ class WebArenaCfg:
     #: 单条观测字符上限(head 60% + tail 40%)。WebServ 不截断、靠 16k ctx
     #: 硬约束;此值影响效果,默认 40000 为工程保底——正式训练值待用户裁定。
     max_obs_chars: int = 40_000
+    #: HAR 保留策略:False = 评测后即删(实测 4-8MB/episode,训练会线性
+    #: 吃盘;agent_response/eval_result 小件始终保留);True = 全保(审计/
+    #: 提交包场景)。
+    keep_har: bool = False
+    #: static 池对 MUTATE 任务的显式放行(默认拒绝:静态池无状态隔离,
+    #: mutate 互踩;只有单任务串行调试才可打开)。
+    allow_static_mutate: bool = False
 
 
 @dataclass
@@ -663,6 +670,14 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"webarena.pool 必须是 static|acs,得到 {cfg.webarena.pool!r}"
         )
+    import math as _math
+    if cfg.webarena.spawn_concurrency < 1:
+        raise ValueError("webarena.spawn_concurrency 必须 >= 1")
+    if (not _math.isfinite(cfg.webarena.acquire_timeout_s)
+            or cfg.webarena.acquire_timeout_s <= 0):
+        raise ValueError("webarena.acquire_timeout_s 必须是有限正数")
+    if cfg.webarena.max_obs_chars < 0:
+        raise ValueError("webarena.max_obs_chars 必须 >= 0(0=不截断)")
     if cfg.environment.name == "webarena" and cfg.webarena.pool == "static":
         # 静态池无 episode 间状态隔离:mutate 任务并发互踩。只拦作为训练
         # 环境的使用;冒烟脚本直构工厂不经此路径。

@@ -32,52 +32,63 @@ def _per_worker(cap: int, workers: int) -> int:
     return max(1, math.ceil(cap / max(1, workers)))
 
 
+def _fork_cfg(cfg, **overrides):
+    """Per-worker 折算必须作用在副本上——原地改写会让同一 Config 被多次
+    装配时反复再折算(审阅 P2-6:16→4→1)。"""
+    import dataclasses
+
+    return dataclasses.replace(cfg, **overrides)
+
+
 def _build_alfworld(config: "Config", workers: int) -> "EnvFactory":
     from .alfworld.adapter import AlfworldEnvFactory
 
     cfg = config.alfworld
-    cfg.spawn_concurrency = _per_worker(cfg.spawn_concurrency, workers)
-    return AlfworldEnvFactory(cfg)
+    return AlfworldEnvFactory(_fork_cfg(
+        cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
 
 
 def _build_spreadsheetbench(config: "Config", workers: int) -> "EnvFactory":
     from .spreadsheetbench.adapter import SpreadsheetbenchEnvFactory
 
     cfg = config.spreadsheetbench
-    cfg.exec_concurrency = _per_worker(cfg.exec_concurrency, workers)
-    return SpreadsheetbenchEnvFactory(cfg)
+    return SpreadsheetbenchEnvFactory(_fork_cfg(
+        cfg, exec_concurrency=_per_worker(cfg.exec_concurrency, workers)))
 
 
 def _build_math(config: "Config", workers: int) -> "EnvFactory":
     from .math.adapter import MathEnvFactory
 
     cfg = config.math
-    cfg.exec_concurrency = _per_worker(cfg.exec_concurrency, workers)
-    return MathEnvFactory(cfg)
+    return MathEnvFactory(_fork_cfg(
+        cfg, exec_concurrency=_per_worker(cfg.exec_concurrency, workers)))
 
 
 def _build_scienceworld(config: "Config", workers: int) -> "EnvFactory":
     from .scienceworld.adapter import SciworldEnvFactory
 
     cfg = config.scienceworld
-    cfg.spawn_concurrency = _per_worker(cfg.spawn_concurrency, workers)
-    return SciworldEnvFactory(cfg)
+    return SciworldEnvFactory(_fork_cfg(
+        cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
 
 
 def _build_terminal(config: "Config", workers: int) -> "EnvFactory":
     from .terminal.adapter import TerminalEnvFactory
 
     cfg = config.terminal
-    cfg.spawn_concurrency = _per_worker(cfg.spawn_concurrency, workers)
-    return TerminalEnvFactory(cfg)
+    return TerminalEnvFactory(_fork_cfg(
+        cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
 
 
 def _build_webarena(config: "Config", workers: int) -> "EnvFactory":
+    """⚠ spawn_concurrency 是 **per-worker** 折算值(全局 cap / workers,
+    向上取整、下限 1)——workers > cap 时总并发会超过名义 cap;真正的
+    跨进程全局预算需要外部协调(审阅 P0-3 遗留,P-B 按机器资源核算)。"""
     from .webarena.adapter import WebArenaEnvFactory
 
     cfg = config.webarena
-    cfg.spawn_concurrency = _per_worker(cfg.spawn_concurrency, workers)
-    return WebArenaEnvFactory(cfg)
+    return WebArenaEnvFactory(_fork_cfg(
+        cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
 
 
 _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {

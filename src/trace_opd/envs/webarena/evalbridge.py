@@ -125,36 +125,34 @@ def evaluate(
             score=0.0, status="failure",
             error_msg="", detail={"reason": "no final response submitted"},
         )
-    trace: object
-    if har_path is not None and Path(har_path).is_file():
-        trace = Path(har_path)
-    else:
-        # HAR 缺失:AgentResponse-only 任务仍可判;NetworkEvent 断言会失败
-        # (而不是 error)。包拒绝空列表("Trace content list is empty"),
-        # 用单个哑 entry 表达"无网络证据"——invalid 域名不可能匹配任何
-        # expected_network_events,语义等价于空。
-        logger.warning("HAR missing for task %s; evaluating with sentinel "
-                       "empty trace", task_id)
-        trace = [{
-            "request": {"method": "GET",
-                        "url": "http://trace-missing.invalid/",
-                        "headers": [], "queryString": []},
-            "response": {"status": 0, "headers": [], "content": {},
-                         "redirectURL": ""},
-        }]
+    if har_path is None or not Path(har_path).is_file():
+        # HAR 缺失 = 证据链断裂,基建口径 fail-loud(审阅 P1-8:哑 trace
+        # 会让 response-only 任务缺证据仍拿 1 分,把 trace 丢失固化成
+        # "成功")。测试需要空 trace 时自建 fixture,不走生产 evaluate。
+        logger.error("HAR missing for task %s — refusing to evaluate", task_id)
+        return EvalOutcome(score=0.0, status="error",
+                           error_msg=f"HAR missing: {har_path}", detail={})
     wa = _get_facade()
     with _lock:
         try:
             from webarena_verified.types.task import WebArenaSite
 
-            for site, url in base_urls.items():
+            # 全量重置每站 URL 列表(审阅 P0-4:set_active_url 会永久
+            # append;K8s 回收的 Pod IP 被另一站复用后,derender 会撞上
+            # 历史 URL 把请求反解成错误站点——48 个多站点任务受影响,
+            # 已离线复现)。每次评测只留"本 episode 的真值 + 占位"。
+            for site in SITES:
                 env = wa.config.environments[WebArenaSite(site)]
-                env.set_active_url(url.rstrip("/"))
+                url = base_urls.get(site)
+                env.urls = [url.rstrip("/") if url
+                            else f"http://{site}.invalid"]
+                env.active_url_idx = 0
             result = wa.evaluate_task(
                 task_id=task_id,
                 agent_response=final_response,
-                network_trace=trace,
+                network_trace=Path(har_path),
             )
+            detail = result.model_dump(mode="json")
         except Exception as err:  # noqa: BLE001 — 评测器崩溃按 error 口径外显
             logger.error("verified evaluation crashed for task %s: %s",
                          task_id, err)
@@ -164,5 +162,5 @@ def evaluate(
         score=float(result.score),
         status=str(result.status),
         error_msg=str(result.error_msg or ""),
-        detail=result.model_dump(mode="json"),
+        detail=detail,
     )
