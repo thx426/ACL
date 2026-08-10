@@ -1,0 +1,1307 @@
+[
+  {
+    "file": "train__pick_and_place_simple-AlarmClock-None-DiningTable-329__trial_T20190909_011727_722798_0694fc9d.json",
+    "turns": 33,
+    "invalid_format": 8,
+    "respLen": 25530,
+    "first_format_fail_step": 15,
+    "total_steps": 33,
+    "env_steps": 25
+  },
+  {
+    "file": "train__pick_and_place_simple-AlarmClock-None-DiningTable-329__trial_T20190909_011727_722798_3edb2ca4.json",
+    "turns": 17,
+    "invalid_format": 4,
+    "respLen": 13731,
+    "first_format_fail_step": 10,
+    "total_steps": 17,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-AlarmClock-None-DiningTable-329__trial_T20190909_011727_722798_680df092.json",
+    "turns": 28,
+    "invalid_format": 5,
+    "respLen": 23175,
+    "first_format_fail_step": 23,
+    "total_steps": 28,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_and_place_simple-AlarmClock-None-DiningTable-329__trial_T20190909_011727_722798_778da227.json",
+    "turns": 18,
+    "invalid_format": 5,
+    "respLen": 14827,
+    "first_format_fail_step": 13,
+    "total_steps": 18,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-AlarmClock-None-DiningTable-329__trial_T20190909_011727_722798_fff5a9af.json",
+    "turns": 27,
+    "invalid_format": 5,
+    "respLen": 18350,
+    "first_format_fail_step": 21,
+    "total_steps": 27,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_01cafcf3.json",
+    "turns": 30,
+    "invalid_format": 5,
+    "respLen": 20486,
+    "first_format_fail_step": 18,
+    "total_steps": 30,
+    "env_steps": 25
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_4a70707f.json",
+    "turns": 23,
+    "invalid_format": 6,
+    "respLen": 14762,
+    "first_format_fail_step": 16,
+    "total_steps": 23,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_5854ce69.json",
+    "turns": 7,
+    "invalid_format": 3,
+    "respLen": 5322,
+    "first_format_fail_step": 5,
+    "total_steps": 7,
+    "env_steps": 4
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_5b3c598f.json",
+    "turns": 28,
+    "invalid_format": 4,
+    "respLen": 19487,
+    "first_format_fail_step": 23,
+    "total_steps": 28,
+    "env_steps": 24
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_845b3e45.json",
+    "turns": 25,
+    "invalid_format": 3,
+    "respLen": 12206,
+    "first_format_fail_step": 23,
+    "total_steps": 25,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_8f0b1d02.json",
+    "turns": 17,
+    "invalid_format": 5,
+    "respLen": 12859,
+    "first_format_fail_step": 10,
+    "total_steps": 17,
+    "env_steps": 12
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_aa339ce1.json",
+    "turns": 28,
+    "invalid_format": 6,
+    "respLen": 22334,
+    "first_format_fail_step": 21,
+    "total_steps": 28,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_bd7fdff4.json",
+    "turns": 27,
+    "invalid_format": 9,
+    "respLen": 26328,
+    "first_format_fail_step": 12,
+    "total_steps": 27,
+    "env_steps": 18
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_bfaa94e6.json",
+    "turns": 33,
+    "invalid_format": 5,
+    "respLen": 20835,
+    "first_format_fail_step": 25,
+    "total_steps": 33,
+    "env_steps": 28
+  },
+  {
+    "file": "train__pick_and_place_simple-Candle-None-Toilet-402__trial_T20190909_150110_676215_fdd74f80.json",
+    "turns": 21,
+    "invalid_format": 4,
+    "respLen": 13031,
+    "first_format_fail_step": 17,
+    "total_steps": 21,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_44dd7c36.json",
+    "turns": 32,
+    "invalid_format": 4,
+    "respLen": 27572,
+    "first_format_fail_step": 28,
+    "total_steps": 32,
+    "env_steps": 28
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_49217929.json",
+    "turns": 30,
+    "invalid_format": 4,
+    "respLen": 24679,
+    "first_format_fail_step": 26,
+    "total_steps": 30,
+    "env_steps": 26
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_50321844.json",
+    "turns": 15,
+    "invalid_format": 4,
+    "respLen": 11655,
+    "first_format_fail_step": 11,
+    "total_steps": 15,
+    "env_steps": 11
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_527f4ea5.json",
+    "turns": 9,
+    "invalid_format": 4,
+    "respLen": 6288,
+    "first_format_fail_step": 5,
+    "total_steps": 9,
+    "env_steps": 5
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_614e8148.json",
+    "turns": 31,
+    "invalid_format": 4,
+    "respLen": 26698,
+    "first_format_fail_step": 25,
+    "total_steps": 31,
+    "env_steps": 27
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_6db61f6f.json",
+    "turns": 8,
+    "invalid_format": 4,
+    "respLen": 6313,
+    "first_format_fail_step": 4,
+    "total_steps": 8,
+    "env_steps": 4
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_99b6dbc1.json",
+    "turns": 22,
+    "invalid_format": 7,
+    "respLen": 15765,
+    "first_format_fail_step": 12,
+    "total_steps": 22,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_acc28e50.json",
+    "turns": 21,
+    "invalid_format": 3,
+    "respLen": 16580,
+    "first_format_fail_step": 19,
+    "total_steps": 21,
+    "env_steps": 18
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_b1887194.json",
+    "turns": 27,
+    "invalid_format": 4,
+    "respLen": 15107,
+    "first_format_fail_step": 21,
+    "total_steps": 27,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144_d1983b88.json",
+    "turns": 25,
+    "invalid_format": 5,
+    "respLen": 26351,
+    "first_format_fail_step": 18,
+    "total_steps": 25,
+    "env_steps": 20
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_0243ed4d.json",
+    "turns": 29,
+    "invalid_format": 5,
+    "respLen": 22500,
+    "first_format_fail_step": 24,
+    "total_steps": 29,
+    "env_steps": 24
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_1cc7a3a4.json",
+    "turns": 21,
+    "invalid_format": 4,
+    "respLen": 17750,
+    "first_format_fail_step": 17,
+    "total_steps": 21,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_26efec31.json",
+    "turns": 22,
+    "invalid_format": 9,
+    "respLen": 24814,
+    "first_format_fail_step": 10,
+    "total_steps": 22,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_3368f702.json",
+    "turns": 10,
+    "invalid_format": 3,
+    "respLen": 7229,
+    "first_format_fail_step": 8,
+    "total_steps": 10,
+    "env_steps": 7
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_46901bdd.json",
+    "turns": 10,
+    "invalid_format": 5,
+    "respLen": 6763,
+    "first_format_fail_step": 5,
+    "total_steps": 10,
+    "env_steps": 5
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_4d4cf8ef.json",
+    "turns": 20,
+    "invalid_format": 5,
+    "respLen": 17099,
+    "first_format_fail_step": 12,
+    "total_steps": 20,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_67289bf4.json",
+    "turns": 15,
+    "invalid_format": 5,
+    "respLen": 4413,
+    "first_format_fail_step": 9,
+    "total_steps": 15,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_83abf326.json",
+    "turns": 14,
+    "invalid_format": 3,
+    "respLen": 14462,
+    "first_format_fail_step": 12,
+    "total_steps": 14,
+    "env_steps": 11
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_86bbaa9b.json",
+    "turns": 24,
+    "invalid_format": 4,
+    "respLen": 12648,
+    "first_format_fail_step": 18,
+    "total_steps": 24,
+    "env_steps": 20
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-ArmChair-322__trial_T20190908_223340_751080_921f812f.json",
+    "turns": 19,
+    "invalid_format": 6,
+    "respLen": 13992,
+    "first_format_fail_step": 11,
+    "total_steps": 19,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_17fc97e4.json",
+    "turns": 16,
+    "invalid_format": 4,
+    "respLen": 9964,
+    "first_format_fail_step": 11,
+    "total_steps": 16,
+    "env_steps": 12
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_3b081c49.json",
+    "turns": 37,
+    "invalid_format": 9,
+    "respLen": 31150,
+    "first_format_fail_step": 7,
+    "total_steps": 37,
+    "env_steps": 28
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_7c9fa776.json",
+    "turns": 12,
+    "invalid_format": 3,
+    "respLen": 9890,
+    "first_format_fail_step": 10,
+    "total_steps": 12,
+    "env_steps": 9
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_7cac62f9.json",
+    "turns": 25,
+    "invalid_format": 6,
+    "respLen": 18972,
+    "first_format_fail_step": 17,
+    "total_steps": 25,
+    "env_steps": 19
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_8e967189.json",
+    "turns": 30,
+    "invalid_format": 6,
+    "respLen": 23668,
+    "first_format_fail_step": 6,
+    "total_steps": 30,
+    "env_steps": 24
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_8ea13b16.json",
+    "turns": 25,
+    "invalid_format": 5,
+    "respLen": 23294,
+    "first_format_fail_step": 17,
+    "total_steps": 25,
+    "env_steps": 20
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_abaa51bb.json",
+    "turns": 11,
+    "invalid_format": 3,
+    "respLen": 11318,
+    "first_format_fail_step": 9,
+    "total_steps": 11,
+    "env_steps": 8
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_bf83b35d.json",
+    "turns": 29,
+    "invalid_format": 6,
+    "respLen": 26558,
+    "first_format_fail_step": 12,
+    "total_steps": 29,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_d944a94d.json",
+    "turns": 31,
+    "invalid_format": 4,
+    "respLen": 20294,
+    "first_format_fail_step": 26,
+    "total_steps": 31,
+    "env_steps": 27
+  },
+  {
+    "file": "train__pick_and_place_simple-KeyChain-None-Sofa-225__trial_T20190908_131143_093789_d94564eb.json",
+    "turns": 24,
+    "invalid_format": 4,
+    "respLen": 19642,
+    "first_format_fail_step": 13,
+    "total_steps": 24,
+    "env_steps": 20
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_39a6da92.json",
+    "turns": 33,
+    "invalid_format": 6,
+    "respLen": 19032,
+    "first_format_fail_step": 8,
+    "total_steps": 33,
+    "env_steps": 27
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_6bd2226d.json",
+    "turns": 36,
+    "invalid_format": 7,
+    "respLen": 26972,
+    "first_format_fail_step": 17,
+    "total_steps": 36,
+    "env_steps": 29
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_801a1c3e.json",
+    "turns": 23,
+    "invalid_format": 5,
+    "respLen": 22864,
+    "first_format_fail_step": 18,
+    "total_steps": 23,
+    "env_steps": 18
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_898194a8.json",
+    "turns": 25,
+    "invalid_format": 4,
+    "respLen": 18513,
+    "first_format_fail_step": 21,
+    "total_steps": 25,
+    "env_steps": 21
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_9706a2a7.json",
+    "turns": 25,
+    "invalid_format": 5,
+    "respLen": 17256,
+    "first_format_fail_step": 19,
+    "total_steps": 25,
+    "env_steps": 20
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_ddfe0cc1.json",
+    "turns": 20,
+    "invalid_format": 4,
+    "respLen": 14523,
+    "first_format_fail_step": 16,
+    "total_steps": 20,
+    "env_steps": 16
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_efc4f9f3.json",
+    "turns": 29,
+    "invalid_format": 5,
+    "respLen": 25190,
+    "first_format_fail_step": 24,
+    "total_steps": 29,
+    "env_steps": 24
+  },
+  {
+    "file": "train__pick_and_place_simple-PepperShaker-None-Drawer-5__trial_T20190908_195340_064065_f19244c9.json",
+    "turns": 27,
+    "invalid_format": 4,
+    "respLen": 18089,
+    "first_format_fail_step": 23,
+    "total_steps": 27,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_0886db0e.json",
+    "turns": 20,
+    "invalid_format": 3,
+    "respLen": 20919,
+    "first_format_fail_step": 18,
+    "total_steps": 20,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_4a0482a3.json",
+    "turns": 18,
+    "invalid_format": 5,
+    "respLen": 16692,
+    "first_format_fail_step": 6,
+    "total_steps": 18,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_5188379b.json",
+    "turns": 12,
+    "invalid_format": 3,
+    "respLen": 8812,
+    "first_format_fail_step": 10,
+    "total_steps": 12,
+    "env_steps": 9
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_5f711ebb.json",
+    "turns": 22,
+    "invalid_format": 8,
+    "respLen": 13776,
+    "first_format_fail_step": 10,
+    "total_steps": 22,
+    "env_steps": 14
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_7b032461.json",
+    "turns": 18,
+    "invalid_format": 3,
+    "respLen": 15233,
+    "first_format_fail_step": 16,
+    "total_steps": 18,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_b40d92c8.json",
+    "turns": 13,
+    "invalid_format": 4,
+    "respLen": 11010,
+    "first_format_fail_step": 8,
+    "total_steps": 13,
+    "env_steps": 9
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_d363bdbd.json",
+    "turns": 36,
+    "invalid_format": 7,
+    "respLen": 32506,
+    "first_format_fail_step": 17,
+    "total_steps": 36,
+    "env_steps": 29
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_e07b20d0.json",
+    "turns": 28,
+    "invalid_format": 4,
+    "respLen": 17519,
+    "first_format_fail_step": 23,
+    "total_steps": 28,
+    "env_steps": 24
+  },
+  {
+    "file": "train__pick_and_place_simple-RemoteControl-None-Dresser-217__trial_T20190909_053743_317534_e5ae60d4.json",
+    "turns": 9,
+    "invalid_format": 4,
+    "respLen": 9164,
+    "first_format_fail_step": 5,
+    "total_steps": 9,
+    "env_steps": 5
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_08c3f641.json",
+    "turns": 23,
+    "invalid_format": 4,
+    "respLen": 18952,
+    "first_format_fail_step": 8,
+    "total_steps": 23,
+    "env_steps": 19
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_1ae08f62.json",
+    "turns": 31,
+    "invalid_format": 4,
+    "respLen": 22113,
+    "first_format_fail_step": 27,
+    "total_steps": 31,
+    "env_steps": 27
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_23555d5c.json",
+    "turns": 26,
+    "invalid_format": 7,
+    "respLen": 16911,
+    "first_format_fail_step": 3,
+    "total_steps": 26,
+    "env_steps": 19
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_4a341794.json",
+    "turns": 29,
+    "invalid_format": 4,
+    "respLen": 25568,
+    "first_format_fail_step": 24,
+    "total_steps": 29,
+    "env_steps": 25
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_537f7dd6.json",
+    "turns": 17,
+    "invalid_format": 4,
+    "respLen": 8589,
+    "first_format_fail_step": 9,
+    "total_steps": 17,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_5594788a.json",
+    "turns": 22,
+    "invalid_format": 5,
+    "respLen": 17780,
+    "first_format_fail_step": 16,
+    "total_steps": 22,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_78ce7b6a.json",
+    "turns": 12,
+    "invalid_format": 5,
+    "respLen": 5223,
+    "first_format_fail_step": 6,
+    "total_steps": 12,
+    "env_steps": 7
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_9c0c103f.json",
+    "turns": 14,
+    "invalid_format": 4,
+    "respLen": 9115,
+    "first_format_fail_step": 10,
+    "total_steps": 14,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_bb9ab2c9.json",
+    "turns": 22,
+    "invalid_format": 6,
+    "respLen": 16448,
+    "first_format_fail_step": 6,
+    "total_steps": 22,
+    "env_steps": 16
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_d013708b.json",
+    "turns": 15,
+    "invalid_format": 4,
+    "respLen": 10164,
+    "first_format_fail_step": 9,
+    "total_steps": 15,
+    "env_steps": 11
+  },
+  {
+    "file": "train__pick_and_place_simple-SoapBottle-None-Drawer-423__trial_T20190909_064813_906845_e4a027e7.json",
+    "turns": 16,
+    "invalid_format": 3,
+    "respLen": 13272,
+    "first_format_fail_step": 14,
+    "total_steps": 16,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-Statue-None-CoffeeTable-229__trial_T20190908_132839_972711_18467b3a.json",
+    "turns": 28,
+    "invalid_format": 6,
+    "respLen": 22832,
+    "first_format_fail_step": 17,
+    "total_steps": 28,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_and_place_simple-Statue-None-CoffeeTable-229__trial_T20190908_132839_972711_7b340a75.json",
+    "turns": 18,
+    "invalid_format": 3,
+    "respLen": 12713,
+    "first_format_fail_step": 16,
+    "total_steps": 18,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_and_place_simple-Statue-None-CoffeeTable-229__trial_T20190908_132839_972711_8a5360db.json",
+    "turns": 6,
+    "invalid_format": 3,
+    "respLen": 5257,
+    "first_format_fail_step": 4,
+    "total_steps": 6,
+    "env_steps": 3
+  },
+  {
+    "file": "train__pick_and_place_simple-Statue-None-CoffeeTable-229__trial_T20190908_132839_972711_e784d1f4.json",
+    "turns": 31,
+    "invalid_format": 9,
+    "respLen": 26084,
+    "first_format_fail_step": 17,
+    "total_steps": 31,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_and_place_simple-Statue-None-CoffeeTable-229__trial_T20190908_132839_972711_ecb4114a.json",
+    "turns": 17,
+    "invalid_format": 4,
+    "respLen": 8309,
+    "first_format_fail_step": 11,
+    "total_steps": 17,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_0c0722e0.json",
+    "turns": 11,
+    "invalid_format": 5,
+    "respLen": 8550,
+    "first_format_fail_step": 6,
+    "total_steps": 11,
+    "env_steps": 6
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_11d45980.json",
+    "turns": 18,
+    "invalid_format": 3,
+    "respLen": 15303,
+    "first_format_fail_step": 16,
+    "total_steps": 18,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_70198d8f.json",
+    "turns": 19,
+    "invalid_format": 3,
+    "respLen": 19601,
+    "first_format_fail_step": 17,
+    "total_steps": 19,
+    "env_steps": 16
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_9ca2ff39.json",
+    "turns": 21,
+    "invalid_format": 4,
+    "respLen": 15966,
+    "first_format_fail_step": 16,
+    "total_steps": 21,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_a5066e3d.json",
+    "turns": 10,
+    "invalid_format": 3,
+    "respLen": 13083,
+    "first_format_fail_step": 8,
+    "total_steps": 10,
+    "env_steps": 7
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_a690b30a.json",
+    "turns": 16,
+    "invalid_format": 4,
+    "respLen": 11360,
+    "first_format_fail_step": 12,
+    "total_steps": 16,
+    "env_steps": 12
+  },
+  {
+    "file": "train__pick_and_place_simple-ToiletPaper-None-ToiletPaperHanger-406__trial_T20190908_122840_498444_de362a7d.json",
+    "turns": 30,
+    "invalid_format": 5,
+    "respLen": 27618,
+    "first_format_fail_step": 23,
+    "total_steps": 30,
+    "env_steps": 25
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_2855f1da.json",
+    "turns": 33,
+    "invalid_format": 4,
+    "respLen": 16568,
+    "first_format_fail_step": 29,
+    "total_steps": 33,
+    "env_steps": 29
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_518737db.json",
+    "turns": 15,
+    "invalid_format": 5,
+    "respLen": 12666,
+    "first_format_fail_step": 8,
+    "total_steps": 15,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_86ad985a.json",
+    "turns": 22,
+    "invalid_format": 6,
+    "respLen": 16961,
+    "first_format_fail_step": 3,
+    "total_steps": 22,
+    "env_steps": 16
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_87b5e9d7.json",
+    "turns": 33,
+    "invalid_format": 10,
+    "respLen": 23041,
+    "first_format_fail_step": 7,
+    "total_steps": 33,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_bc27988c.json",
+    "turns": 20,
+    "invalid_format": 7,
+    "respLen": 11398,
+    "first_format_fail_step": 10,
+    "total_steps": 20,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_c504f5e5.json",
+    "turns": 29,
+    "invalid_format": 6,
+    "respLen": 19737,
+    "first_format_fail_step": 11,
+    "total_steps": 29,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_ca0ef79a.json",
+    "turns": 17,
+    "invalid_format": 7,
+    "respLen": 16852,
+    "first_format_fail_step": 8,
+    "total_steps": 17,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_cd4fa1e4.json",
+    "turns": 27,
+    "invalid_format": 6,
+    "respLen": 29873,
+    "first_format_fail_step": 19,
+    "total_steps": 27,
+    "env_steps": 21
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_d93f000d.json",
+    "turns": 25,
+    "invalid_format": 6,
+    "respLen": 15708,
+    "first_format_fail_step": 9,
+    "total_steps": 25,
+    "env_steps": 19
+  },
+  {
+    "file": "train__pick_cool_then_place_in_recep-Plate-None-Shelf-7__trial_T20190907_124749_594195_e4d538e1.json",
+    "turns": 21,
+    "invalid_format": 6,
+    "respLen": 8475,
+    "first_format_fail_step": 2,
+    "total_steps": 21,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_20fc161a.json",
+    "turns": 32,
+    "invalid_format": 6,
+    "respLen": 26932,
+    "first_format_fail_step": 5,
+    "total_steps": 32,
+    "env_steps": 26
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_2b736166.json",
+    "turns": 10,
+    "invalid_format": 5,
+    "respLen": 5301,
+    "first_format_fail_step": 5,
+    "total_steps": 10,
+    "env_steps": 5
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_36e922d8.json",
+    "turns": 26,
+    "invalid_format": 4,
+    "respLen": 13330,
+    "first_format_fail_step": 22,
+    "total_steps": 26,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_58c082a7.json",
+    "turns": 33,
+    "invalid_format": 7,
+    "respLen": 22748,
+    "first_format_fail_step": 23,
+    "total_steps": 33,
+    "env_steps": 26
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_652ba7de.json",
+    "turns": 16,
+    "invalid_format": 3,
+    "respLen": 17946,
+    "first_format_fail_step": 14,
+    "total_steps": 16,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_75216b1b.json",
+    "turns": 21,
+    "invalid_format": 4,
+    "respLen": 13041,
+    "first_format_fail_step": 16,
+    "total_steps": 21,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_78169b2e.json",
+    "turns": 25,
+    "invalid_format": 3,
+    "respLen": 15755,
+    "first_format_fail_step": 23,
+    "total_steps": 25,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_799e987b.json",
+    "turns": 26,
+    "invalid_format": 3,
+    "respLen": 21654,
+    "first_format_fail_step": 24,
+    "total_steps": 26,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_88b315f9.json",
+    "turns": 10,
+    "invalid_format": 3,
+    "respLen": 3364,
+    "first_format_fail_step": 8,
+    "total_steps": 10,
+    "env_steps": 7
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_93ad31a5.json",
+    "turns": 28,
+    "invalid_format": 7,
+    "respLen": 16542,
+    "first_format_fail_step": 5,
+    "total_steps": 28,
+    "env_steps": 21
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_be61ae14.json",
+    "turns": 28,
+    "invalid_format": 5,
+    "respLen": 19832,
+    "first_format_fail_step": 22,
+    "total_steps": 28,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_e148c1dd.json",
+    "turns": 18,
+    "invalid_format": 3,
+    "respLen": 8764,
+    "first_format_fail_step": 16,
+    "total_steps": 18,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-5__trial_T20190908_003743_285560_e2b9ae3b.json",
+    "turns": 19,
+    "invalid_format": 6,
+    "respLen": 16880,
+    "first_format_fail_step": 10,
+    "total_steps": 19,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_302884aa.json",
+    "turns": 31,
+    "invalid_format": 7,
+    "respLen": 29315,
+    "first_format_fail_step": 21,
+    "total_steps": 31,
+    "env_steps": 24
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_38084847.json",
+    "turns": 19,
+    "invalid_format": 3,
+    "respLen": 17804,
+    "first_format_fail_step": 17,
+    "total_steps": 19,
+    "env_steps": 16
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_839d941c.json",
+    "turns": 34,
+    "invalid_format": 6,
+    "respLen": 22043,
+    "first_format_fail_step": 12,
+    "total_steps": 34,
+    "env_steps": 28
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_9e20ec78.json",
+    "turns": 15,
+    "invalid_format": 5,
+    "respLen": 13874,
+    "first_format_fail_step": 8,
+    "total_steps": 15,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_bd7228de.json",
+    "turns": 16,
+    "invalid_format": 4,
+    "respLen": 14270,
+    "first_format_fail_step": 12,
+    "total_steps": 16,
+    "env_steps": 12
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_c3889384.json",
+    "turns": 18,
+    "invalid_format": 4,
+    "respLen": 18313,
+    "first_format_fail_step": 14,
+    "total_steps": 18,
+    "env_steps": 14
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_d05b6386.json",
+    "turns": 30,
+    "invalid_format": 8,
+    "respLen": 22724,
+    "first_format_fail_step": 16,
+    "total_steps": 30,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_d29b4b1f.json",
+    "turns": 23,
+    "invalid_format": 5,
+    "respLen": 19847,
+    "first_format_fail_step": 4,
+    "total_steps": 23,
+    "env_steps": 18
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_d4f3dffa.json",
+    "turns": 13,
+    "invalid_format": 3,
+    "respLen": 7348,
+    "first_format_fail_step": 11,
+    "total_steps": 13,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_f9d63d17.json",
+    "turns": 5,
+    "invalid_format": 3,
+    "respLen": 2060,
+    "first_format_fail_step": 3,
+    "total_steps": 5,
+    "env_steps": 2
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Book-None-Desk-310__trial_T20190906_202447_734445_fd8554c2.json",
+    "turns": 22,
+    "invalid_format": 4,
+    "respLen": 8487,
+    "first_format_fail_step": 15,
+    "total_steps": 22,
+    "env_steps": 18
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Egg-None-Microwave-30__trial_T20190907_163255_256147_3794dad9.json",
+    "turns": 17,
+    "invalid_format": 4,
+    "respLen": 7649,
+    "first_format_fail_step": 12,
+    "total_steps": 17,
+    "env_steps": 13
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Egg-None-Microwave-30__trial_T20190907_163255_256147_4b106e56.json",
+    "turns": 14,
+    "invalid_format": 4,
+    "respLen": 9996,
+    "first_format_fail_step": 9,
+    "total_steps": 14,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Egg-None-Microwave-30__trial_T20190907_163255_256147_6da1dee7.json",
+    "turns": 23,
+    "invalid_format": 5,
+    "respLen": 11921,
+    "first_format_fail_step": 18,
+    "total_steps": 23,
+    "env_steps": 18
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Egg-None-Microwave-30__trial_T20190907_163255_256147_7153ffea.json",
+    "turns": 35,
+    "invalid_format": 7,
+    "respLen": 30129,
+    "first_format_fail_step": 13,
+    "total_steps": 35,
+    "env_steps": 28
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Egg-None-Microwave-30__trial_T20190907_163255_256147_8c708ed5.json",
+    "turns": 18,
+    "invalid_format": 3,
+    "respLen": 16799,
+    "first_format_fail_step": 16,
+    "total_steps": 18,
+    "env_steps": 15
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Egg-None-Microwave-30__trial_T20190907_163255_256147_d547eb0f.json",
+    "turns": 12,
+    "invalid_format": 3,
+    "respLen": 9685,
+    "first_format_fail_step": 10,
+    "total_steps": 12,
+    "env_steps": 9
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_34eda97e.json",
+    "turns": 19,
+    "invalid_format": 5,
+    "respLen": 14165,
+    "first_format_fail_step": 13,
+    "total_steps": 19,
+    "env_steps": 14
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_48d8dc11.json",
+    "turns": 24,
+    "invalid_format": 4,
+    "respLen": 16632,
+    "first_format_fail_step": 17,
+    "total_steps": 24,
+    "env_steps": 20
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_48e72ce5.json",
+    "turns": 6,
+    "invalid_format": 3,
+    "respLen": 5825,
+    "first_format_fail_step": 4,
+    "total_steps": 6,
+    "env_steps": 3
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_864e65d2.json",
+    "turns": 22,
+    "invalid_format": 5,
+    "respLen": 13571,
+    "first_format_fail_step": 6,
+    "total_steps": 22,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_9b84cd42.json",
+    "turns": 11,
+    "invalid_format": 4,
+    "respLen": 9519,
+    "first_format_fail_step": 6,
+    "total_steps": 11,
+    "env_steps": 7
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_ae095ae0.json",
+    "turns": 20,
+    "invalid_format": 3,
+    "respLen": 14798,
+    "first_format_fail_step": 18,
+    "total_steps": 20,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_c54a7634.json",
+    "turns": 28,
+    "invalid_format": 7,
+    "respLen": 12302,
+    "first_format_fail_step": 3,
+    "total_steps": 28,
+    "env_steps": 21
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_c88a3a95.json",
+    "turns": 29,
+    "invalid_format": 3,
+    "respLen": 22635,
+    "first_format_fail_step": 27,
+    "total_steps": 29,
+    "env_steps": 26
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_dbd72c7e.json",
+    "turns": 5,
+    "invalid_format": 3,
+    "respLen": 4833,
+    "first_format_fail_step": 3,
+    "total_steps": 5,
+    "env_steps": 2
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_ddfda2b1.json",
+    "turns": 19,
+    "invalid_format": 3,
+    "respLen": 19588,
+    "first_format_fail_step": 17,
+    "total_steps": 19,
+    "env_steps": 16
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_e0c0953a.json",
+    "turns": 22,
+    "invalid_format": 5,
+    "respLen": 13492,
+    "first_format_fail_step": 13,
+    "total_steps": 22,
+    "env_steps": 17
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Pen-None-Shelf-320__trial_T20190907_174259_205684_ec2b5ceb.json",
+    "turns": 20,
+    "invalid_format": 6,
+    "respLen": 22604,
+    "first_format_fail_step": 11,
+    "total_steps": 20,
+    "env_steps": 14
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_02268801.json",
+    "turns": 15,
+    "invalid_format": 5,
+    "respLen": 10705,
+    "first_format_fail_step": 9,
+    "total_steps": 15,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_07947711.json",
+    "turns": 13,
+    "invalid_format": 3,
+    "respLen": 16124,
+    "first_format_fail_step": 11,
+    "total_steps": 13,
+    "env_steps": 10
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_11d63ac8.json",
+    "turns": 29,
+    "invalid_format": 7,
+    "respLen": 23136,
+    "first_format_fail_step": 21,
+    "total_steps": 29,
+    "env_steps": 22
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_5ef5269d.json",
+    "turns": 20,
+    "invalid_format": 6,
+    "respLen": 18825,
+    "first_format_fail_step": 13,
+    "total_steps": 20,
+    "env_steps": 14
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_7a56bec1.json",
+    "turns": 12,
+    "invalid_format": 4,
+    "respLen": 5378,
+    "first_format_fail_step": 7,
+    "total_steps": 12,
+    "env_steps": 8
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_8041fdbf.json",
+    "turns": 26,
+    "invalid_format": 3,
+    "respLen": 21168,
+    "first_format_fail_step": 24,
+    "total_steps": 26,
+    "env_steps": 23
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_9159c008.json",
+    "turns": 31,
+    "invalid_format": 3,
+    "respLen": 21199,
+    "first_format_fail_step": 29,
+    "total_steps": 31,
+    "env_steps": 28
+  },
+  {
+    "file": "train__pick_two_obj_and_place-Vase-None-CoffeeTable-209__trial_T20190906_192158_361652_ea0c644e.json",
+    "turns": 20,
+    "invalid_format": 3,
+    "respLen": 16575,
+    "first_format_fail_step": 18,
+    "total_steps": 20,
+    "env_steps": 17
+  }
+]

@@ -1,0 +1,294 @@
+{
+  "task_id": "train/pick_and_place_simple-CreditCard-None-Sofa-207/trial_T20190908_050901_604144",
+  "split": "train",
+  "validate": false,
+  "global_step": 1,
+  "outcome": "SUCCESS",
+  "won": true,
+  "env_steps": 23,
+  "assistant_turns": 23,
+  "invalid_format": 0,
+  "truncated": false,
+  "steering": {
+    "doc_missing": 0,
+    "doc_overflow": 0,
+    "steer_arm": 0,
+    "steer_d": [],
+    "steer_base_open": [],
+    "steer_cap_active": [],
+    "steer_budget_after": [],
+    "steer_budget_spent": 0.0,
+    "steer_turns_capped": 0,
+    "steer_count": 0,
+    "steer_record_rows": 0,
+    "steer_reject_count": 0,
+    "steer_d_hist_max": 6.25,
+    "steer_d_hist_bins": 2048,
+    "steer_d_count": 0,
+    "steer_d_mean": 0.0,
+    "steer_n_candidates": 0,
+    "steer_n_base_open": 0,
+    "steer_n_probe_flipped": 0,
+    "steer_n_budget_blocked": 0,
+    "steer_n_bypassed": 0,
+    "steer_n_pacing_wait": 0,
+    "steer_n_gate_bypassed": 0,
+    "steer_n_pt_window_miss": 0,
+    "steer_ell_count": 0,
+    "steer_cand_positions": [],
+    "steer_d_all": [],
+    "steer_ent_count": 0,
+    "steer_ent_hist_bins": 1024,
+    "steer_ent_hist_max": 8.0,
+    "steer_intensity_mean": 0.0,
+    "steer_entropy_mean": 0.0,
+    "steer_gate_open_rate": 0.0,
+    "steer_w_beh_mode": "off",
+    "steer_w_beh_gamma": 0.1,
+    "steer_log_ratio_cap": 2.5,
+    "steer_theta_d": 0.0,
+    "steer_entropy_theta": 0.0
+  },
+  "research": {
+    "research_error": 0,
+    "research_experiments": 4,
+    "research_episodes": 8,
+    "research_turns": 7,
+    "research_final_success": 0.0,
+    "research_doc_words": 840,
+    "research_doc_missing": 0,
+    "research_policy_version": 0,
+    "research_archive": "research/train__pick_and_place_simple-CreditCard-None-Sofa-207__trial_T20190908_050901_604144--27cdc05068/20260808_032235_v0"
+  },
+  "policy_version": {
+    "min_global_steps": 0,
+    "max_global_steps": 0
+  },
+  "trajectory": {
+    "episode_id": "student",
+    "task_id": "train/pick_and_place_simple-CreditCard-None-Sofa-207/trial_T20190908_050901_604144",
+    "guidance_hash": "bare",
+    "sample_idx": 0,
+    "initial_obs": "-= Welcome to TextWorld, ALFRED! =-\n\nYou are in the middle of a room. Looking quickly around you, you see a armchair 2, a armchair 1, a coffeetable 2, a coffeetable 1, a garbagecan 1, a shelf 8, a shelf 7, a shelf 6, a shelf 5, a shelf 4, a shelf 3, a shelf 2, a shelf 1, a sofa 1, and a tvstand 1.\n\nYour task is to: put a creditcard in sofa.",
+    "steps": [
+      {
+        "t": 1,
+        "thought": "I need to find a creditcard and put it in the sofa. First, I should look around to see what objects are in the room and where they are located. Since I'm already looking at the general list, I should examine specific areas or objects that might contain a creditcard, like tables, shelves, or the floor.",
+        "action_raw": "look at armchair 1",
+        "action_norm": "look at armchair 1",
+        "observation": "Nothing happens.",
+        "valid": false,
+        "acted": true
+      },
+      {
+        "t": 2,
+        "thought": "The command \"look at coffeetable 1\" didn't produce visible output in the logs, but I need to continue searching for a creditcard. I should explore other areas like the tvstand or shelves which are common places to find small items like creditcards.",
+        "action_raw": "look at tvstand 1",
+        "action_norm": "look at tvstand 1",
+        "observation": "Nothing happens.",
+        "valid": false,
+        "acted": true
+      },
+      {
+        "t": 3,
+        "thought": "The command \"look at tvstand 1\" returned nothing. I need to try other locations. Since I haven't found a creditcard yet, I should check the shelves or other surfaces where items might be placed. Let me try looking at shelf 1.",
+        "action_raw": "look at shelf 1",
+        "action_norm": "look at shelf 1",
+        "observation": "Nothing happens.",
+        "valid": false,
+        "acted": true
+      },
+      {
+        "t": 4,
+        "thought": "The command \"look at shelf 1\" returned nothing. I need to try a different approach. Perhaps I should use the \"examine\" command on objects or look at other areas. Let me try examining the sofa first to see if there's anything inside or on it, or if the command works differently.",
+        "action_raw": "examine sofa 1",
+        "action_norm": "examine sofa 1",
+        "observation": "Nothing happens.",
+        "valid": false,
+        "acted": true
+      },
+      {
+        "t": 5,
+        "thought": "The \"examine sofa 1\" command did not produce any result. I am stuck without finding a creditcard. Let me try a different strategy: maybe I need to look around more broadly using the \"look\" command again, or try visiting different locations systematically. Let me try looking at the garbagecan, which sometimes has items thrown in it.",
+        "action_raw": "look at garbagecan 1",
+        "action_norm": "look at garbagecan 1",
+        "observation": "Nothing happens.",
+        "valid": false,
+        "acted": true
+      },
+      {
+        "t": 6,
+        "thought": "The \"look at garbagecan 1\" command did not return any results. I seem to be hitting limitations with the \"look at\" or \"examine\" commands on specific objects. Let me try a different approach: I'll try to move to different locations and use the general \"look\" command from there, as that seems to work. First, let me try to move to the sofa since that's where I eventually need to put the creditcard.",
+        "action_raw": "go to sofa 1",
+        "action_norm": "go to sofa 1",
+        "observation": "You arrive at sofa 1. On the sofa 1, you see a pillow 2, and a pillow 1.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 7,
+        "thought": "I successfully moved to the sofa 1. On the sofa, I see there are two pillows (pillow 1 and pillow 2), but no creditcard here yet. I need to find a creditcard first. Let me try looking around more carefully or checking other locations. Maybe I should go back to a common place where items like creditcards might be found, such as a table or shelf, and then look more thoroughly there.",
+        "action_raw": "look",
+        "action_norm": "look",
+        "observation": "You are facing the sofa 1. Next to it, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 8,
+        "thought": "I am now at the sofa 1. Nothing is visible next to it. I need to find a creditcard to put inside the sofa. Since I can't see any creditcard around here, I should go back to other locations where it might be, such as a table, shelf, or elsewhere in the room. Let me try moving to a different location first, maybe the tvstand 1 since smaller items often end up there.",
+        "action_raw": "go to tvstand 1",
+        "action_norm": "go to tvstand 1",
+        "observation": "You arrive at tvstand 1. On the tvstand 1, you see a remotecontrol 1, a statue 1, a television 1, a vase 1, a watch 2, and a watch 1.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 9,
+        "thought": "The \"look at television 1\" command didn't return any information about a creditcard. I need to continue searching. Let me check other areas in the room. The room description mentioned several shelves. Let me try to go to one of the shelves to see if a creditcard might be there.",
+        "action_raw": "go to shelf 1",
+        "action_norm": "go to shelf 1",
+        "observation": "You arrive at shelf 1. On the shelf 1, you see a vase 2.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 10,
+        "thought": "I am at shelf 1 and see only a vase 2 here. No creditcard. Let me continue searching. I should check the other shelves (shelf 2 through shelf 8) since creditcards might be stored somewhere. Let me go to shelf 2.",
+        "action_raw": "go to shelf 2",
+        "action_norm": "go to shelf 2",
+        "observation": "You arrive at shelf 2. On the shelf 2, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 11,
+        "thought": "I am at shelf 2 and see nothing. Let me continue searching through the other shelves. I'll go to shelf 3 next.",
+        "action_raw": "go to shelf 3",
+        "action_norm": "go to shelf 3",
+        "observation": "You arrive at shelf 3. On the shelf 3, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 12,
+        "thought": "I am at shelf 3 and see nothing. Let me continue searching through the other shelves. I'll go to shelf 4 next.",
+        "action_raw": "go to shelf 4",
+        "action_norm": "go to shelf 4",
+        "observation": "You arrive at shelf 4. On the shelf 4, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 13,
+        "thought": "I am at shelf 4 and see nothing. Let me continue searching through the other shelves. I'll go to shelf 5 next.",
+        "action_raw": "go to shelf 5",
+        "action_norm": "go to shelf 5",
+        "observation": "You arrive at shelf 5. On the shelf 5, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 14,
+        "thought": "I am at shelf 6 and see nothing. Let me continue searching through the other shelves. I'll go to shelf 7 next.",
+        "action_raw": "go to shelf 7",
+        "action_norm": "go to shelf 7",
+        "observation": "You arrive at shelf 7. On the shelf 7, you see a vase 3.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 15,
+        "thought": "I am at armchair 1. I need to see what is here and check the surroundings. Let me look around this area to find the creditcard.",
+        "action_raw": "look",
+        "action_norm": "look",
+        "observation": "You are facing the shelf 7. Next to it, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 16,
+        "thought": "The \"go to armchair 1\" command may have positioned me incorrectly, and the \"look\" command showed me from shelf 7's perspective. I should clarify my exact location and then systematically check each armchair and coffeetable. Let me try to explicitly move to and examine armchair 1 again with a \"take\" or \"look at\" command after confirming its location.",
+        "action_raw": "look at armchair 1",
+        "action_norm": "look at armchair 1",
+        "observation": "Nothing happens.",
+        "valid": false,
+        "acted": true
+      },
+      {
+        "t": 17,
+        "thought": "The \"look at armchair 1\" command returned nothing. It seems \"look at\" may not be a valid command for this environment. Let me try to use \"examine\" or simply move to the armchair and then use \"look\" from there. First, let me try to move to armchair 1 using \"go to\" again, as that seemed to work for other locations, and then look from there.",
+        "action_raw": "go to armchair 1",
+        "action_norm": "go to armchair 1",
+        "observation": "You arrive at armchair 1. On the armchair 1, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 18,
+        "thought": "I am at armchair 1 and see nothing. Let me try armchair 2 next.",
+        "action_raw": "go to armchair 2",
+        "action_norm": "go to armchair 2",
+        "observation": "You arrive at armchair 2. On the armchair 2, you see nothing.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 19,
+        "thought": "I am at armchair 2 and see nothing. Let me try the coffeetables next. I'll go to coffeetable 1 first.",
+        "action_raw": "go to coffeetable 1",
+        "action_norm": "go to coffeetable 1",
+        "observation": "You arrive at coffeetable 1. On the coffeetable 1, you see a houseplant 1, and a statue 2.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 20,
+        "thought": "I am at coffeetable 1 and see a houseplant 1 and a statue 2, but no creditcard. Let me try coffeetable 2 next.",
+        "action_raw": "go to coffeetable 2",
+        "action_norm": "go to coffeetable 2",
+        "observation": "You arrive at coffeetable 2. On the coffeetable 2, you see a box 1, a creditcard 1, a keychain 2, and a laptop 1.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 21,
+        "thought": "I have successfully located creditcard 1 on coffeetable 2. Now I need to take it and put it in the sofa. First, I'll take the creditcard from coffeetable 2.",
+        "action_raw": "take creditcard 1 from coffeetable 2",
+        "action_norm": "take creditcard 1 from coffeetable 2",
+        "observation": "You pick up the creditcard 1 from the coffeetable 2.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 22,
+        "thought": "I have successfully picked up creditcard 1. Now I need to put it in the sofa. I should move to the sofa 1 and then place the creditcard there.",
+        "action_raw": "go to sofa 1",
+        "action_norm": "go to sofa 1",
+        "observation": "You arrive at sofa 1. On the sofa 1, you see a pillow 2, and a pillow 1.",
+        "valid": true,
+        "acted": true
+      },
+      {
+        "t": 23,
+        "thought": "I am at the sofa 1. I have the creditcard 1 in my inventory. Now I need to put (move) the creditcard into/on the sofa. I will use the \"move (object) to (receptacle)\" command to place the creditcard in the sofa.",
+        "action_raw": "move creditcard 1 to sofa 1",
+        "action_norm": "move creditcard 1 to sofa 1",
+        "observation": "You move the creditcard 1 to the sofa 1.",
+        "valid": true,
+        "acted": true
+      }
+    ],
+    "outcome": "SUCCESS",
+    "won": true,
+    "score": 1.0,
+    "error": null,
+    "meta": {
+      "wall_s": 374.31,
+      "guidance_chars": 0
+    }
+  },
+  "response_token_len": 25003,
+  "response_token_hash": 7055772427063058009,
+  "ts": 1786130930.4774332
+}

@@ -2020,3 +2020,1135 @@ schema / policy 版本证据 / 一致性哨兵全零)。我把 `research_doc_ove
 被 bool 过滤器吃掉 ⇒ 锯齿 ⇒ IndexError)。若把"批内 schema 恒齐"做成**双向**
 的显式契约(两类行各自补齐对方的键集),这两个问题会一起消失,
 且 `compute_rollout_extra_metrics` 也不再需要靠前缀猜口径。
+
+---
+
+## 2026-08-07 · [★★ 实证] researcher 预算 16/4/8→8/2/4 的真实代价:文档实证强度 −22pp,而形式质检查不出来
+
+**结论先行**:`k_default` 这个参数**根本没在起作用**;`n_exp: 8` 成了绑定约束;
+降预算省下 32% 的 episode,代价是 guidance 的实证成功率从 **87.5% 掉到 65.2%** ——
+而文档词数与四项形式质检**完全持平**,查不出这个降级。已按用户裁定提回
+`n_exp: 12 / k_default: 4 / k_max: 4`。
+
+**同 step1、同原始 4B 基座的受控对照**(脚本 `researcher_quality.py`,
+第三参数按 `meta.json` 的 `global_step` 对齐,跨步混合会被后期更强的 policy 稀释):
+
+| 指标 | s3(16/4/8) | v33 第一版(8/2/4) | 变化 |
+|---|---|---|---|
+| episode 合计 | 740 | **506** | −32%(省下的墙钟) |
+| 实验次数中位 | 10.5(max 16) | 8.0(max 8) | −24% |
+| **episode/实验** | **4.00** | **3.98** | **没变** |
+| 全部实验成功率 | 65.0% | 55.3% | −9.7pp |
+| 会话内 前半→后半 | 43.9% → **86.3%** | 43.6% → **69.1%** | 起点同,**终点 −17.2pp** |
+| **最后一次实验成功率** | **87.5%**(56/64) | **65.2%**(43/66) | **−22.3pp** |
+| 文档词数中位 | 1160 | 1129 | 持平 |
+| 形式质检(动作词/实例名/引用证据/markdown) | 16/16 全中 | 17/17 全中 | **持平** |
+
+**三个发现**
+
+**① `k_default` 不生效 —— 两边 episode/实验都是 4.00。**
+`tools.py:144` 是 `k_req = args.get("k", cfg.k_default)`,模型在 `run_experiment`
+里**显式填 k**,`k_default` 只是它不填时的兜底。实测 35B 稳定填 4。
+真正起作用的是 `k_max`(8→4 把上限压住)与 `n_exp`。
+⇒ 我此前"k_default 4→2 直接把 episode 数减半"的推断**是错的**,已作废。
+
+**② `n_exp: 8` 是绑定约束,不是宽松上限。** 实验次数分布:
+
+- s3(上限 16):`{5:1, 8:1, 9:3, 10:3, 11:1, 12:1, 14:1, 15:2, 16:3}` 中位 10.5,自然分散
+- v33(上限 8):`{5:2, 7:3, **8:12**}` —— **12/17 顶到上限**
+
+researcher 还想继续做实验但被截断。s3 的分布说明其自然收敛点在 **10–12 次**。
+
+**③ 形式质检查不出实证强度的下降 —— 这条最值得 CD-010 注意。**
+两版文档的词数、结构、实例名、证据引用四项**完全一样好**,但背后验证过的成功率
+差 22pp。若用"文档是否规范/具体"这类形式指标做 doc 质量门,会把一份实证不足的
+文档判为合格。**doc 质量的可信读数只能是"它指导下的 episode 成功率"**
+(与 [[doc-quality-three-metrics]] 记录的"三个不等价口径"同源)。
+
+**顺带确立的一个正面事实**:35B researcher 的 guidance 极其有效 ——
+bare policy 在 val 上 **0.0%**、训练 rollout 上 0.78%,而带 guidance 的实验 episode
+达 **55.3%(最后一次 65.2%)**。抽到的文档自带对照:
+> "In bare runs, **0/4 episodes succeeded**. With clear step-by-step guidance…,
+> **4/4 episodes succeed**."
+
+文档内容是真知识而非套话,含负面知识(`put`/`place`/`drop` 非法、只有 `move` 有效)
+和从实验中发现的硬约束(`move` 只在站到目标 receptacle 时才生效)。
+**这为 PGS 确立了教师增益的空间上限:原始 4B 不是不会做,是不知道怎么做。**
+
+**一个 API 侧的观察(仅供参考)**:`n_exp` 与 `k_default` **进 objective_fingerprint**
+(实测 8/2/4 → 12/4/4 时指纹 `ab7b59c6232a` → `658e0c93598f`),而
+`rollout_gpu_mem` / `rollout_max_num_batched_tokens` **不进**(受控回退验证过)。
+这个划分是合理的(前者影响文档质量即优化目标,后者纯执行档),记在这里备查。
+
+---
+
+## 2026-08-07 · [★★ P1 已修] 工具 schema 硬编码 "default 4",使 `research.k_default` 完全失效
+
+**症状**:把 `research.k_default` 从 4 改到 2 之后,**episode/实验 仍恒为 4.00**
+—— s3(k_default=4)与 v33(k_default=2)两个 run 逐位一致。该配置项对行为零影响,
+"降 k 省一半 episode"的预期收益一次也没兑现。
+
+**根因**:`research/prompts.py` 的 `TOOL_SCHEMAS` 里,`run_experiment.k` 的描述
+硬编码了默认值:
+
+```python
+"k": {"type": "integer",
+      "description": "Number of parallel episodes (default 4)."},   # ← 写死
+```
+
+这段描述**原样发给模型**(fncall 直接给 tools,text 协议由
+`toolproto._TEXT_TOOLS_TEMPLATE` 把 schema JSON 塞进 system prompt)。
+模型把它当权威,于是**每次都显式填 `k: 4`**。而 `tools.py:144` 是
+
+```python
+k_req = args.get("k", cfg.k_default)     # 显式填了 ⇒ 永远取不到 cfg.k_default
+k_clamped = max(1, min(k, cfg.k_max))    # 只有 k_max 的 clamp 真正生效
+```
+
+⇒ **`k_default` 是一个"看起来能调、实际调不动"的参数**,只有 `k_max` 有效。
+这类"配置与 prompt 各说各话"的失效很隐蔽:配置文件、manifest、effective_config
+三层全都显示 `k_default: 2`,只有看 rollout 产物的 episode/实验比才发现是 4。
+(与 [[param-truth-fourth-layer]] 记的"语义层"同类:三层全对行为仍可错。)
+
+**已修**:新增 `prompts.tool_schemas_for(cfg)` —— 深拷贝 `TOOL_SCHEMAS` 并按
+运行配置改写 k 的描述;`TOOL_SCHEMAS` 里的兜底文案去掉数字。
+`session.py` 改用 `tool_schemas_for(router.cfg)`(router.cfg 就是 ResearchCfg)。
+
+实际注入效果(cfg 为 2/4):
+```
+'Number of parallel episodes (default 2, maximum 4). Prefer the default
+ unless you have a specific reason to spend more of your episode budget.'
+```
+
+新增 `tests/test_tool_schema_k_follows_config.py` 5 项:描述带上配置值、
+换配置能跟随、模块常量不得再含写死的默认值、必须深拷贝(就地改会污染同进程
+后续会话)、其余工具不受影响。本地全量 **380 passed**。
+
+**建议(仅供参考)**:同类风险还在别处 —— `RESEARCHER_SYSTEM_TEMPLATE` 里
+`{n_exp}` 是模板变量(正确),但工具描述这一路没有走同样的注入。若 CD-010 之后
+再加"有配置对应项"的工具参数,建议一律走 `tool_schemas_for` 而不是写字面量。
+
+---
+
+## 2026-08-07 · [★ 方法论更正] 我用单点最高值当基准,误判了 researcher 降预算的代价
+
+**先撤回**:上一条 `[★★ 实证] researcher 预算 16/4/8→8/2/4 的真实代价` 里
+"文档实证强度 −22pp"的结论**不成立**。
+
+我拿 s3 的 **step1(87.5%)** 作基准,但那是 s3 自身 8 个采样点里的**最高值**:
+
+| s3 step | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 10 |
+|---|---|---|---|---|---|---|---|---|
+| 最后一次实验成功率 | **87.5%** | 75.0% | 73.4% | **65.6%** | 70.3% | 75.0% | 81.2% | 71.9% |
+| 全部实验成功率 | 65.0% | 38.9% | 54.7% | 57.5% | 45.9% | 53.4% | 48.4% | 50.1% |
+
+s3 自己的范围是 **65.6%–87.5%**(均值 ~75%),而 v33 的 65.2%(n_exp8)/
+65.6%(n_exp12)**全在范围内**;v33 的"全部实验成功率"55.3%/58.4% 甚至
+**高于** s3 的均值 51.7%。
+
+**而代价是实打实的**:n_exp 8→12 使 `timing_s/step` 从 **843s 涨到 1337s(+58%)**,
+358 步从 3.5 天变 5.5 天,换来的质量差异在噪声内。故用户裁定定回 8/2/4。
+
+**教训**:比较两个配置前,必须先测**被比较对象自身的波动范围**;单个采样点
+(尤其恰好是极值)不能当基准。这与 [[training-rollout-cannot-judge-improvement]]
+是同一类错误的不同表现 —— 那条讲的是"逐步曲线判不了改善",这条是
+"单点基准判不了差异"。
+
+---
+
+## 2026-08-08 · [★★ P0 环境] Qwen3.5-9B 在 A800 起 SGLang 0.5.10,`qwen35-9b-env-plan.md` 漏了两层编译前置
+
+**结论先行**:按 plan 装完 0.5.10 后,单卡 serve **连续崩两次**,都不是 plan 覆盖的
+版本/依赖问题,而是**编译工具链前置**。两条都已修复并写进
+`TRACE-OPD-Q35/env_q35_a800.sh`(新建的 q35 专用入口,不动生产入口)。
+现单卡 serve 稳定 60s 就绪,门 1/2/3 全 PASS。
+
+### 崩溃 1:triton JIT 拿不到 ptxas
+
+不 source 环境入口直接 `python -m sglang.launch_server`,
+`TRITON_PTXAS_PATH`/`CUDA_HOME` 全为空,
+`create_flashinfer_kv_indices_triton` 编译时报
+`TypeError: expected str, bytes or os.PathLike object, not NoneType`。
+——这条是**我方操作失误**(记忆里已有"A800 起服务必须走 env.sh"),记此备查。
+
+### 崩溃 2(★ plan 未覆盖):flashinfer 0.6.7 的 ninja JIT 缺 `cublasLt.h`
+
+```
+flashinfer/trtllm/common/cudaUtils.h:25:10: fatal error: cublasLt.h: No such file or directory
+```
+`$VENV/targets/x86_64-linux/include` 里**没有** cublasLt.h,生产环境
+`env_sglang_train` 同样没有 —— 0.5.8/flashinfer 0.6.1 从不编这个 op 所以没暴露。
+全机唯一一份在 `TRACE-OPD/venv_sglang/lib/python3.12/site-packages/nvidia/cublas/include/`。
+**修复**:入口里只读引用该 donor 的 16 个 `nvidia/*/include`(不装包、不改 donor 环境)。
+
+### 崩溃 3(★★ plan 未覆盖,最隐蔽):0.5.10 的 tvm-ffi JIT 要 **C++20**
+
+```
+nvcc warning : The -std=c++20 flag is not supported with the configured host compiler. Flag will be ignored.
+sglang/jit_kernel/include/sgl_kernel/source_location.h:8:10: fatal error: version
+```
+A800 系统 gcc 是 **8.5.0**,无 `<version>` 头。nvcc **静默**把 `-std=c++20` 降回 c++17
+再报缺头,`clamp_position` kernel 编译失败 → `SIGQUIT received. It usually means one child failed`
+→ 整个 Scheduler 死。**症状伪装成"服务起不来"**,真因在编译器版本。
+
+注意其中一个同类错误(`kvcache` kernel)只是 `Failed to load JIT KV-Cache kernel` 的
+**降级 fallback,不致命**;而 `clamp_position` 致命。同一个根因,一个降级一个致命,
+只看"服务起没起来"会误判成偶发。
+
+**修复**:用 q35 环境**自带**的 conda-forge `x86_64-conda-linux-gnu-g++ 14.3.0` 作
+nvcc host 编译器(`CXX`/`CC`/`NVCC_PREPEND_FLAGS="-ccbin ..."`)。
+系统另有 `/opt/rh/gcc-toolset-13` 也可用,但环境自带的更符合"GPU 栈以 conda-forge 为底"。
+
+**给 plan 的建议**:门 0 应加一条编译前置自检 ——
+`nvcc -std=c++20 -c` 编一个含 `#include <version>` + `#include <cublasLt.h>` 的样例,
+过了再进门 1。这比装完再崩省一轮。
+
+---
+
+## 2026-08-08 · [P1 工具] `q35_gate1.py` 的 `_launch_subprocesses` 检查是假阳性
+
+门 1 报 `FAIL: sglang import 面断 1/16:
+['sglang.srt.entrypoints.http_server._launch_subprocesses']`。
+
+**实际不是断点**。0.5.10 把它从模块级函数移入 `Engine` 类(`engine.py:619 @classmethod`),
+而 **verl 0.9.0.dev0 早就按版本分支处理了**:
+
+```python
+# verl/workers/rollout/sglang_rollout/async_sglang_server.py:407
+# For SGLang main branch or version >= 0.5.10
+if version.parse(sglang.__version__) >= version.parse("0.5.10"):
+    from sglang.srt.entrypoints.http_server import Engine
+    ... = Engine._launch_subprocesses(server_args=..., init_tokenizer_manager_func=..., ...)
+```
+实测:classmethod 存在、verl 传的 4 个关键字参数**全部支持**、
+`engine.{init_tokenizer_manager,run_scheduler_process,run_detokenizer_process,_set_envs_and_config}` 全在。
+
+**建议**:该符号的检查改成版本条件式 —— `>=0.5.10` 查 `Engine._launch_subprocesses`
+且校验签名,`<0.5.10` 才查 `http_server._launch_subprocesses`。否则每次都会报一个假 FAIL,
+消耗判读注意力(且有把真 FAIL 淹没的风险)。
+
+---
+
+## 2026-08-08 · [★ P1 工具] `sgl_probe_q35.py` 的 thinking 判据漏了最有效的一维
+
+探针输出 `VERDICT: INFO — 两档均无 thinking(模型可能无 thinking 模式,或 kwarg 被静默忽略)`。
+**这个判读不成立**。同一问题("9.11 和 9.9 哪个大")三档实测:
+
+| 档 | 输出长度 | 开头 |
+|---|---|---|
+| default | 1361 | `Thinking Process:\n\n1. **Analyze the Request:**...` |
+| **think_off** | **13** | `9.11 比 9.9 大。` |
+| think_on | 1361 | 同 default |
+
+`enable_thinking=False` **确实生效,差 100 倍**。探针误判的原因:它只检查
+`<think>` 标签与 `reasoning_content` 字段,而 **Qwen3.5 把思考以纯文本
+`Thinking Process:` 写进 content**,两个判据都不命中。
+
+**建议**:thinking 判据加"三档输出长度比"这一维 —— off/default 长度比 <0.3
+即可判定 kwarg 生效,不依赖模型用哪种标记形式。
+
+(附:non-thinking 下模型答错了这道经典陷阱题(9.9>9.11)。对 ALFWorld agentic 任务
+的影响待 smoke 观察,此处只记读数不外推。)
+
+---
+
+## 2026-08-08 · [INFO 实测] Qwen3.5-9B 的三个架构成本读数(实机)
+
+1. **KV = 32 KB/token**(非 16)。实机反算:`KV Cache #tokens: 771195, K 11.77GB + V 11.77GB`
+   → 23.54GB/771195 = 32.0 KB/token。来源是 8 个 full_attention 层
+   (`layer_types` 实测 `{linear_attention: 24, full_attention: 8}`)×4 kv_heads×256 head_dim×2B×2。
+   对比 Qwen3-4B 的 144 KB/token,**同显存下 token 容量约 4.5×**。
+2. **tail/full 耗时比 0.189**,而 162 全注意力语境实测 **0.024**。
+   线性注意力下 tail 复用的收益差约 8 倍 —— SPS 的成本账要按这个重算,
+   不能沿用全注意力的经验值。
+3. radix 增量(共享前缀+新尾段)0.294s,介于 tail 重复 0.157s 与 full 冷 0.830s 之间,
+   说明 mamba 层对 logprobs **有部分复用但不完全**。
+
+单卡 80GB / mem-fraction 0.80 / ctx 32768 实测:权重 17.62GB,KV 23.54GB(771195 tokens),
+cuda graph 0.44GB,就绪 60s。
+
+---
+
+## 2026-08-08 · [★ P0 bug] `launch_train.py` 的 fused_kernels override 用了单 `+`,启动即崩
+
+**结论先行**:`use_fused_kernels` 这段新代码把 hydra override 写成
+`+actor_rollout_ref.model.fused_kernel_options.impl_backend=torch`,
+而该键**在 verl 默认配置里已存在**,单 `+`(append-only)会抛:
+
+```
+hydra.errors.ConfigCompositionException: Could not append to config.
+An item is already at 'actor_rollout_ref.model.fused_kernel_options.impl_backend'.
+```
+
+9B 冒烟因此**秒崩在 hydra 组装阶段**,连 Ray 都没起。已改为 `++`(覆盖或添加)
+并加注释说明原因;改后 dry-run 复验 `++...impl_backend=torch` 正常,
+objective fingerprint `f3c767801c30` 不变(fused_kernels 是执行档,不进指纹,符合设计)。
+
+**为什么之前没暴露**:V33 树没有这段代码(`use_fused_kernels`/`fused_kernels_backend`
+是本地新增,`config.py` 与 `launch_train.py` 两处),9B 是**第一个真正开这个开关的档**。
+
+**建议**:`launch_train.py` 里所有 `+xxx=` 形式的 override 值得过一遍 ——
+凡是 verl 默认配置里已有的键都应该用 `++`。单 `+` 只在确认是全新键时才安全,
+而"是不是全新键"随 verl 版本变化,`++` 在两种情况下都对,没有下行风险。
+
+---
+
+## 2026-08-08 · [INFO] 9B 的 SP 档由实测激活曲线定为 4(用户裁定)
+
+单卡实测(B=1、梯度检查点开、flash_attention_2):
+
+| 每卡 tokens | 净激活 | logits 张量 |
+|---|---|---|
+| 2048 | 1.0 GiB | 0.95 |
+| 4096 | 2.0 GiB | 1.89 |
+| **8704** | **14.0 GiB** | 4.03 |
+| 17408 | 单卡 OOM | 8.06 |
+
+4096→8704 是 **7 倍非线性跳增**,故不在该曲线上外推。`max_token_len_per_gpu=34816`
+下 SP=4 每卡 8704 tokens 正好落在**实测**档;SP=2 的 17408 只能外推,不采信。
+
+补充:实际启动命令里 `param_offload=True` + `optimizer_offload=True`,
+参数与 Adam 状态都 offload 到 CPU,所以 GPU 静态开销比按 FSDP 分片估的
+16.7 GiB **更低**,SP=4 余量比表上还大。
+
+另:9B 稳态训练吞吐实测 **2799 tok/s/GPU @seq2048、2893 @seq4096**,
+对理论下限(6·N·T / 200 TFLOPS)的效率 **75%–77%**。首次 triton JIT 编译
+额外 +1.7s(seq2048) / +13.0s(seq4096),只在首步付 —— 不要把首步墙钟当稳态。
+
+---
+
+## 2026-08-08 · [★★ P0 实证] 9B 首个 step 的四组读数:截断 68%、门开启率越界、显存崩溃形态
+
+数据源:`TRACE-OPD-Q35/runs/q35_9b_formal.gpumem065.crash/rollouts/step_00001`
+(217 行,step1 跑到 85% 时因显存崩,产物完整可用)。
+
+### ① 显存崩溃:不走标准 OOM 路径,`ALERT` 正则会漏
+
+`rollout_gpu_mem=0.65` 下显存峰值 **79725/81920 = 97.3%**,崩在
+`hook.py:459 _verify_rows` —— teacher verify 要在 rollout engine 之外再做一轮前向。
+**日志里没有 `CUDA out of memory`**,而是:
+```
+c10::cuda::MemPool::~MemPool()
+Fatal Python error: Aborted
+Subprocess scheduler_0 crashed with exit code -6   ← SIGABRT
+```
+**建议**:任何 OOM 监控的正则都要含 `MemPool|exit code -6|Fatal Python error: Aborted|
+EngineDeadError|crashed with exit code`,只匹配 "CUDA out of memory" 会漏掉这一整类。
+已降到 0.55(显存 60603→47131 MiB/卡)。
+
+### ② 截断率 68%/73%(★ 最影响结论的一条)
+
+| 臂 | won | respLen 中位 | **截断率** | n |
+|---|---|---|---|---|
+| bare | 3.1% | 20187 | **68.0%** | 128 |
+| steered | 2.2% | 16956 | **73.0%** | 89 |
+
+`response_length=32768` 下仍有近七成轨迹撞上限。按 [[truncation-masks-capability]]
+的实证(「赢&截断」恒为 0),**最多只有 32% 的轨迹有机会赢,当前 won 读数不可信**。
+这属于"影响效果的限制",已报用户裁定,未擅自改。
+
+### ③ `gate_open_rate` 中位 30.3%,越出 `gate_rate_bounds` 上界
+
+目标 `gate_target_rate=0.10`、允许区间 `[0.05, 0.25]`,实测**中位 30.3%、max 67.2%、
+min 0.0%**。自适应门没收敛回目标带。9B 的截断熵分布(top-16 口径,全生成位无偏,
+累计 1,352,482 个观测位):
+
+| P25 | P50 | P75 | P90 | P95 | P99 |
+|---|---|---|---|---|---|
+| 0.0039 | 0.0039 | 0.1211 | 0.6992 | **1.0586** | 1.6914 |
+
+对照 4B P95=1.276、1.7B P95=0.043。**9B 的 P95 与 4B 只差 17%,但分布形状极度右偏
+——中位数仅 0.0039,一半以上位置熵接近零**。`entropy_theta_init=1.28` 这个 4B 占位值
+在 9B 上不是"太高导致门关死",而是配合自适应机制后**开得过多**。若要收敛回 10%,
+方向是调 `gate_ema_beta`/`gate_rate_bounds` 或直接下调 theta,但都会动 fingerprint,
+待用户裁定。
+
+### ④ 已排除的两个虚警(记此避免他人重踩)
+
+- **`guidance_hash` 217 行全等于 bare 空值 hash —— 这是正确设计**,不是文档没注入。
+  `agent_loop.py:1036/1059` 两臂 episode 都传 `guidance=""`;文档只用于
+  `agent_loop.py:407-417` 构造 **teacher 的特权前缀**。学生永远看 bare 上下文,
+  只有采样分布被倾斜 —— 这正是信息状态一致性的要求。
+- **researcher 链路正常**:`research_experiments=8`、`research_episodes=16`
+  (=8×k2)、`research_doc_words` 中位 1168(840–1482)、16/16 任务都产出了文档。
+  文档质量实查很好(含可执行命令序列 + 4 类失效模式,其中"`none`×20 循环"这种
+  带具体计数的观察说明确实读了轨迹)。
+
+### ⑤ 方法论自省(给后续分析者)
+
+我在这批数据上**连续四次误判**,全部源于**猜字段名而非先 dump schema**:
+把 `steer_n_tilted`(不存在)当干预计数→误判"覆盖率 0%、机制没跑";
+在不存 prompt 的 json 里查 prompt→误判"文档没注入";
+用 `doc_digest`/`doc_hash`(不存在)→误判"0 种文档指纹"。
+**正确字段**:干预看 `steer_gate_open_rate`/`steer_n_base_open`/`steer_n_candidates`,
+文档看 `research_doc_words`/`research_doc_missing`/`trajectory.guidance_hash`。
+教训:分析新 run 的第一步永远是打印一条样本的完整 schema,不要凭其他 run 的经验猜。
+
+---
+
+## 2026-08-08 · [★★★ P0] 9B 上 145/217 轨迹 outcome=`DEGENERATE:format`,现场移交
+
+**这条只报现场与数据,不下判断,请 CD-010 分析。**
+
+数据源:`TRACE-OPD-Q35/runs/q35_9b_formal.gpumem065.crash/rollouts/step_00001`(217 行,
+step1 跑到 85% 时因显存崩,产物完整)。模型 = 原始 `Qwen/Qwen3.5-9B`(未经任何 SFT)。
+
+### 一、outcome 构成
+
+| truncated | outcome | 行数 |
+|---|---|---|
+| True | **DEGENERATE:format** | **145** |
+| False | FAILED | 59 |
+| True | FAILED | 7 |
+| False | SUCCESS | 6 |
+
+truncated 行中 `respLen >= 97%×32768` 的:**7/152 = 5%**。
+
+(注:我先前在本文件报过"截断率 68%,建议提 response_length"。按上表,truncated 中
+只有 5% 的 respLen 接近预算上限。`response_length` 32768→38912 的改动已按用户裁定落地。)
+
+### 二、首次格式失败位置分布(全部 145 条)
+
+```
+首次 acted=False 的 step:  中位 13   min 2   max 29
+  ≤ step  1:   0/145 =  0%
+  ≤ step  3:   6/145 =  4%
+  ≤ step  5:  17/145 = 12%
+  ≤ step 10:  53/145 = 37%
+  ≤ step 15:  81/145 = 56%
+轨迹总步数 中位 22    invalid_format 中位 4(max 10)
+```
+
+### 三、成功 / 失败轨迹的对照读数
+
+| | turns | invalid_format | respLen | 首次 acted=False |
+|---|---|---|---|---|
+| SUCCESS | 8 | 0 | 6063 | 无 |
+| DEGENERATE | 18 | 5 | 14827 | step 13 |
+
+### 四、失败时的模型输出原文
+
+同一条轨迹,step 12 与 step 13 相邻:
+
+```
+step 12 [acted=True]
+"I've been trying to complete this task for many turns but cannot find or obtain an
+alarmclock. The inventory is empty, and no location contains an alarmclock that I can
+access. ... Let me try one final approach - maybe I should just execute the move command
+one more time to see if it'll work this time."
+
+step 13 [acted=False]
+<reasoning>
+user
+assistant
+<think>
+
+</think>
+
+<
+
+</think>
+
+<reasoning>
+user
+assistant
+<think>
+user
+...(反复)
+```
+
+另一条轨迹的 step 26:
+```
+<reasoning>
+The "move alarmclock to
+user
+
+assistant
+<think>
+assistant
+<think>
+...(反复)
+```
+
+环境返回:
+```
+Nothing happens. (Your reply had no <action>...</action> block — respond with
+<reasoning>...</reasoning> then <action>one command</action>.)
+```
+
+另有部分 step `acted=True` 但 action 解析为空字符串,环境返回 `Nothing happens.`
+(不带格式提示)。见移交文件中 DEGENERATE 轨迹的 step 27 / 30。
+
+### 五、现场文件(可直接查看,无需连服务器)
+
+`trace_opd-pgs/analysis/q35-9b/trajectories/`
+- `DEGENERATE__*.txt` ×3 —— 逐 step 完整原文**不截断**,含 `acted=` 与环境返回
+- `SUCCESS__*.txt` ×2 / `FAILED__*.txt` ×1 —— 对照
+- `*.json` —— 同名精简 json(已去 token_ids 等大字段)
+- `_DEGENERATE_summary.json` —— 全部 145 条汇总(首次失败位置/轮数/invalid_format/respLen)
+
+分析脚本:`analysis/q35-9b/{export_traj,dump_traj,slow_diag,step1_accept,ent_calib_q35}.py`
+
+### 六、代码位置(省去重复定位;以下均为代码事实,非推断)
+
+- 终止判据:`core/episode.py:219-226` —— `consecutive_bad >= MAX_CONSECUTIVE_FORMAT_FAILURES`
+  时置 `truncated=True` + `outcome=DEGENERATE:format` + `error="no parseable action repeatedly"`
+- 协议常量:`core/protocol.py:46/50/54` —— `MAX_ASSISTANT_TURNS=40`、
+  `GEN_MAX_TOKENS_PER_TURN=2048`、`MAX_CONSECUTIVE_FORMAT_FAILURES=3`
+- `core/template_delta.py:33` —— `_CHAT_KWARGS = {"enable_thinking": False}`(硬编码)
+- `core/template_delta.py:113` —— 断言文案 `"glue does not start with a stop token"`
+- `train/backends.py` `EngineGenerate.__call__` —— 未见 `stop` 字段透传
+- `train/agent_loop.py:1023/1039/1062` —— `sampling_params` 的传入路径;
+  **grep 该文件未见 `"stop"` 键**
+
+### 七、可能相关的其它实测(仅列读数)
+
+- 门 2 单轮 thinking 三向对比(单轮短问答,非多轮会话):
+  default 输出 1361 字符 / `enable_thinking=false` **13 字符** / `enable_thinking=true` 1361 字符。
+- 本 run `model_path` = 原始 `Qwen/Qwen3.5-9B`,未经 SFT。
+- 熵门:`steer_gate_open_rate` 中位 30.3%(max 67.2%,目标 10%,bounds 上界 25%);
+  该统计的候选位包含上述格式失败段的生成位,未做分离。
+- researcher 侧:16/16 任务产出文档,`research_experiments=8`、`research_episodes=16`、
+  文档词数中位 1168。其失效模式章节原文含:
+  > "**Format errors (most common)** — Symptom: `Your reply had no <action>...</action>
+  > block`. Cause: The executor outputs reasoning text but omits or corrupts the
+  > `<action>` tags. This is the single most frequent failure mode."
+
+### 八、需要 CD-010 定夺的事
+
+现象与代码事实如上。是否与 stop token 透传、`enable_thinking` 在多轮下的作用范围、
+或格式冷启动有关,由 CD-010 判断。若需要我在 9B 上跑对照实验(如加 stop 的 A/B、
+不同 `MAX_ASSISTANT_TURNS` 下的 `invalid_format` 曲线、或换 SFT ckpt 的对照),告知即可。
+
+---
+
+## 2026-08-08 · [★★ 闭环] EOS 修复(b2f62e1)在 A800 实测生效,干净基线出炉
+
+修复已同步 A800(`template_delta.py`/`backends.py`/`sgl_probe_q35.py` 三文件逐字节对拍一致),
+`tests/test_engine_stop_tokens.py` + `test_backends_routing.py` 本地与 A800 各 8 passed。
+
+### 一、stop stage 验收(对 `--skip-tokenizer-init` 起服,与生产同构)
+
+```
+A(no stop_token_ids):        len=4  first_im_end=1  overrun=YES   ← 缺陷复现
+B(stop_token_ids=[248046]):  len=2  last=248046  im_start_inside=False  n_im_end=1  → PASS
+```
+
+### 二、修复前后对照(同配置、同模型,唯一差异是 stop_token_ids)
+
+| 指标 | 污染批次 | 修复后 |
+|---|---|---|
+| val won (valid_seen) | 0.746% / 0.0%(两次) | **30.71%** |
+| val won (valid_unseen) | — | **26.87%** |
+| `DEGENERATE:format` | 145/217 = 67% | **0/274** |
+| 截断率 | 68% / 73% | **0.0%** |
+| `invalid_format` 均值 | — | seen **0.0%** / unseen **1.5%** |
+| respLen 中位 | 18952 | **2370** |
+| 每轮 token 中位 | 800 | **88** |
+| val 墙钟 | 40+ 分钟 | **300s** |
+
+每轮 token 800→88 与"86.5% 垃圾"精确吻合(1−0.865=13.5%≈1/7.4)。
+
+### 三、9B raw 干净基线(未经任何 SFT)
+
+```
+valid_seen    n=140  won 30.71%  respLen中位 2281  turns中位 30  SUCCESS 43 / FAILED 97
+valid_unseen  n=134  won 26.87%  respLen中位 2489  turns中位 30  SUCCESS 36 / FAILED 98
+赢轨迹 n= 79  respLen中位 1625  turns中位 17
+输轨迹 n=195  respLen中位 2548  turns中位 30   ← 正好卡在 max_env_steps=30
+```
+
+供 CD-010 参考的两点(**只报读数,不做裁定**):
+1. 9B raw zero-shot 已有 30.7%/26.9%,对照 4B raw 0.73%、4B SFT 后 47.4%。
+   诊断文档里列的"假设 C:需要格式冷启动 SFT"在此读数下可重新评估。
+2. 输轨迹 turns 中位 = `max_env_steps` 上限(30),赢轨迹 17。失败主因已从格式退化
+   转为环境步数预算。是否调该预算属效果相关参数,未动,待裁定。
+
+### 四、我方已做的回滚
+
+`response_length` 38912 → **32768**、`eval.response_budget` 同步回滚。
+理由:该上调的依据("截断率 68%")属污染读数,按诊断文档"勿基于污染批次裁定下游问题"回滚。
+objective fingerprint 仍为 `f3c767801c30`。
+
+污染批次完整归档 `TRACE-OPD-Q35/runs/q35_9b_formal.noeos/`(日志 `.noeos.log`),未删除。
+
+---
+
+## 2026-08-08 · [★★★ 用户需求转达] 正式实验阶段的任务环境与协议 —— 见独立需求文档
+
+用户就**方案机制正式试验阶段**提出了成体系的需求,内容涉及 benchmark 选定、
+统一协议、已引入环境的改造与删除、以及未引入环境的引入流程。
+
+**需求全文见**:
+`docs/collab/cd010-cd006/requirements-formal-experiment-benchmarks.md`
+
+该文档为**用户需求的忠实转录**,不含 CD-006 的分析、建议或调研结论,请以其为准。
+提要(仅为索引,细节以需求文档为准):
+
+1. **选定 7 个任务环境**:ALFWorld、ScienceWorld、WebShop、SearchQA、SWE-bench、
+   SpreadsheetBench、TIR-Math。
+2. **统一采用 OpenAI 格式 Function Call**,且**在任务环境层实现**;
+   **不引入到方案机制中**,机制保持通用泛化、可对接任何协议。
+3. **已引入且在名单内的**:保留 setting,但协议改为 Function Call;
+   工具与环境信息的描述要**精心实现**,不得敷衍。
+   **不在名单内的直接完全删除**(据现状映射,`envs/appworld` 属此列)。
+4. **未引入的**(ScienceWorld、WebShop、SearchQA、SWE-bench):必须**一个一个**
+   走"仔细搜索调研 → 规划设计 → **与用户充分探讨协商** → 用户确认后才引入"的流程;
+   协商内容至少含训练数据、测试数据、格式协议与默认系统提示、评估方案、
+   Ground Truth 反馈信息、任务特定信息、搜索调研分析发现等。
+5. 用户要求 CD-010 开展:深入搜索调研、相关工作与代码实现的观察分析、
+   引入选中 benchmark、实现对应 agentic 格式协议。
+
+CD-006 侧不对上述需求作技术判断;若 CD-010 在执行中需要 CD-006 提供实验侧
+现状数据(如现有环境的实测读数、协议实现现状),告知即可。
+
+---
+
+## 2026-08-08 · [★★★ P0 实证] text 协议把整篇文档转义进 JSON,小模型撑不住;换 fncall 后错误率 45.2%→0
+
+**结论先行**:在 162 用 Qwen3.5-9B/4B 做 researcher 探针(ALFWorld,32 任务分层抽样)时发现,
+`research.tool_protocol: text` 下工具调用被大比例拒绝。**根因不是模型不会调工具,
+而是协议要求把整篇 markdown 文档转义进 JSON 字符串**。换成 Qwen3.5 原生 XML
+function-call(服务端 `--tool-call-parser qwen3_coder` 负责转义)后,**错误率归零**。
+
+### 一、text 协议下的实测(同一批 32 任务,seed=42)
+
+| | 9B | 4B |
+|---|---|---|
+| assistant 消息 | 416 | 312 |
+| `TOOL ARGUMENTS ERROR` | 40 | 141 |
+| **错误率** | **9.6%** | **45.2%** |
+| 受影响会话 | 22/60 | 11/15 |
+| 其中 **JSON 转义/截断** | 39(**97.5%**) | 139(**98.6%**) |
+| markdown 围栏包裹 | 1 | 2 |
+
+失败集中在 `finalize`(它带整篇 experience_doc)。文档 500–1000 词,含大量 `"`、换行、
+反引号,作为 JSON 字符串值需逐字符转义,**一处错整个 arguments 作废**
+(`research/tools.py:105-111` 拒绝执行且不扣预算)。模型越小越撑不住 —— 但注意
+**9B 也有 9.6%**,这不是"4B 的问题",是**协议与模型能力的结构性错配**。
+
+### 二、换 fncall 后的实测(同任务、同模型、同 ctx)
+
+`sglang 0.5.10` **无 `qwen3_xml`**,但有 **`qwen3_coder`**,其 XML 形态
+(`<function=名><parameter=键>`)与 Qwen3.5 chat_template 逐字一致。实测可用:
+
+```
+（服务端 parser 单元验证,4B）
+✓ tool_calls 已填充  name='finalize'
+✓ arguments 是合法 JSON;experience_doc 129 词 676 字符
+  文档含换行 True / 含双引号 True / 含反引号 True
+```
+
+4B 单会话端到端验证:
+
+| | text | **fncall** |
+|---|---|---|
+| `TOOL ARGUMENTS ERROR` | 45.2% | **0** |
+| assistant 带 tool_calls | 靠客户端正则 | **19/19** |
+| experiments_used | 6 | **15** |
+| episodes | — | **56** |
+| doc 词数 | 530 | **1044** |
+
+**机理**:XML 的 `<parameter>` 块内容读到闭合标签为止,**转义由服务端做,模型不碰**。
+
+### 三、给 CD-010 的两点(供判断,非结论)
+
+1. 用户已定"正式实验统一采用 OpenAI 格式 Function Call"
+   (见 `requirements-formal-experiment-benchmarks.md`)。上述实测是该方向的独立证据:
+   **凡 tool 参数里要塞长文本的场景,text/JSON 协议对 ≤9B 模型都不安全**。
+2. `common/config.py:619` 现有两条校验会挡住 fncall:
+   `research_rl 下 tool_protocol 必须为 text`、`research.backend 必须为 external`。
+   前者的理由(RL 训练时 verl rollout 是 token-in-token-out,拿不到服务端 parser)是成立的
+   —— 这意味着**若 researcher 要做 RL 训练,fncall 这条路在训练期不可用**,需要
+   CD-010 判断如何取舍(例如训练期 text、推理期 fncall 是否会造成分布不一致)。
+   探针配置 `162-q35-researcher-probe-fncall.yaml` 为绕开校验关掉了 `research_rl`,
+   仅用于本次探针,不作为正式配置。
+
+CD-006 侧数据与脚本:`/data4/ws/PGS/researcher_probe_q35/`(162),
+分析脚本 `analysis/q35-researcher/quality.py`,会话查看器 `scripts/researcher_viewer.py`。
+
+---
+
+## 2026-08-08 · [需求文档更新] 已补入 §6「训练期的协议转换要求」
+
+用户看过 fncall 探针结果后确认了统一 Function Call 的方向,并就**训练期必须转换为
+纯 text 格式**这一点提出了新需求,要求与既有需求一并实施。
+
+**需求文档已更新**:`docs/collab/cd010-cd006/requirements-formal-experiment-benchmarks.md`
+新增 **§6 训练期的协议转换要求**(6.1 确认统一 Function Call / 6.2 训练时必须转换成
+纯 text 格式 / 6.3 由开发分支实施,并要求与 §1–§5 一并实施),以及
+**附二:§6 相关的实测背景(客观事实)**。
+
+请以需求文档为准;本文件 2026-08-08 那条【★★★ P0 实证】条目是同一批实测的详细版,
+可作为技术细节参考。
+
+---
+
+## 2026-08-08 · [★★★ P0 bug] `episode.max_tokens_per_turn` 是 dead config —— 配置 4096,实际生效 2048
+
+**结论先行**:`episode:` 段三个键里,`max_env_steps` 与 `max_assistant_turns`
+经 `configure_episode_caps()` 正常注入,**唯独 `max_tokens_per_turn` 没有任何
+注入点**,消费方读的是模块级硬编码常量。用户 2026-08-07 的裁定
+「任务执行 agent 单轮 2048→4096」**从未生效**。
+
+### 复现(本地,无需 GPU)
+
+```python
+cfg = load_config("configs/experiments/162-pgs-s4-selfres-1p7b.yaml")
+protocol.configure_episode_caps(cfg.episode.max_env_steps,
+                                cfg.episode.max_assistant_turns)
+```
+
+实际输出:
+
+```
+配置 episode.max_tokens_per_turn = 4096
+注入后 protocol.GEN_MAX_TOKENS_PER_TURN = 2048   ← **未生效**
+对照   MAX_ENV_STEPS       30 | 配置 30 → 生效
+对照   MAX_ASSISTANT_TURNS 40 | 配置 40 → 生效
+```
+
+### 事实链
+
+| 位置 | 内容 |
+|---|---|
+| `common/config.py:203` | `max_tokens_per_turn: int = 2048` 键定义存在 |
+| `configs/pgs.yaml:74` | 模板有该键,注释「2026-07-30 用户裁定改配置项」 |
+| `tests/test_162_selfres_config.py:62` | 断言 `== 4096` —— **只断言读到,未断言行为** |
+| `core/protocol.py:61-68` | `configure_episode_caps()` 只 `global MAX_ENV_STEPS, MAX_ASSISTANT_TURNS` |
+| `core/episode.py:182` | `turn_max = min(protocol.GEN_MAX_TOKENS_PER_TURN, budget)` ← 硬编码 2048 |
+| `research/continuation.py:232` | 同上,同一个硬编码常量 |
+
+`grep -rn "GEN_MAX_TOKENS_PER_TURN" src/` 全库只有三处:定义 + 两处消费,
+无任何赋值点(除测试的 monkeypatch)。
+
+### 影响面
+
+1. 所有历史实验的 executor 单轮上限实际都是 2048,与配置声明不符
+   —— 含 162 v4 全部 run(配置写 4096)。相关读数(respLen 分布、
+   num_turns、截断率)的解释需以 2048 为准。
+2. 该键是用户新方案「轨迹长度由 max_turns × per-turn 控制」的核心旋钮,
+   不修则该方案在 executor 侧不可实施。
+
+### 与既有事故同型
+
+与 `param-truth-fourth-layer`(seq-mean 事故)同类:配置层/manifest/verl 实收
+三层都对,**语义层断链**——消费方带默认值,静默降级。建议修复时一并加
+行为级断言(不只断言 `cfg.x == v`,而要断言注入后 `protocol.X == v`)。
+
+### 用户需求(已写入需求文档 §7)
+
+需求文档 `requirements-formal-experiment-benchmarks.md` 新增
+**§7 轨迹与上下文预算的配置化要求**:7.1 轨迹长度由轮数×单轮上限控制、
+7.2 本 P0、7.3 **per-benchmark 的轨迹/上下文配置能力**、7.4 长轨迹必须
+保留训练梯度。请以需求文档为准。
+
+---
+
+## 2026-08-08 · [需求文档更新] §7.5 上下文上限与轨迹有效长度须拆为两个量
+
+用户在准备 Qwen3.5-4B v3.3×v4 实验、逐项核对预算链时提出本需求,并明确
+**请 CD-010 理解、分析、思考,设计恰当、干净的改进完善方案**。
+
+用户意图(原文见需求文档 §7.5):
+- 模型总上下文由一个**配置参数**控制,是一般不会达到的上限(举例 128K);
+- 推理生成与训练时单条轨迹的最大有效 tokens,由**派生值
+  `max_turn × per-turn max_tokens`** 控制;
+- 二者是**两个独立的量**,不应由同一个量兼任;
+- 用户推测现状可能受 **verl 或相关框架的约束**所致。
+
+CD-006 侧只提供事实、不提方案(需求文档**附三**已整理):现状代码位置
+(`agent_loop.py:467` / `backends.py:196` / `episode.py:178`)、两侧口径不一致
+(researcher 扣 prompt、executor 不扣)、`stream` 同时装生成与工具返回、
+verl `_pad_token_ids` 只补不截且 `padding="max_length"` 是固定维度、
+4B researcher 探针 64 条会话的生成/工具返回/总量分位、162 的 503GB 内存
+与 1.7B 冒烟 `cpu_memory_used_gb=177.2` 的对照基线。
+
+与本节相关但已单独成条的既有条目:§7.1(轮×单轮主导)、§7.2(P0 dead config,
+CD-010 已修 `9c9568a`)、§7.3(per-benchmark 配置能力)、§7.4(长轨迹保留梯度,
+CD-010 已实现 `4baa455`)。§7.3 的 per-benchmark 要求同样适用于 §7.5 引入的
+新参数。
+
+---
+
+## 2026-08-08 · [需求文档更新] §7.6 executor 侧也需要独立 session_token_budget
+
+用户裁定本次 Qwen3.5-4B 正式实验的两个预算:**researcher 48K / 任务执行 16K**。
+§7.5 已给 researcher 落地控制器,executor 侧尚无对应键,故该裁定在现有键位上
+无法表达 —— 详见需求文档 §7.6(含 CD-006 核对的四条现状事实:EpisodeCfg 无流
+预算键、executor 预算取自 train.response_length、该值同时兼任 verl padding 维度
+与 executor 流预算两职、§7.5 校验以该单值为准)。
+
+本次实验的处置(CD-006 侧,待用户裁定后定稿):researcher 侧按 48K 配置;
+executor 侧暂由轮预算(max_assistant_turns × max_tokens_per_turn)主导,
+与用户要求的 16K 存在差异,已向用户明确报告。
+
+**补充(同日)**:按 CD-010「四类量」模型复核后确认,缺口精确落在 **③ 流预算**
+这一层 —— executor 与 researcher 各自流预算的语义都对,但
+`train.response_length` 当前一身两职(executor 流预算 + verl 唯一 padding 维度),
+`launch_train.py:299`/`:356` 两个 hydra 键绑同一配置值。实测
+`response_length: 16384` + `session_token_budget: 49152` 被 §7.5 校验 FAIL,
+报错与 info 行已附在需求文档 §7.6。CD-006 侧本次实验待该项落地后按
+用户裁定值(16K/48K)起跑。
+
+---
+
+## 2026-08-08 · [★★★ P0 阻断] v4 research 行在 step-1 必崩:policy version 证据在首次权重更新前恒为 None
+
+**结论先行**:`selfres.py:209` 的 fail-loud(`no rollout policy version evidence`)
+在**任何 run 的 step-1 都会触发**,因为 `min/max_global_steps` 的源头
+`self.global_steps` 只在**权重更新时**才被赋值,而 step-1 的 rollout 发生在
+第一次权重更新**之前**。executor 行因为处理方式不对称而静默通过,
+research 行则整批崩掉。Qwen3.5-4B 正式 run(`q35_4b_v33_selfres_162`)
+因此在 step-1 阻断,research 行只落盘 **2/128**。
+
+### 一、根因链路(逐跳,全部为 vendored verl 与本仓代码)
+
+```
+① workers/rollout/sglang_rollout/async_sglang_server.py:257
+   self.global_steps = None                       ← 初始值
+② 同文件 :867-869  async def set_global_steps(...) ← 唯一赋值入口
+③ workers/rollout/sglang_rollout/sglang_rollout.py:369
+   if self._engine is not None and self._is_server_tp_leader():
+       await self._engine.flush_cache()
+       if global_steps is not None:
+           await self.server_actor.set_global_steps.remote(global_steps)
+   ↑ 位于 _update_weights 内 —— **只有权重更新才会调用它**
+④ 同文件 :833  extra_fields = {"global_steps": self.global_steps}   ← 此时为 None
+⑤ workers/rollout/llm_server.py:273-275
+   global_steps = output.extra_fields.get("global_steps")            # None
+   output.extra_fields.setdefault("min_global_steps", global_steps)  # key 存在,值 None
+   output.extra_fields.setdefault("max_global_steps", global_steps)
+⑥ src/trace_opd/train/backends.py:47-50(EngineGenerate)
+   for key in ("min_global_steps","max_global_steps"):
+       if key in out_extra: extra[key] = out_extra[key]              # 照拷 None
+⑦ 同文件 _track_policy_version
+   raw = (extra or {}).get(key); if raw is None: continue            # 被跳过
+⑧ policy_version_fields() → {} → selfres.py:209 raise RuntimeError
+```
+
+**关键的不对称**:同一份 None,两侧处理完全不同 ——
+
+| | 代码 | 行为 |
+|---|---|---|
+| executor | `core/episode.py:212` `if key in out.extra: gen_extra.setdefault(...)` | 静默跳过,轨迹正常落盘 |
+| research | `train/selfres.py:207-210` `if not version_fields: raise` | **fail-loud,整行崩** |
+
+而 `agent_loop_tq.py:136` 的 `asyncio.wait_for(asyncio.gather(*tasks))` 会让
+一个 research 行的异常**带垮同一 prompt 的所有行**。
+
+### 二、实测对照(同一台 162,同一份 vendored verl)
+
+| | 1.7B 冒烟 `pgs_s4_smoke5` | 4B 正式 `q35_4b_v33_selfres_162` |
+|---|---|---|
+| `val_before_train` | **False** | **True** |
+| step-1 research 行落盘 | **128/128**(16 任务 ×8) | **2/128** |
+| step-1 executor 行 | SUCCESS 117 / FAILED 129 / DEGENERATE 10 | SUCCESS 50 / FAILED 126 |
+| `rollout_extra/min_global_steps/mean` | **0.0** | 拿不到(fail-loud) |
+| 结局 | 正常完成 step-1 | step-1 阻断 |
+
+`val_before_train` 是两者唯一的相关差异(CD-006 观察,**不是因果结论**);
+1.7B 的 formal run(`val_before_train=True`)在 2026-08-07 被 SIGTERM 停在
+step:0,从未跑到 step-1,故无法用于验证。
+
+### 三、给 CD-010 的三点(供判断,不含方案)
+
+1. fail-loud 本身的动机成立(`selfres.py` 注释所述:trainer 的
+   `_compute_metrics` 对每行 `np.array(..., dtype=int)`,None 会 TypeError
+   崩整步)。问题在于**它守的那个前提在 step-1 不成立**。
+2. 两侧对同一缺失值的处理不对称(executor 静默 / research fail-loud),
+   使同一个根因表现为"executor 正常、research 全崩",极易误诊为 research
+   侧的 FC 或 engine 后端问题 —— CD-006 最初正是往那个方向查的。
+3. `llm_server.py:274` 的 `setdefault(key, None)` 让下游的 `key in extra`
+   判定失去意义(键在、值空),`EngineGenerate` 因此把 None 一路带下去。
+
+### 四、CD-006 侧现状
+
+正式 run 已停(GPU 已释放,step-0 val 结果保留:
+seen won 7.14% / unseen won 4.48%,`rollouts/step_00000_val/` 274 条齐)。
+实验目录 `experiments/q35-4b-v33-selfres-162/`(config + run.sh + README)已就绪,
+待本项修复后按原配置重起。
+
+### 【更正与补强】2026-08-08 同日 —— 结论更强,因果换了
+
+用户质疑「A800 也用 SGLang server 为何能跑」后复核,两处更正:
+
+**更正一:A800 不构成反证。** `a800-pgs-v33-4braw-asym.yaml` **无 `research_rl` 段**
+(external 35B researcher,researcher 会话走 HTTP 到独立服务,不产生训练行),
+`selfres.py:209` 的 fail-loud 只在 `research_rl.enabled=true` 的 research 行上执行,
+A800 不走该路径。
+
+**更正二:上一条里「1.7B 冒烟 min_global_steps=0.0」是聚合假象,须撤回。**
+直接读两个 run 的 rollout 落盘:
+
+```
+1.7B 冒烟 smoke5:  research 128/128 = (None, None);  executor 256/256 = (None, None)
+4B 本次 run:       research  35/35  = (None, None);  executor 176/176 = (None, None)
+```
+
+**两个 run 的落盘真值都是 None。** 先前引用的
+`rollout_extra/min_global_steps/mean: 0.0` 是聚合阶段 None→0 的产物,非落盘值。
+因此 `val_before_train` 的差异是巧合而非原因 —— 1.7B 冒烟能过,是因为它跑在
+`selfres.py` 加入 fail-loud **之前**(该 fail-loud 的注释自述依据即
+"2026-08-07 162 v4 冒烟实测",时间上晚于 smoke5)。
+
+**修正后的结论(更强)**:`global_steps` 在首次权重更新前恒为 None,
+**任何 v4 run 的 step-1 都会触发该 fail-loud**,与模型、机器、
+`val_before_train` 均无关。
+
+**CD-006 对修复复杂度的评估(供参考,方案由 CD-010 定)**:整条链的实质是
+"初始值是 None 而非 0",可下手处四个 ——
+(A) `async_sglang_server.py:257` 初始值改 0(1 行;语义成立:训练前权重版本即 0,
+`trajectory_spans = 0−0+1 = 1`;代价是 vendored verl 的 upstream 同步维护);
+(B) `selfres.py` 缺失时兜底 0 而非 raise(局部,但两侧不对称仍在);
+(C) 训练循环前显式 `set_global_steps(0)`(语义最明确,需定位时机);
+(D) `llm_server.py:274` 不对 None 做 setdefault(只恢复 `key in` 判定的意义,
+不解决 research 取不到值)。
+
+---
+
+## 2026-08-09 · P1 · research 行落盘丢失 role 标识,导致下游观察量被按臂占比缩放
+
+**结论先行**:v4 每步落盘 3 类行(bare / steered / research),但 **research 行落盘时
+`steering` 是空 dict**,`steer_arm` 取出为 `None` —— 而训练侧内存里它是 `0`(占位)。
+两边约定在落盘这一步分叉,任何按 `steer_arm` 分组的下游消费者都会把 research 行
+误归类。显微镜(`scripts/pgs_microscope.py:build_step_entry`)即因此把 research 行
+收进分母,**全部 per-trajectory 观察量被按臂占比缩放**。训练侧指标不受影响。
+
+**证据**(run `q35_4b_v33_selfres_162`,step_00020,384 行):
+
+| (steer_arm, 行类) | 条数 | won 均值 | steer_entropy_mean |
+|---|---|---|---|
+| 0 (bare 执行臂) | 128 | 0.9375 | 0.0000(哨兵) |
+| 1 (steered 执行臂) | 128 | 0.9766 | 0.0168(真值) |
+| **None (research)** | **128** | **0.0000** | **字段整个缺失** |
+
+`.get(k, 0.0)` 对缺失字段补 0、分母照加 ⇒ 精确稀释。逐值验证(修复前显示 vs 真值):
+
+| step | 量 | 修复前 | 真值 | 倍数 |
+|---|---|---|---|---|
+| 1 | entTheta | 0.640 | **1.280** | 2× (恰为配置 `entropy_theta_init`) |
+| 1 | entMean | 0.138 | 0.276 | 2× |
+| 1 | wMean | 0.266 | 0.533 | 2× |
+| 1 | tilt | 155.2 | 465.7 | 3× |
+| 1 | lenMean | 5180 | 2127 | 2.4×(混入 research 行的 11287) |
+| 20 | won(混合) | 0.638 | 0.957 | 恒等于两臂均值 × 2/3 |
+
+**危害不止于看图**:`entropy_theta` 的目标语境标定按规范要在真实语境实测。若照显微镜
+读数标定,θ 会整体标低一倍。9B 线挂账的"熵门 4B 占位待 step1 重标"若已用显微镜读数,
+需按上表 ×2 复核。
+
+**已做**(CD-006 侧,不涉机制代码):`build_step_entry` 改为"每个量的分母 = 该量有定义
+的行"—— won 取执行行(arm∈{0,1})、软门/干预量取 steered 行、research 行长度单列
+`lenResearchMean`;靠"是否出现过 arm 0/1"区分分臂 run 与历史全臂 run,旧曲线不变
+(已单元验证)。
+
+**更正(同日,写完上段后复核落盘发现)**:上段"落盘无 role 标识"**不成立**,已撤回。
+落盘顶层**有** `sample_role` 字段,step_00020 实测分布干净:
+
+    ('research', steer_arm=None) 128 | (None, 0) 128 | (None, 1) 128
+
+即 role 标识一直存在,只是显微镜没用它、改去按 `steer_arm != 0` 间接推断行类 ——
+**这是 CD-006 侧的实现缺陷,不是机制侧的 schema 缺陷**。修复已改用 `sample_role`
+作首选判据(缺失时回退 arm 推断,兼容旧 run)。机制侧无需改动。
+
+**仍建议订正**(纯注释,不涉行为):`metric_utils.py:501` 注释称 "research rows carry
+steer_arm=0" 描述的是内存态;落盘态是 `steering` 整个为空 dict ⇒ 取出为 `None`。
+`pgs_microscope.py` 里"v4 research 行 steer_arm=0 恰被排除"同源于此,已随修复删除。
+两处描述内存态的注释被下游当成落盘契约,是本次误判的共同来源。
+
+---
+
+## 2026-08-09 · P2 · SSB `answer_position` 解析:sheet 名含逗号被当多区域切分
+
+**结论先行**:`evaluate()` 对 `answer_position` 的解析按逗号切分多区域,但
+**Excel 里 sheet 名本身可以含逗号**(用单引号包裹),导致合法记法被切坏、整个
+任务评分抛异常。实测 verified-400 里命中 2 个,它们因此 reward 恒零。
+
+**证据**(实际打开 workbook 核对,非猜测):
+
+| 任务 | dataset.json 的 answer_position | golden 实际 sheet 名 | 报错 |
+|---|---|---|---|
+| `130-9` | `'b2b, sez, de'!A5:V10` | 确有 sheet `b2b, sez, de` | `ValueError: b2b is not a valid coordinate or range` |
+| `283-32` | `Sheet3'!A:G,'Sheet4'!A:G` | Sheet1–4 均在 | `ValueError: invalid literal for int() with base 10: ''` |
+
+`130-9` 的 prompt 原文即要求把数据并入名为 `b2b, sez, de` 的目标 sheet ——
+sheet 名含逗号是任务本身的一部分,不是脏数据。`283-32` 另叠加两点:多区域
+(两个 sheet 各一段)+ 整列引用 `A:G`,且该字段开头缺一个 `'`(数据侧 typo)。
+
+**建议**:解析时先按**引号配对**切分,再对未被引号包裹的逗号做多区域切分;
+整列引用 `A:G` 需要单独处理(openpyxl 的 range 解析不吃裸列区间)。修好后这
+两个任务可回收进训练集。
+
+**CD-006 侧已做**(不改机制代码):把 27 个 reward 恒零任务(含这 2 个)整体
+剔除,清单落 `envs/spreadsheetbench/unreliable_tasks.json`,由
+`scripts/ssb_audit_reward_reliability.py` 可重审、`--verify` 可当启动门禁。
+用户裁定 2026-08-09:对所有 SpreadsheetBench 实验一律生效。其余 25 个是
+LibreOffice 与 Excel 的语义鸿沟(新函数/数组公式),6.4 与 7.6 实测同结果,
+非代码问题。
+
+**另请一并知悉**(非 bug,是口径事实):纯静态值答案不进重算,实测可靠率
+99.7%;写公式要过 LibreOffice 重算,可靠率 90.5% —— reward 在事实上轻微
+偏好写静态值。官方文档既未讨论后端差异,也未说明论文 baseline 用的哪个后端。
+
+---
+
+## 2026-08-09 · P1 · SSB `build_dataset` 多 sheet 合成产出非法 answer_position
+
+**结论先行**:`make_row` 在 `answer_position` 无 `!` 时用
+`f"{answer_sheet}!{answer_position}"` 合成,但 **`answer_sheet` 可能是多个 sheet
+(逗号分隔)**,于是拼出 `A,B,C,D!A3:E11`。evaluator 按逗号切段后,前几段没有
+`!`,整段被当成 cell_range 送进 openpyxl ⇒ `ValueError` ⇒ `_score_output` 的
+`except Exception: pass` 吞掉 ⇒ **该任务 reward 恒 0**。
+
+**实测**:verified-400 里 `answer_sheet` 含多 sheet 的有 10 个,其中只有 `60-7`
+同时满足"`answer_position` 无 `!`"而触发该分支:
+
+    answer_sheet    = 'Consolidated Tracker,Existing Task,Additions,Retired'
+    answer_position = 'A3:E11'
+    合成后          = 'Consolidated Tracker,Existing Task,Additions,Retired!A3:E11'
+    生产 _score_output(golden) = 0.0     ← 完美答案判 0
+
+**CD-006 侧已修**(`build_dataset.make_row`):`answer_sheet` 拆多 sheet 后逐个配
+range —— `'Consolidated Tracker'!A3:E11,'Existing Task'!A3:E11,…`。修后 `60-7`
+六门全过,已回收进训练集。
+
+**顺带**:数据 `42930` 的 golden 文件名 id 写错(目录下是 `1_43930_golden.xlsx`),
+`find_test_cases` 返回空 ⇒ `build_dataset` 直接 `SystemExit`。已在两机建 symlink
+`1_42930_golden.xlsx -> 1_43930_golden.xlsx`。这属上游数据 typo,记录备查。
+
+**仍未修、已知会误判的**(P2,上一条已报):`evaluate` 的 answer_position 解析
+按逗号切多区域,sheet 名含逗号(`'b2b, sez, de'`)会被切坏 —— `130-9`、`283-32`
+因此 reward 恒零,本轮按用户裁定一并剔除。修好可回收 2 个任务。
+
+---
+
+## 2026-08-09 · P1 · 零正例时 researcher 会产出高置信度的错误文档(prompt 结构强制所致)
+
+**结论先行**:`DOC_RULES_TEMPLATE` 强制"exactly these three sections",其中第一节
+`# Understanding & Approach` 要求写"the **verified** way to solve it"。当一个
+researcher 会话的全部实验都失败(零正例)时,它没有任何可验证的解法,却仍被格式
+要求交出一份"已验证解法" —— 实测它会**编造**,并在文档里反复标注 verified。
+这类文档进入 steered 臂后,教师会拿一份错误指导去干预策略,不只是无效,而是
+**主动往错误方向拉**。
+
+**实证**(SSB · A800 · `ssb_4b_selfres_a800` step_00001,同一步内的两个任务,
+bare 成功率均为 0):
+
+| 任务 | researcher 自己的实验结果 | 文档形态 | 前缀续写 | steered 效果 |
+|---|---|---|---|---|
+| `42515` | 0,0,0,0,0,1 → **1/12 成功** | 主体是 `# Failure Modes & Remedies`,诊断 INDEX/MATCH 为何失败并给补救 | 14/20 胜 | bare 0.000 → **steered 0.600(+60pp)** |
+| `194-19` | 0,0,0,0,0 → **0/10 成功** | 主体是 "Verified Solution Approach",给出完整列映射与 Python 代码,文中 **3 处 "verified"** | **0/20 胜** | bare 0.000 → **steered 0.000(+0pp)** |
+
+决定性差别是**有没有撞到过一次成功**,不是文档写得像不像样 —— `194-19` 那份读
+起来远比 `42515` 专业(结构化、代码完整、断言明确),但一次都没赢过。
+
+**根因是 prompt 内部的自相矛盾**(`research/prompts.py`):
+
+- 第 69-72 行(WHEN TO FINISH)已有软约束:"…then summarize what you actually
+  observed; **never invent**"
+- 但第 78-84 行(DOC_RULES_TEMPLATE)是硬性格式:"Markdown, **exactly these three
+  sections**" + `# Understanding & Approach` = "What this task requires and the
+  **verified way to solve it**"
+
+硬格式压过软约束:零正例时"必须交出 verified way"这条结构要求没有合法出口,
+模型只能编。而且第一节位居文档之首、权重最高,与同一 prompt 第 59-67 行
+"happy-path-only knowledge is silent exactly where supervision matters most"
+的设计意图恰好相反。
+
+**用户裁定 2026-08-09**:
+
+> 产出的特权文档中 verified solution 不应该是必须的,只有有成功经验时才总结,
+> 全部失败不要写,写错误模式、经验教训总结。
+
+**建议的落地方向**(具体实现由 CD-010 定):
+1. 把第一节**条件化** —— 会话内有 ≥1 次成功才写"已验证解法";零正例时该节改为
+   "当前理解 + 已排除的方向",并**显式禁止** verified/confirmed 一类断言措辞。
+2. 或放宽"exactly three sections"为"至少包含失败模式一节",给零正例一个合法出口。
+3. 无论哪种,`self_assessment` 里应能反映"本次零正例",便于下游按置信度加权
+   (例如零正例文档不参与 argmax 择优,或降低其 steered 权重)。
+
+**CD-006 侧的观察计划**:往后每步盯 **δgap 为负的任务**(steered < bare)。若出现,
+即为错误文档造成负增益的直接证据。目前样本仅 step-1 的 8 个任务(3 难/3 中/2 易),
+`194-19` 的 steered 恰好也是 0.000、没有变差,尚不能排除别的任务上会变差。
+
+**顺带**(同批数据,供机制侧参考,非问题):按难度分层,教师增益在最难一档最大 ——
+bare=0 组 δgap **+31.1pp**、bare 0~40% 组 +24.6pp、bare>40% 组 +12.5pp;而
+researcher 的 r̄ 随难度单调下降(0.215 / 0.396 / 0.853)。即文档质量本质受限于
+researcher 自己的 rollout 成功率,与 [opd-capability-boundary] 的老结论一致:
+机制放大已有行为,不凭空引入新能力。`research_n=8` 的择优确实有回报
+(难档 argmaxR 0.383 vs r̄ 0.215)。
+
+---
+
+## 2026-08-09 · P0 · PGS 自进化在 SSB 上吞吐低:根因定位与待探讨项
+
+**详细分析全文**:`docs/pgs-throughput-ssb-analysis.md`(含代码位置、量化推导、MENTOR 逐项对比、
+可复现方法)。本条只列结论与需要 CD-010 参与判断的问题。
+
+**结论先行**:SSB 上 steered 臂比 ALFWorld 慢约 **30 倍**(bare 只慢 12 倍),额外劣化来自机制。
+主因是「长段 draft → 长段 verify → 任一拒绝丢弃余段并重启」在长轨迹上的**近平方级放大**
+(`W ≈ N(1+R/2A)`,SSB 3.69× vs ALFWorld 1.06×,再乘候选长度 5× ⇒ 约 17×,与实测同量级)。
+**不是** CPU 空等、LibreOffice 或全局串行锁 —— GPU 利用率 84%(15 次采样无一低于 30%)。
+
+**⚠ CD-006 先前一个判断作废,请勿据其排优先级**:曾报"开门率 35–46% 远高于目标 5%,
+熵门未标定"。经查 `steering/gate.py:165/188`:`entropy_target_rate=0.05` 控制的是
+`H ≥ Hq` 即 **`w=1` 满强度位置**的比例,而 `base_open` 条件是 `H ≥ w_min·Hq = 0.05·Hq`。
+**5% 是满强度目标,不是非零干预目标**,35–46% 未必异常。(MENTOR 同样无 hard bypass。)
+
+**另一处口径更正**:先前报"整步约 80 分钟"是把最后一条成功落盘当成步结束。
+真实 **107 分钟** = 成功生成 62.9 + 未决长尾至 90(超时) + 训练约 17。
+
+### 需要 CD-010 判断的三件事
+
+1. **是否值得做引擎内改造** —— 同权重双前缀(student KV=`h`,teacher KV=`h⊕doc`)、持久双 KV、
+   bounded K 的 exact speculative loop。这是唯一能切断近平方放大的路径,预估 2–4 周、高风险。
+   但**天花板只有约 1.23×**:steered 一旦降到 39.2 分钟以下,research(48.0 分钟)立即变成
+   关键路径。投入产出比需共同判断。
+2. **research 阶段是否同步优化** —— 每步 2304 个 episode + 1024 次 narration LLM 调用。
+   可能方向(narration 是否必需 / continuation 批量化 / researcher 顺序 turn 并行)**都改机制语义**,
+   须用户裁定。
+3. **`w_min = 0.05` 在 SSB 长段场景是否过低** —— 段级 bypass 概率是 `(1-q)^m`,SSB 平均段长
+   约 261,即使非零干预率降到 5%,整段跳过概率仍只有 1.5×10⁻⁶。**ALFWorld 段短才碰巧有效,
+   同一份代码在两个 benchmark 上行为完全不同**。这是机制参数问题,不是标定问题。
+
+### 明确不该做的(避免走弯路)
+
+- **不能只把 Python 层 draft 的 `max_tokens` 改成 4**(MENTOR 的 `num_speculative_tokens=4`):
+  对 16k 轨迹会制造 4000+ 次 RPC,比现在更慢。bounded K 只有与引擎内循环 + 持久双 KV 一起才有意义。
+- **不能照搬 MENTOR 的全词表算术混合** `(1-w)π + w·p_T`:会丢失尾部质量恒等、密度比界
+  (`e^{±2ηc}`)与预算证明,GPU 上还需持有数百 MiB fp32 全词表张量。
+- **不能直接复用 stock vLLM `SpecDecodeWorker`**:它只接收一套 `seq_group_metadata`,
+  **不支持 target-only 的 doc prefix**。doc 塞进公共 prompt 会同时污染 draft,
+  使 proposal 不再是 `π(a|h)`;不塞则 target 不是 `p_T(a|h⊕doc)`。
+
+### 一个与吞吐无关但更紧急的正确性问题
+
+**5400 秒超时后,残缺的 prompt 组仍被采样进训练**。`agent_loop_tq.py:124` 超时取消 pending task
+并标 `failure`,但已完成 session 早已独立写入 TransferQueue(`:144`);ReplayBuffer 把
+`finished_keys | failure_keys` 都当可采样终态(`replay_buffer.py:164`),且留有未实现的
+`# TODO: failure samples dropping and refilling`(`:243`)。
+
+⇒ step_00001 的 **191/192 是训练数据真实缺一条**,不是少个归档文件。缺任务 42515 的 1 条 steered,
+`seq-mean-token-mean` 下该任务 steered 臂权重 `8/192 → 7/191`,**−12.0%**;且**丢失的是最慢样本**,
+系统性关联长轨迹/难任务 —— 属**非随机右删失**。
+
+`objective_fingerprint()`(`config.py:1075`)不含 `agent_task_timeout_s`,故提高超时是纯工程修复;
+**但 timeout 一旦命中并允许残组入训,它已在操作上改变采样分布**。建议处置(待定):failure prompt
+不可采样 → 清理其已落地部分轨迹 → 同一冻结 policy version 完整重试或整步 fail-loud →
+用**无进展 watchdog** 替代单一总墙钟。
+
+### CD-006 建议的低成本先行项(不改行为)
+
+**增加真实工作量计数**:radix matched tokens、teacher prefill/decode tokens、**draft-discarded
+tokens**、block accept prefix、序列化字节。1–3 天、风险极低。
+
+价值:**当前无法区分"cache miss"与"拒绝丢弃 suffix"两种浪费** —— `steer_n_candidates` 在逐位
+judge 时递增,拒绝后未 judge 的尾段已被 GPU 算出但不入账,故用它估 GPU 工作量会**低估约 3.69×**。
+这两种浪费对应完全不同的优化方案;拿到数字前,上述所有收益估算都还是推断。
+
+### 另附:两个观测口径的坑(写离线分析时会踩)
+
+- `steer_count` 只统计 `eta>0` 的最终执行位置(`ledger.py:169`),不含关闭位与丢弃 suffix。
+- `response_token_len` **含环境观察**(以 `mask=0` 追加进同一 response stream,`episode.py:255`),
+  不是纯生成 token。SSB 16390 vs ALFWorld 682 不能直接当"模型生成量"比较。
