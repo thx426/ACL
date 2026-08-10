@@ -169,7 +169,10 @@ class vLLMHttpServer:
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
-        self.global_steps = None
+        # trace-opd (2026-08-10): 0, not None — pre-update weights are version
+        # 0; None made every step-1 trajectory ship version evidence = None
+        # (see sglang_rollout/async_sglang_server.py for the full rationale).
+        self.global_steps = 0
         self._warned_missing_spec_decode_stats = False
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":

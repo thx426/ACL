@@ -254,7 +254,12 @@ class SGLangHttpServer:
         self.nnodes = nnodes
         self.base_gpu_id = base_gpu_id
         # model weights version, set by ServerAdapter when update weights.
-        self.global_steps = None
+        # trace-opd (2026-08-10): initialised to 0, not None — step-1 rollouts
+        # happen BEFORE the first weight update, so with None every trajectory
+        # of the first step ships min/max_global_steps=None and any consumer
+        # that requires version evidence (selfres research rows) fails loud on
+        # a healthy run. The pre-update weights ARE version 0 (span 0-0+1=1).
+        self.global_steps = 0
 
         # PD peer linkage populated post-launch by SGLangPDReplica.set_pd_peer.
         self._pd_decode_peers: list[ActorHandle] = []

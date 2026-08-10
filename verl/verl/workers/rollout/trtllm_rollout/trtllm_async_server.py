@@ -126,7 +126,10 @@ class TRTLLMHttpServer:
         self.pgs = pgs
         self.bundle_indices = bundle_indices
         # model weights version, set by ServerAdapter when update weights.
-        self.global_steps = None
+        # trace-opd (2026-08-10): 0, not None — pre-update weights are version
+        # 0; None made every step-1 trajectory ship version evidence = None
+        # (see sglang_rollout/async_sglang_server.py for the full rationale).
+        self.global_steps = 0
         # Set when generation is allowed; cleared during weight sync to block new requests.
         self._generation_allowed = asyncio.Event()
         self._generation_allowed.set()
