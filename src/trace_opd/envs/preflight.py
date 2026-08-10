@@ -47,13 +47,14 @@ def main() -> int:
         from ..common.config import load_config
 
         cfg = load_config(args.config)
-        from ..core import protocol
+        from ..core import protocol, template_delta
 
         protocol.configure_episode_caps(
             cfg.episode.max_env_steps,
             cfg.episode.max_assistant_turns,
             cfg.episode.max_tokens_per_turn,
         )
+        template_delta.configure_thinking(cfg.episode.enable_thinking)
     except BaseException as err:  # noqa: BLE001
         return _fail("config load (check env vars referenced by the yaml)", err)
     _ok("config", f"environment={cfg.environment.name}")

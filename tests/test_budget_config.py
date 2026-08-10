@@ -108,3 +108,35 @@ def test_executor_budget_decoupled_from_padding_dimension(tmp_path, monkeypatch)
                   + "episode: {session_token_budget: 40000}\n")
     with pytest.raises(ValueError, match="episode.session_token_budget"):
         load_config(str(p3))
+
+
+def test_enable_thinking_is_actually_injected_into_the_template_kwargs():
+    """thinking 开关必须真的改变模板渲染,而不是只存在于配置对象里。
+
+    对照 2026-08-08 的 P0:`episode.max_tokens_per_turn` 曾是 dead config
+    —— 键读得到、无注入点,而当时的测试只断言 `cfg.x == v` 故未拦住。
+    因此这里断言**注入后的模块状态**。
+    """
+    from trace_opd.core import template_delta as td
+
+    before = dict(td._CHAT_KWARGS)
+    try:
+        td.configure_thinking(True)
+        assert td._CHAT_KWARGS == {"enable_thinking": True}
+        td.configure_thinking(False)
+        assert td._CHAT_KWARGS == {"enable_thinking": False}
+    finally:
+        td._CHAT_KWARGS = before
+
+
+def test_thinking_flag_enters_the_objective_fingerprint(tmp_path, monkeypatch):
+    """两种 thinking 模式的 run 不能共用一条曲线 ⇒ 必须改变指纹;
+    而 non-thinking(历史默认)必须保持既有指纹逐字节不变。"""
+    from trace_opd.common import config as C
+
+    cfg = _load(tmp_path, monkeypatch, **GOOD)   # GOOD = 本文件既有的合法预算三件套
+    base = C.objective_fingerprint(cfg)
+    cfg.episode.enable_thinking = True
+    assert C.objective_fingerprint(cfg) != base
+    cfg.episode.enable_thinking = False
+    assert C.objective_fingerprint(cfg) == base

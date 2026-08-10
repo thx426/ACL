@@ -31,6 +31,7 @@ import pandas as pd
 
 from ...common.config import SciworldCfg, load_config
 from ...core import protocol
+from ...core import template_delta
 from .adapter import GT_SENTINEL, _Worker, _is_electrical, _scaffold
 from .adapter import COMMAND_REFERENCE, ELECTRICAL_EXTRA, WorkerFailure
 
@@ -150,6 +151,7 @@ def main() -> int:
             cfg_all.episode.max_assistant_turns,
             cfg_all.episode.max_tokens_per_turn,
         )
+        template_delta.configure_thinking(cfg_all.episode.enable_thinking)
     else:
         cfg = SciworldCfg()
     cfg.worker_python = args.worker_python

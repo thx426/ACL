@@ -45,8 +45,29 @@ def load_items(paths: list[str]) -> list[dict]:
     return list(seen.values())
 
 
+UNRELIABLE_PATH = Path(__file__).with_name("unreliable_tasks.json")
+
+
+def load_unreliable() -> tuple[set[str], dict]:
+    """reward 恒零的任务集(判定过程与根因见同目录 unreliable_tasks.json)。
+
+    这些任务的 golden 交给生产评分链路自比都拿不到 1.0 —— agent 逐格复现
+    verified 答案 reward 仍是 0。留在 train 里,组内 rollout 全 0 ⇒ GRPO
+    advantage 全零、该组无梯度、纯烧算力;留在 val 里则压低天花板。
+    用户裁定 2026-08-09:全部剔除,对所有 SpreadsheetBench 实验生效。
+    """
+    doc = json.loads(UNRELIABLE_PATH.read_text(encoding="utf-8"))
+    return {str(t["task_id"]) for t in doc["unreliable_tasks"]}, doc
+
+
 def split_seed42(items: list[dict], n_train: int = 200, n_test: int = 200):
-    """union → sort(id) → shuffle(seed42) → 切分(旧 manifest 同法)。"""
+    """union → sort(id) → shuffle(seed42) → 切分(旧 manifest 同法)。
+
+    注意:不可靠任务的剔除**发生在本函数之后**,不在 pool 里预先剔除 ——
+    预先剔除会让 shuffle 的落位整体平移、划分全变;放在切分后剔除,得到的
+    train/valid 是原 200/200 的严格子集,与已按全 400 起跑的对照臂仍保持
+    子集关系,val 曲线可比。
+    """
     pool = sorted(items, key=lambda it: str(it["id"]))
     random.Random(42).shuffle(pool)
     if len(pool) < n_train + n_test:
@@ -60,7 +81,16 @@ def make_row(item: dict, split: str, data_root: str) -> dict:
     answer_position = str(item.get("answer_position", ""))
     answer_sheet = str(item.get("answer_sheet", "") or "")
     if answer_position and answer_sheet and "!" not in answer_position:
-        answer_position = f"{answer_sheet}!{answer_position}"   # 旧实现同法合成
+        # answer_sheet 可能是**多个 sheet**(逗号分隔),此时必须给每个 sheet 各配
+        # 一份 range。旧实现直接 f"{answer_sheet}!{answer_position}" 会拼出
+        # `A,B,C!A3:E11` —— evaluator 按逗号切段后,前几段没有 `!`,整段被当成
+        # cell_range 送进 openpyxl ⇒ ValueError ⇒ _score_output 的 except 吞掉
+        # ⇒ 该任务 reward 恒 0。2026-08-09 实测命中 60-7(四个 sheet)。
+        sheets = [s.strip().strip("'\"") for s in answer_sheet.split(",") if s.strip()]
+        if len(sheets) > 1:
+            answer_position = ",".join(f"'{s}'!{answer_position}" for s in sheets)
+        else:
+            answer_position = f"{answer_sheet}!{answer_position}"
     task_dir = Path(data_root) / str(item["spreadsheet_path"])
     cases = find_test_cases(str(task_dir))
     if not cases:
@@ -100,11 +130,24 @@ def main() -> int:
                     help="items.json 文件或含它们的目录(旧 split 树可整目录传入)")
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--keep-unreliable", action="store_true",
+                    help="保留 reward 恒零的任务(仅用于复现旧数据集或重新审计;"
+                         "正式实验一律不加 —— 用户裁定 2026-08-09)")
     args = ap.parse_args()
 
     items = load_items(args.items)
     print(f"[ssb] union: {len(items)} tasks")
     train, test = split_seed42(items)
+    excluded_doc = None
+    if args.keep_unreliable:
+        print("[ssb] ⚠ --keep-unreliable:保留 reward 恒零任务,不得用于正式实验")
+    else:
+        bad, excluded_doc = load_unreliable()
+        n0 = (len(train), len(test))
+        train = [it for it in train if str(it["id"]) not in bad]
+        test = [it for it in test if str(it["id"]) not in bad]
+        print(f"[ssb] 剔除 reward 恒零任务 {len(bad)} 个 "
+              f"(train {n0[0]}→{len(train)}, valid {n0[1]}→{len(test)})")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for split, part in (("train", train), ("valid", test)):
@@ -123,8 +166,19 @@ def main() -> int:
         print(f"[ssb]   instruction_type: {fams}; multi-case tasks: {n_multi}")
     manifest = {
         "source_items": args.items,
-        "method": "union -> sort(id) -> random.Random(42).shuffle -> (200, 200)",
+        "method": ("union -> sort(id) -> random.Random(42).shuffle -> (200, 200)"
+                   + ("" if args.keep_unreliable
+                      else " -> 剔除 reward 恒零任务(切分后剔除,故为原划分子集)")),
         "counts": {"train": len(train), "valid": len(test)},
+        "unreliable_excluded": (
+            None if excluded_doc is None else {
+                "n": len(excluded_doc["unreliable_tasks"]),
+                "source": "envs/spreadsheetbench/unreliable_tasks.json",
+                "决定": excluded_doc["决定"],
+                "判定环境": excluded_doc["判定环境"],
+                "task_ids": sorted(str(t["task_id"])
+                                   for t in excluded_doc["unreliable_tasks"]),
+            }),
     }
     (out / "split_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"

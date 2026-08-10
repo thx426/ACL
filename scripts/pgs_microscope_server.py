@@ -148,6 +148,11 @@ def _meta_of(d: dict) -> dict:
         split=d.get("split", ""),
         # 分臂采样(v3.1):None=非分臂 run(历史全臂);0=bare 臂;1=steered 臂
         arm=int(arm) if arm is not None else None,
+        # v4 行类的**权威**判据(落盘顶层字段)。arm 只能间接推断且在 research
+        # 行上取到 None,2026-08-09 的分母污染即源于此,不要退回按 arm 猜。
+        role=d.get("sample_role"),
+        research=d.get("research") or {},
+        conts=d.get("continuations") or [],
         len=d.get("response_token_len", 0),
         m=dict(
             cand=s.get("steer_n_candidates", 0),

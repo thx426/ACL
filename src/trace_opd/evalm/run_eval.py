@@ -34,6 +34,7 @@ import pandas as pd
 from ..common.config import load_config
 from ..core import protocol
 from ..core.episode import GenResult, run_episode
+from ..core import template_delta
 from ..core.template_delta import TemplateDelta
 from ..core.types import OUTCOME_ENV_ERROR
 from ..envs.registry import make_env_factory
@@ -119,6 +120,7 @@ async def main_async(args) -> int:
         config.episode.max_assistant_turns,
         config.episode.max_tokens_per_turn,
     )
+    template_delta.configure_thinking(config.episode.enable_thinking)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
     protocol.configure_fc_dialect(delta.fc_dialect)

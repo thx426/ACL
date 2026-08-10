@@ -24,9 +24,21 @@ research:
   enabled: true
   backend: external
   tool_protocol: fncall
+  # 用户裁定 2026-08-07 第三轮,定回 8/2/4。三轮的实测账:
+  #   ① 曾以为"降预算伤文档质量"(最后一次实验成功率 87.5%→65.2%),后发现
+  #      那是**拿 s3 的 step1 单点当基准**造成的假象:s3 自身 8 个采样点的范围是
+  #      65.6%–87.5%(step4 就是 65.6%),而 v33 的 65.2%/65.6% 全在范围内;
+  #      v33 的"全部实验成功率"55.3%/58.4% 反而**高于** s3 的均值 51.7%。
+  #   ② n_exp 8→12 的代价是实打实的:timing_s/step 843s→1337s(**+58%**),
+  #      358 步从 3.5 天涨到 5.5 天,而质量收益在噪声内。故定回 8。
+  #   ③ k_default 曾"改了不生效"的真因已定位并修复:prompts.TOOL_SCHEMAS 里
+  #      k 的描述硬编码 "default 4",模型照着显式填 4,使 tools.py 的
+  #      args.get("k", cfg.k_default) 永不触发 —— 两个 run 的 episode/实验
+  #      因此恒为 4.00。现已改为 tool_schemas_for(cfg) 按配置生成描述
+  #      (tests/test_tool_schema_k_follows_config.py 锁定),k_default=2 才真正生效。
   n_exp: 8
   k_default: 2
-  k_max: 4                   # tools.py 取 min(k_req, k_max),留大即绕过默认
+  k_max: 4                   # tools.py 取 min(k_req, k_max)
   max_turns: 30
   wrapup_buffer: 2
   fetch_raw_limit: 20
@@ -36,11 +48,14 @@ research:
   episode_temperature: 1.0
   researcher_max_tokens: 8192
   session_timeout_s: 3600
+  session_token_budget: 32768   # §7.5 必配(代补,机械迁移)
+  max_prompt_tokens: 2048
 
 narration:
   backend: engine
   max_words: 1000
   temperature: 0.3
+  max_prompt_tokens: 6144   # §7.5 必配(代补)
 
 roles:
   researcher:
@@ -104,9 +119,25 @@ train:
   log_prob_max_token_len_per_gpu: 8192
   ulysses_sp: 2
   rollout_max_model_len: 40960
-  rollout_max_num_batched_tokens: 8192
+  rollout_max_num_batched_tokens: 16384  # 用户裁定 2026-08-07(原 8192):prefill 并发。
+                            # 8192 是 vLLM 时代为绕 step-17 illegal-access 设的模板值,
+                            # 本 run 后端已是 SGLang。不拉到 32768 的原因:SPS verify 的
+                            # prompt_logprobs 临时 logits = 本值 × vocab × 2B × 2,
+                            # 32768 时要 19.9GB,与提高后的 KV pool 叠加会顶到 80GB 上限;
+                            # 16384 对应 9.9GB,稳妥。
+                            # ⚠ 与大 sidecar 共存拓扑必须调回 ≤2048(本 run researcher
+                            #   是 external 35B 远端隧道,本机无 sidecar)
   rollout_backend: sglang
-  rollout_gpu_mem: 0.5
+  rollout_gpu_mem: 0.70     # 用户裁定 2026-08-07(原 0.5):KV cache 是并发的绑定约束。
+                            # 实测账(Qwen3-4B:36层×8KVheads×128 ⇒ KV/token=144KB):
+                            #   0.5 ⇒ SGLang 41GB − 权重 8GB = KV pool 33GB = 224K token
+                            #   而 256 条并发 × 冒烟中位 3154 token = 需求 807K token
+                            #   ⇒ 只装得下 28%,SGLang 排队 ⇒ 实际 batch 只有理论的 1/3。
+                            # 证据:utilization.memory 仅 40–51%(decode 是 memory-bound,
+                            # batch 够大时带宽应近饱和)、功耗 216–295W/400W、显存 46/82GB。
+                            # 0.70 ⇒ KV pool ≈49GB(+48%),覆盖率 28%→41%。
+                            # 安全性:冒烟实测 actor max_memory_allocated 仅 27.7GB,
+                            # 且 SGLang 训练期 sleep 让出显存(162 实测 42→21GB)。
   rollout_max_num_seqs: 256
   rollout_temperature: 1.0
   loss_agg_mode: seq-mean-token-mean

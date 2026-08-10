@@ -1,0 +1,217 @@
+# =============================================================================
+# A800 · Qwen3.5-9B · SpreadsheetBench(verified 400)· **v3.3 × v4 自体研究员**
+# =============================================================================
+# 用户裁定 2026-08-09:ALFWorld 对 9B 已饱和(PGS 与纯 GRPO 最终同为 ~98%,
+# 只差收敛速度),换 SSB 以拉开机制差异。本臂 = 完整自进化机制:
+#   researcher = 9B policy 本体(engine 后端,research_rl.enabled)
+#   steering   = v3.3 六模块(asym adv / 熵门 / W off / α cosine)
+# 对照臂:experiments/ssb-9b-grpo-baseline-a800(纯 GRPO,逐键相同只关机制)
+#
+# 数据:verified-400 → seed42 → train 200 / valid 200
+#   ⚠ 每任务**单 case**(实测:全库无 2_/3_ 前缀文件)⇒ soft ≡ hard,
+#     reward 二值(0/1),无部分分。912 全集才有多 case。
+#   ⚠ 上游 typo:spreadsheet/42930 的 golden 文件名 id 写作 43930,
+#     已用 symlink 修正(不动原文件),全库仅此一处。
+#
+# 部署前置:LibreOffice 7.6.7.2(免 root 装于 $SSB_SOFFICE;评分前公式重算刚需,
+#   26.x 需 GLIBC 2.29 而 Rocky 8 只有 2.28 故降版)。
+# =============================================================================
+
+run:
+  name: ssb_9b_selfres
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs
+  tape: true
+
+environment:
+  name: spreadsheetbench    # envs/registry.py 分派键(非默认值,进指纹)
+
+research:
+  enabled: true
+  backend: engine   # v4 自体:researcher chat 走本机引擎
+  tool_protocol: text
+  n_exp: 8  # 用户裁定 2026-08-07(原 16):降 episode 开销
+  k_default: 2  # 同上(原 4)
+  k_max: 4  # 同上(原 8);tools.py 用 min(k_req,k_max)
+  max_turns: 20  # 用户裁定 2026-08-08(原 30)
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"                 # SSB 下 gt_text 恒 None(golden=测试答案);此开关无效果位
+  episode_temperature: 1.0
+  researcher_max_tokens: 4096  # 用户裁定 2026-08-08(原 8192)
+  session_timeout_s: 3600
+  # §7.5 必配(2026-08-08):流预算控制器与 prompt 上限(定值依据:4B 探针
+  # 会话总量 p90=42k/max=58.8k;prompt 中位 1426/max 1598)
+  session_token_budget: 32768
+  max_prompt_tokens: 8192  # 用户裁定 2026-08-08(原 2048 过紧)
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+  max_prompt_tokens: 32768  # 用户裁定 2026-08-08
+  max_tokens: 0  # 0 = 沿用旧推导 3×max_words(§7.5 新键)
+
+roles:
+  researcher:               # v4 自体不消费(engine 豁免);保留段与 s4 同构
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+
+episode:
+  max_env_steps: 20         # 用户裁定 2026-08-07:SSB 默认 20 次工具调用
+                            # (旧 skills_evolve 实证 max_turns=8,9B 下够用;
+                            # 4B 放宽;按截断率数据再调)
+  max_assistant_turns: 28   # 步预算 + 格式失败余量(校验 turns > steps)
+  max_tokens_per_turn: 4096 # 用户裁定 2026-08-09。SSB 每轮要写 Python 代码,
+                            # 比 ALFWorld 的单条命令长得多(那边 1024 够用)
+  session_token_budget: 32768   # executor 流预算(§7.6 新键,与 padding 维度解耦)。
+                            # 估算:20 轮 ×(代码 ~1500 + 表格观察 ~900)≈ 48000 上界,
+                            # 实际远低于此;SSB 首跑无实测,冒烟后按分布回调
+
+spreadsheetbench:
+  data_root: "${SSB_DATA}"  # verified 400 xlsx 根(服务器数据,env 注入)
+  exec_concurrency: 64      # run_python 子进程全局并发门。用户裁定 2026-08-09:
+                            # 32 → 64(= A800 物理核数)。依据实测:32 并发下
+                            # vmstat 显示 us=20~57% / id=42~78% / wa=0,CPU 有大量
+                            # 余量;GPU 侧稳定 94~96% 未受挤压。
+                            # ⚠ 8 个 sglang scheduler 各自 busy-poll 占满一核
+                            #   (已知行为),故 64 并发时总需求会略超物理核数 ——
+                            #   若后续出现 wa 上升或 id 逼近 0,回调到 48。
+                            # ⚠ 正在跑的 GRPO 对照臂仍是 32,不中途改(改并发会让
+                            #   前后步墙钟不可比);本值自下一个实验起生效。
+  python_timeout_s: 120
+  recalc_timeout_s: 120   # 评分前 LibreOffice 公式重算(官方语义;需装
+                          # libreoffice 或设 SSB_SOFFICE,缺失装配期即死)
+  obs_max_chars: 3500       # 工具输出截断(保 <tool_response> 包裹完整)
+
+train:
+  model_path: "${TRACE_MODEL_PATH}"  # 基座 Qwen3.5-9B 原始权重(env_ssb.sh 注入)
+  train_file: "${SSB_TRAIN_FILE}"      # build_dataset 产出 train.parquet(200)
+  val_files:
+    - "${SSB_VAL_FILE}"                # valid.parquet(200;seed42 后半)
+  experiment_name: ssb_9b_selfres
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1
+  train_batch_size: 8  # 用户裁定 2026-08-09
+  rollout_n: 16            # 分臂 8 bare + 8 steered(+8 research 由 launcher 追加)
+  ppo_mini_batch_size: 8  # 单位=任务数;= batch ⇒ 每步一次全批更新
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  # ---- M1 估计器(与 steering.adv_mode 强制联动,config.py:546 防半配置)----
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false    # 不除 std:K_c 级样本噪声下除 std 放大纯噪声
+  response_length: 32768
+  max_prompt_length: 8192  # verl prompt padding 维度 >= research prompt 上限
+                            # 预览,比 ALFWorld 长;fail-loud 口径下取宽
+  max_token_len_per_gpu: 34816  # 单序列容量声明:本值 × ulysses_sp(4) = 139264 ≥ prompt+response
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 4
+  rollout_max_model_len: 40960
+  rollout_max_num_batched_tokens: 16384
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 128
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 10  # 用户裁定 2026-08-09
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 8  # 必须 = train_batch_size(校验强制)
+  use_fused_kernels: true  # ⚠ 默认 false 必须显式开:Qwen3.5 词表 248320,不开则 logits 显存必爆
+  fused_kernels_backend: torch  # torch 首发,triton 待验
+
+steering:
+  enabled: true
+  doc_source: researcher      # 每 (global_step, task_id) 在线动态生产,组内共享
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf                 # 预算不设限;spent 仅作观察量
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0                # 熵门档下 D 门阈无语义(gate_mode=entropy)
+  # ---- M4 门控组件化:强度函数 w_t∈[0,1],η_t = η_max·w_t ----
+  gate_mode: entropy          # G-E 熵门(v3.3 默认首发):w = min(1, h_t/H_q);
+                              # 关门位零教师成本(熵是 draft 侧免费信号)
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05               # ε 探针:5% 位置随机 w→0,承担因果读数
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  # ---- M3 W_beh 档位 ----
+  w_beh_mode: "off"           # v3.3 新默认:steered 行不做行为 IS,ratio 分母
+                              # 统一 π_θold(MENTOR 口径)
+  w_beh_shaped_gamma: 0.1
+  # ---- M1 不对称 advantage ----
+  adv_mode: asym              # bare 行组内 LOO;steered 行 A = [r − mean_bare]₊ × α_t
+                              # (失败或不超均值 ⇒ advantage 恰 0,零梯度不惩罚)
+  # ---- M2 α cosine 有限期 ----
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 167  # T_decay ≈ 总步数×2/3。250 步 = train 200 ÷ batch 8 × 10 epochs
+                              # batch 16 = 12 步/epoch × 2 epochs = 25 步 ⇒ 17。
+                              # ⚠ 总步数远小于 ALFWorld(358),α 衰减窗很短
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  # ---- 熵门标定(⚠ SSB 语境从未标定,下列为 4B/ALFWorld 占位)----
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28    # ⚠ 占位:该值来自 ALFWorld 语境。SSB 的任务表面
+                              # (表格预览 + Python 代码)完全不同,熵分布不迁移。
+                              # gate_adaptive=true 会自校,但前若干步门率可能
+                              # 落在 gate_rate_bounds 外 —— 属预期不属故障
+  entropy_floor: 0.6          # ⚠ 同上,占位
+  intensity_w_min: 0.05       # w_t < 本值 ⇒ 跳过教师 verify(bypass 省算力)
+  # ---- 分臂采样(v3.1)----
+  steered_fraction: 0.5       # 16 executor 行 = 8 bare + 8 steered
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768    # 训评同构:与 episode.session_token_budget 一致
+  n: 3                      # 用户裁定 2026-08-09:val 每题采样 3 次,指标 avg@3。
+                            # verl 按实际 n_resps 命名 ⇒ 指标变为 mean@3,
+                            # 并额外给出 best@3(=pass@3)/ worst@3(稳定性)。
+                            # 动机:SSB reward 二值且起点极低,greedy@1 会长期恒 0
+                            # 看不出进展;3 次采样给出 0/.33/.67/1 的分辨率
+  temperature: 0.6          # 用户裁定。n>1 必须 >0(校验强制):温度 0 时 3 次贪心
+                            # 解码逐字节相同,avg@3 退化为 mean@1 却多付 3 倍成本。
+                            # ⚠ 与 ALFWorld 线的 greedy@1 口径不可直接比较
+
+research_rl:
+  enabled: true
+  research_n: 8
+  prefix_quantiles: [0.05, 0.15, 0.30, 0.50, 0.75]
+  continuation_samples: 4
+  continuation_temperature: 1.0
+  researcher_temperature: 1.0
+  research_rl_weight: 1.0  # λ_r 用户裁定 2026-08-08(原 0.1 过小);seq-mean 下行间等权
+  research_warmup_steps: 0
+  research_max_sample_tokens: 0  # 0 = 联动 session_token_budget(§7.4:预算内轨迹恒有梯度)

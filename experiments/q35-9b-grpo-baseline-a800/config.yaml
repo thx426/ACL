@@ -1,0 +1,210 @@
+# =============================================================================
+# A800 · Qwen3.5-9B · **原生 GRPO 对照臂**(无 PGS steering / 无 researcher)
+# =============================================================================
+# 用户裁定 2026-08-09:「为了做一次对照试验,在 A800 上用这个 9B 的模型运行一次
+# 原生的 GRPO 训练作为方案机制的对照」「不要求严格对照,先跑一组纯 GRPO 看效果」。
+#
+# 对照对象:q35_9b_formal(v3.3 × external 35B researcher),其 val 曲线
+#   step0 30.71/26.87 → step40 100.00/97.76 → step100 98.57/96.27 (seen/unseen)
+# 本臂回答的问题:**这条 +68pp 里,纯 on-policy GRPO 自己能拿到多少?**
+#
+# 与 PGS 臂的差异**只有三处机制开关**(其余逐键相同,同一棵代码树):
+#   steering.enabled  true → false     无教师倾斜、无 verify、无分臂
+#   train.adv_estimator pgs_asym_grpo → grpo_loo
+#   steering.adv_mode asym → legacy_shared
+#     (后两项由 config.py:546 的守卫强制联动:关 steering 却留 asym 会直接报错,
+#      因为 asym advantage 需要分臂标签)
+#   research.enabled  true → false     文档无人消费,关掉省 35B 端点与 episode 开销
+#
+# ⚠ 本配置基于 A800 的 TRACE-OPD-Q35 树(旧版,无 §7.5/§7.6 新键、
+#   episode.max_tokens_per_turn 仍是 dead config 实际生效 2048)。**故意不同步
+#   新代码** —— 对照臂必须与 PGS 臂跑在同一棵树上,否则差异不止机制开关。
+# =============================================================================
+
+run:
+  name: q35_9b_grpo_baseline
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-Q35/runs
+  tape: true
+
+# ---------------------------------------------------------------------------
+# 在线 researcher 文档 producer(沿 v3.3 预算档;35B 仍走 162 隧道,与 9B 无关)
+# ---------------------------------------------------------------------------
+research:
+  enabled: false           # 纯 GRPO 不消费文档:关掉省 35B 端点与 episode 开销
+  backend: external
+  tool_protocol: fncall
+  n_exp: 8
+  k_default: 2
+  k_max: 4
+  max_turns: 30
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"
+  episode_temperature: 1.0
+  researcher_max_tokens: 8192
+  session_timeout_s: 3600
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+
+# ---------------------------------------------------------------------------
+# Episode 协议(训练/评测同构;逐字沿 v3.3 4B 档)
+# ---------------------------------------------------------------------------
+episode:
+  max_env_steps: 30
+  max_assistant_turns: 40
+  max_tokens_per_turn: 2048
+
+alfworld:
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  spawn_concurrency: 64
+  start_timeout_s: 300
+  step_timeout_s: 120
+  boot_concurrency: 32
+
+# ---------------------------------------------------------------------------
+# 训练:verl GRPO —— 与 4B v3.3 档的差异仅四处,均为 9B/hybrid 适配:
+#   ① use_fused_kernels(248k 词表 logits 不落地,显存刚需)
+#   ② rollout_max_num_seqs 256→128(mamba state pool ≈50MB/req,控池)
+#   ③ model_path → Qwen3.5-9B
+#   ④ SP=2 主档前置:环境须装 flash-linear-attention(verl qwen3_5 patch 在
+#      SP>1 时要求 FLA cp_context 支持,缺失即 raise;SP=1 fallback 免 FLA)
+# ---------------------------------------------------------------------------
+train:
+  model_path: "${TRACE_MODEL_PATH}"    # Qwen/Qwen3.5-9B 原始权重
+  train_file: "${TRACE_TRAIN_FILE}"
+  val_files:
+    - "${TRACE_VAL_SEEN_FILE}"
+    - "${TRACE_VAL_UNSEEN_FILE}"
+  experiment_name: q35_9b_grpo_baseline
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1             # 2026-08-08 用户裁定回 1(曾试 TP=2:每实例跨 2 卡、
+                            # 显存 58-62GB/卡起服正常,但 rollout DP 从 8 降到 4)。
+                            # TP=1 保持 8 路 DP 并发,配 memory-saver 与训练错峰。
+  train_batch_size: 16
+  rollout_n: 16             # 分臂 8 bare + 8 steered(steered_fraction 0.5)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo_loo   # 原生 GRPO(组内 LOO,不除 std);与 steering.enabled=false
+                            # 强制联动(config.py:546 守卫)
+  norm_adv_by_std: false
+  response_length: 32768    # 2026-08-08 回滚到原始档(曾按"截断率 68%"上调到 38912)。
+                            # 那个截断率是 EOS 停止符缺失导致的越界垃圾撑出来的假象
+                            # (86.5% response token 是垃圾,docs/qwen35-9b-eos-stop-bug.md);
+                            # 污染批次的裁定不作数,等修复后的干净读数再定。
+
+  max_prompt_length: 2048
+  max_token_len_per_gpu: 34816
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 4             # 用户裁定 2026-08-08,依据 A800 实测激活曲线:
+                            #   每卡 tokens  2048 -> 1.0 GiB
+                            #                4096 -> 2.0 GiB
+                            #                8704 -> 14.0 GiB   ← SP=4 落在此档(实测)
+                            #               17408 -> 单卡 OOM    ← SP=2 只能外推(36.6)
+                            # 4096->8704 已是 7 倍非线性跳增,故不在该曲线上外推。
+                            # SP=4 每卡账 = 激活 14.0 + FSDP 静态 16.7 = 30.7 GiB,余量足。
+                            # 静态 16.7 = 权重2.08+梯度2.08+Adam8.34+master4.17(8卡分片,与SP无关)。
+                            # FLA 前置见上。fallback:2(若通信开销过大且实测峰值 <60G)
+  use_fused_kernels: true   # fused linear+CE(torch backend 首发;triton 待验)
+  rollout_max_model_len: 40960
+  rollout_max_num_batched_tokens: 16384   # 2026-08-08 用户裁定(原 8192)。8192 配
+                            # response_length=32768 会让 chunked prefill 切很多块;
+                            # 同项在 v4 线上调后有实测收益。不进 fingerprint。
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55     # 2026-08-08 降到 0.55。0.65 实测崩:显存峰值摸到
+                            # 79725/81920=97.3%,teacher verify(hook.py:459 _verify_rows)
+                            # 要在 rollout engine 之外再做一轮前向,分配失败触发异步
+                            # CUDA 错误 -> c10::cuda::MemPool 析构 abort -> scheduler
+                            # exit -6(SIGABRT)。注意日志**没有** "CUDA out of memory",
+                            # 是显存不足伪装成 SIGABRT。原注释保留如下:
+                            # (曾试 0.65/0.75;0.75 未实测,mamba state
+                            # pool 128req 的开销未实测,0.75 可能顶到边界)。原值 0.5
+                            # 太保守:val 实测每卡仅用 43.7/81.9 GB。训练期 rollout
+                            # sleep 后只剩 4.3 GB(门 4 实测),不挤训练激活。
+                            # 该项不进 objective_fingerprint(纯执行档)。
+  rollout_max_num_seqs: 128
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 2
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true    # 训前 val 即 9B raw 的 won_bare 基线读数(白拿)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16
+
+# ---------------------------------------------------------------------------
+# PGS steering —— v3.3 全套开关逐字沿 4B 正式档;仅熵门三参为占位(见文件头)
+# ---------------------------------------------------------------------------
+steering:
+  enabled: false           # 纯 GRPO 对照:无教师倾斜/无 verify/无分臂
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  w_beh_shaped_gamma: 0.1
+  adv_mode: legacy_shared   # steering 关闭时的合法取值(同上守卫)
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 240   # 冒烟 2 步内无效应;正式 9B 档随总步数定版
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  # ---- 熵门三参:4B 语境占位(P95=1.276 → 1.28;9B 分布未知)----
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28  # ⚠ 占位。9B 正式值 = 本冒烟 dump 的 steer_ent_hist
+  entropy_floor: 0.6        # ⚠ 占位。经 analysis/s3-arm-split-diagnosis/ent_calib.py
+  intensity_w_min: 0.05     #    重标(P95→init、floor 按分布形状报 CD-010 裁定)
+  steered_fraction: 0.5
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768    # 同上,随 train.response_length 回滚(训练/评测同构 PG-3)。
+
+  temperature: 0.0

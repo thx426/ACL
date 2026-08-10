@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import json
 import threading
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -341,15 +342,47 @@ def deploy_env(monkeypatch, tmp_path):
 
 
 def test_ssb_yaml_pair_loads_and_fingerprints(deploy_env):
+    """SSB 的两个正式实验臂:v4 自体研究员 vs 纯 GRPO 对照。
+
+    2026-08-09 迁移:原先指向 configs/experiments/a800-ssb-s1-{selfres,extres}.yaml,
+    那两份成文于 v3.2 时代(gate_mode=always_on / w_beh=per_token / 无 M1M2M4 键),
+    机制定型到 v3.3 后已过期,按用户裁定删除。实验配置改为一实验一目录。
+    """
     root = Path(__file__).resolve().parents[1]
-    selfres = load_config(root / "configs/experiments/a800-ssb-s1-selfres.yaml")
-    extres = load_config(root / "configs/experiments/a800-ssb-s1-extres.yaml")
+    selfres = load_config(root / "experiments/ssb-9b-selfres-a800/config.yaml")
+    grpo = load_config(root / "experiments/ssb-9b-grpo-baseline-a800/config.yaml")
     assert selfres.environment.name == "spreadsheetbench"
-    assert selfres.research_rl.enabled and not extres.research_rl.enabled
-    assert extres.research.backend == "external"      # 外部 researcher 路保留
-    fp_self, fp_ext = objective_fingerprint(selfres), objective_fingerprint(extres)
-    assert fp_self != fp_ext                          # 双目标 vs 单目标
-    assert "environment=spreadsheetbench" not in (fp_self + fp_ext)  # 哈希非明文
+    # 自体研究员臂 = v3.3 全套 + v4 双目标
+    assert selfres.research_rl.enabled and selfres.research.backend == "engine"
+    assert selfres.steering.enabled and selfres.steering.adv_mode == "asym"
+    assert selfres.train.adv_estimator == "pgs_asym_grpo"
+    assert selfres.steering.gate_mode == "entropy"     # M4 熵门(v3.3),非 always_on
+    assert selfres.steering.w_beh_mode == "off"        # M3 新默认
+    # 对照臂 = 机制全关,且守卫强制的联动到位
+    assert not (grpo.steering.enabled or grpo.research_rl.enabled or grpo.research.enabled)
+    assert grpo.train.adv_estimator == "grpo_loo"
+    assert grpo.steering.adv_mode in ("", "legacy_shared")
+    fp_self, fp_grpo = objective_fingerprint(selfres), objective_fingerprint(grpo)
+    assert fp_self != fp_grpo
+    assert "environment=spreadsheetbench" not in (fp_self + fp_grpo)   # 指纹是哈希非明文
     # 换环境进指纹:同配置改回 alfworld 指纹必变
     selfres.environment.name = "alfworld"
     assert objective_fingerprint(selfres) != fp_self
+
+
+def test_ssb_external_researcher_path_still_expressible(deploy_env, tmp_path):
+    """方案裁定 4:researcher 双模式必须都保留(自体 + 外部大模型端点)。
+
+    不再用一份静态 yaml 占位 —— 改为从自体臂就地改三个键构造 external 变体,
+    证明该路径在**当前机制**下仍可表达(旧做法会让模板随机制演进而腐化)。
+    """
+    root = Path(__file__).resolve().parents[1]
+    raw = (root / "experiments/ssb-9b-selfres-a800/config.yaml").read_text(encoding="utf-8")
+    raw = raw.replace("  backend: engine", "  backend: external", 1)
+    raw = raw.replace("  tool_protocol: text", "  tool_protocol: fncall", 1)
+    raw = re.sub(r"^(research_rl:\s*\n)  enabled: true", r"\1  enabled: false", raw, count=1, flags=re.M)
+    f = tmp_path / "ssb_extres.yaml"
+    f.write_text(raw, encoding="utf-8")
+    cfg = load_config(f)
+    assert cfg.research.backend == "external" and not cfg.research_rl.enabled
+    assert cfg.steering.enabled and cfg.steering.adv_mode == "asym"   # 机制仍是 v3.3
