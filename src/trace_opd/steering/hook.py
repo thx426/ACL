@@ -159,6 +159,7 @@ class SpsGenerate:
         c: float,
         obs_topk: int,
         stop_token_ids: set[int] | frozenset[int] = frozenset(),
+        draft_horizon: int = 0,
     ) -> None:
         self._draft = draft
         self._verify = verify
@@ -182,6 +183,16 @@ class SpsGenerate:
         # 于 draft 段,replacement 后必须由钩子自己重判,否则会在「已结束」的
         # 前缀后继续 draft,产出停止符之后的 token。
         self._stop_ids = frozenset(int(t) for t in stop_token_ids)
+        # Engine-Resident SPS P0a(2026-08-10 用户裁定,设计文档
+        # docs/plans/2026-08-10-engine-resident-sps-design.md):bounded K——
+        # 单次 draft 上限,拒绝丢弃的 suffix 从「半个 turn」封顶到 ≤K−1
+        # (SSB 近平方放大的解)。0 = 不分段(历史行为逐字节不变)。
+        # 纯执行参数:逐位接受/重采只依赖前缀与该位置双侧明细,与 draft
+        # 分段方式无关 ⇒ 采样分布逐位恒等(恒等式,非近似;机器证明见
+        # tests/steering/test_sps_bounded_k.py),不进 objective_fingerprint。
+        # ⚠ 仅在进程内原语下取小值才有意义:HTTP 路径上小 K = RPC 次数
+        # 爆炸(CD-006 已证的 MENTOR max_tokens=4 灾难)。
+        self._draft_horizon = int(draft_horizon)
 
     @staticmethod
     def _merge_policy_range(gen_extra: dict[str, Any], out_extra: dict[str, Any]) -> None:
@@ -221,11 +232,17 @@ class SpsGenerate:
 
         while len(executed) < max_tokens and not finished:
             remaining = max_tokens - len(executed)
+            # bounded K(P0a):0 = 整段(历史行为);>0 = 分段 draft,拒绝
+            # 浪费上界 K−1。自然终止判据随请求量走(draft_budget,非 remaining)。
+            draft_budget = (
+                remaining if self._draft_horizon <= 0
+                else min(remaining, self._draft_horizon)
+            )
             draft_out = await self._draft(
                 prompt_ids + executed,
                 {
                     **params,
-                    "max_tokens": remaining,
+                    "max_tokens": draft_budget,
                     "logprobs": self._obs_topk,
                     # 响应 text 由 verl 侧 EngineGenerate 自行 decode;vLLM 的
                     # detokenize/对象构造对 draft 的 256 宽明细同样是纯浪费。
@@ -246,7 +263,9 @@ class SpsGenerate:
                 break
             # 自然终止判定:引擎在预算内停下(eos)⇒ 本轮生成结束,除非
             # 停点 token 被拒绝重采(那会改变续写条件,回去继续 draft)。
-            draft_finished = len(gen_ids) < remaining
+            # bounded K 下以本次请求量为准:打满 K 窗(=draft_budget)不是
+            # 终止,是分段边界,外层 while 续 draft 下一窗。
+            draft_finished = len(gen_ids) < draft_budget
 
             pi_lp = draft_out.extra.get("log_probs")
             pi_topk_ids = draft_out.extra.get("response_topk_ids")
