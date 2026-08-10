@@ -260,6 +260,72 @@ class CloudSandbox:
             except Exception:  # noqa: BLE001
                 pass
 
+    def run_polled(self, command: str, timeout_s: float,
+                   poll_s: float = 5.0,
+                   grace_s: float = _EXEC_GRACE_S) -> ExecResult:
+        """Long-command variant of ``run``: launch detached (setsid) inside
+        the sandbox, then poll a completion marker with SHORT execs — no
+        long-lived websocket to drop.
+
+        依据(2026-08-11 瘦镜像 setup 门实测):3-8 分钟的单次 exec 在公网
+        API server 上 157-184s 处流中断(3/5),而流中断按设计不可重试
+        (非幂等)。分离执行把每次网络交互压到秒级;掉的只会是某次轮询
+        (幂等,重试安全)。适用:provision setup.sh / 判分 test.sh 这类
+        一次性长命令;交互式短命令仍走 ``run``(轮询会加时延)。
+
+        沙箱内 ``timeout`` 仍是硬终止兜底(exit 124 语义同 run);客户端
+        deadline+grace 后仍无 rc 文件 ⇒ 沙箱死,CloudboxError。"""
+        tok = uuid.uuid4().hex[:10]
+        d = f"/tmp/.cbx_run_{tok}"
+        dq = shlex.quote(d)
+        t = int(timeout_s)
+        inner = (
+            f"timeout --signal=TERM --kill-after=10 {t} "
+            f"bash -c {shlex.quote(command)} > {dq}/out 2> {dq}/err; "
+            f"echo $? > {dq}/rc.tmp && mv {dq}/rc.tmp {dq}/rc"
+        )
+        launch = (
+            f"mkdir -p {dq} && "
+            f"{{ setsid bash -c {shlex.quote(inner)} "
+            f"< /dev/null > /dev/null 2>&1 & }} && echo LAUNCHED"
+        )
+        r = self._exec(launch, deadline_s=30.0)
+        if "LAUNCHED" not in r.stdout:
+            raise CloudboxError(
+                f"detached launch failed on {self._name}: "
+                f"{(r.stderr or r.stdout)[:300]}"
+            )
+        deadline = time.monotonic() + timeout_s + grace_s
+        probe = (
+            f"if [ -f {dq}/rc ]; then echo RC=$(cat {dq}/rc); "
+            f"else echo PENDING; fi"
+        )
+        while True:
+            time.sleep(poll_s)
+            try:
+                p = self._exec(probe, deadline_s=30.0)
+            except CloudboxError:
+                if time.monotonic() > deadline:
+                    raise
+                continue                      # 单次轮询掉线:幂等,重试
+            out = p.stdout.strip()
+            if out.startswith("RC="):
+                rc = int(out[3:] or 1)
+                fetch = self._exec(
+                    f"head -c 200000 {dq}/out; echo; echo __CBX_SEP__; "
+                    f"head -c 200000 {dq}/err; rm -rf {dq}",
+                    deadline_s=60.0,
+                )
+                stdout, _, stderr = fetch.stdout.partition("__CBX_SEP__")
+                return ExecResult(stdout=stdout.rstrip("\n"),
+                                  stderr=stderr.strip("\n"),
+                                  exit_code=rc)
+            if time.monotonic() > deadline:
+                raise CloudboxError(
+                    f"detached command on {self._name} yielded no rc within "
+                    f"{timeout_s + grace_s:.0f}s (sandbox dead or wedged)"
+                )
+
     # -------------------------------------------------------------- transfer
 
     def _put_b64(self, payload: bytes, remote_tmp: str) -> None:

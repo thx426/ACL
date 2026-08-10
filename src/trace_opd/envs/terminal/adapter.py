@@ -211,7 +211,8 @@ class TerminalEnvHandle:
                 )
             else:
                 raise CloudboxError("tests upload never materialized test.sh")
-            result = self._sbx.run(
+            # run_polled:判分最长 600s,同样不可依赖长活 websocket。
+            result = self._sbx.run_polled(
                 "bash /tests/test.sh",
                 self._cfg.test_timeout_s,
                 grace_s=self._cfg.test_grace_s,
@@ -340,7 +341,9 @@ class TerminalTaskAdapter:
         reset)。setup 失败 fail-loud——静默继续会把基建残破伪装成任务失败。"""
         setup_sh = (assets / "setup.sh").read_text(encoding="utf-8")
         sbx.write_file("/tmp/.trace_setup.sh", setup_sh)
-        r = sbx.run(
+        # run_polled:setup 是分钟级长命令,长活 websocket 会中途掉线
+        # (2026-08-11 瘦镜像 setup 门 3/5 实测);分离执行 + 短轮询根治。
+        r = sbx.run_polled(
             "cd / && bash /tmp/.trace_setup.sh",
             self._cfg.setup_timeout_s,
             grace_s=120.0,
