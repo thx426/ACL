@@ -56,7 +56,7 @@ def test_preflight_fails_loud_on_bad_factory(math_env, monkeypatch, tmp_path):
     """factory 级失败(SSB 无 data_root)非零退出且不抛未捕获异常。"""
     yaml = tmp_path / "bad.yaml"
     src = (Path(__file__).resolve().parents[1] /
-           "configs/experiments/a800-ssb-s1-selfres.yaml").read_text()
+           "experiments/ssb-9b-selfres-a800/config.yaml").read_text()
     yaml.write_text(src)
     monkeypatch.setenv("SSB_TRAIN_FILE", str(tmp_path / "t.parquet"))
     monkeypatch.setenv("SSB_VAL_FILE", str(tmp_path / "v.parquet"))

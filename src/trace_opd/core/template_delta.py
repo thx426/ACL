@@ -33,6 +33,25 @@ logger = logging.getLogger(__file__)
 _CHAT_KWARGS = {"enable_thinking": False}
 
 
+def configure_thinking(enabled: bool) -> None:
+    """安装 yaml 配置的 thinking 模式(单一真源:configs 的 episode.enable_thinking)。
+
+    影响**所有 engine 侧渲染**(executor 轨迹 / v4 自体 researcher 会话 /
+    叙述),因为它们共用 render_ids。Qwen3.5 模板的实测行为:
+
+        enable_thinking=False -> '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n'
+                                 (预填空块 = 模型直接出正文,不是"禁用思考")
+        enable_thinking=True  -> '<|im_start|>assistant\\n<think>\\n'
+                                 (模型自己写思考,再 </think>,再出正文)
+
+    幂等;必须在任何 adapter/runner 使用前执行。与 configure_episode_caps
+    同期调用 —— 它改变的是**模型每轮生成的形状**,属于协议面而非执行档,
+    因此进 objective_fingerprint(两种模式的 run 不可混为同一条曲线)。
+    """
+    global _CHAT_KWARGS
+    _CHAT_KWARGS = {"enable_thinking": bool(enabled)}
+
+
 def render_ids(
     tokenizer, messages, add_generation_prompt: bool, tools: list[dict] | None = None
 ) -> list[int]:

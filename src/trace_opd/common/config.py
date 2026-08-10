@@ -250,6 +250,13 @@ class EpisodeCfg:
     #: 48K 时此键 16384、response_length 49152)。
     session_token_budget: int = 0
     max_tokens_per_turn: int = 2048
+    #: Qwen3.5 等 thinking-family 模板的思考模式(engine 侧全局:executor /
+    #: v4 自体 researcher / 叙述共用 render_ids)。False = 预填空 think 块
+    #: (模型直接出正文);True = 模型自己写思考再出正文。
+    #: 改变每轮生成的形状 ⇒ 进 objective_fingerprint。
+    #: ⚠ 开启会显著抬高 token 消耗(历史实测同答案 8 → 167 token),
+    #: session_token_budget / max_tokens_per_turn 须随之重估。
+    enable_thinking: bool = False
 
 
 @dataclass
@@ -397,6 +404,11 @@ class TrainCfg:
 class EvalCfg:
     response_budget: int = 32768
     temperature: float = 0.0
+    #: 训练内 val 的每题采样次数 → verl val_kwargs.n;指标名随之变成
+    #: `mean@N`(metric_utils.py:1093 按实际 n_resps 命名),N>1 时 verl 另给
+    #: best@N / worst@N。1 = 历史 greedy 单次口径。
+    #: ⚠ N>1 必须配 temperature>0,否则 N 次贪心解码逐字节相同、平均无意义。
+    n: int = 1
 
 
 @dataclass
@@ -592,6 +604,15 @@ def _validate(cfg: "Config") -> None:
             f"轮×单轮乘积={_turn_budget}({who});padding 维度="
             f"train.response_length={cfg.train.response_length},"
             f"CPU 内存 ∝ 行数×维度。"
+        )
+    # eval 采样口径自洽(用户裁定 2026-08-09 引入 avg@N):
+    if cfg.eval.n < 1:
+        raise ValueError(f"eval.n 必须 >=1,得到 {cfg.eval.n}")
+    if cfg.eval.n > 1 and cfg.eval.temperature <= 0:
+        raise ValueError(
+            f"eval.n={cfg.eval.n} > 1 要求 eval.temperature > 0(得到 "
+            f"{cfg.eval.temperature}):温度为 0 时 N 次贪心解码逐字节相同,"
+            "avg@N 退化为 mean@1 却多付 N 倍评测成本"
         )
     if t.rollout_backend not in ("vllm", "sglang"):
         raise ValueError(f"train.rollout_backend 必须是 vllm|sglang,得到 {t.rollout_backend!r}")
@@ -1079,6 +1100,11 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 在跑 text run 的指纹逐字节不变,误用新代码续跑旧 run 会被 resume 守卫拦下。
     if cfg.environment.name == "alfworld" and cfg.alfworld.protocol != "text":
         material += f"|alfworld_protocol={cfg.alfworld.protocol}"
+    # thinking 模式改变每轮生成的形状(空 think 块 vs 模型自写思考),
+    # 是协议面而非执行档:两种模式的 run 不可混为同一条曲线。条件追加
+    # 以保 non-thinking 历史 run 的指纹逐字节不变。
+    if cfg.episode.enable_thinking:
+        material += "|thinking=on"
     # 分臂采样(v3.1)改变优化目标(组内一半样本换回 π 采样),必须进指纹;
     # 条件追加:fraction=1.0(历史全臂)不改 material,既有 run 指纹逐字节不变
     # (researcher source 哨兵同款先例)。

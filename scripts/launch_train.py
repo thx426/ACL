@@ -228,6 +228,7 @@ def preflight_static_doc_table(path: str) -> None:
 
 def build_command(cfg: Config, run_dir: Path) -> list[str]:
     t = cfg.train
+    e = cfg.eval
     if not t.model_path or not t.train_file or not t.val_files:
         raise SystemExit("train.model_path / train.train_file / train.val_files are required")
     agent_cfg = ROOT / "train" / "agent_loop_config.yaml"
@@ -358,10 +359,15 @@ def build_command(cfg: Config, run_dir: Path) -> list[str]:
         "actor_rollout_ref.rollout.calculate_log_probs=False",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
         f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={t.log_prob_max_token_len_per_gpu}",
-        "actor_rollout_ref.rollout.val_kwargs.temperature=0",
+        # 训练内 val 的采样口径由 eval 段决定(2026-08-09 接线:此处原为硬编码
+        # greedy,导致 eval.temperature 只对离线 run_eval 生效、训练内 val 恒
+        # 贪心)。do_sample 由 n/temperature 推导 —— 二者任一要求随机性即开。
+        f"actor_rollout_ref.rollout.val_kwargs.temperature={e.temperature}",
         "actor_rollout_ref.rollout.val_kwargs.top_p=1.0",
         "actor_rollout_ref.rollout.val_kwargs.top_k=-1",
-        "actor_rollout_ref.rollout.val_kwargs.do_sample=False",
+        f"actor_rollout_ref.rollout.val_kwargs.n={e.n}",
+        f"actor_rollout_ref.rollout.val_kwargs.do_sample="
+        f"{bool(e.n > 1 or e.temperature > 0)}",
         f"actor_rollout_ref.rollout.agent.agent_loop_config_path={agent_cfg}",
         f"actor_rollout_ref.rollout.agent.num_workers={t.agent_num_workers}",
         f"trainer.n_gpus_per_node={t.n_gpus}",
