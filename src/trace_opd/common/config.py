@@ -218,6 +218,36 @@ class SciworldCfg:
 
 
 @dataclass
+class TerminalCfg:
+    """终端 CLI 域(TMax-15K × ACS 云沙箱;envs/terminal/adapter.py,引入
+    裁定 2026-08-10 terminal-env-proposal.md)。部署事实走 env(TERMINAL_*),
+    不进 yaml 字面量。协议面常量(截断 10k、单工具 bash、提交标记、wrapper
+    路径)是 TMax 忠实字面量,故意**不做**配置——改它们=改任务表面。"""
+
+    protocol: str = "fncall"        # 终端域 FC 原生,无 text 档
+    task_data_root: str = ""        # TERMINAL_TASK_DATA(解包的 per-task 资产根:
+                                    # <root>/<task_id>/{setup.sh,tests/,instruction.md})
+    kubeconfig: str = ""            # TERMINAL_KUBECONFIG(集群 kubeconfig 路径)
+    namespace: str = "default"
+    image: str = ""                 # TERMINAL_IMAGE(ACR 胖基镜像全名:tag)
+    image_pull_secret: str = "acr-zjk"
+    run_label: str = ""             # Pod label trace-run=<值>(残留沙箱按标签清理)
+    pod_cpu: str = "1"              # TMax 同款沙箱资源(convert_to_harbor.py:244-248)
+    pod_memory: str = "2Gi"
+    spawn_concurrency: int = 32     # 沙箱 Pod 创建全局并发门(按 worker 折算;
+                                    # 保护 ACS 创建速率与 K8s API)
+    create_timeout_s: float = 300.0  # 创建→Running(冒烟实测 23s 无预热池;
+                                    # 胖基镜像首拉 GB 级,留余量)
+    setup_timeout_s: float = 600.0  # 运行时 setup.sh(任务初始化,深读 §6.3)
+    command_timeout_s: float = 120.0  # 单条 bash 命令(TMax Table 13)
+    test_timeout_s: float = 600.0   # 判分沙箱内 timeout(TMax _MIN_TEST_TIMEOUT_S)
+    test_grace_s: float = 300.0     # 判分外层墙钟余量:外层 = test_timeout_s +
+                                    # 此值(默认 900,修 TMax 120<600 倒挂)
+    score_at_budget: bool = False   # False = TMax 训练语义(不提交 ⇒ 0,不跑
+                                    # verifier);True = TB 式末步仍判分(评测近似)
+
+
+@dataclass
 class EnvironmentCfg:
     """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
     benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
@@ -543,6 +573,7 @@ class Config:
     spreadsheetbench: SpreadsheetbenchCfg
     math: MathCfg
     scienceworld: SciworldCfg
+    terminal: TerminalCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -569,7 +600,7 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
-    "scienceworld",
+    "scienceworld", "terminal",
 }
 
 
@@ -580,6 +611,21 @@ def _validate(cfg: "Config") -> None:
     if cfg.alfworld.protocol not in ("fncall", "text"):
         raise ValueError(
             f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
+        )
+    if cfg.terminal.protocol != "fncall":
+        raise ValueError(
+            f"terminal.protocol 仅支持 fncall(TMax 语料即 FC 单工具 bash,"
+            f"无 text 档),得到 {cfg.terminal.protocol!r}"
+        )
+    if cfg.terminal.test_timeout_s < 600.0:
+        raise ValueError(
+            f"terminal.test_timeout_s({cfg.terminal.test_timeout_s}) 必须 >= "
+            "600(TMax _MIN_TEST_TIMEOUT_S;更小会把慢 verifier 伪装成任务失败)"
+        )
+    if cfg.terminal.test_grace_s < 60.0:
+        raise ValueError(
+            f"terminal.test_grace_s({cfg.terminal.test_grace_s}) 必须 >= 60"
+            "(外层墙钟必须显著大于沙箱内判分 timeout,修 TMax 倒挂)"
         )
     # §7.6:executor 流预算(episode.session_token_budget,0=跟随维度)必须
     # 被 padding 维度容下(verl 只补不截)——与 research 侧同款不变式。
@@ -1226,6 +1272,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         ),
         math=_build(MathCfg, data.get("math") or {}),
         scienceworld=_build(SciworldCfg, data.get("scienceworld") or {}),
+        terminal=_build(TerminalCfg, data.get("terminal") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),
