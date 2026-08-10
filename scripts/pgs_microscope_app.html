@@ -383,7 +383,13 @@ const GLOSS = {
   gbypass:["强度旁路率","w<w_min 而整段跳过教师 verify 的 token 占比——G-E 的墙钟红利读数。越高教师开销越省;骤降=熵分布整体抬升(检查是否弥散化复发)。"],
   absorb:["吸收进度","「最后一公里」三读数:Δlogπ(draft−final)中位→0 =教师换上的 token 正被 π 内化;final=π-top1 率高=教师多在降噪;拒绝密度降=师生趋同。⚠ Δlogπ 只统计 draft/final 均在 π-top16 内的拒绝位,远 rank 硬知识按删失计入 absorbMiss16Rate——删失率升高时中位曲线会偏乐观,须并读。"],
   fork:["fork-token 双带","MENTOR Fig.3 口径:该词至少出现一次的轨迹占比。红带(wait/however/but…)升+长度涨=冗余分叉膨胀(s3 病);essence 带(check/verify)升=有用校验被吸收(良性)。"],
-  lenmax:["响应长度","lenMean=均值;lenMax=最长轨迹。lenMax 逼近 response_length 上限(虚线)= 截断风险:截断按约定判输且会把能力上升伪装成下跌,红条即处置。"],
+  resR:["r_raw(researcher 成绩)","research 行的 reward 原始值 = 前缀续写胜率 wins/valid ——「这份文档能不能让人从教师前缀续写赢」。恒零=研究信号消失(崩塌前兆);贴顶=任务侧已饱和,r 失去分辨力,此时别再据它调 λ_r。"],
+  resLam:["λ_r 实际权重","名义 λ_r × 有效梯度率。research 行 overlong 会被整行 mask 成零梯度(行还在、reward 仍进组内 baseline,但对 policy 零贡献),故实际权重可比配置值低一个数量级 —— 只看配置里的 λ_r 会严重高估 researcher 这一环的话语权。"],
+  resGrad:["有效梯度率","未被 overlong 掐掉梯度的 research 行占比。这是 researcher 环的先决条件:它低,下面所有成绩读数都只是少数行的读数。"],
+  resExp:["研究充分度","每个 researcher 会话实际做的实验次数中位。随训练上移=研究行为在变充分;塌回 1–2 = 会话退化(与 r=0 率互证)。恒等于 n_exp 上限 = 触顶,上限本身成了约束。"],
+  resSel:["择优增益","每任务 8 条研究行只有 argmax 那条的文档被 steered 臂真正消费。argmaxR = 实际投产的文档质量;增益 = argmaxR − 任务均值(两者同按任务加权,故恒非负)。它随 researcher 整体变强而收窄 —— 收窄本身不是坏事,是水位抬高了。"],
+  resLoop:["自进化闭环","argmaxR(投产文档质量)与 wonSteered(用了该文档的执行臂胜率)并列。两线同步上行 = 闭环闭上了;argmaxR 高而 wonSteered 不动 = 文档赢了续写却没帮到执行,续写 reward 与真实任务脱钩。"],
+    lenmax:["响应长度","lenMean=均值;lenMax=最长轨迹。lenMax 逼近 response_length 上限(虚线)= 截断风险:截断按约定判输且会把能力上升伪装成下跌,红条即处置。"],
 };
 const tipHTML = k => { const g=GLOSS[k]; return g?`<div class="t">${g[0]}</div>${g[1]}`:""; };
 const tip = $("#tip");
@@ -423,6 +429,10 @@ function viewOverview(){
   const CFG = R.config||{};
   const SOFT = ["entropy","d_var","soft_or"].includes(CFG.gateMode);
   const HAS_ABS = S.some(s=>s.absorbDlogpMed!=null);
+  const RES = S.map(s=>s.res).filter(Boolean);          // v4 researcher 环
+  const RID = S.filter(s=>s.res).map(s=>s.id);          // 与 RES 同序的 step id
+  const HAS_RES = RES.length>0;
+  const LR = HAS_RES ? RES[RES.length-1] : null;
   const lenWarn = CFG.responseLength>0 && L.lenMax>0.9*CFG.responseLength;
   const BMAX=runBmax();
   const Vp = Vall.find(v=>v.partial);
@@ -491,6 +501,66 @@ function viewOverview(){
       {y0:0,y1:Math.max(CFG.responseLength||0,...S.map(s=>s.lenMax||0))*1.06||undefined,
        fmt:v=>Math.round(v),target:CFG.responseLength||undefined})}
   </div>
+  ${!HAS_RES?"":`
+  <div style="margin:22px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line);
+              display:flex;align-items:baseline;gap:10px">
+    <b style="font-size:14px">researcher 环(v4 自体研究员)</b>
+    <span style="font-size:12px;color:var(--text2)">
+      每 step ${LR.n} 条研究行 / ${LR.nTasks} 任务 · 组大小 ${CFG.researchN||"—"} ·
+      续写 ${CFG.contSamples||"—"}×分位 · 排障从①管道往下看</span>
+  </div>
+  <div class="grid cards" style="margin-bottom:16px">
+    ${kpi("researcher 成绩 r̄", pct(LR.rMean),
+          `中位 ${LR.rMed?.toFixed(2)} · r=1 ${pct(LR.rOneRate)} · r=0 ${pct(LR.rZeroRate)}`,
+          "resR", LR.rZeroRate>=0.5?"warn":"")}
+    ${kpi("λ_r 实际权重", LR.lambdaEff?.toFixed(3),
+          `名义 ${LR.lambdaNominal} × 有效梯度率 ${pct(LR.validGradRate)}`,
+          "resLam", LR.validGradRate<0.8?"warn":"")}
+    ${kpi("研究充分度", `${LR.expMed?.toFixed(1)}${CFG.nExp?" / "+CFG.nExp:""}`,
+          `轮次中位 ${LR.turnsMed?.toFixed(1)}${CFG.researchMaxTurns?" / "+CFG.researchMaxTurns:""} · episode ${LR.episodesMed?.toFixed(0)}`,
+          "resExp", (CFG.nExp&&LR.expMed>=CFG.nExp)?"warn":"")}
+    ${kpi("投产文档质量", pct(LR.argmaxRMean),
+          `择优增益 ${LR.selGain>=0?"+":""}${pct(LR.selGain)} · 文档 ${LR.docWordsMed?.toFixed(0)} 词`,
+          "resSel","")}
+  </div>
+  <div class="grid charts" style="margin-bottom:16px">
+    ${chart("① 管道:有效梯度率","overlong 行被整行 mask 成零梯度。此线掉下来,下面的成绩读数就只是残余行的读数 —— 先修这里再看别的。虚线=名义 λ_r 全额生效的位置。",[
+      {label:"有效梯度率",color:"#0891b2",pts:RES.map((x,i)=>[RID[i],x.validGradRate])},
+      {label:"λ_r 实际/名义",color:"#7c3aed",pts:RES.map((x,i)=>[RID[i],x.lambdaNominal?x.lambdaEff/x.lambdaNominal:null]).filter(p=>p[1]!=null)}],
+      {y0:0,y1:1.08,fmt:pct,target:1})}
+    ${chart("① 管道:故障分解","四类故障各自的行占比。no_finalize=会话没产出文档;overflow=文档太长转不成教师前缀;degraded=有效续写不足半数;error=会话报错。",[
+      {label:"no_finalize",color:"#e11d48",pts:RES.map((x,i)=>[RID[i],x.noFinalize])},
+      {label:"doc_overflow",color:"#d97706",pts:RES.map((x,i)=>[RID[i],x.docOverflow])},
+      {label:"degraded",color:"#7c3aed",pts:RES.map((x,i)=>[RID[i],x.degraded])},
+      {label:"error",color:"#64748b",pts:RES.map((x,i)=>[RID[i],x.error])}],
+      {y0:0,y1:Math.max(0.08,...RES.flatMap(x=>[x.noFinalize,x.docOverflow,x.degraded,x.error]))*1.15,fmt:pct})}
+    ${chart("② 成绩:r_raw","前缀续写胜率。r̄ 按行平均(成绩水平);argmax 与任务均值按任务平均 —— 择优增益只能在这两条同权线之间读,拿 argmax 减 r̄ 会在各任务行数不齐时算出假的负增益。r=0 率是崩塌前兆判据。",[
+      {label:"r̄ 均值(按行)",color:"#4f46e5",pts:RES.map((x,i)=>[RID[i],x.rMean])},
+      {label:"中位",color:"#059669",pts:RES.map((x,i)=>[RID[i],x.rMed]).filter(p=>p[1]!=null)},
+      {label:"任务均值(增益基线)",color:"#64748b",pts:RES.map((x,i)=>[RID[i],x.taskMeanR]).filter(p=>p[1]!=null)},
+      {label:"argmax(投产)",color:"#d97706",pts:RES.map((x,i)=>[RID[i],x.argmaxRMean]).filter(p=>p[1]!=null)}],
+      {y0:0,y1:1.08,fmt:pct})}
+    ${chart("② 成绩:分布两端","r=0 率升 = 研究信号在消失(崩塌前兆);r=1 率贴顶 = 任务侧饱和,r 已无分辨力,不能再据它判 researcher 强弱。",[
+      {label:"r=0 率",color:"#e11d48",pts:RES.map((x,i)=>[RID[i],x.rZeroRate])},
+      {label:"r=1 率",color:"#059669",pts:RES.map((x,i)=>[RID[i],x.rOneRate])}],
+      {y0:0,y1:1.08,fmt:pct})}
+    ${chart("③ 过程:研究行为","实验次数/轮次中位。虚线=n_exp 上限:长期贴线说明上限本身成了约束,研究充分度读数已被截顶。",[
+      {label:"实验次数中位",color:"#4f46e5",pts:RES.map((x,i)=>[RID[i],x.expMed]).filter(p=>p[1]!=null)},
+      {label:"轮次中位",color:"#0891b2",pts:RES.map((x,i)=>[RID[i],x.turnsMed]).filter(p=>p[1]!=null)}],
+      {y0:0,fmt:v=>v.toFixed(1),target:CFG.nExp||undefined})}
+    ${chart("④ 闭环:投产文档 vs 执行臂","自进化闭环的直读证据。两线同步上行=闭环闭上;argmaxR 高而 wonSteered 不动=文档赢了续写却没帮到执行(续写 reward 与真实任务脱钩)。",[
+      {label:"argmaxR(投产文档质量)",color:"#d97706",pts:RES.map((x,i)=>[RID[i],x.argmaxRMean]).filter(p=>p[1]!=null)},
+      {label:"wonSteered(用该文档的执行臂)",color:"#059669",pts:RES.map((x,i)=>[RID[i],x.wonSteeredRef]).filter(p=>p[1]!=null)}],
+      {y0:0,y1:1.08,fmt:pct})}
+    ${chart("④ 产物:文档规模与续写截断","文档词数中位(左)。截断率非零 ⇒ 续写没跑完就判输,r_raw 会把预算不足伪装成文档质量差。",[
+      {label:"文档词数中位",color:"#4f46e5",pts:RES.map((x,i)=>[RID[i],x.docWordsMed]).filter(p=>p[1]!=null)}],
+      {y0:0,fmt:v=>Math.round(v)})}
+    ${chart("④ 续写健康度","续写侧的三个率。contWon 应与 r̄ 重合(口径互证,分叉=各行 valid 数不齐);trunc/err 非零即续写通道有问题。",[
+      {label:"contWon",color:"#059669",pts:RES.map((x,i)=>[RID[i],x.contWonRate]).filter(p=>p[1]!=null)},
+      {label:"截断率",color:"#e11d48",pts:RES.map((x,i)=>[RID[i],x.contTruncRate]).filter(p=>p[1]!=null)},
+      {label:"错误率",color:"#d97706",pts:RES.map((x,i)=>[RID[i],x.contErrRate]).filter(p=>p[1]!=null)}],
+      {y0:0,y1:Math.max(0.08,...RES.map(x=>x.contWonRate||0))*1.12,fmt:pct})}
+  </div>`}
   <div class="card table-card"><div class="table-scroll"><table>
     <thead><tr><th>step</th><th>状态</th><th>轨迹</th>
       <th data-tipkey="won">won <span class="q">?</span></th><th data-tipkey="gate">开门率 <span class="q">?</span></th>
