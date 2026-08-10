@@ -58,11 +58,16 @@ python scripts/engine_sps_parity_check.py \
   --a runs/<A>/rollouts/step_XXXXX --b runs/<B>/rollouts/step_XXXXX
 ```
 
-**判据**:`PARITY PASS`。脚本语义:两路径独立采样,比分布层统计——
-开门率/干预率/拒绝率/直方图 L1/won,率差容差 = max(0.03, 两比例合并 2σ)
-(won 分母只有轨迹数,二项噪声自动豁免;开门/干预率分母是十万级 token,
-容差捕捉的就是系统性偏移);**密度比界(|log_b−log_pi| ≤ 2ηc)违例必须为 0**。
-FAIL 任一项:保留两侧 dump,报 CD-010,勿自修机制侧。
+**判据**:`PARITY PASS`。脚本语义(codex 审阅 P1-1/P1-2 后修订):
+- **判定项**:账本完整性(坏文件/数组长度/非有限值/positions 单调,一律
+  fail-loud 点名文件)、**逐行密度比界 |log_b−log_pi| ≤ 该行 steer_delta**
+  (行级紧界,非轨迹级全局 cap)、两侧任务多重集与 global_step 一致、机制率
+  (open/intervene 以 `steer_ent_count` 全执行位为公共分母——G-E bypass 触发
+  面随 K 合法变化,旧的 n_candidates 分母会比较不同总体)、ent_hist L1;
+- **参考项(打印不判)**:won(差值±2σ,低功效指标)、resp_len、d_hist、
+  bypass/discarded/budget。
+- **PASS ≠ 任务效果等价证明**——效果面由 V2 的 bare 同水位硬前提与任务级
+  outcome 承担。FAIL 任一项:保留两侧 dump,报 CD-010,勿自修机制侧。
 
 ## 3. V2 · 吞吐效果与归因(用户重点;生产同构现场)
 
@@ -71,6 +76,10 @@ FAIL 任一项:保留两侧 dump,报 CD-010,勿自修机制侧。
 executor 档。对照基线 = 你们已有的 step-1 分解(107 min:bare 7.3 / research
 48.0 / steered 54.1 / 超时尾 ~27 / 训练 ~17)——若嫌陈旧,可先重跑 1 step
 python 档刷新基线(顺便让新账本键就位)。
+
+**基线刷新(codex 审阅 P2-6 后从"可选"改为必做)**:先在**同一部署 sha** 重跑
+1–2 step 的 python 档 A0——旧 107 分钟基线的代码/timeout 语义已多轮变动,跨代
+比较不可靠;两档各取第 2 步为主读数、两步差作粗方差参考。
 
 **归因两步 + sweep(每档 2 个 step,第 2 步作读数主——第 1 步含缓存冷启)**:
 
@@ -91,7 +100,12 @@ python 档刷新基线(顺便让新账本键就位)。
    计数(**timeout 语义已变**:超时组 purge+同版本重试一次,二次失败
    ReplayBuffer fail-loud——长尾读数形态与旧基线不同,分解时把重试墙钟单列);
 6. radix/前缀复用的代理读数(若 sglang 指标可得则记 cache hit;拿不到就记
-   verify 段 TTFT 变化,标注口径)。
+   verify 段 TTFT 变化,标注口径);
+7. **teacher 实际打分量降幅**(codex 审阅 P1-6:K=64 的段级 bypass 复活并无
+   数学保证——(1−q)^64 在 q=35–46% 下仍≈0,除非真实序列有低熵长程聚类):
+   每档记 `steer_n_gate_bypassed / steer_ent_count`;若 K 档相对基线无显著
+   提升,说明第二根因(bypass 失效)未被 bounded K 解决——如实记录,后续
+   走自适应窗口切分等设计层方案,不影响根因一(拒绝浪费)的收益判定。
 
 **预注册判据**(2026-08-10):
 - 主判据:E2 的 **steered 流墙钟 ≥3× 改善**(54.1 → ≤18 min);

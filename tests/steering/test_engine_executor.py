@@ -140,6 +140,32 @@ def test_engine_executor_bounded_k_over_rpc_stream_identical():
     assert 0 < st_k.ledger.n_draft_discarded < st_ref.ledger.n_draft_discarded
 
 
+def test_budget_spent_survives_a_zero_charge_turn():
+    """codex review P0-3:server 每 turn 从空账起记,而 ledger.budget_spent
+    只在正扣费路径赋值——turn1 花费、turn2 全程门关零扣费时,delta 的 0 曾
+    经 latest-wins 把轨迹总账清零。修复 = server 起账即写入轨迹累计。"""
+    # 前 8 位强异议高熵(turn1 干预扣费),后 8 位跟随低熵(turn2 零干预)
+    spec = [{"y": 5, "alt": 6, "teacher": "objects", "entropy": "high"}] * 8 \
+        + [{"y": 3, "entropy": "low"}] * 8
+    world = _PositionalWorld(spec)
+
+    st = _mk_state(seed=11)
+    client = EngineSteeredGenerate(
+        server_manager=_FakeServerManager(world), tokenizer=_Tok(),
+        request_id="r3", teacher_prefix_ids=PREFIX, student_prompt_ids=PROMPT,
+        state=st, topk=8, c=2.5, obs_topk=16, stop_token_ids={EOS},
+        draft_horizon=0,
+    )
+    t1 = asyncio.run(client(list(PROMPT), {"max_tokens": 8, "temperature": 1.0}))
+    spent_after_t1 = st.ledger.budget_spent
+    assert spent_after_t1 > 0                       # turn1 真实扣了费
+    asyncio.run(client(list(PROMPT) + list(t1.token_ids),
+                       {"max_tokens": 8, "temperature": 1.0}))
+    # turn2 零扣费:总账必须保持 turn1 的累计,不得被清零
+    assert st.ledger.budget_spent == spent_after_t1
+    assert st.budget.spent == spent_after_t1
+
+
 def test_engine_executor_abort_passthrough():
     """draft 首调 aborted:episode 语义 = 基建故障透传(token 空、
     stop_reason=aborted),客户端与状态不被污染。"""
@@ -203,6 +229,20 @@ def test_token_output_to_prim_respects_explicit_range():
                                     "max_global_steps": 9},
     ))
     assert prim.extra["min_global_steps"] == 3 and prim.extra["max_global_steps"] == 9
+
+
+def test_token_output_to_prim_verify_rows_and_finish_type_contract():
+    # codex review P2-2:verify 侧 prompt 打分行与 finish_type(P0-1 主判据)
+    # 的透传契约锁死——两套适配器(本函数 vs EngineGenerate)同字段清单。
+    prim = token_output_to_prim(_FakeTokenOutput(
+        token_ids=[1],
+        extra_fields={"global_steps": 2,
+                      "prompt_ids": [[7, 8]], "prompt_logprobs": [[-0.1, -0.2]],
+                      "finish_type": "stop"},
+    ))
+    assert prim.extra["prompt_ids"] == [[7, 8]]
+    assert prim.extra["prompt_logprobs"] == [[-0.1, -0.2]]
+    assert prim.extra["finish_type"] == "stop"
 
 
 # ------------------------------------------------------------- config 校验

@@ -158,10 +158,30 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 return
             except Exception as e:
                 logger.exception(f"Error in _run_prompt (attempt {attempt + 1}/2, uid={uid}): {e}")
-                # Let the cancelled loops actually terminate before purging —
-                # a straggler still unwinding could re-write rows after the
-                # purge and resurrect the residual group.
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # codex review P1-5: gather() does NOT cancel siblings on a
+                # non-timeout exception — cancel explicitly, then wait a
+                # BOUNDED time for the loops to unwind before purging (a
+                # straggler re-writing rows after the purge would resurrect
+                # the residual group).
+                for t in tasks:
+                    t.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True), timeout=120.0
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    # A session refused to die within the grace window. The
+                    # retry path is no longer safe: a late straggler could
+                    # write stale rows under the SAME {uid}_{sid}_{i} keys as
+                    # the retry. Purge what we can and mark failure — the
+                    # ReplayBuffer fail-loud never samples failure prompts,
+                    # so any late write lands on an unsampleable group.
+                    logger.error(
+                        f"prompt {uid}: session(s) still unwinding after 120s "
+                        "grace — skipping the retry, marking failure"
+                    )
+                    self._purge_prompt_rows(uid, partition_id)
+                    break
                 self._purge_prompt_rows(uid, partition_id)
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 

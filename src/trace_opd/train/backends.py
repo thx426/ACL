@@ -56,7 +56,8 @@ class EngineGenerate:
         #                         行语义:第 j 行预测位置 j+1,末行 dummy)
         if getattr(out, "log_probs", None) is not None:
             extra["log_probs"] = list(out.log_probs)
-        for key in ("response_topk_ids", "response_topk_logprobs", "prompt_ids", "prompt_logprobs"):
+        for key in ("response_topk_ids", "response_topk_logprobs", "prompt_ids", "prompt_logprobs",
+                    "finish_type"):
             if key in out_extra:
                 extra[key] = out_extra[key]
         # verl aborts (e.g. weight sync preemption) return empty ids with

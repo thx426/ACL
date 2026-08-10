@@ -15,6 +15,8 @@ replica 无关;几十 KB/turn,对比 python 路径每周期 MiB 级明细可忽�
 """
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 from ..core.episode import GenResult
@@ -76,6 +78,10 @@ class EngineSteeredGenerate:
         }
 
     async def __call__(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> GenResult:
+        # codex review P1-3:Ray 不向 actor 方法传播客户端取消——训练侧
+        # prompt 墙钟超时后,server 循环会成为继续烧 GPU 的孤儿。payload 带
+        # 绝对 deadline(对齐 prompt 级墙钟),server 每周期在 draft 前检查。
+        wall_s = float(os.environ.get("TRACE_AGENT_TASK_TIMEOUT_S", "2700") or 0)
         payload = {
             "prompt_ids": [int(t) for t in prompt_ids],
             "sampling_params": dict(sampling_params),
@@ -83,13 +89,17 @@ class EngineSteeredGenerate:
             "student_prompt_ids": self._student_prompt,
             "mech": self._mech_snapshot(),
             "state": steer_state_to_wire(self._state),
+            "deadline_unix": (time.time() + wall_s) if wall_s > 0 else 0.0,
         }
         resp = await self._server.steered_generate(
             request_id=self._request_id, payload=payload
         )
-        # 真源回写:先状态(budget/cap/gate/rng),再账本增量汇入总账
+        # 真源回写,事务式(codex review P2-3):先做全部可失败的解析与
+        # merge(merge 会做单调/位置/schema 校验),全部通过后才 apply
+        # state(纯赋值,不会失败)——任何一步炸,客户端状态整体未动。
+        turn_ledger = ledger_from_wire(resp["ledger"])
+        merge_ledger(self._state.ledger, turn_ledger)
         steer_state_apply_wire(self._state, resp["state"])
-        merge_ledger(self._state.ledger, ledger_from_wire(resp["ledger"]))
         ids = [int(t) for t in resp["token_ids"]]
         return GenResult(
             token_ids=ids,

@@ -114,6 +114,17 @@ token 流在给定前缀下同分布;判定层代码原样复用 ⇒ 核语义 b
 **不进 objective_fingerprint**(纯执行层,分布恒等);`draft_horizon` 同理为执行
 参数。
 
+**恒等声明的适用域**(codex 审阅 2026-08-10 后收窄并封闭):
+1. K 窗尾停止语义:引擎细类 `finish_type`(stop|length)是自然终止的主判据,
+   长度与段尾停止符为辅——纯长度判据在 EOS 恰落窗尾时会越过终止符(P0-1,
+   已修,三路径窗尾测试锁死);
+2. **seeded 采样(显式 seed / full_determinism)与 draft_horizon>0 互斥**:
+   request-scoped seed 在每个 K 窗重启随机流,K 进入 proposal 联合分布——
+   在具备分段不变 counter-based RNG 之前该组合被两道运行时防线拒绝(P0-2);
+   恒等声明仅对非 seeded 采样成立(生产 rollout 的常态)。
+在此适用域内,恒等由机器证明(fake 世界 bit-equal)+ 对拍门双保险支撑,
+"不进指纹"的决定维持。
+
 ## 5. 分期与出口判据
 
 | 期 | 内容 | 出口判据 |
@@ -157,9 +168,19 @@ server actor 内 handler 直调的最短路径(绕 HTTP 序列化层的接口点
 | 端到端协议对拍 | `tests/steering/test_engine_executor.py`(薄客户端→pickle 边界→run_steered_turn 两 turn 与单进程 bit-equal;abort 透传;原语适配;config 校验) | ✅ |
 | P0b 统计对拍门脚本 | `scripts/engine_sps_parity_check.py`(+判定逻辑单测)——真机两 executor 的 rollout dump 比对,PASS/FAIL 判据参数化 | ✅ 待真机数据 |
 
+**codex 深度审阅(gpt-5.6-sol,2026-08-10)**:报告
+`docs/reviews/2026-08-10-codex-engine-sps-review.md`(3 P0 / 6 P1 / 6 P2,
+初判 NO-GO)。处置:P0-1 窗尾 EOS(finish_type 三重判据+三路径测试)、
+P0-2 seeded×K 互斥(两道运行时防线)、P0-3 budget_spent 累计账(server 起账
+种子+merge 单调守卫)全修;P1-3 deadline/P1-4 协作让出/P1-5 有限清理等待、
+P2-1 wire 版本号/P2-2 contract test/P2-3 事务式提交全落;P1-1/P1-2 对拍脚本
+重写(行级密度界/完整性 fail-loud/公共分母/won 降参考);P1-4/P1-6 的定量
+留 P0b 真机;P2-4 prefix 重传优化不做(量级小)。恒等声明适用域收窄见 §4。
+
 **剩余 = GPU 面(P0b,等窗口)**:server actor 冒烟(import/engine 原语真实往返)、
 HTTP vs 进程内统计对拍(用上表脚本)、吞吐/radix 命中实测、K sweep{32,64,128}、
-工作量计数器。
+工作量计数器;P1-4 的 event-loop lag 与 P1-6 的 bypass 复活率按 runbook 新增
+读数实测。
 
 ## 7. 明确不做(与用户对齐过)
 

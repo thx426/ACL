@@ -95,10 +95,19 @@ class _PositionalDraft:
             rows_l.append(r_lps)
             if y == EOS:
                 break
+        # finish_type 语义模拟真 engine(P0-1 主判据):停止符停=stop、
+        # 打满请求量=length、世界表耗尽=stop
+        if ids and ids[-1] == EOS:
+            finish = "stop"
+        elif len(ids) == n:
+            finish = "length"
+        else:
+            finish = "stop"
         return _GenResult(ids, {
             "log_probs": lps,
             "response_topk_ids": rows_i,
             "response_topk_logprobs": rows_l,
+            "finish_type": finish,
         })
 
 
@@ -235,6 +244,62 @@ def test_teacher_gated_soft_modes_bitequal(mode, epsilon):
     _assert_bitequal(ref, got)
     # 非平凡性:该档确实干预过(w_d = min(1, D/θ_D) 在小 θ_D 下达满强度)
     assert any(r.eta > 0 for r in got[1].ledger.records)
+
+
+@pytest.mark.parametrize("path", ["gate_closed", "ge_bypass", "verify_accept"])
+def test_eos_exactly_at_window_tail_ends_the_turn(path):
+    """codex review P0-1:EOS 恰落 K 窗尾(len(gen_ids)==draft_budget)时,
+    旧的纯长度判据会把「因停止符停下」误判为分段边界,在终止符之后继续
+    生成。三条执行路径(无预算直通 / G-E 段级 bypass / verify 接受)都必须
+    在窗尾 EOS 处终止,且与 K=0 逐字节同流。"""
+    K = 4
+    ent = "low" if path == "ge_bypass" else "high"
+    # EOS 恰在第一个 K 窗的第 4 位;其后故意再铺 8 个位置——越界继续生成
+    # 就会执行它们,断言即失败
+    spec = [{"y": 7, "entropy": ent}] * (K - 1) + [{"y": EOS, "entropy": ent}] \
+        + [{"y": 9, "entropy": ent}] * 8
+    world = _PositionalWorld(spec)
+    if path == "gate_closed":
+        gate = lambda: _adaptive(theta_d=1e9)          # 门恒关:直通路径
+    elif path == "ge_bypass":
+        gate = _entropy_gate                            # 低熵窗:段级 bypass 路径
+    else:
+        gate = lambda: _adaptive(theta_d=1e-9)          # 门恒开:verify+接受路径
+    ref = _run_hook(world, gate(), horizon=0)
+    got = _run_hook(world, gate(), horizon=K)
+    _assert_bitequal(ref, got, ledger_too=(path != "ge_bypass"))
+    assert list(got[0].token_ids)[-1] == EOS
+    assert len(got[0].token_ids) == K                   # 未越过终止符
+    assert len(got[2].calls) == 1                       # 没有第二窗 draft
+
+
+def test_seeded_sampling_with_bounded_k_fails_loud():
+    """codex review P0-2:request-scoped seed 在每个 K 窗重启随机流,恒等
+    不成立——组合必须拒绝;K=0 时 seed 合法(单请求单流)。"""
+    world = _PositionalWorld([{"y": 5, "entropy": "high"}] * 4)
+    with pytest.raises(RuntimeError, match="seed"):
+        _run_hook_params(world, _adaptive(theta_d=1e9), horizon=3,
+                         extra_params={"seed": 7})
+    out, _, _ = _run_hook_params(world, _adaptive(theta_d=1e9), horizon=0,
+                                 extra_params={"seed": 7})
+    assert list(out.token_ids)
+
+
+def _run_hook_params(world, gate, *, horizon, extra_params, seed=42):
+    state = TrajectorySteerState(
+        gate=gate, budget=TrajectoryBudget(b_max=50.0, c=2.5),
+        reject_cap=TurnRejectCap(r_max=50), rng=np.random.default_rng(seed),
+    )
+    draft = _PositionalDraft(world)
+    hook = SpsGenerate(
+        draft=draft, verify=_PositionalVerify(world),
+        teacher_prefix_ids=PREFIX, student_prompt_ids=PROMPT,
+        state=state, tokenizer=_Tok(), topk=8, c=2.5, obs_topk=OBS,
+        stop_token_ids={EOS}, draft_horizon=horizon,
+    )
+    out = asyncio.run(hook(list(PROMPT), {"max_tokens": 16, "temperature": 1.0,
+                                          **extra_params}))
+    return out, state, draft
 
 
 def test_horizon_zero_equals_huge_horizon():

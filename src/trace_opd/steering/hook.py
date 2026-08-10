@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -214,6 +215,16 @@ class SpsGenerate:
         params = dict(sampling_params)
         max_tokens = int(params.pop("max_tokens"))
         self._assert_measure_compatible(params)
+        # codex review P0-2:request-scoped 采样种子在每个 K 窗重启随机流
+        # (同 seed 逐窗重复 U1..UK),分段数进入 proposal 联合分布,恒等
+        # 声明被破坏——在具备分段不变的 counter-based RNG 前,该组合禁用。
+        if self._draft_horizon > 0 and ("seed" in params or "sampling_seed" in params):
+            raise RuntimeError(
+                "draft_horizon > 0 with a fixed sampling seed restarts the "
+                "engine RNG stream at every K-window (per-request seed) — "
+                "distribution identity does not hold; drop the seed or run "
+                "draft_horizon=0"
+            )
         st = self._state
         st.reject_cap.new_turn()
 
@@ -265,7 +276,17 @@ class SpsGenerate:
             # 停点 token 被拒绝重采(那会改变续写条件,回去继续 draft)。
             # bounded K 下以本次请求量为准:打满 K 窗(=draft_budget)不是
             # 终止,是分段边界,外层 while 续 draft 下一窗。
-            draft_finished = len(gen_ids) < draft_budget
+            # codex review P0-1:EOS 恰落 K 窗尾时 len(gen_ids)==draft_budget,
+            # 只看长度会把「因停止符停下」误判成「分段边界」而越过终止符继续
+            # 生成——三重判据:①引擎细类 finish_type=="stop"(主判据,sglang
+            # 适配器透传);②长度短于请求量;③段尾 token 落在轮末停止集
+            # (no_stop_trim 形态的兜底;停止符被拒绝重采时 rejected 分支
+            # continue 不消费本值,语义不受影响)。
+            draft_finished = (
+                draft_out.extra.get("finish_type") == "stop"
+                or len(gen_ids) < draft_budget
+                or int(gen_ids[-1]) in self._stop_ids
+            )
 
             pi_lp = draft_out.extra.get("log_probs")
             pi_topk_ids = draft_out.extra.get("response_topk_ids")
@@ -324,6 +345,13 @@ class SpsGenerate:
 
             rejected = False
             for g, y in enumerate(gen_ids):
+                # codex review P1-4:逐位 judge 是纯同步 numpy 段;engine 档
+                # 下它跑在高并发共享 server actor 的 event loop 上,长段不
+                # 让出会拖延同 actor 的其余请求。周期性协作让出——sleep(0)
+                # 不触碰判定 rng,分布语义零影响(python 档同样受益,对应
+                # CD-006 吞吐分析 §4 的次级放大器)。
+                if g and g % 16 == 0:
+                    await asyncio.sleep(0)
                 y = int(y)
                 log_pi_y = float(pi_lp[g])
                 position = stream_len + len(executed)

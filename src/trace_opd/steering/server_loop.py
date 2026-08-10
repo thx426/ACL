@@ -59,7 +59,8 @@ def token_output_to_prim(out: Any) -> SimpleNamespace:
             extra[key] = out_extra[key]
     if getattr(out, "log_probs", None) is not None:
         extra["log_probs"] = list(out.log_probs)
-    for key in ("response_topk_ids", "response_topk_logprobs", "prompt_ids", "prompt_logprobs"):
+    for key in ("response_topk_ids", "response_topk_logprobs", "prompt_ids", "prompt_logprobs",
+                "finish_type"):
         if key in out_extra:
             extra[key] = out_extra[key]
     stop_reason = getattr(out, "stop_reason", None)
@@ -89,6 +90,10 @@ def _rebuild_state(payload: dict[str, Any]) -> TrajectorySteerState:
         rng=np.random.default_rng(0),  # 占位:立刻被 wire 状态整体覆盖
     )
     steer_state_apply_wire(state, payload["state"])
+    # codex review P0-3:ledger.budget_spent 只在正扣费路径被赋值;fresh
+    # 增量账若从 0 起,零扣费 turn 的 delta 会经 merge 的 latest-wins 把
+    # 客户端总账清零。起账即写入轨迹累计,任何 turn 的 delta 都携带有效值。
+    state.ledger.budget_spent = state.budget.spent
     return state
 
 

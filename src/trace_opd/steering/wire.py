@@ -41,6 +41,9 @@ def steer_state_to_wire(state: TrajectorySteerState) -> dict[str, Any]:
     定义在哪、清单就在哪;缺注册表的门类进 engine 档会在此 fail-loud,
     而不是静默丢态)。"""
     wire: dict[str, Any] = {
+        # 协议版本(codex review P2-1):两端代码不同版时 fail-loud,
+        # 而不是让缺键/改名伪装成 dataclass 默认值
+        "v": 1,
         # numpy Generator 完整状态:恢复后 draw 流与原对象逐位一致
         "rng": state.rng.bit_generator.state,
     }
@@ -61,6 +64,11 @@ def steer_state_apply_wire(state: TrajectorySteerState, wire: dict[str, Any]) ->
     """把线协议快照回写进(通常是新构造的)state。构造参数(b_max/c/
     r_max/门配置)不在 wire 里——两端各自从同一份 run 配置构造,漂移由
     对拍门兜底。快照键与注册表逐一对应,任何缺键即协议损坏,fail loud。"""
+    if wire.get("v") != 1:
+        raise RuntimeError(
+            f"state wire protocol version mismatch: got {wire.get('v')!r}, "
+            "expected 1 — the two sides run different code versions"
+        )
     for key, obj in _wire_parts(state):
         part = wire[key]
         for name in type(obj)._WIRE_MUTABLE:
@@ -98,10 +106,11 @@ _MERGE_INVARIANT = {"d_hist_max"}     # 配置同源,两段必须一致
 
 
 def merge_ledger(total: SteeringLedger, delta: SteeringLedger) -> None:
-    """把本 turn 的增量账(server 侧从空 ledger 记起)汇入轨迹总账。
+    """把本 turn 的增量账(server 侧起账于轨迹累计)汇入轨迹总账。
 
-    records 沿用 append 的位置严格递增校验(turn 间位置单调是 stream
-    坐标的固有性质,违反即 fail loud)。"""
+    事务式(codex review P2-3):先做全部校验(零副作用),全过再纯累加
+    提交——任何校验失败时 total 逐字节未动,调用方可安全放弃本 turn。"""
+    # ---- 预检(零副作用)----
     known = _MERGE_EXTEND | _MERGE_ADD | _MERGE_LATEST | _MERGE_INVARIANT
     actual = {f.name for f in fields(SteeringLedger)}
     if actual != known:
@@ -109,21 +118,36 @@ def merge_ledger(total: SteeringLedger, delta: SteeringLedger) -> None:
             "SteeringLedger fields changed without updating the merge policy: "
             f"unregistered={sorted(actual - known)}, stale={sorted(known - actual)}"
         )
-    for rec in delta.records:
-        total.append(rec)
-    for name in _MERGE_ADD:
-        a, b = getattr(total, name), getattr(delta, name)
-        if isinstance(a, list):
-            if len(a) != len(b):
-                raise RuntimeError(f"histogram width mismatch on {name}: {len(a)} vs {len(b)}")
-            setattr(total, name, [x + y for x, y in zip(a, b)])
-        else:
-            setattr(total, name, a + b)
-    for name in _MERGE_EXTEND - {"records"}:
-        getattr(total, name).extend(getattr(delta, name))
     if delta.d_hist_max != total.d_hist_max:
         raise RuntimeError(
             f"d_hist_max mismatch: {total.d_hist_max} vs {delta.d_hist_max} — "
             "the two sides were built from different run configs"
         )
+    # budget_spent 是轨迹累计(单调不减):delta 由 server 起账时写入轨迹
+    # 累计(server_loop._rebuild_state,codex review P0-3),回退即协议损坏。
+    if delta.budget_spent + 1e-9 < total.budget_spent:
+        raise RuntimeError(
+            f"budget_spent went backwards across the wire: total="
+            f"{total.budget_spent} -> delta={delta.budget_spent} — the server "
+            "turn ledger was not seeded with the trajectory total"
+        )
+    last = total.records[-1].position if total.records else -1
+    for rec in delta.records:
+        if rec.position <= last:
+            raise ValueError("ledger positions must be strictly increasing")
+        last = rec.position
+    for name in _MERGE_ADD:
+        a, b = getattr(total, name), getattr(delta, name)
+        if isinstance(a, list) and len(a) != len(b):
+            raise RuntimeError(f"histogram width mismatch on {name}: {len(a)} vs {len(b)}")
+    # ---- 提交(纯累加,不失败)----
+    total.records.extend(delta.records)
+    for name in _MERGE_ADD:
+        a, b = getattr(total, name), getattr(delta, name)
+        if isinstance(a, list):
+            setattr(total, name, [x + y for x, y in zip(a, b)])
+        else:
+            setattr(total, name, a + b)
+    for name in _MERGE_EXTEND - {"records"}:
+        getattr(total, name).extend(getattr(delta, name))
     total.budget_spent = delta.budget_spent

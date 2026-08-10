@@ -779,6 +779,11 @@ class SGLangHttpServer:
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
+        # trace-opd engine-SPS(codex review P0-1):保留归一化前的细类
+        # (stop|length|abort)。bounded-K 的自然终止判定必须能区分「引擎因
+        # 停止符停下」与「打满 K 窗」——len(gen_ids)==K 时两者长度相同,
+        # 只看长度会在 EOS 恰落窗尾时越过终止符继续生成。
+        raw_finish_type = finish_reason
         # trace-opd PGS(codex review P0):SGLang 的 finish 值域是
         # stop|length|abort,而消费端(hook/episode/backends)只识别 vLLM 适配器
         # 的 completed|aborted——"abort" 直达会把基建中止静默当普通失败轨迹入训。
@@ -837,6 +842,8 @@ class SGLangHttpServer:
                 )
 
         extra_fields = {"global_steps": self.global_steps}
+        if raw_finish_type is not None:
+            extra_fields["finish_type"] = raw_finish_type
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,
@@ -883,6 +890,18 @@ class SGLangHttpServer:
         this method is pure wiring. trace_opd must be importable in the actor
         process (same Python env as training; fail loud otherwise).
         """
+        # codex review P0-2: full_determinism injects the SAME per-replica seed
+        # into every request (see generate()); with bounded K each window would
+        # restart the sampler stream from that seed, so K enters the proposal's
+        # joint distribution. Refuse the combination until a segmentation-
+        # invariant (counter-based) RNG exists.
+        if self.config.full_determinism and int(payload["mech"]["draft_horizon"]) > 0:
+            raise RuntimeError(
+                "steered_generate: full_determinism seeds every engine request "
+                "identically — bounded K (draft_horizon>0) would replay the "
+                "same RNG stream in every window and break distribution "
+                "identity; run draft_horizon=0 or disable full_determinism"
+            )
         try:
             from trace_opd.steering.server_loop import run_steered_turn, token_output_to_prim
         except ImportError as err:
@@ -893,7 +912,22 @@ class SGLangHttpServer:
                 f"{err}"
             ) from err
 
+        deadline = float(payload.get("deadline_unix") or 0.0)
+
         async def _prim(prompt_ids: list[int], params: dict[str, Any]):
+            # codex review P1-3: the client's asyncio cancellation does not
+            # propagate into this actor coroutine — without a deadline an
+            # abandoned turn would keep burning GPU cycles (up to a whole
+            # assistant turn) invisible to the load balancer. Checked once per
+            # draft/verify cycle; import time locally to keep wiring thin.
+            import time as _time
+
+            if deadline > 0.0 and _time.time() > deadline:
+                raise RuntimeError(
+                    "steered turn deadline exceeded — the client has almost "
+                    "certainly timed out and gone away; aborting the orphan "
+                    "loop to free the replica"
+                )
             p = dict(params)
             # Mirror the client-side EngineGenerate single-point backstop: every
             # engine request carries the turn-final stop set explicitly (the
