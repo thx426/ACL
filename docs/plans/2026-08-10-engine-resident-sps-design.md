@@ -141,6 +141,26 @@ token 流在给定前缀下同分布;判定层代码原样复用 ⇒ 核语义 b
 **待核**(P0b 前):sglang 0.5.10 `token_ids_logprob` 请求参数可用性(P2 用,非阻塞);
 server actor 内 handler 直调的最短路径(绕 HTTP 序列化层的接口点)。
 
+## 6.5 实现状态(2026-08-10,无 GPU 面全部完成)
+
+| 件 | 位置 | 状态 |
+|---|---|---|
+| bounded K + 恒等证明 | `steering/hook.py` + `tests/steering/test_sps_bounded_k.py` | ✅ P0a(`5dc0e31`) |
+| 状态线协议 + 账本 merge | `steering/wire.py` + `tests/steering/test_sps_state_wire.py` | ✅(`b2c5a06`) |
+| server 侧 turn 入口(纯逻辑) | `steering/server_loop.py`(`run_steered_turn`/`token_output_to_prim`,含 manager 层版本区间语义镜像) | ✅ |
+| 薄客户端 | `steering/engine_client.py`(`EngineSteeredGenerate`,state 真源在训练进程,下游零感知) | ✅ |
+| server actor 接线 | `verl .../async_sglang_server.py::steered_generate`(进程内原语=包自家 `generate()`;延迟 import trace_opd,失败 fail-loud) | ✅(待 GPU 冒烟) |
+| manager 路由 | `verl .../llm_server.py::steered_generate`(sticky 同 request_id 契约) | ✅(待 GPU 冒烟) |
+| config 开关 | `steering.executor: python\|engine` + `steering.draft_horizon`(python 档禁非零;engine 档限 sglang) | ✅ |
+| agent_loop 分派 | 构造点按 executor 切换;state/记账/下游零改动 | ✅ |
+| preflight 提示 | executor=engine 的两条上线前置显式打印 | ✅ |
+| 端到端协议对拍 | `tests/steering/test_engine_executor.py`(薄客户端→pickle 边界→run_steered_turn 两 turn 与单进程 bit-equal;abort 透传;原语适配;config 校验) | ✅ |
+| P0b 统计对拍门脚本 | `scripts/engine_sps_parity_check.py`(+判定逻辑单测)——真机两 executor 的 rollout dump 比对,PASS/FAIL 判据参数化 | ✅ 待真机数据 |
+
+**剩余 = GPU 面(P0b,等窗口)**:server actor 冒烟(import/engine 原语真实往返)、
+HTTP vs 进程内统计对拍(用上表脚本)、吞吐/radix 命中实测、K sweep{32,64,128}、
+工作量计数器。
+
 ## 7. 明确不做(与用户对齐过)
 
 - 不深改 vLLM/sglang 推测解码框架(单序列假设,装不下双前缀);

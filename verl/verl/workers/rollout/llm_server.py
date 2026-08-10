@@ -277,6 +277,21 @@ class LLMServerClient:
         finally:
             self._release_server(server_id)
 
+    async def steered_generate(self, request_id, *, payload: dict[str, Any]) -> dict[str, Any]:
+        """trace-opd Engine-Resident SPS (P1): route one steered assistant turn
+        to a replica and run the whole draft->verify->judge loop inside that
+        actor process (SGLangHttpServer.steered_generate). Sticky routing uses
+        the SAME request_id contract as generate(), so a task's student and
+        teacher prefixes keep hitting one replica's radix cache. Version-range
+        defaults are applied inside the in-process primitive adapter
+        (trace_opd server_loop.token_output_to_prim), not here.
+        """
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            return await server.steered_generate.remote(payload=payload)
+        finally:
+            self._release_server(server_id)
+
 
 class FullyAsyncLLMServerClient(LLMServerClient):
     """FullyLLMServerClient supports resume generation on partial rollout, making rollout interruption

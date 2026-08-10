@@ -20,6 +20,7 @@ import os
 import secrets
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 import ray
 import sglang
@@ -868,6 +869,46 @@ class SGLangHttpServer:
             stop_reason=finish_reason,
             extra_fields=extra_fields,
         )
+
+    async def steered_generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """trace-opd Engine-Resident SPS (P1, docs/plans/2026-08-10-engine-
+        resident-sps-design.md): run ONE assistant turn's draft->verify->judge
+        loop entirely inside this actor process, with in-process ``generate()``
+        calls as the draft/verify primitives — the per-cycle HTTP+JSON round
+        trips and the wide-logprob serialization of the client-side executor
+        disappear; the training process makes a single RPC per turn.
+
+        All mechanism logic lives in trace_opd.steering (the SAME SpsGenerate
+        loop the python executor runs — distribution identity by code reuse);
+        this method is pure wiring. trace_opd must be importable in the actor
+        process (same Python env as training; fail loud otherwise).
+        """
+        try:
+            from trace_opd.steering.server_loop import run_steered_turn, token_output_to_prim
+        except ImportError as err:
+            raise RuntimeError(
+                "steering.executor=engine requires the trace_opd package to be "
+                "importable inside the rollout server actor process (install "
+                "it into the same environment / PYTHONPATH the trainer uses): "
+                f"{err}"
+            ) from err
+
+        async def _prim(prompt_ids: list[int], params: dict[str, Any]):
+            p = dict(params)
+            # Mirror the client-side EngineGenerate single-point backstop: every
+            # engine request carries the turn-final stop set explicitly (the
+            # engine runs skip_tokenizer_init; asset-derived stops are not
+            # trusted). The snapshot travels in the payload.
+            if payload["mech"]["stop_token_ids"]:
+                p.setdefault("stop_token_ids", list(payload["mech"]["stop_token_ids"]))
+            out = await self.generate(
+                prompt_ids=prompt_ids,
+                sampling_params=p,
+                request_id=uuid4().hex,
+            )
+            return token_output_to_prim(out)
+
+        return await run_steered_turn(payload, draft=_prim, verify=_prim)
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""

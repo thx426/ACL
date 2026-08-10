@@ -57,6 +57,13 @@ def main() -> int:
     except BaseException as err:  # noqa: BLE001
         return _fail("config load (check env vars referenced by the yaml)", err)
     _ok("config", f"environment={cfg.environment.name}")
+    if cfg.steering.enabled and cfg.steering.executor == "engine":
+        # Engine-Resident SPS(P1):服务能力只能在部署机的 server actor 里
+        # 验(首调 fail-loud 兜底);这里把两个上线前置显式喊出来。
+        print("[preflight] note: steering.executor=engine — ① rollout server "
+              "actor 进程必须能 import trace_opd(否则 steered_generate 起手 "
+              "fail-loud);② 本模型/配置须先过 python|engine 对拍门"
+              "(设计文档 §4)再进正式 run。")
 
     # 2. model assets -------------------------------------------------------
     # 2026-08-08 Qwen3.5 EOS 事故的固化:eos 三处一致性 + 模板差分断言前置。

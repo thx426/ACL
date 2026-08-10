@@ -29,10 +29,12 @@ research_rl: {enabled: true, research_n: 8}
 """
 
 
-def _load(tmp_path, monkeypatch, train="", research="", narration=""):
+def _load(tmp_path, monkeypatch, train="", research="", narration="", extra=""):
     monkeypatch.setenv("TEST_BUDGET_KEY", "k")
     p = tmp_path / "b.yaml"
-    p.write_text(_BASE % (train, research, narration))
+    # extra:追加顶层段;同名顶层键按 yaml 语义整体覆盖 _BASE 里的段
+    # (steering 档位测试等借此换段,test_engine_executor.py)。
+    p.write_text(_BASE % (train, research, narration) + extra)
     return load_config(str(p))
 
 

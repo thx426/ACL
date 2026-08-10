@@ -445,6 +445,20 @@ class SteeringCfg:
     r_max: int = 0                 # 每轮拒绝上限;0=无上限(v3.2 默认,用户裁定
                                    # 2026-08-06:干预不受轮内拒绝数限制,bare 臂+
                                    # outcome reward 锚定);≥1=历史 cap 行为态
+    executor: str = "python"       # SPS 循环宿主(Engine-Resident SPS P1,用户
+                                   # 裁定 2026-08-10;docs/plans/2026-08-10-
+                                   # engine-resident-sps-design.md):
+                                   #   python = 训练进程内循环,每周期 2 次
+                                   #     RPC(历史行为);
+                                   #   engine = server actor 进程内循环,每
+                                   #     turn 1 次 RPC(仅 sglang 后端)。
+                                   # 纯执行层,采样分布逐位恒等 ⇒ 不进指纹;
+                                   # 切换前须过对拍门(设计文档 §4)。
+    draft_horizon: int = 0         # bounded K:单次 draft 的 token 上限(0=
+                                   # 整段)。拒绝丢弃 suffix 的上界即 K−1——
+                                   # SSB 近平方放大的解。仅 engine 档允许
+                                   # 非零:HTTP 路径上小 K = 每周期固定往返
+                                   # 成本 × 周期数暴涨(CD-006 已证)。
     w_beh_mode: str = "per_token"  # per_token | per_decision | vtrace | off |
                                    # shaped_reject(v3.3 M3,spec §2.6 版本演进):
                                    # off = steered 行为分布免 IS(MENTOR 口径,ratio
@@ -615,6 +629,25 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             "steering.enabled=false 与 pgs_asym_grpo/adv_mode=asym 不相容——"
             "asym advantage 需要分臂标签,请开 steering 或换回 grpo_loo"
+        )
+    # Engine-Resident SPS(P1)执行档:st.enabled 门外校验——错误组合在
+    # steering 关闭时同样是配置矛盾,应当即拒。
+    if st.executor not in ("python", "engine"):
+        raise ValueError(
+            f"steering.executor 必须是 python|engine,得到 {st.executor!r}"
+        )
+    if st.draft_horizon < 0:
+        raise ValueError(f"steering.draft_horizon 必须 >= 0,得到 {st.draft_horizon}")
+    if st.executor == "python" and st.draft_horizon > 0:
+        raise ValueError(
+            "steering.draft_horizon > 0 仅在 executor=engine 下允许——HTTP 路径"
+            "上的小 K 是每周期固定往返成本 × 周期数暴涨(CD-006 吞吐分析已证);"
+            "python 档请保持 0(整段 draft)"
+        )
+    if st.executor == "engine" and t.rollout_backend != "sglang":
+        raise ValueError(
+            f"steering.executor=engine 仅支持 train.rollout_backend=sglang"
+            f"(P1 实现面;得到 {t.rollout_backend!r})——vLLM 路径请用 python 档"
         )
     if st.enabled:
         # 审阅 IF-13:数值面先过有限性——NaN/inf 能绕过大小比较,错误会

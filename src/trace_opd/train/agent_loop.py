@@ -1064,6 +1064,31 @@ class TraceAgentLoop(AgentLoopBase):
             ledger=SteeringLedger(d_hist_max=st_cfg.c * st_cfg.c),
         )
         steer_ctx["state"] = state
+        # IF-06:轮末停止口径与引擎请求同源(turn_stop_token_ids 单一
+        # 真源)。只拿 tokenizer.eos 在 Qwen3.5 上恰好等价(eos==im_end),
+        # 但对 eos=<|endoftext|> 的资产会漏认轮末,重采路径跨轮拼接
+        # ——EOS 病灶经 resample 复活且只偏 steered 臂(2026-08-08 审阅)。
+        stop_ids = frozenset(turn_stop_token_ids(self.tokenizer))
+        if st_cfg.executor == "engine":
+            # Engine-Resident SPS(P1,用户裁定 2026-08-10):循环宿主在
+            # rollout server actor,每 turn 一次 RPC;state 仍是训练进程侧
+            # 真源(wire 往返),下游记账消费零感知。同 request_id ⇒ 两前缀
+            # KV 与 python 档同样命中该任务的 sticky replica。
+            from ..steering.engine_client import EngineSteeredGenerate
+
+            return EngineSteeredGenerate(
+                server_manager=self.server_manager,
+                tokenizer=self.tokenizer,
+                request_id=epi_route,
+                teacher_prefix_ids=teacher_prompt_ids,
+                student_prompt_ids=student_prompt_ids,
+                state=state,
+                topk=st_cfg.topk,
+                c=st_cfg.c,
+                obs_topk=st_cfg.obs_topk,
+                stop_token_ids=stop_ids,
+                draft_horizon=st_cfg.draft_horizon,
+            )
         return SpsGenerate(
             draft=engine,
             verify=engine,           # 同引擎同路由:两个前缀的 KV 同 replica
@@ -1074,11 +1099,7 @@ class TraceAgentLoop(AgentLoopBase):
             topk=st_cfg.topk,
             c=st_cfg.c,
             obs_topk=st_cfg.obs_topk,
-            # IF-06:轮末停止口径与引擎请求同源(turn_stop_token_ids 单一
-            # 真源)。只拿 tokenizer.eos 在 Qwen3.5 上恰好等价(eos==im_end),
-            # 但对 eos=<|endoftext|> 的资产会漏认轮末,重采路径跨轮拼接
-            # ——EOS 病灶经 resample 复活且只偏 steered 臂(2026-08-08 审阅)。
-            stop_token_ids=frozenset(turn_stop_token_ids(self.tokenizer)),
+            stop_token_ids=stop_ids,
         )
 
     async def _student_rollout(
