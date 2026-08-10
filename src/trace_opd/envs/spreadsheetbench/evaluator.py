@@ -11,6 +11,9 @@ tests/test_ssb_evaluator.py):
     日取整;bool 提升为 float(1 vs True 对齐);
   * ``""`` 与 ``None`` 等价;此外类型不同即不等;
   * 只比 answer_position 区域;格式/样式不比(官方注释掉的行为一致);
+  * 2026-08-10(CD-006 反馈):多区域切分改为引号感知(sheet 名可含逗号,
+    130-9)+ 裸整列区间 ``A:G`` 按已用行数展开(283-32);无引号、无裸列
+    的存量输入行为逐字节不变(tests/test_ssb_answer_position.py 钉住);
   * data_only=True 读缓存值 ⇒ agent 用 openpyxl 写公式得不到缓存值,读出
     None——必须写计算结果值(scaffold 明示;与旧实现同语义)。
 
@@ -61,6 +64,33 @@ def _compare_cell_value(v1, v2) -> bool:
     return v1 == v2
 
 
+# ---------- answer_position 多区域切分(2026-08-10 CD-006 反馈修复) ----------
+
+def _split_regions(answer_position: str) -> list[str]:
+    """按逗号切多区域 —— 但 Excel sheet 名自身可含逗号(单引号包裹,
+    verified-400 任务 130-9 `'b2b, sez, de'!A5:V10` 是任务语义的一部分),
+    引号内的逗号不是分隔符。引号计数为奇 = 配对已坏(数据侧 typo,如
+    283-32 `Sheet3'!A:G,...` 缺前引号),状态机会吞掉真分隔符,此时回退
+    裸切分 —— 每段的 strip("'\\"") 恰好消化散落的引号。无引号输入两条
+    路径与历史 `split(",")` 逐字节一致。"""
+    s = answer_position or ""
+    if s.count("'") % 2 != 0:
+        return s.split(",")
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quote = False
+    for ch in s:
+        if ch == "'":
+            in_quote = not in_quote
+        if ch == "," and not in_quote:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
 # ---------- range 解析(官方移植) ----------
 
 def _col_num2name(n: int) -> str:
@@ -87,9 +117,17 @@ def _parse_range(range_str: str):
     return (_col_name2num(sc), int(sr)), (_col_name2num(ec), int(er))
 
 
-def _generate_cell_names(range_str: str):
+def _generate_cell_names(range_str: str, max_row: int | None = None):
     if ":" not in range_str:
         return [range_str]
+    start_cell, end_cell = range_str.split(":")
+    if (max_row is not None
+            and not any(ch.isdigit() for ch in start_cell)
+            and not any(ch.isdigit() for ch in end_cell)):
+        # 裸整列区间 `A:G`(verified-400 任务 283-32):无行号,历史实现在
+        # int("") 上炸。语义 = 整列,按两侧 workbook 的已用行数展开
+        # (2026-08-10 CD-006 反馈修复)。
+        range_str = f"{start_cell.strip()}1:{end_cell.strip()}{max_row}"
     (sc, sr), (ec, er) = _parse_range(range_str)
     cols = [_col_num2name(i) for i in range(sc, ec + 1)]
     return [f"{c}{r}" for c in cols for r in range(sr, er + 1)]
@@ -100,7 +138,10 @@ def _cell_level_compare(wb_gt, wb_proc, sheet_name: str, cell_range: str):
         return False, f"worksheet not found: {sheet_name}"
     ws_gt = wb_gt[sheet_name]
     ws_proc = wb_proc[sheet_name]
-    for cn in _generate_cell_names(cell_range):
+    # 取两侧较大的已用行数:pred 比 golden 多写行时也要进比较(多写的行
+    # golden 侧读出 None,与空等价规则一致地参与判定)。
+    max_row = max(ws_gt.max_row or 1, ws_proc.max_row or 1)
+    for cn in _generate_cell_names(cell_range, max_row):
         cg = ws_gt[cn]
         cp = ws_proc[cn]
         if not _compare_cell_value(cg.value, cp.value):
@@ -125,7 +166,7 @@ def compare_workbooks(gt_file: str, proc_file: str, answer_position: str) -> tup
     try:
         ok_all = True
         msg_first = ""
-        for scr in (answer_position or "").split(","):
+        for scr in _split_regions(answer_position):
             scr = scr.strip()
             if not scr:
                 continue
