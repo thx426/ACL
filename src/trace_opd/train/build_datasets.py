@@ -34,6 +34,7 @@ import pandas as pd
 
 from ..common.config import AlfworldCfg, load_config
 from ..core import protocol
+from ..core import template_delta
 from ..envs.alfworld import gt as gt_mod
 from ..envs.alfworld.adapter import (
     GT_SENTINEL,
@@ -185,6 +186,7 @@ def main() -> int:
         cfg.episode.max_assistant_turns,
         cfg.episode.max_tokens_per_turn,
     )
+        template_delta.configure_thinking(cfg.episode.enable_thinking)
     else:
         env_cfg = AlfworldCfg()
 
