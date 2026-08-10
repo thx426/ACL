@@ -36,6 +36,26 @@ class SitePoolError(RuntimeError):
     """Infrastructure-level site-pool failure (no capacity / claim failed)."""
 
 
+#: 原版 WebArena 的站点 base-URL 语义:占位符渲染出的 base 自带入口路径
+#: (2026-08-10 实测:__SHOPPING_ADMIN__/catalog/product/edit/… 是 Magento
+#: 后台路由,base 不带 /admin 会落到店面首页)。wikipedia 是 kiwix ZIM 的
+#: landing 页。其余站点裸 host:port。
+SITE_URL_SUFFIX = {
+    "shopping_admin": "/admin",
+    "wikipedia": "/wikipedia_en_all_maxi_2022-05/A/User:The_other_Kiwix_guy/Landing",
+}
+
+
+def apply_site_suffix(site: str, url: str) -> str:
+    """Append the site's canonical entry path unless already present
+    (idempotent — configs may pass either bare host:port or the full base)."""
+    suffix = SITE_URL_SUFFIX.get(site, "")
+    url = url.rstrip("/")
+    if suffix and not url.endswith(suffix):
+        url += suffix
+    return url
+
+
 @dataclass
 class SiteAllocation:
     """Sites leased to one episode. ``release()`` is idempotent."""
@@ -59,7 +79,8 @@ class StaticSitePool:
     """Fixed site → URL mapping; no isolation, no capacity limit."""
 
     def __init__(self, base_urls: dict[str, str]) -> None:
-        self._base_urls = {k: v.rstrip("/") for k, v in base_urls.items()}
+        self._base_urls = {k: apply_site_suffix(k, v)
+                           for k, v in base_urls.items()}
 
     def acquire(self, sites: list[str]) -> SiteAllocation:
         missing = [s for s in sites if s not in self._base_urls]
@@ -118,7 +139,8 @@ class AcsSitePool:
                 pod = self._claim_one(site)
                 claimed.append(pod)
                 port = self._map_port if site == "map" else self._site_port
-                base_urls[site] = f"http://{pod.status.pod_ip}:{port}"
+                base_urls[site] = apply_site_suffix(
+                    site, f"http://{pod.status.pod_ip}:{port}")
             pods = list(claimed)
             return SiteAllocation(
                 base_urls, _releaser=lambda: self._release_pods(pods),

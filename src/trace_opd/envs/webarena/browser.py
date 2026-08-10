@@ -63,11 +63,13 @@ _LAUNCH_ARGS = [
 ]
 _VIEWPORT = {"width": 1440, "height": 900}   # WebServ context_options.viewport
 
-#: 原版 WebArena 公共账号(WebServ conf/base.yaml accounts;am1n3e verified
-#: 镜像内置同一批账号)。站点无登录:map / wikipedia。
+#: 原版 WebArena 公共账号(am1n3e verified 镜像内置)。站点无登录:map /
+#: wikipedia。⚠ shopping_admin 密码是原版 ``admin1234``——WebServ conf 里的
+#: ``admin12341`` 是其自有部署的改密,对 verified 镜像无效(2026-08-10 本地
+#: 容器实测:12341 被拒 "authentication failed",1234 进 Dashboard)。
 ACCOUNTS: dict[str, dict[str, str]] = {
     "shopping": {"username": "emma.lopez@gmail.com", "password": "Password.123"},
-    "shopping_admin": {"username": "admin", "password": "admin12341"},
+    "shopping_admin": {"username": "admin", "password": "admin1234"},
     "reddit": {"username": "MarvelsGrantMan136", "password": "test1234"},
     "gitlab": {"username": "byteblaze", "password": "hello1234"},
 }
@@ -262,9 +264,12 @@ class BrowserSession:
                 record_har_mode="full",
             )
             if "shopping_admin" in sites:
+                # 值格式 = "username:password"(镜像内 AutoLoginPlugin.php
+                # 的 explode(':') 契约,2026-08-10 实测;裸用户名会被拒)。
+                adm = ACCOUNTS["shopping_admin"]
                 self._context.set_extra_http_headers({
                     MAGENTO_ADMIN_AUTO_LOGIN_HEADER:
-                        ACCOUNTS["shopping_admin"]["username"],
+                        f"{adm['username']}:{adm['password']}",
                 })
             self._context.add_init_script(_INITSCRIPT_JS)
             if not start_urls:
