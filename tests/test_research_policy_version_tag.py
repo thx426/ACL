@@ -82,9 +82,23 @@ def test_no_evidence_yields_empty_so_caller_can_fail_loud():
 def test_research_row_refuses_to_emit_without_version_evidence():
     src = (ROOT / "src/trace_opd/train/selfres.py").read_text(encoding="utf-8")
     assert "policy_version_fields()" in src
-    assert "has no rollout policy version evidence" in src
+    assert "no policy version evidence" in src
     # 必须在构造 ResearchRowResult 之前校验
     assert src.index("policy_version_fields()") < src.index("return ResearchRowResult(")
+
+
+def test_version_failure_surfaces_the_underlying_session_error():
+    """版本证据为空时,报错必须带出会话的真实死因。
+
+    2026-08-08 事故:researcher 首调 prompt 超 max_prompt_tokens 的 fail-loud
+    被 ResearchSession 的 `except Exception` 降级进 snapshot.error,这里若只报
+    "no policy version evidence",现场就只剩一个不相干的症状 —— 据此误诊了两轮。
+    """
+    src = (ROOT / "src/trace_opd/train/selfres.py").read_text(encoding="utf-8")
+    head, _, tail = src.partition("policy_version_fields()")
+    raise_block = tail[: tail.index("return ResearchRowResult(")]
+    assert 'getattr(session_result, "error"' in raise_block, "未从 session_result 取真实死因"
+    assert "Underlying session error" in raise_block, "报错未带出底层原因"
 
 
 def test_row_fields_reach_extra_fields():

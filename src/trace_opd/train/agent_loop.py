@@ -40,6 +40,7 @@ from ..common.hashing import response_token_hash
 from ..common.llm import make_client
 from ..common.tape import TapeWriter
 from ..core.episode import EpisodeResult, run_episode
+from ..core import template_delta
 from ..core.template_delta import TemplateDelta, render_ids, turn_stop_token_ids
 from ..core.types import OUTCOME_ENV_ERROR, inject_guidance
 from ..docstore.archive import ResearchArchive
@@ -145,6 +146,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         config.episode.max_assistant_turns,
         config.episode.max_tokens_per_turn,
     )
+        template_delta.configure_thinking(config.episode.enable_thinking)
         workers = int(os.environ.get("TRACE_AGENT_WORKERS", config.train.agent_num_workers))
         doc_table: dict[str, str] = {}
         gate_tracker = None

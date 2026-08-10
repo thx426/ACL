@@ -206,9 +206,17 @@ async def run_research_row(
     # 缺则取到 None 直接 TypeError 崩整步(2026-08-07 162 v4 冒烟实测)。
     version_fields = chat.policy_version_fields() if hasattr(chat, "policy_version_fields") else {}
     if not version_fields:
+        # 版本证据为空的**唯一**成因是会话一次成功生成都没有,而会话内的真实
+        # 死因已被 ResearchSession 的 `except Exception` 降级进 snapshot.error
+        # (session.py:175)。不把它带出来,这里就会用一个不相干的症状掩盖真凶
+        # ——2026-08-08 实测:researcher 首调 prompt 超 max_prompt_tokens 的
+        # fail-loud 被吞掉后,现场只看得到 "no policy version evidence",
+        # 据此误诊了两轮。
+        cause = getattr(session_result, "error", None) if session_result is not None else None
         raise RuntimeError(
-            f"research row session={session_id} has no rollout policy version evidence "
-            "(engine did not report min/max_global_steps)"
+            f"research row session={session_id} produced no engine generation "
+            f"(no policy version evidence). Underlying session error: "
+            f"{cause or '<none recorded — session returned without generating>'}"
         )
     fields.update(version_fields)
     # λ_r 预乘 + warmup 置零:reward 的线性变换与 advantage 缩放等价
