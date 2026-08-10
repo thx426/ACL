@@ -42,6 +42,9 @@ DOC_BLACKLIST = re.compile(
     re.IGNORECASE,
 )
 VERBATIM_WINDOW = 4  # consecutive actions counting as a pasted script
+# 零正例会话里构成"把解法说成已确立"的断言措辞(2026-08-10 裁定;动词原形
+# verify/confirm 放过 —— "could not verify" 一类否定语境降误伤)。
+_ZERO_SUCCESS_CLAIM = re.compile(r"\b(verified|confirmed)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -62,6 +65,11 @@ class SessionState:
     guidance_log: list[dict[str, Any]] = field(default_factory=list)
     last_exp_successes: int = 0
     last_exp_attempts: int = 0
+    # 会话累计(2026-08-10 零正例裁定):文档可信度的机器判据 —— 零正例
+    # (exp_successes_total == 0)的会话不允许交出"verified solution",
+    # 下游按此加权/审计,不依赖模型自报。
+    exp_successes_total: int = 0
+    exp_attempts_total: int = 0
     finalized: bool = False
     doc: str | None = None
     self_assessment: str = ""
@@ -298,6 +306,8 @@ class ToolRouter:
         if attempts:
             st.last_exp_successes = successes
             st.last_exp_attempts = attempts
+        st.exp_successes_total += successes
+        st.exp_attempts_total += attempts
         summary = f"\nSummary: {successes}/{attempts} SUCCESS"
         if len(records) != attempts:
             summary += f" ({len(records) - attempts} episode(s) hit environment errors — not counted)"
@@ -387,6 +397,28 @@ class ToolRouter:
                 f"document contains a pasted sequence of {VERBATIM_WINDOW}+ consecutive "
                 "episode actions; express the approach as situation-level knowledge instead"
             )
+        # 2026-08-10 用户裁定(零正例):一次成功都没有的会话不得交出
+        # "verified" 解法 —— 程序化 enforce,不只靠 prompt 期望(SSB 实测
+        # 194-19:零正例被旧硬格式逼出带 3 处 "verified" 的编造解法,
+        # steered 0/20)。判据用机制侧累计 exp_successes_total,非模型自报;
+        # 零实验直接 finalize 的会话同样零证据,一并适用。
+        if self.state.exp_successes_total == 0:
+            claim_hits = sorted({
+                m.group(0).lower()
+                for m in _ZERO_SUCCESS_CLAIM.finditer(doc)
+            })
+            if "# Understanding & Approach".lower() in doc.lower():
+                claim_hits.append("'# Understanding & Approach' section")
+            if claim_hits:
+                violations.append(
+                    "zero of this session's runs succeeded, but the document "
+                    "presents a solution as established ("
+                    + ", ".join(claim_hits)
+                    + ") — rewrite in the zero-success layout ('# Current "
+                    "Understanding & Ruled-Out Directions', '# Failure Modes "
+                    "& Lessons', '# Facts & Reusable Notes') and state "
+                    "observations without verified/confirmed claims"
+                )
         return violations
 
     def _verbatim_script_hit(self, doc: str) -> bool:

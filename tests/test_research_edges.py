@@ -6,6 +6,7 @@ import pytest
 from fakes import FakeTokenizer, ScriptedAdapter, ScriptedGenerate, reply
 from test_research import (
     GOOD_DOC,
+    ZERO_SUCCESS_DOC,
     ScriptedChat,
     assistant_with_call,
     flat_narration,
@@ -72,7 +73,8 @@ async def test_snapshot_available_after_external_timeout():
 async def test_single_call_per_message_enforced():
     """Two calls in one assistant turn: only the first executes; the model is
     told the rest were ignored (review P2-5)."""
-    router = make_router()
+    # win 动作 ⇒ 实验成功,GOOD_DOC 的 verified 断言合法(零正例规则)
+    router = make_router(action="do the thing")
     two_calls = ChatResult(
         content="double spend",
         tool_calls=[
@@ -101,8 +103,9 @@ async def test_single_call_per_message_enforced():
 async def test_text_protocol_malformed_framing_gets_hint():
     router = make_router()
     broken = ChatResult(content='I will call now\n<tool_call>\n{"name": "run_experiment"')
+    # 零实验会话 ⇒ 文档须走零成功出口(无 verified 断言)才能干净接受
     finalize_json = json.dumps(
-        {"name": "finalize", "arguments": {"experience_doc": GOOD_DOC}}
+        {"name": "finalize", "arguments": {"experience_doc": ZERO_SUCCESS_DOC}}
     )
     good = ChatResult(content=f"<tool_call>\n{finalize_json}\n</tool_call>")
     session = ResearchSession(

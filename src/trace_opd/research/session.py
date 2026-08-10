@@ -41,6 +41,10 @@ class SessionResult:
     flags: list[str]
     last_exp_successes: int
     last_exp_attempts: int
+    # 会话累计成败(2026-08-10 零正例裁定):零正例文档的机器判据,
+    # 下游择优/降权用它,不依赖模型在文档里的自我陈述。
+    exp_successes_total: int = 0
+    exp_attempts_total: int = 0
     messages: list[dict[str, Any]] = field(default_factory=list)
     guidance_log: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None  # set when the session ended on an exception
@@ -102,6 +106,8 @@ class ResearchSession:
             flags=list(state.flags),
             last_exp_successes=state.last_exp_successes,
             last_exp_attempts=state.last_exp_attempts,
+            exp_successes_total=state.exp_successes_total,
+            exp_attempts_total=state.exp_attempts_total,
             messages=list(self._messages),
             guidance_log=list(state.guidance_log),
             error=error,

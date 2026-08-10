@@ -76,11 +76,20 @@ spending every experiment.
 === THE EXPERIENCE DOCUMENT ===
 {doc_rules}"""
 
+# 2026-08-10 用户裁定(CD-006 SSB 实证:零正例会话被旧硬格式逼出编造的
+# "verified" 解法,steered 拿错误指导 0/20;有过 1 次成功的失败模式文档
+# +60pp):verified solution 一节不再是必须——只有会话内真有成功才写;
+# 零正例改写"理解+已排除方向 / 失败模式与教训",并显式禁止 verified 断言。
 DOC_RULES_TEMPLATE = """\
-Markdown, exactly these three sections, at most {doc_max_words} words:
+Markdown, at most {doc_max_words} words. The section layout depends on what
+your experiments ACTUALLY verified — never present an approach as verified,
+confirmed, or working unless at least one of your own runs succeeded with it.
+
+IF at least one of your runs succeeded, write exactly these three sections:
 
 # Understanding & Approach
-What this task requires and the verified way to solve it.
+What this task requires and the way to solve it that a successful run
+verified.
 
 # Failure Modes & Remedies
 Observed error patterns -> how to recognize each -> what to do; mark which
@@ -88,6 +97,20 @@ remedies you verified by experiment.
 
 # Facts & Reusable Notes
 Verified environment facts and transferable tips.
+
+IF none of your runs succeeded (zero successes), you have no verified
+solution and must not invent one — write exactly these three sections:
+
+# Current Understanding & Ruled-Out Directions
+What the task appears to require, what you tried, and which directions your
+runs ruled out (with the observed evidence for each).
+
+# Failure Modes & Lessons
+Observed error patterns -> how to recognize each -> what you would try next
+and why, marked as untested.
+
+# Facts & Reusable Notes
+Directly observed environment facts only.
 
 Write task-anchored, situation-level knowledge: "WHEN <observable
 situation> DO <specific action pattern>", with the task's real action

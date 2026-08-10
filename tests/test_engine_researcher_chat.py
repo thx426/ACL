@@ -120,6 +120,8 @@ def test_end_to_end_with_research_session_text_protocol():
             flags: list = []
             last_exp_successes = 0
             last_exp_attempts = 0
+            exp_successes_total = 0
+            exp_attempts_total = 0
             guidance_log: list = []
 
         def __init__(self):
