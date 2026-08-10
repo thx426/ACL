@@ -1,0 +1,188 @@
+# =============================================================================
+# 实验:Qwen3.5-4B · ScienceWorld(ETO 口径)· 原生 GRPO 基线 · A800 八卡
+# 实验 ID: sw-4b-grpo-a800
+# =============================================================================
+# 目的:建立**第二个 benchmark 的基线**(用户裁定 2026-08-09)。
+# 第一个是 SpreadsheetBench(162 上的 ssb-4b-grpo-162,同模型 4B、同为纯 GRPO)。
+#
+# 为什么选 ScienceWorld 作第二基线:环境交互实测 ~300 step/s(A800 64 核),
+# 一个训练步的 256 episode × 30 env step ≈ 26 秒 —— **环境侧几乎不占时间**,
+# 训练墙钟将由 LLM 生成主导。这使机制开销可被干净测量,不被环境噪声淹没
+# (对比 SSB:光 run_python + LibreOffice 重算就要几十分钟)。
+#
+# 五项已裁定(2026-08-08,落码见 envs/scienceworld/):
+#   ① simplifications = easy 全开(ETO/PGPO 硬编码、RLVMR 默认,社区一致口径)
+#   ② 步预算 = 全局 30(RLVMR 口径,不采 ETO per-task 表)
+#   ③ reward = 终局二元(won = engine completed 且 score ≥ 100,严格版;
+#      RLVMR 宽松版 score>0 不采,对照时披露)
+#   ④ 数据 = ETO 口径(train 1483 / seen 194 / unseen 211,**变体级**划分 ——
+#      与 ALFWorld 的场景级 seen/unseen 语义不同,报告须注明)
+#   ⑤ 不注入 admissible-action 表(动作知识正是 researcher 文档要填的信息面;
+#      与 RLVMR 比数字时披露该差异 —— 它有动作先验、我们没有)
+# =============================================================================
+
+run:
+  name: sw_4b_grpo_a800
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-SSB/runs
+  tape: true
+
+environment:
+  name: scienceworld
+
+# 纯 GRPO 基线:不产文档、不做研究会话。research 段保留仅为 schema 完整。
+research:
+  enabled: false
+  backend: engine
+  tool_protocol: text
+  n_exp: 8
+  k_default: 2
+  k_max: 4
+  max_turns: 20
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"
+  episode_temperature: 1.0
+  researcher_max_tokens: 4096
+  session_timeout_s: 3600
+  session_token_budget: 40960
+  max_prompt_tokens: 8192
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+  max_prompt_tokens: 32768
+  max_tokens: 0
+
+roles:
+  researcher:
+    endpoint: ""
+    model: ""
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+
+# ---- executor 预算(用户裁定 2026-08-09)----
+episode:
+  max_env_steps: 30          # 已裁定(RLVMR 全局口径);引擎侧 env_step_limit=100 兜底
+  max_assistant_turns: 50    # > env_steps,留格式失败与免费动作(look/inventory)余量
+                             # (ETO 的"对话步含格式失败步"口径对应本键)
+  max_tokens_per_turn: 2048
+  session_token_budget: 24576
+
+scienceworld:
+  worker_python: "${SCIWORLD_WORKER_PYTHON}"   # 装 scienceworld+py4j 的 venv;PATH 需 java≥1.8
+  simplifications: easy
+  env_step_limit: 100        # 引擎侧兜底(episode.max_env_steps 主导)
+  spawn_concurrency: 64      # JVM boot 并发门。实测:64 并发即达吞吐饱和
+                             # (287 step/s;128→292、256→308,只多 7% 却让 load 翻 10 倍)。
+                             # 保持 64 —— CPU 饥饿曾饿死推理引擎,不为 7% 冒险。
+  start_timeout_s: 120       # 实测 JVM boot 0.7s + load 0.2s,余量充足
+  step_timeout_s: 60
+  boot_concurrency: 16       # 仅 build_dataset 期用
+
+train:
+  model_path: "${TRACE_MODEL_PATH}"
+  train_file: "${SW_TRAIN_FILE}"
+  val_files:
+    - "${SW_VAL_SEEN_FILE}"      # dev 194,变体级 seen
+    - "${SW_VAL_UNSEEN_FILE}"    # test 211,变体级 unseen
+  experiment_name: sw_4b_grpo_a800
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1
+  train_batch_size: 16       # 用户裁定;1483 ÷ 16 ⇒ 93 步/epoch
+  rollout_n: 16
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo_loo    # 原生 GRPO(leave-one-out baseline)
+  norm_adv_by_std: false
+  response_length: 24576     # padding 维度 = executor 流预算(24576),二者同口径
+  max_prompt_length: 8192
+  max_token_len_per_gpu: 32768
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  rollout_max_model_len: 131072
+  rollout_max_num_batched_tokens: 16384
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 3            # 用户裁定;93 步/epoch ⇒ 约 278 步
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16      # 必须 == train_batch_size(config.py 校验:同任务副本须落同一 worker)
+  use_fused_kernels: true
+  fused_kernels_backend: torch
+
+steering:
+  enabled: false             # 基线臂无教师干预
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  w_beh_shaped_gamma: 0.1
+  adv_mode: legacy_shared
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 185
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28
+  entropy_floor: 0.6
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 24576
+  n: 3                       # avg@3(沿用 SSB 口径,用户裁定 2026-08-09)
+  temperature: 0.6
+
+research_rl:
+  enabled: false
+  research_n: 8
+  prefix_quantiles: [0.05, 0.15, 0.30, 0.50, 0.75]
+  continuation_samples: 4
+  continuation_temperature: 1.0
+  researcher_temperature: 1.0
+  research_rl_weight: 1.0
+  research_warmup_steps: 0

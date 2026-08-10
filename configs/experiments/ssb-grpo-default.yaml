@@ -1,0 +1,176 @@
+# =============================================================================
+# SpreadsheetBench 默认配置 · 原生 GRPO 对照臂
+# =============================================================================
+# **这是 SSB 对照臂的默认起点**(用户裁定 2026-08-09)。与
+# configs/experiments/ssb-selfres-default.yaml **executor 侧逐键相同**,
+# 差异只有机制开关(本臂 steering/research/research_rl 全关 + grpo_loo)。
+#
+# 定稿依据 = 正在跑的 experiments/ssb-4b-grpo-162(162 四卡,指纹 2c3cbff7c99e)。
+#
+# 注:research/research_rl 段保留仅为 schema 完整,本臂全部 disabled、不生效,
+#    但**其字面值仍进 objective_fingerprint** —— 故此处与主臂取同一组 v4 设计值,
+#    使两臂指纹的差异纯粹来自机制开关本身。
+#
+# 按机器覆盖的字段、数据集约束、未标定项:同 ssb-selfres-default.yaml 头部说明。
+# =============================================================================
+run:
+  name: ssb_4b_grpo_162
+  runs_root: /data4/ws/PGS/runs
+  tape: true
+
+environment:
+  name: spreadsheetbench
+
+# 纯 GRPO:不产文档、不做研究会话。research 段保留仅为 schema 完整。
+research:
+  enabled: false
+  backend: engine
+  tool_protocol: text
+  n_exp: 8
+  k_default: 2
+  k_max: 4
+  max_turns: 20
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"
+  episode_temperature: 1.0
+  researcher_max_tokens: 4096
+  session_timeout_s: 3600
+  session_token_budget: 40960
+  max_prompt_tokens: 8192
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+  max_prompt_tokens: 32768
+  max_tokens: 0
+
+roles:
+  researcher:
+    endpoint: ""
+    model: ""
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+
+# ---- executor 侧:与主臂逐键一致 ----
+episode:
+  max_env_steps: 20
+  max_assistant_turns: 28
+  max_tokens_per_turn: 4096
+  session_token_budget: 32768
+
+spreadsheetbench:
+  data_root: "${SSB_DATA}"
+  exec_concurrency: 64
+  python_timeout_s: 120
+  recalc_timeout_s: 120
+  obs_max_chars: 3500
+
+train:
+  model_path: "${TRACE_MODEL_PATH}"
+  train_file: "${SSB_TRAIN_FILE}"
+  val_files:
+    - "${SSB_VAL_FILE}"
+  experiment_name: ssb_4b_grpo_162
+  project_name: trace_opd
+  n_gpus: 4
+  rollout_tp: 1
+  train_batch_size: 8       # 与主臂同(train 184 ⇒ 23 步/epoch)
+  rollout_n: 16
+  ppo_mini_batch_size: 8
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo_loo   # 原生 GRPO(leave-one-out baseline)
+  norm_adv_by_std: false
+  # 无 research 行,流预算上界=executor 的 32768;padding 维度仍与主臂对齐 40960,
+  # 使两臂的 collate 行为同构(该键只影响内存,不进机制指纹)。
+  response_length: 40960
+  max_prompt_length: 8192
+  max_token_len_per_gpu: 32768
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  rollout_max_model_len: 131072
+  rollout_max_num_batched_tokens: 16384
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 8           # 23 步/epoch ⇒ 184 步(与主臂同)
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 8
+  use_fused_kernels: true
+  fused_kernels_backend: torch
+
+steering:
+  enabled: false            # 本臂无教师干预
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  w_beh_shaped_gamma: 0.1
+  adv_mode: legacy_shared
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 123
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28
+  entropy_floor: 0.6
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768
+  n: 3                      # avg@3(与主臂同口径)
+  temperature: 0.6
+
+research_rl:
+  enabled: false
+  research_n: 8
+  prefix_quantiles: [0.05, 0.15, 0.30, 0.50, 0.75]
+  continuation_samples: 4
+  continuation_temperature: 1.0
+  researcher_temperature: 1.0
+  research_rl_weight: 1.0
+  research_warmup_steps: 0

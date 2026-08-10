@@ -1,0 +1,320 @@
+# =============================================================================
+# 162 · Qwen3.5-4B · v3.3 机制 × v4 自体研究员 × FC 协议 —— 完整自进化实验
+# =============================================================================
+# 用户裁定 2026-08-08:「用最新的方案机制(v3.3 和 v4,也就是现在的最新代码实现,
+# 每一部分都是最新的)用完整自进化机制来运行 Qwen3.5-4B 模型的实验;以后实验只有
+# 用不用同一个 policy 作为 researcher 的区别,通过配置指定这个差异,其他都是要
+# 最新方案机制。」
+#
+# 三条线的合流(此前不存在同时具备三者的配置):
+#   · steering 六模块 = v3.3(源 a800-pgs-v33-4braw-asym.yaml;M1 asym advantage /
+#     M2 α cosine / M3 W_beh off / M4 熵门 G-E / M5 不截断 / M6 记账)
+#   · researcher = v4 自体(源 162-pgs-s4-selfres-1p7b.yaml 的 research_rl 全段;
+#     researcher 即 policy 本体,每任务 24 行 = 8 steered + 8 bare + 8 research)
+#   · 协议 = FC(commit 3be537f→c3942b8;ALFWorld 单工具 execute(command),
+#     researcher 走客户端解析 FC)
+#
+# 基座 = 原始 Qwen3.5-4B(无 SFT 冷启动)。依据:CD-006 2026-08-08 在 162 上的
+# researcher 探针(32 任务分层抽样 × 2 会话 = 64 条,FC 协议)——finalize 98.4%、
+# 工具调用错误 0、doc 词数中位 676、含可执行命令 63/63。1.7B 当初必须先做
+# researcher SFT 冷启动是因为它不具备工具使用能力,4B 无此问题。
+# ⚠ 探针走 external 后端 + 服务端解析,本 run 走 engine 后端 + 客户端解析;
+#   wire format 同一个,解析位置不同 —— 冒烟须复核 engine 侧 finalize 率。
+# =============================================================================
+
+run:
+  name: q35_4b_v33_selfres_162   # = 实验目录名 experiments/q35-4b-v33-selfres-162,
+                           # 保证 launcher run_dir / verl checkpoint / swanlab
+                           # 三处身份一致(勿在启动器里另行覆盖)
+  runs_root: /data4/ws/PGS/runs
+  tape: true
+
+# ---------------------------------------------------------------------------
+# researcher:v4 自体(policy 本体在线生产文档)
+# ---------------------------------------------------------------------------
+research:
+  enabled: true
+  backend: engine          # v4 自体:researcher chat 走本机 rollout 引擎
+                           # (与 executor 共用 server_manager,agent_loop.py:459)
+  tool_protocol: text      # M2 后语义 = **客户端解析的 FC**(toolproto.py 头注释):
+                           # 同一个 wire format,解析在客户端而非服务端 —— 因为
+                           # 训练通道 token-in-token-out 拿不到服务端 parser
+                           # (需求 §6.2,用户裁定 2026-08-08)
+  n_exp: 8                 # 每 (step, task) 最多 8 次 researcher 实验
+  k_default: 2             # 每次 run_experiment 默认 2 个 episode
+  k_max: 4                 # 模型可自主提到 4,不能更高
+  max_turns: 20            # 用户裁定 2026-08-08(原 30):researcher 轨迹长度改由
+                           # 「轮数 × 单轮上限」控制(需求 §7.1)
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"                # 自体研究员无 GT(信息状态一致性;校验强制)
+  episode_temperature: 1.0
+  researcher_max_tokens: 4096   # 用户裁定 2026-08-08(原 8192):researcher 单轮
+                           # 上限 = 单轮峰值弹性。实测工作轮远低于它
+                           # (run_experiment p90 2324 / finalize p90 3063,
+                           # 全部 626 轮中 ≥4096 的仅 5.6%)
+  # ---- §7.5 上限与控制器解耦(用户裁定 2026-08-08;CD-010 commit c2273a8)----
+  session_token_budget: 40960   # researcher 流预算。step-1 实测 research 行 respLen
+                           # 中位 10872 / p90 14679 / max 19861 —— 原 49152 是 2.5×
+                           # 过度预留,每行都被 padding 到该维度,白付 collate 与
+                           # 内存带宽。40960 覆盖实测 max 的 2.06×,仍充裕
+  max_prompt_tokens: 8192  # 8K —— researcher 首调 prompt 上限(用户裁定 2026-08-08)。
+                           # 构成 = system 模板 966 + tools 块渲染 573 + task_brief。
+                           # ⚠ 原值 2048 是过紧的错值,已实测证伪:本 run 成功的 35 条
+                           #   research 行 prompt 实测 1998/2021/2037(min/中位/max),
+                           #   全部贴着 2048 天花板,略超者被 fail-loud 打掉,再被
+                           #   ResearchSession 的 except Exception 吞成 session error,
+                           #   最终以 "no rollout policy version evidence" 的假面目爆出。
+                           #   注:M2(FC 改造)后 tools 从"折进 system 文本"改为
+                           #   chat template 原生渲染,prompt 构成已变,旧经验值不适用
+  session_timeout_s: 3600
+
+narration:
+  backend: engine          # 自体模式校验强制
+  max_words: 1000          # prompt 里的篇幅指令词数,**不是**解码上限(§7.5 后
+                           # 该键回归纯措辞语义)
+  temperature: 0.3
+  max_tokens: 0            # 单次叙述解码上限;0 = 沿用旧推导 3×max_words
+  max_prompt_tokens: 32768 # 32K —— 叙述 prompt 上限(用户裁定 2026-08-08)。
+                           # 叙述是引擎内部调用,不进 verl prompt 张量,故不受
+                           # train.max_prompt_length 约束;超长轨迹渲染走中段截断
+                           # 后重渲,不失败(§7.5)
+
+# ---------------------------------------------------------------------------
+# roles:自体模式(research_rl.enabled=true)**不使用**本段(config.py:788
+# `if selfres: pass`)。保留以便切「external researcher 对照臂」时只改三个键:
+# research.backend=external + research.tool_protocol=fncall + research_rl.enabled=false
+# ---------------------------------------------------------------------------
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:18888/v1,http://127.0.0.1:18889/v1"
+    model: qwen3.6-35b-a3b
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs: {enable_thinking: false}
+
+# ---------------------------------------------------------------------------
+# Episode 协议(训练/评测同构,PG-3)
+# 用户裁定 2026-08-08:轨迹长度的主导权在「轮数 × 单轮上限」,
+# train.response_length 退居 verl 侧容量声明(需求 §7.1)。
+# ---------------------------------------------------------------------------
+episode:
+  max_env_steps: 30         # 环境步预算:仅 acted=True 且 consumed_env_step=True
+                            # 才 +1(episode.py:246)。h3 实测中位 11 步,cap=30
+                            # 保住 94.2% 成功
+  max_assistant_turns: 40   # LLM 调用次数上限:每次生成无条件 +1(episode.py:201)。
+                            # 与 max_env_steps 的差值 10 = 格式失败余量;两者
+                            # 触顶语义不同(前者=正常预算耗尽,后者=异常截断,
+                            # episode.py:267)
+  session_token_budget: 16384   # 16K —— **executor 的流预算**(用户裁定
+                            # 2026-08-08:「任务执行的 session_token_budget
+                            # 设为 16K」)。§7.6 新键(CD-010 commit 5ba872a):
+                            # 与 train.response_length(纯 padding 维度)解耦,
+                            # 0 = 跟随维度(历史等值行为的显式拼写)。
+                            # 口径 = episode 流(生成 + 观察 + 结构),不含 prompt,
+                            # 与 research.session_token_budget 同口径。
+                            # 本值 < 轮预算 40×1024=40960 ⇒ **流预算先绑定**
+  max_tokens_per_turn: 1024 # 用户裁定 2026-08-08。⚠ 本键曾是 dead config
+                            # (CD-006 实测:配 4096 实际生效 2048),CD-010 已修
+                            # (commit 9c9568a,configure_episode_caps 第三参强制传)
+
+alfworld:
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  spawn_concurrency: 64
+  start_timeout_s: 300
+  step_timeout_s: 120
+  boot_concurrency: 32
+  protocol: fncall          # 单工具 execute(command)(用户裁定 2026-08-08,需求 §2/§3.1;
+                            # commit 57d9955)。新代码默认即 fncall,此处显式写出
+                            # 以求配置自足;进 objective_fingerprint
+
+# ---------------------------------------------------------------------------
+# 训练:verl GRPO
+# ---------------------------------------------------------------------------
+train:
+  model_path: "${TRACE_MODEL_PATH}"    # 原始 Qwen3.5-4B(非任何 SFT/RL ckpt)
+  train_file: "${TRACE_TRAIN_FILE}"
+  val_files:
+    - "${TRACE_VAL_SEEN_FILE}"
+    - "${TRACE_VAL_UNSEEN_FILE}"
+  experiment_name: q35_4b_v33_selfres_162   # 与 run.name 同值
+  project_name: trace_opd
+  n_gpus: 4                 # 162 实机四卡(2×A800 PCIe + 2×A100 PCIe)
+  rollout_tp: 1             # TP=1 ⇒ 四个独立 rollout replica,无跨卡通信
+  train_batch_size: 16
+  rollout_n: 16             # executor 行 = 8 bare + 8 steered;research 行由
+                            # research_rl.research_n 另加 8 ⇒ 每任务 24 行
+  ppo_mini_batch_size: 16   # 单位=任务数,verl 内部自动 ×rollout_n
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  # ---- M1 不对称 advantage 的估计器(与 steering.adv_mode=asym 强制联动,
+  #      config.py:676 校验「防半配置」)----
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false    # 不除 std:K_c 级样本噪声下除 std 放大纯噪声
+                            # (历史 75× 实证;v4 设计 §1.5)
+  # ---- 序列容量(需求 §7.1:容量声明,非行为主导)----
+  response_length: 40960    # verl padding 维度 = max(researcher 40960, executor 16384)。
+                            # 内存 ∝ 行数×本值:较 49152 降 17%,直接缩短
+                            # rollout→actor 之间的 CPU collate 空窗
+  max_prompt_length: 8192   # verl prompt padding 维度 = max(各角色 prompt 上限)
+                            # = max(executor 4K 期望, researcher 8192) = 8192。
+                            # 校验强制 research.max_prompt_tokens <= 本值。
+                            # ⚠ 与 response 侧 §7.6 同构的问题:executor 侧**没有**
+                            #   独立的 prompt 上限键,其上限即本共用维度,故用户裁定的
+                            #   「任务执行 4K」当前只能体现为"实际用量远低于共用维度"
+                            #   (executor 实测 prompt mean 945 / max 2020),
+                            #   而非一道独立的闸。
+                            # 内存代价可忽略:384 行 × 6144 增量 × 8B ≈ 19MB
+                            # (response 维度 49152 才是内存主项)
+  max_token_len_per_gpu: 32768   # 单序列容量声明:本值 × ulysses_sp(4) = 131072
+                            # ≥ rollout_max_model_len。实际最长序列 =
+                            # max_prompt_length(2048) + response_length(81920)
+                            # = 83968,SP 切分后单卡 20992,本值有余量
+  ppo_max_token_len_per_gpu: 8192      # actor 训练前反向微批打包预算/卡
+  log_prob_max_token_len_per_gpu: 8192 # old_log_prob 推理打包预算/卡
+  ulysses_sp: 2             # 用户 2026-08-09 提出、本 run 自己的 step-1 实测支持:
+                            #   executor respLen 中位 2232 ⇒ SP=4 后每卡仅 558 token
+                            #   research  respLen 中位 10872 ⇒ 每卡 2718
+                            #   max_memory_allocated 仅 21.2GB/80GB(闲置 74%)
+                            # 每卡 token 太少 ⇒ kernel 启动与 Ulysses 每层两次
+                            # all-to-all 开销主导;162 是 PCIe 无 NVLink,4 卡
+                            # all-to-all 代价显著高于 2 卡;且 SP=4 ⇒ dp=1 无数据并行。
+                            # SP=2 ⇒ 每卡 token 翻倍 + dp=2。显存预计 30-35GB,余量足
+  rollout_max_model_len: 131072  # **保险丝**(用户裁定 2026-08-08:「总的模型总
+                            # 上下文由一个参数配置来控制,一般是不会达到的上限
+                            # 比如 128K」)。Qwen3.5-4B 的 max_position_embeddings
+                            # = 262144,128K 在物理上限内。
+                            # §7.5 后它不再兼任控制器:backends.py:216-227 的
+                            # fuse = model_len − 实测 prompt − stream,只在
+                            # session_token_budget 之外做兜底;实测 4B 会话
+                            # 总量 max 58828,本保险丝不应被触发
+  rollout_max_num_batched_tokens: 16384  # 与 A800 v3.3/9B 主线同档
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5      # 4B 训练侧占用高于 1.7B,不上调;SPS 的
+                            # prompt_logprobs 有预算外分配史(vLLM #5907)
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  use_fused_kernels: true   # ⚠ 默认 false,必须显式开:Qwen3.5 词表 248320,
+                            # 64K 序列的 fp32 logits = 63.5GB 必爆;fused
+                            # linear+CE 使 logits 不落地(launch_train.py:252
+                            # 注释「Qwen3.5 248k 词表显存刚需」)
+  fused_kernels_backend: torch   # torch 首发,triton 待验
+  loss_agg_mode: seq-mean-token-mean   # 每行先 token-mean 再行间等权 ⇒ λ_r
+                            # 即角色间权重比(v4 设计 §1.6)
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400      # 必须显著大于 research.session_timeout_s(3600)
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 2           # 用户裁定 2026-08-08:跑满 2 epochs = 358 步
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true    # step-0 val = 训前裸基线(三件套之①)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 16     # 必须 = train_batch_size(自体模式校验强制)
+
+# ---------------------------------------------------------------------------
+# PGS steering —— v3.3 六模块(源 a800-pgs-v33-4braw-asym.yaml,逐键对齐)
+# ---------------------------------------------------------------------------
+steering:
+  enabled: true
+  doc_source: researcher    # 每 (global_step, task_id) 在线动态生产,组内共享
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf               # 预算不设限(v3.2 起默认档),spent 仅作观察量
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0              # 熵门档下 D 门阈无语义(gate_mode=entropy)
+  # ---- M4 门控组件化:强度函数 w_t∈[0,1],η_t = η_max·w_t ----
+  gate_mode: entropy        # G-E 熵门(v3.3 默认首发):w = min(1, h_t/H_q);
+                            # 关门位零教师成本(熵是 draft 侧免费信号)
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05             # ε 探针:5% 位置随机 w→0,承担因果读数
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0                  # 无拒绝上限,计数为观察量
+  # ---- M3 W_beh 档位 ----
+  w_beh_mode: "off"         # v3.3 新默认:steered 行不做行为 IS,ratio 分母统一
+                            # π_θold(MENTOR 口径)。依据:s3 实测教师信息最密处
+                            # (远 rank 硬知识)W≈0.01–0.1,打折与吸收慢直接相关
+  w_beh_shaped_gamma: 0.1
+  # ---- M1 不对称 advantage ----
+  adv_mode: asym            # bare 行组内 LOO(组=同任务 8 条 bare);steered 行
+                            # A = clamp_min(r − mean_bare, 0) × α_t,失败或不
+                            # 超均值 ⇒ advantage 恰 0(零梯度,不惩罚)
+  # ---- M2 α cosine 有限期 ----
+  steered_adv_weight: 1.0   # α_0
+  steered_adv_decay_steps: 240   # T_decay。用户裁定 2026-08-08 跑满 2 epochs
+                            # = 358 步(train 2875 条 ÷ batch 16 = 179 步/epoch);
+                            # 设计文档建议 T_decay ≈ 总步数×2/3 = 238,取 240 与
+                            # A800 v3.3 线(a800-pgs-v33-4braw-asym)同值,便于对照。
+                            # α=0 后 steered 臂停产,末段 118 步是纯 bare
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0      # 防御闸,0=不激活
+  # ---- 熵门标定(⚠ 必须在 FC 语境重标,见下)----
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28  # H_q 的 EMA **初值**。用户裁定 2026-08-08:「熵先用
+                            # 当前的初始配置值(反正是可以自适应调整的)」——
+                            # gate_adaptive: true 下该值只是起点,门率反馈环会按
+                            # entropy_target_rate 自校。该 1.28 来自 4B 在 text
+                            # 协议语境的标定,FC 语境的分布不同,故前若干步门率
+                            # 可能落在 gate_rate_bounds 外,属预期不属故障
+  entropy_floor: 0.6        # H_q 硬地板(防阈值追着熵坍缩一起跌,MENTOR
+                            # max(q80,1.5) 先例)。同上,用当前值起步
+  intensity_w_min: 0.05     # w_t < 本值 ⇒ 跳过教师 verify(bypass 省算力)
+  # ---- 分臂采样(v3.1)----
+  steered_fraction: 0.5     # 16 executor 行 = 8 bare + 8 steered
+  budget_pacing: false      # b_max=inf 下解锁曲线无定义(校验拒绝组合)
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 16384    # 训评同构:评测只跑 executor,故与 executor 的
+                            # episode.session_token_budget 逐值一致(**不是**与
+                            # response_length 一致——后者已重定义为 padding 维度)。
+                            # 口径不一致会让评测侧的退出语义与训练侧不同,
+                            # 系统性偏移 val 截断率读数
+  temperature: 0.0          # greedy(与 pilot 可比)
+
+# ---------------------------------------------------------------------------
+# v4 自体研究员双目标 RL(机制 v4.0,docs/pgs-self-researcher-design.md)
+# ---------------------------------------------------------------------------
+research_rl:
+  enabled: true
+  research_n: 8             # 每任务研究会话数 = research GRPO 组大小
+  prefix_quantiles: [0.05, 0.15, 0.30, 0.50, 0.75]
+  continuation_samples: 4
+  continuation_temperature: 1.0
+  researcher_temperature: 1.0
+  research_rl_weight: 1.0   # λ_r —— 用户裁定 2026-08-08(原 0.1):
+                            # 「researcher 自进化也是很重要的一个能力,不要设置
+                            #  这么小不然跟不上」。seq-mean-token-mean 下行间等权
+                            # ⇒ 名义梯度份额 = 8λ_r/(16+8λ_r) = 33.3%(与 executor
+                            # 行完全等权)。1.7B 实证支持该调整:research 组内
+                            # reward 挤在 r_raw≈0.06 附近,组内归一化后 advantage
+                            # 仅 ±0.03 量级,而 executor 侧是 0.3–1.0 ⇒ λ_r=0.1
+                            # 时实际份额远低于名义 4.8%。
+                            # 干涉监测:executor 的 rollout_extra/invalid_format
+  research_warmup_steps: 0
+  # research_max_sample_tokens 有意不写 —— 默认 0 = 联动会话 token 墙
+  # max(4096, rollout_max_model_len−2048) = 63488(CD-010 commit 4baa455,
+  # 需求 §7.4「长的正常轨迹也应该有训练梯度,不能随意置为 0」)。

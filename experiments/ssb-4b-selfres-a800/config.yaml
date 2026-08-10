@@ -1,0 +1,181 @@
+# =============================================================================
+# 实验:Qwen3.5-4B · SpreadsheetBench(reliable-372)· v3.3 × v4 完整自进化 · A800 八卡
+# 实验 ID: ssb-4b-selfres-a800   —— 主臂
+# =============================================================================
+# 对照臂:experiments/ssb-4b-grpo-162(162 四卡 · 原生 GRPO)
+#
+# 两臂**同模型(4B)、同数据集(reliable-372)、同 executor 预算与 eval 口径**,
+# 差异只有:① 机制(本臂 v3.3 asym + 熵门 + v4 自体研究员;对照臂全关 + grpo_loo)
+#           ② 机器档(8 卡 vs 4 卡,均 SP=2)—— 执行档不进 objective_fingerprint。
+#
+# research 侧一律用 v4 设计值,不做任何成本缩减(用户裁定 2026-08-09)。
+#
+# 机制侧照搬 162 上已验证到 step 35 的 q35-4b-v33-selfres-162,不自创。
+# =============================================================================
+
+run:
+  name: ssb_4b_selfres_a800
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-SSB/runs
+  tape: true
+
+environment:
+  name: spreadsheetbench
+
+# ---- v4 自体研究员:researcher = policy 本体,走本机 rollout 引擎 ----
+# research_rl.enabled=true 时 config.py:836 强制 backend=engine + tool_protocol=text,
+# 且 roles.researcher(endpoint/key/thinking)整体被校验豁免 —— 162 无需 35B 隧道。
+research:
+  enabled: true
+  backend: engine
+  tool_protocol: text
+  n_exp: 8                 # 每 (step,task) 最多 8 次 researcher 实验(v4 设计值)
+  k_default: 2
+  k_max: 4
+  max_turns: 20
+  wrapup_buffer: 2
+  fetch_raw_limit: 20
+  fetch_raw_max_chars: 16000
+  doc_max_words: 3000
+  gt: "off"                # 自体研究员无 GT(信息状态一致性;校验强制)
+  episode_temperature: 1.0
+  researcher_max_tokens: 4096
+  session_timeout_s: 3600
+  # SSB 的 observation 比 ALFWorld 长(obs_max_chars 3500/次),researcher 要反复
+  # 读表结构,故沿用 ALFWorld 线实测定下的 40960 而非 A800 GRPO 臂那份未启用的 32768。
+  session_token_budget: 40960
+  max_prompt_tokens: 8192
+
+narration:
+  backend: engine
+  max_words: 1000
+  temperature: 0.3
+  max_prompt_tokens: 32768
+  max_tokens: 0
+
+# roles.researcher 在自体档下不被求值(agent_loop.py:161),保留仅为 schema 完整。
+roles:
+  researcher:
+    endpoint: ""
+    model: ""
+    api_key_env: TRACE_RESEARCHER_API_KEY
+    mode: external_pool
+    sidecar_sleep: false
+    sidecar_sleep_level: 1
+    dp_size: 0
+    max_concurrency: 64
+    temperature: 0.7
+    max_tokens: 8192
+    timeout_s: 600
+
+# ---- executor 侧:与 A800 GRPO 臂逐键一致 ----
+episode:
+  max_env_steps: 20
+  max_assistant_turns: 28
+  max_tokens_per_turn: 4096
+  session_token_budget: 32768
+
+spreadsheetbench:
+  data_root: "${SSB_DATA}"
+  exec_concurrency: 64
+  python_timeout_s: 120
+  recalc_timeout_s: 120
+  obs_max_chars: 3500
+
+train:
+  model_path: "${TRACE_MODEL_PATH}"
+  train_file: "${SSB_TRAIN_FILE}"
+  val_files:
+    - "${SSB_VAL_FILE}"
+  experiment_name: ssb_4b_selfres_a800
+  project_name: trace_opd
+  n_gpus: 8
+  rollout_tp: 1
+  train_batch_size: 8       # 与对照臂同(train 184 ⇒ 23 步/epoch)
+  rollout_n: 16
+  ppo_mini_batch_size: 8
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo     # v3.3 M1 不对称 advantage
+  norm_adv_by_std: false
+  # 流预算三者取上界:research 40960 > executor 32768;padding 维度须 ≥ 两者。
+  response_length: 40960
+  max_prompt_length: 8192
+  max_token_len_per_gpu: 32768
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  rollout_max_model_len: 131072    # 128K 保险丝(用户裁定 2026-08-08)
+  rollout_max_num_batched_tokens: 16384
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.5
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  fsdp_mode: shard
+  fsdp_strategy: fsdp2
+  fsdp_size: 0
+  param_offload: true
+  reshard_after_forward: true
+  dist_backend: ""
+  total_epochs: 8           # 23 步/epoch ⇒ 184 步(与对照臂同)
+  test_freq: 10
+  save_freq: 10
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  agent_num_workers: 8      # 必须 == train_batch_size(config.py 校验:同任务副本须落同一 worker),不是可自由调的执行档
+  use_fused_kernels: true
+  fused_kernels_backend: torch
+
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5                    # ⚠ 未在 SSB 语境标定(沿用 ALFWorld 值,见 run.sh 门禁提示)
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy        # v3.3 M4 熵门 G-E
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"         # v3.3 M3 三档默认 off
+  w_beh_shaped_gamma: 0.1
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 123     # ≈ 总步数 184 的 2/3(ALFWorld 线 240/358 同比例)
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 1.28  # ⚠ ALFWorld-4B 占位值,SSB 未标定 —— step-1 后须按实测重标
+  entropy_floor: 0.6
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+  budget_pacing: false
+  budget_u0: 5.0
+  budget_profile_power: 2.0
+
+eval:
+  response_budget: 32768
+  n: 3                      # 与 A800 GRPO 臂同:avg@3
+  temperature: 0.6
+
+research_rl:
+  enabled: true
+  research_n: 8             # 每任务研究会话数 = research GRPO 组大小(v4 设计值)
+  prefix_quantiles: [0.05, 0.15, 0.30, 0.50, 0.75]
+  continuation_samples: 4
+  continuation_temperature: 1.0
+  researcher_temperature: 1.0
+  research_rl_weight: 1.0   # λ_r(用户裁定 2026-08-08)
+  research_warmup_steps: 0
+  # research_max_sample_tokens 不写 —— 默认联动会话 token 墙

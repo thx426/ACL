@@ -13,7 +13,7 @@
 
 run:
   name: pgs_q35_9b_smoke
-  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/runs
+  runs_root: /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-Q35/runs
   tape: true
 
 # ---------------------------------------------------------------------------
@@ -35,11 +35,14 @@ research:
   episode_temperature: 1.0
   researcher_max_tokens: 8192
   session_timeout_s: 3600
+  session_token_budget: 32768   # §7.5 必配(代补,机械迁移)
+  max_prompt_tokens: 2048
 
 narration:
   backend: engine
   max_words: 1000
   temperature: 0.3
+  max_prompt_tokens: 6144   # §7.5 必配(代补)
 
 roles:
   researcher:
@@ -90,7 +93,9 @@ train:
   experiment_name: pgs_q35_9b_smoke
   project_name: trace_opd
   n_gpus: 8
-  rollout_tp: 1
+  rollout_tp: 1             # 2026-08-08 用户裁定回 1(曾试 TP=2:每实例跨 2 卡、
+                            # 显存 58-62GB/卡起服正常,但 rollout DP 从 8 降到 4)。
+                            # TP=1 保持 8 路 DP 并发,配 memory-saver 与训练错峰。
   train_batch_size: 16
   rollout_n: 16             # 分臂 8 bare + 8 steered(steered_fraction 0.5)
   ppo_mini_batch_size: 16
@@ -99,20 +104,41 @@ train:
   lr_warmup_steps_ratio: 0.0
   adv_estimator: pgs_asym_grpo
   norm_adv_by_std: false
-  response_length: 32768    # 沿 4B 口径首试;冒烟显存读数紧(>75G 峰值)则降
-                            # 16384 重冒烟(裁定分支,docs/qwen35-9b-env-plan.md §3.5)
+  response_length: 32768    # 2026-08-08 回滚到原始档(曾按"截断率 68%"上调到 38912)。
+                            # 那个截断率是 EOS 停止符缺失导致的越界垃圾撑出来的假象
+                            # (86.5% response token 是垃圾,docs/qwen35-9b-eos-stop-bug.md);
+                            # 污染批次的裁定不作数,等修复后的干净读数再定。
+
   max_prompt_length: 2048
   max_token_len_per_gpu: 34816
   ppo_max_token_len_per_gpu: 8192
   log_prob_max_token_len_per_gpu: 8192
-  ulysses_sp: 2             # 主档;FLA 前置见上。fallback:1(联动 rmpad=off+sdpa,
-                            # 同时把两个 token_len 预算减半再冒烟)
+  ulysses_sp: 4             # 用户裁定 2026-08-08,依据 A800 实测激活曲线:
+                            #   每卡 tokens  2048 -> 1.0 GiB
+                            #                4096 -> 2.0 GiB
+                            #                8704 -> 14.0 GiB   ← SP=4 落在此档(实测)
+                            #               17408 -> 单卡 OOM    ← SP=2 只能外推(36.6)
+                            # 4096->8704 已是 7 倍非线性跳增,故不在该曲线上外推。
+                            # SP=4 每卡账 = 激活 14.0 + FSDP 静态 16.7 = 30.7 GiB,余量足。
+                            # 静态 16.7 = 权重2.08+梯度2.08+Adam8.34+master4.17(8卡分片,与SP无关)。
+                            # FLA 前置见上。fallback:2(若通信开销过大且实测峰值 <60G)
   use_fused_kernels: true   # fused linear+CE(torch backend 首发;triton 待验)
   rollout_max_model_len: 40960
-  rollout_max_num_batched_tokens: 8192
+  rollout_max_num_batched_tokens: 16384   # 2026-08-08 用户裁定(原 8192)。8192 配
+                            # response_length=32768 会让 chunked prefill 切很多块;
+                            # 同项在 v4 线上调后有实测收益。不进 fingerprint。
   rollout_backend: sglang
-  rollout_gpu_mem: 0.5      # 40G 预算:权重 19.3 + mamba pool(128req≈6.4G)+ KV;
-                            # 起服失败或 KV 池告警则升 0.55 重试并回报
+  rollout_gpu_mem: 0.55     # 2026-08-08 降到 0.55。0.65 实测崩:显存峰值摸到
+                            # 79725/81920=97.3%,teacher verify(hook.py:459 _verify_rows)
+                            # 要在 rollout engine 之外再做一轮前向,分配失败触发异步
+                            # CUDA 错误 -> c10::cuda::MemPool 析构 abort -> scheduler
+                            # exit -6(SIGABRT)。注意日志**没有** "CUDA out of memory",
+                            # 是显存不足伪装成 SIGABRT。原注释保留如下:
+                            # (曾试 0.65/0.75;0.75 未实测,mamba state
+                            # pool 128req 的开销未实测,0.75 可能顶到边界)。原值 0.5
+                            # 太保守:val 实测每卡仅用 43.7/81.9 GB。训练期 rollout
+                            # sleep 后只剩 4.3 GB(门 4 实测),不挤训练激活。
+                            # 该项不进 objective_fingerprint(纯执行档)。
   rollout_max_num_seqs: 128
   rollout_temperature: 1.0
   loss_agg_mode: seq-mean-token-mean
@@ -171,5 +197,6 @@ steering:
   budget_profile_power: 2.0
 
 eval:
-  response_budget: 32768
+  response_budget: 32768    # 同上,随 train.response_length 回滚(训练/评测同构 PG-3)。
+
   temperature: 0.0
