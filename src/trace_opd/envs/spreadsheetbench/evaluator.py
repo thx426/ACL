@@ -197,9 +197,10 @@ def evaluate(pred_path: str, gold_path: str, answer_position: str) -> dict:
 # ---------- test-case discovery(旧 testcases.py 移植) ----------
 
 def find_test_cases(task_dir: str) -> list[tuple[str, str, str]]:
-    """[(case_no, input_path, answer_path), ...]; 支持三种发布命名:
+    """[(case_no, input_path, answer_path), ...]; 支持四种发布命名:
     ``{no}_{id}_input/answer``(original)、``{no}_{id}_init/golden``
-    (verified_400)、bare ``initial/golden``(verified_400 无前缀)。"""
+    (verified_400)、bare ``initial/golden``(verified_400 无前缀)、
+    bare ``input/target``(Spreadsheet-RL, arXiv:2605.22642)。"""
     cases: list[tuple[str, str, str]] = []
     inputs = sorted(_glob.glob(os.path.join(task_dir, "*_input.xlsx")))
     for ip in inputs:
@@ -218,6 +219,13 @@ def find_test_cases(task_dir: str) -> list[tuple[str, str, str]]:
         bare_gold = os.path.join(task_dir, "golden.xlsx")
         if os.path.exists(bare_init) and os.path.exists(bare_gold):
             cases.append(("1", bare_init, bare_gold))
+    if not cases:
+        # Spreadsheet-RL:golden = target.xlsx(官方 sample_meta.py 同款);
+        # 同目录的 output.xlsx 是 oracle 中间产物,判分不用。
+        srl_init = os.path.join(task_dir, "input.xlsx")
+        srl_gold = os.path.join(task_dir, "target.xlsx")
+        if os.path.exists(srl_init) and os.path.exists(srl_gold):
+            cases.append(("1", srl_init, srl_gold))
     return cases
 
 
@@ -231,6 +239,12 @@ def preview_workbook(path: str, max_rows: int = 5, max_cols: int = 20) -> str:
     chunks: list[str] = []
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
+        if not hasattr(ws, "iter_rows"):
+            # Chartsheet 等无单元格网格的 sheet(SRL Charting 任务实测;
+            # SSB verified 无此形态,存量 initial_obs 逐字节不变)
+            chunks.append(f"## Sheet: {sheet_name}  (chart sheet — no cell grid)")
+            chunks.append("")
+            continue
         chunks.append(
             f"## Sheet: {sheet_name}  "
             f"(dim={ws.dimensions}, max_row={ws.max_row}, max_col={ws.max_column})"

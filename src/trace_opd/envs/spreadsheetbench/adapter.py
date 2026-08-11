@@ -28,7 +28,7 @@ from ...core import protocol
 from ...core.adapter import ActionOutcome
 from ..pytool import clip_middle, run_python_script
 from .evaluator import evaluate, find_test_cases, preview_workbook  # noqa: F401 — preview 供 live 重算
-from .recalc import find_soffice, recalculated_for_grading
+from .recalc import find_soffice, recalc_remote_url, recalculated_for_grading
 
 #: 无合法 tool call 时的提醒(裸文本——assistant 未发起调用,反馈不是
 #: tool 响应)
@@ -396,15 +396,17 @@ class SpreadsheetbenchEnvFactory:
                 "spreadsheetbench config incomplete: data_root is required "
                 "(set SSB_DATA)"
             )
-        if find_soffice() is None:
+        if find_soffice() is None and recalc_remote_url() is None:
             # 装配期 fail loud(比第二代运行时降级更严):没有重算后端,
             # 公式解法会被静默判 0 —— 那是 reward 语义漂移,不是可降级
-            # 的小故障。装 LibreOffice 或设 SSB_SOFFICE 后再起。
+            # 的小故障。设 SSB_RECALC_URL(Windows Excel 服务,与 golden
+            # 同引擎,优先)或装 LibreOffice / 设 SSB_SOFFICE 后再起。
             raise ValueError(
-                "spreadsheetbench: no LibreOffice backend found for formula "
-                "recalculation — install libreoffice/soffice into PATH or "
-                "set SSB_SOFFICE (grading without recalc would silently "
-                "fail every formula answer)"
+                "spreadsheetbench: no formula-recalc backend — set "
+                "SSB_RECALC_URL (Windows Excel service, preferred) or "
+                "install libreoffice/soffice into PATH or set SSB_SOFFICE "
+                "(grading without recalc would silently fail every formula "
+                "answer)"
             )
         self._cfg = cfg
         self._gate = threading.Semaphore(cfg.exec_concurrency)

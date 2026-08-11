@@ -241,7 +241,9 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         # 审阅:训练进程绕过 preflight 起跑时 'none' 曾被静默安装,首个
         # 解析在 worker 深处才炸成 ENV_ERROR 假象)。
         _fc_needed = (
-            config.environment.name in {"spreadsheetbench", "math", "scienceworld"}
+            config.environment.name in {"spreadsheetbench", "math",
+                                        "scienceworld", "terminal", "webarena",
+                                        "swe"}
             or (config.environment.name == "alfworld"
                 and config.alfworld.protocol == "fncall")
             or (config.research.enabled and config.research.tool_protocol == "text")

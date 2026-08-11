@@ -30,6 +30,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 from functools import lru_cache
 from pathlib import Path
@@ -39,6 +41,42 @@ logger = logging.getLogger(__name__)
 
 class RecalcError(RuntimeError):
     pass
+
+
+def recalc_remote_url() -> str | None:
+    """Windows Excel 重算服务地址(部署事实走 env,SSB_RECALC_URL)。
+
+    设置时优先于本地 soffice——用户裁定 2026-08-11:golden 是官方在真实
+    Excel 里执行保存的产物,LibreOffice 重算与 Excel 求值语义差(pivot
+    重建/函数兼容/#VALUE 传播/bool 存储)造成 SRL 全量 6.9%、SSB 7.0% 的
+    unreliable;Excel 重算与 golden 同引擎对齐是根治。服务端见
+    experiments/bench_env/win_recalc/excel_recalc_server.py。"""
+    url = os.environ.get("SSB_RECALC_URL", "").strip()
+    return url or None
+
+
+def recalculate_remote(data: bytes, *, url: str, timeout_s: float) -> bytes:
+    """POST xlsx 字节到 Windows Excel 重算服务,返回重算后的字节。
+
+    协议:POST {url}/recalc,body=xlsx bytes,200=重算后 xlsx bytes,
+    非 200 = 失败(body 为错误文本)。"""
+    req = urllib.request.Request(
+        url.rstrip("/") + "/recalc",
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            out = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        raise RecalcError(f"remote recalc HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RecalcError(f"remote recalc unreachable: {exc}") from exc
+    if len(out) < 100:
+        raise RecalcError(f"remote recalc returned {len(out)} bytes (not a workbook)")
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -120,13 +158,32 @@ def recalculated_for_grading(
     data: bytes, *, soffice: str | None, timeout_s: float, task_id: str
 ) -> bytes:
     """评分用字节:有公式且有后端 ⇒ 重算;否则原字节(公式 workbook 无法
-    重算时响亮记日志——那意味着公式解法将被判 0,是口径事故信号)。"""
+    重算时响亮记日志——那意味着公式解法将被判 0,是口径事故信号)。
+
+    后端优先级:SSB_RECALC_URL(Windows Excel 服务,与 golden 同引擎)>
+    本地 soffice(LibreOffice,实测 SRL 全量 6.9% / SSB 7.0% 任务求值
+    漂移)。remote 失败**不**静默回落 soffice——两引擎结果不同,混用会让
+    同一任务的 reward 语义随故障漂移;失败按原字节评分并响亮记日志
+    (与 soffice 失败同语义)。"""
     if not workbook_has_formulas(data):
         return data
+    remote = recalc_remote_url()
+    if remote is not None:
+        try:
+            out = recalculate_remote(data, url=remote, timeout_s=timeout_s)
+        except RecalcError as exc:
+            logger.error("ssb remote recalc FAILED for task %s: %s", task_id, exc)
+            return data
+        logger.info(
+            "ssb remote recalc ok for task %s (%d -> %d bytes)",
+            task_id, len(data), len(out),
+        )
+        return out
     if soffice is None:
         logger.error(
             "ssb recalc UNAVAILABLE for task %s: workbook has formulas but no "
-            "LibreOffice backend — formula answers will grade as misses",
+            "recalc backend (neither SSB_RECALC_URL nor LibreOffice) — "
+            "formula answers will grade as misses",
             task_id,
         )
         return data

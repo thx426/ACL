@@ -218,6 +218,136 @@ class SciworldCfg:
 
 
 @dataclass
+class TerminalCfg:
+    """终端 CLI 域(TMax-15K × ACS 云沙箱;envs/terminal/adapter.py,引入
+    裁定 2026-08-10 terminal-env-proposal.md)。部署事实走 env(TERMINAL_*),
+    不进 yaml 字面量。协议面常量(截断 10k、单工具 bash、提交标记、wrapper
+    路径)是 TMax 忠实字面量,故意**不做**配置——改它们=改任务表面。"""
+
+    protocol: str = "fncall"        # 终端域 FC 原生,无 text 档
+    task_data_root: str = ""        # TERMINAL_TASK_DATA(解包的 per-task 资产根:
+                                    # <root>/<task_id>/{setup.sh,tests/,instruction.md})
+    kubeconfig: str = ""            # TERMINAL_KUBECONFIG(集群 kubeconfig 路径)
+    namespace: str = "default"
+    image: str = ""                 # TERMINAL_IMAGE(ACR 胖基镜像全名:tag)
+    image_pull_secret: str = "acr-zjk"
+    run_label: str = ""             # Pod label trace-run=<值>(残留沙箱按标签清理)
+    pod_cpu: str = "1"              # TMax 同款沙箱资源(convert_to_harbor.py:244-248)
+    pod_memory: str = "2Gi"
+    spawn_concurrency: int = 32     # 沙箱 Pod 创建全局并发门(按 worker 折算;
+                                    # 保护 ACS 创建速率与 K8s API)
+    create_timeout_s: float = 300.0  # 创建→Running(冒烟实测 23s 无预热池;
+                                    # 胖基镜像首拉 GB 级,留余量)
+    setup_timeout_s: float = 600.0  # 运行时 setup.sh(任务初始化,深读 §6.3)
+    command_timeout_s: float = 120.0  # 单条 bash 命令(TMax Table 13)
+    test_timeout_s: float = 600.0   # 判分沙箱内 timeout(TMax _MIN_TEST_TIMEOUT_S)
+    test_grace_s: float = 300.0     # 判分外层墙钟余量:外层 = test_timeout_s +
+                                    # 此值(默认 900,修 TMax 120<600 倒挂)
+    score_at_budget: bool = False   # False = TMax 训练语义(不提交 ⇒ 0,不跑
+                                    # verifier);True = TB 式末步仍判分(评测近似)
+
+
+@dataclass
+class SweCfg:
+    """SWE 域(R2E-Gym-Subset × ACS 云沙箱;envs/swe/,协商稿
+    2026-08-11-swe-env-proposal.md)。三工具 FC(str_replace_editor/
+    execute_bash/submit,openhands 套件)+ 容器内 pytest 判分(judge.py
+    移植 R2E _calculate_reward_r2e,二值)。特权(GT patch/期望输出)在
+    privileged_root,judge 从此读 expected_output_json,不进 agent 面。"""
+
+    protocol: str = "fncall"        # SWE 域 FC 原生
+    data_root: str = ""             # SWE_DATA(dataset 根:train.parquet +
+                                    # privileged/<instance_id>.json)
+    kubeconfig: str = ""            # SWE_KUBECONFIG(集群 kubeconfig)
+    namespace: str = "default"
+    image_registry: str = ""        # SWE_IMAGE_REGISTRY(ACR 前缀,拼
+                                    # <registry>/<repo>_final:<hash>;空则用
+                                    # 数据集原 docker_image = dockerhub)
+    image_pull_secret: str = "acr-zjk"
+    run_label: str = ""             # Pod label trace-run=<值>(残留清理)
+    pod_cpu: str = "2"              # SWE 单任务 ~1 core(NeMo Gym 实测)+ 余量
+    pod_memory: str = "4Gi"
+    spawn_concurrency: int = 16     # 沙箱创建全局并发门
+    create_timeout_s: float = 300.0  # 创建→Running(SWE 镜像 0.3-0.5GB 压缩)
+    command_timeout_s: float = 120.0  # 单条工具命令(R2E CMD_TIMEOUT=120)
+    setup_timeout_s: float = 300.0  # episode 开局容器内 setup(symlink/pyc 清理/
+                                    # r2e_tests 归位;raw 镜像必需,见 adapter)
+    test_timeout_s: float = 300.0   # 判分 pytest 超时(R2E reward_timeout=300)
+    test_grace_s: float = 60.0      # 判分外层墙钟余量(外层=test_timeout+此值)
+    max_obs_chars: int = 10000      # observation 截断(R2E 工具内部 10k 字符
+                                    # 同量级;execute_bash 上游不截断,我们补)
+    prebaked_setup: bool = False    # True = 镜像已烘 setup(M2 后),开局只按
+                                    # tests_visible 建/撤软链;False = raw 镜像
+                                    # 走完整 setup(每 episode 一次合并 exec)
+    budget_exhaust_reward_scale: float = 0.5  # R2E α:预算耗尽仍判分,分数 ×α
+                                    # (先例 0.5,动机=约 20% 轨迹撞墙、其中
+                                    # 近 1/4 已修好;设 1.0 关闭惩罚)
+                                    # ⚠ 影响效果的参数,档位待用户确认
+    grading_mode: str = "deferred"  # swebench(Verified)判分:deferred =
+                                    # episode 只收 patch、分数离线由官方
+                                    # harness 出(**报表口径**,训练环境零
+                                    # swebench 依赖);inline = 沙箱内跑官方
+                                    # eval_script 判(给 in-loop val 曲线,
+                                    # 需装 swebench 包)。r2e 源不受此影响
+    tests_visible: bool = True      # True = R2E 训练 setting(r2e_tests 软链
+                                    # 对 agent 可见,DeepSWE/SWE-Master 同款);
+                                    # False = 对齐 SWE-bench Verified 评测口径
+                                    # (F2P 测试不可见),供消融
+    allow_git: bool = False         # git 封禁(先例意图=agent 完全无 git);
+                                    # True 仅供调试,正式实验恒 False
+
+    def _validate(self) -> None:
+        for k in ("spawn_concurrency", "max_obs_chars"):
+            if getattr(self, k) <= 0:
+                raise ValueError(f"swe.{k} must be > 0")
+        for k in ("command_timeout_s", "test_timeout_s", "create_timeout_s",
+                  "setup_timeout_s"):
+            if getattr(self, k) <= 0:
+                raise ValueError(f"swe.{k} must be > 0")
+        if self.grading_mode not in ("deferred", "inline"):
+            raise ValueError(
+                f"swe.grading_mode 必须是 deferred|inline,得到 {self.grading_mode!r}"
+            )
+        if not 0.0 <= self.budget_exhaust_reward_scale <= 1.0:
+            raise ValueError(
+                "swe.budget_exhaust_reward_scale 必须在 [0,1](R2E α;1.0=不罚)"
+            )
+
+
+@dataclass
+class WebArenaCfg:
+    """WebArena 域(WebArena-Verified 812 × 站点池;envs/webarena/,引入
+    裁定 2026-08-10 webarena-env-proposal.md §9)。评测桥钉死
+    webarena-verified==1.2.3(evalbridge.PINNED_VERSION);交互面 = WebServ
+    step_browser 语义 + terminate 结构化终局(FinalAgentResponse)。"""
+
+    protocol: str = "fncall"        # 单工具 step_browser,无 text 档
+    pool: str = "static"            # static(固定 URL,冒烟/只读)| acs
+                                    # (Checkpoint/Restore SandboxSet 池,隔离)
+    #: pool=static:site → base URL(如 {"shopping": "http://localhost:7770"})
+    static_base_urls: dict[str, str] = field(default_factory=dict)
+    #: pool=acs:site → SandboxSet 名(每站点一池,RUNBOOK §12.5 配方)
+    sandboxsets: dict[str, str] = field(default_factory=dict)
+    kubeconfig: str = ""            # WEBARENA_KUBECONFIG(pool=acs 必填)
+    namespace: str = "default"
+    work_dir: str = ""              # episode 产物根(HAR/agent_response/eval)
+    run_label: str = ""             # 领用注解标识 + 产物归属
+    headless: bool = True
+    spawn_concurrency: int = 16     # 并发浏览器会话门(chromium ~200MB/个)
+    acquire_timeout_s: float = 300.0  # 站点池领用等待上限(池竭即 fail)
+    #: 单条观测字符上限(head 60% + tail 40%)。WebServ 不截断、靠 16k ctx
+    #: 硬约束;此值影响效果,默认 40000 为工程保底——正式训练值待用户裁定。
+    max_obs_chars: int = 40_000
+    #: HAR 保留策略:False = 评测后即删(实测 4-8MB/episode,训练会线性
+    #: 吃盘;agent_response/eval_result 小件始终保留);True = 全保(审计/
+    #: 提交包场景)。
+    keep_har: bool = False
+    #: static 池对 MUTATE 任务的显式放行(默认拒绝:静态池无状态隔离,
+    #: mutate 互踩;只有单任务串行调试才可打开)。
+    allow_static_mutate: bool = False
+
+
+@dataclass
 class EnvironmentCfg:
     """任务环境选择(envs/registry.py 的注册键)。机制层永不感知具体
     benchmark;装配层凭 name 分派工厂。默认 alfworld = 历史行为,且默认值
@@ -569,6 +699,9 @@ class Config:
     spreadsheetbench: SpreadsheetbenchCfg
     math: MathCfg
     scienceworld: SciworldCfg
+    terminal: TerminalCfg
+    webarena: WebArenaCfg
+    swe: SweCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -595,7 +728,7 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
-    "scienceworld",
+    "scienceworld", "terminal", "webarena", "swe",
 }
 
 
@@ -606,6 +739,51 @@ def _validate(cfg: "Config") -> None:
     if cfg.alfworld.protocol not in ("fncall", "text"):
         raise ValueError(
             f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
+        )
+    if cfg.terminal.protocol != "fncall":
+        raise ValueError(
+            f"terminal.protocol 仅支持 fncall(TMax 语料即 FC 单工具 bash,"
+            f"无 text 档),得到 {cfg.terminal.protocol!r}"
+        )
+    if cfg.terminal.test_timeout_s < 600.0:
+        raise ValueError(
+            f"terminal.test_timeout_s({cfg.terminal.test_timeout_s}) 必须 >= "
+            "600(TMax _MIN_TEST_TIMEOUT_S;更小会把慢 verifier 伪装成任务失败)"
+        )
+    if cfg.terminal.test_grace_s < 60.0:
+        raise ValueError(
+            f"terminal.test_grace_s({cfg.terminal.test_grace_s}) 必须 >= 60"
+            "(外层墙钟必须显著大于沙箱内判分 timeout,修 TMax 倒挂)"
+        )
+    if cfg.webarena.protocol != "fncall":
+        raise ValueError(
+            f"webarena.protocol 仅支持 fncall(单工具 step_browser,无 text "
+            f"档),得到 {cfg.webarena.protocol!r}"
+        )
+    if cfg.webarena.pool not in ("static", "acs"):
+        raise ValueError(
+            f"webarena.pool 必须是 static|acs,得到 {cfg.webarena.pool!r}"
+        )
+    if cfg.swe.protocol != "fncall":
+        raise ValueError(
+            f"swe.protocol 仅支持 fncall(R2E openhands 三工具,无 text 档),"
+            f"得到 {cfg.swe.protocol!r}"
+        )
+    cfg.swe._validate()
+    import math as _math
+    if cfg.webarena.spawn_concurrency < 1:
+        raise ValueError("webarena.spawn_concurrency 必须 >= 1")
+    if (not _math.isfinite(cfg.webarena.acquire_timeout_s)
+            or cfg.webarena.acquire_timeout_s <= 0):
+        raise ValueError("webarena.acquire_timeout_s 必须是有限正数")
+    if cfg.webarena.max_obs_chars < 0:
+        raise ValueError("webarena.max_obs_chars 必须 >= 0(0=不截断)")
+    if cfg.environment.name == "webarena" and cfg.webarena.pool == "static":
+        # 静态池无 episode 间状态隔离:mutate 任务并发互踩。只拦作为训练
+        # 环境的使用;冒烟脚本直构工厂不经此路径。
+        raise ValueError(
+            "webarena.pool='static' 不可用于训练(无状态隔离,mutate 任务"
+            "互踩);训练用 pool='acs'(Checkpoint/Restore 池)"
         )
     # §7.6:executor 流预算(episode.session_token_budget,0=跟随维度)必须
     # 被 padding 维度容下(verl 只补不截)——与 research 侧同款不变式。
@@ -1302,6 +1480,9 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         ),
         math=_build(MathCfg, data.get("math") or {}),
         scienceworld=_build(SciworldCfg, data.get("scienceworld") or {}),
+        terminal=_build(TerminalCfg, data.get("terminal") or {}),
+        webarena=_build(WebArenaCfg, data.get("webarena") or {}),
+        swe=_build(SweCfg, data.get("swe") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),

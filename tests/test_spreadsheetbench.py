@@ -319,11 +319,13 @@ def test_registry_dispatch_and_dataroot_required(tmp_path, fake_soffice):
 
 
 def test_factory_fails_loud_without_soffice(monkeypatch, tmp_path):
-    """无重算后端 = 公式解法静默判 0 = reward 语义漂移 ⇒ 装配期即死。"""
+    """无重算后端(soffice 与 SSB_RECALC_URL 皆无)= 公式解法静默判 0 =
+    reward 语义漂移 ⇒ 装配期即死。"""
     find_soffice.cache_clear()
     monkeypatch.setenv("SSB_SOFFICE", str(tmp_path / "nonexistent"))
+    monkeypatch.delenv("SSB_RECALC_URL", raising=False)
     try:
-        with pytest.raises(ValueError, match="LibreOffice"):
+        with pytest.raises(ValueError, match="no formula-recalc backend"):
             SpreadsheetbenchEnvFactory(SpreadsheetbenchCfg(data_root=str(tmp_path)))
     finally:
         find_soffice.cache_clear()
@@ -386,3 +388,133 @@ def test_ssb_external_researcher_path_still_expressible(deploy_env, tmp_path):
     cfg = load_config(f)
     assert cfg.research.backend == "external" and not cfg.research_rl.enabled
     assert cfg.steering.enabled and cfg.steering.adv_mode == "asym"   # 机制仍是 v3.3
+
+
+# ---------- Spreadsheet-RL 引入件(2026-08-11) ----------
+
+def test_find_test_cases_srl_naming(tmp_path):
+    """SRL 目录形态 input/target ⇒ 单 case;output.xlsx(oracle 中间产物)
+    不得干扰发现;SSB 三种存量命名优先级不受影响。"""
+    td = tmp_path / "excelforum" / "sub" / "task-job-x"
+    td.mkdir(parents=True)
+    _wb(td / "input.xlsx", {"A1": 1})
+    _wb(td / "target.xlsx", {"A1": 1, "B1": 2})
+    _wb(td / "output.xlsx", {"A1": 1})
+    cases = find_test_cases(str(td))
+    assert len(cases) == 1
+    no, ip, ap = cases[0]
+    assert no == "1" and ip.endswith("input.xlsx") and ap.endswith("target.xlsx")
+
+
+def test_normalize_answer_position_forms():
+    """实测三形态:A 单区域缺前引号 / B 多区域首段缺 / D 合法撇号不动;
+    完好输入恒等。"""
+    from trace_opd.envs.spreadsheetbench.build_dataset_srl import (
+        normalize_answer_position as norm,
+    )
+    assert norm("Sheet1'!C3:C545") == "'Sheet1'!C3:C545"                    # A
+    assert norm("Total'!G2,'Total'!H2") == "'Total'!G2,'Total'!H2"          # B
+    assert norm("'RYAN'S ORDERS'!M6:M42") == "'RYAN'S ORDERS'!M6:M42"       # D
+    assert norm("'Sheet1'!K2:K71") == "'Sheet1'!K2:K71"                     # 恒等
+    assert norm("B2:C160") == "B2:C160"                                     # 无 sheet 段
+
+
+def test_preview_workbook_chartsheet(tmp_path):
+    """含 Chartsheet 的 workbook(SRL Charting 任务实测形态)preview 不炸,
+    输出占位行;普通 sheet 输出不变。"""
+    from openpyxl.chart import BarChart, Reference
+
+    p = tmp_path / "chart.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = 7
+    cs = wb.create_chartsheet("MyChart")
+    chart = BarChart()  # 空 chartsheet openpyxl 自己写完读不回,挂真 chart
+    chart.add_data(Reference(ws, min_col=1, min_row=1, max_row=1))
+    cs.add_chart(chart)
+    wb.save(p)
+    wb.close()
+    text = preview_workbook(str(p))
+    assert "A1=7" in text
+    assert "MyChart" in text and "no cell grid" in text
+
+
+# ---------- Windows Excel 远程重算后端(2026-08-11,用户裁定) ----------
+
+def _mock_recalc_server(response_bytes: bytes | None, status: int = 200):
+    """本地 HTTP mock:POST /recalc → status+bytes。返回 (server, url)。"""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(n)
+            body = response_bytes if response_bytes is not None else b"boom"
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def _formula_wb_bytes() -> bytes:
+    import io
+
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "=1+1"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_remote_recalc_preferred_over_soffice(monkeypatch):
+    """SSB_RECALC_URL 设置 ⇒ 走 remote,soffice 不被调用。"""
+    from trace_opd.envs.spreadsheetbench import recalc as R
+
+    payload = b"X" * 200  # >100 字节即视为合法 workbook 响应
+    srv, url = _mock_recalc_server(payload)
+    monkeypatch.setenv("SSB_RECALC_URL", url)
+    called = []
+    monkeypatch.setattr(R, "recalculate", lambda *a, **k: called.append(1) or b"")
+    out = R.recalculated_for_grading(
+        _formula_wb_bytes(), soffice="/fake/soffice", timeout_s=10, task_id="t"
+    )
+    srv.shutdown()
+    assert out == payload and not called
+
+
+def test_remote_recalc_failure_no_fallback(monkeypatch):
+    """remote 失败 ⇒ 原字节评分,绝不回落 soffice(引擎混用=语义漂移)。"""
+    from trace_opd.envs.spreadsheetbench import recalc as R
+
+    srv, url = _mock_recalc_server(None, status=500)
+    monkeypatch.setenv("SSB_RECALC_URL", url)
+    called = []
+    monkeypatch.setattr(R, "recalculate", lambda *a, **k: called.append(1) or b"")
+    data = _formula_wb_bytes()
+    out = R.recalculated_for_grading(
+        data, soffice="/fake/soffice", timeout_s=10, task_id="t"
+    )
+    srv.shutdown()
+    assert out == data and not called
+
+
+def test_factory_boots_with_remote_url_only(monkeypatch, tmp_path):
+    """无 soffice 但有 SSB_RECALC_URL ⇒ factory 可装配(装配门放行)。"""
+    from trace_opd.envs.spreadsheetbench import adapter as A
+
+    monkeypatch.setenv("SSB_RECALC_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(A, "find_soffice", lambda: None)
+    cfg = SpreadsheetbenchCfg(data_root=str(tmp_path))
+    A.SpreadsheetbenchEnvFactory(cfg)  # 不抛即过
+
+    monkeypatch.delenv("SSB_RECALC_URL")
+    with pytest.raises(ValueError, match="no formula-recalc backend"):
+        A.SpreadsheetbenchEnvFactory(cfg)

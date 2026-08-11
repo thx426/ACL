@@ -75,7 +75,8 @@ def main() -> int:
     # 即 v4 自体研究员/sftgen——2026-08-08 审阅补缺:两条 selfres 配置
     # 都是 text 环境 + text researcher,曾整体漏过 FC 门)。
     _fc_active = (
-        cfg.environment.name in {"spreadsheetbench", "math", "scienceworld"}
+        cfg.environment.name in {"spreadsheetbench", "math", "scienceworld",
+                                 "terminal", "webarena", "swe"}
         or (cfg.environment.name == "alfworld" and cfg.alfworld.protocol == "fncall")
         or (cfg.research.enabled and cfg.research.tool_protocol == "text")
     )

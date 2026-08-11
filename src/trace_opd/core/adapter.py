@@ -92,7 +92,15 @@ class TaskAdapter(Protocol):
     @property
     def initial_obs(self) -> str:
         """Deterministic initial observation (captured at dataset build time;
-        deterministic engines must reproduce it on open_episode)."""
+        deterministic engines must reproduce it on open_episode).
+
+        Non-deterministic environments (live web pages, per-episode URLs) may
+        additionally implement an OPTIONAL ``validate_initial_obs(live: str)
+        -> bool`` method: when present, the episode runner calls it instead of
+        the byte-compare against this property (which then only carries the
+        static task-instruction part). Keep the validator strict about the
+        stable parts — it exists to relax reproduction of the dynamic parts,
+        not to disable drift detection."""
         ...
 
     def task_brief(self) -> str:
