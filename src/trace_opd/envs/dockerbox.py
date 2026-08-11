@@ -38,23 +38,43 @@ _NAME_PREFIX = "tbx"
 _LABELS = {"app": "trace-dockerbox"}
 
 
-def _client(docker_host: str = ""):
-    """docker-py 客户端。docker_host 空 ⇒ 用环境变量/本机 socket。"""
+#: docker-py 的 **连接池默认只有 10**;高并发下 64 个线程共用一个 client 会
+#: 排队到 60s 读超时(2026-08-11 c64 实测:10/96 容器创建失败,报
+#: `UnixHTTPConnectionPool ... Read timed out`)。池大小必须 ≥ 并发数。
+_DEFAULT_POOL = 64
+_DEFAULT_API_TIMEOUT_S = 180
+
+_CLIENT_LOCK = threading.Lock()
+_CLIENTS: dict[tuple, object] = {}
+
+
+def _client(docker_host: str = "", pool_size: int = _DEFAULT_POOL):
+    """docker-py 客户端(**进程内按 (host,pool) 复用**:每 episode 建新 client
+    会各带一个连接池,几十个 episode 就是几百条空闲连接)。"""
     try:
         import docker  # noqa: PLC0415 — 惰性:不用 docker 后端的部署无需装
     except ImportError as err:  # pragma: no cover
         raise CloudboxError(
             "docker backend needs the docker-py package (pip install docker)"
         ) from err
-    try:
-        if docker_host:
-            return docker.DockerClient(base_url=docker_host)
-        return docker.from_env()
-    except Exception as err:  # noqa: BLE001
-        raise CloudboxError(
-            f"docker connect failed (DOCKER_HOST={docker_host or os.environ.get('DOCKER_HOST', '')!r}) "
-            f"— 若走 162:先跑 ~/dockfwd.sh 建 socket 转发: {err}"
-        ) from err
+    key = (docker_host, pool_size)
+    with _CLIENT_LOCK:
+        cli = _CLIENTS.get(key)
+        if cli is not None:
+            return cli
+        try:
+            base = docker_host or os.environ.get("DOCKER_HOST", "")
+            kw = {"max_pool_size": max(8, pool_size),
+                  "timeout": _DEFAULT_API_TIMEOUT_S}
+            cli = (docker.DockerClient(base_url=base, **kw) if base
+                   else docker.from_env(**kw))
+        except Exception as err:  # noqa: BLE001
+            raise CloudboxError(
+                f"docker connect failed (DOCKER_HOST={docker_host or os.environ.get('DOCKER_HOST', '')!r}) "
+                f"— 若走 162:先跑 ~/dockfwd.sh 建 socket 转发: {err}"
+            ) from err
+        _CLIENTS[key] = cli
+        return cli
 
 
 class DockerSandbox:
@@ -76,8 +96,10 @@ class DockerSandbox:
         create_timeout_s: float = 120.0,
         run_label: str = "",
         network: str = "bridge",
+        pool_size: int = _DEFAULT_POOL,
+        volumes: dict | None = None,
     ) -> None:
-        self._cli = _client(docker_host)
+        self._cli = _client(docker_host, pool_size)
         self._name = f"{_NAME_PREFIX}-{task_id[:32]}-{uuid.uuid4().hex[:6]}"
         self._dead = False
         labels = dict(_LABELS)
@@ -94,6 +116,7 @@ class DockerSandbox:
                 nano_cpus=int(float(cpus) * 1e9),
                 mem_limit=memory,
                 network_mode=network,
+                volumes=volumes or None,
                 # 任务 setup.sh 会 useradd/chown/apt —— 容器内 root 是必需的
                 # (TMax 任务的既定前提);容器边界即隔离边界。
                 user="root",
@@ -101,8 +124,10 @@ class DockerSandbox:
             )
         except Exception as err:  # noqa: BLE001
             raise CloudboxError(f"container create failed ({self._name}): {err}") from err
-        # 就绪判据:能执行一条命令(不是"状态 running"——那不是可用性判据)
+        # 就绪判据 = 能执行一条命令(不是"状态 running")。**退避轮询**:
+        # 定频 0.2s × 高并发会把 docker API/隧道灌爆(c64 实测教训)。
         deadline = time.monotonic() + create_timeout_s
+        wait = 0.3
         while True:
             try:
                 rc, _ = self._c.exec_run("true", demux=False)
@@ -117,7 +142,8 @@ class DockerSandbox:
                 raise CloudboxError(
                     f"container {self._name} not usable after {create_timeout_s:.0f}s"
                 )
-            time.sleep(0.2)
+            time.sleep(wait)
+            wait = min(wait * 1.6, 3.0)
 
     @property
     def name(self) -> str:

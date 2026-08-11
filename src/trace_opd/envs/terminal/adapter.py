@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 #     逐字节照搬;路径都保留原名——沙箱内表面与 TMax 完全同构)-------------
 SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
+#: 快照在容器内的挂载点(只读;provision 期解开后不再需要)
+_SNAP_IN_CONTAINER = "/tmp/.trace_snapshot.tgz"
+
 _BASH_WRAPPER_PATH = "/tmp/.swerl_vanillux_bash_wrapper.sh"
 _BASH_WRAPPER_PATH_QUOTED = shlex.quote(_BASH_WRAPPER_PATH)
 _BASH_CWD_PATH = "/tmp/.swerl_vanillux_cwd"
@@ -297,6 +300,15 @@ class TerminalTaskAdapter:
     def executor_scaffold(self) -> str:
         return SYSTEM_PROMPT
 
+    def _snapshot_path(self):
+        """该任务的环境快照(存在才返回);仅 docker 后端有意义(快照须与
+        docker 宿主同机才能 bind-mount)。"""
+        root = self._cfg.snapshot_root
+        if not root or self._cfg.backend != "docker":
+            return None
+        p = Path(root) / f"{self.task_id}.tgz"
+        return p if p.is_file() else None
+
     def _spawn_sandbox(self):
         """按 cfg.backend 造沙箱 —— acs(阿里云)/ docker(162 环境池)。
         两者方法面与错误类型完全一致(dockerbox 复用 ExecResult/CloudboxError),
@@ -305,6 +317,11 @@ class TerminalTaskAdapter:
         if cfg.backend == "docker":
             from ..dockerbox import DockerSandbox  # noqa: PLC0415
 
+            vols = None
+            snap = self._snapshot_path()
+            if snap is not None:
+                # 快照与 docker 同在宿主 ⇒ bind-mount,客户端零传输
+                vols = {str(snap): {"bind": _SNAP_IN_CONTAINER, "mode": "ro"}}
             return DockerSandbox(
                 image=cfg.image,
                 task_id=self.task_id,
@@ -313,6 +330,8 @@ class TerminalTaskAdapter:
                 docker_host=cfg.docker_host,
                 create_timeout_s=cfg.create_timeout_s,
                 run_label=cfg.run_label,
+                pool_size=max(16, cfg.spawn_concurrency),
+                volumes=vols,
             )
         return CloudSandbox(
             kubeconfig=cfg.kubeconfig,
@@ -352,20 +371,32 @@ class TerminalTaskAdapter:
         """Deviation #1(runtime setup)+ TMax reset 骨架(逐字节命令)。
         顺序忠实于原镜像生命周期:setup(≙镜像 %post)→ 骨架(≙harness
         reset)。setup 失败 fail-loud——静默继续会把基建残破伪装成任务失败。"""
-        setup_sh = (assets / "setup.sh").read_text(encoding="utf-8")
-        sbx.write_file("/tmp/.trace_setup.sh", setup_sh)
+        snap = self._snapshot_path()
+        if snap is not None:
+            # ---- 快照还原路径(方案 A:复刻 TMax 预建;实测 107s→~3s)----
+            # 语义等价性已实测:文件树/md5/useradd 用户身份与原生 setup 逐一致。
+            r = sbx.run(f"cd / && tar -xzf {_SNAP_IN_CONTAINER}",
+                        self._cfg.command_timeout_s)
+            if r.exit_code != 0:
+                raise CloudboxError(
+                    f"snapshot restore failed for {self.task_id} "
+                    f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-400:]}"
+                )
+        else:
+            setup_sh = (assets / "setup.sh").read_text(encoding="utf-8")
+            sbx.write_file("/tmp/.trace_setup.sh", setup_sh)
         # run_polled:setup 是分钟级长命令,长活 websocket 会中途掉线
         # (2026-08-11 瘦镜像 setup 门 3/5 实测);分离执行 + 短轮询根治。
-        r = sbx.run_polled(
-            "cd / && bash /tmp/.trace_setup.sh",
-            self._cfg.setup_timeout_s,
-            grace_s=120.0,
-        )
-        if r.exit_code != 0:
-            raise CloudboxError(
-                f"setup.sh failed for {self.task_id} (rc={r.exit_code}): "
-                f"{(r.stderr or r.stdout)[-800:]}"
+            r = sbx.run_polled(
+                "cd / && bash /tmp/.trace_setup.sh",
+                self._cfg.setup_timeout_s,
+                grace_s=120.0,
             )
+            if r.exit_code != 0:
+                raise CloudboxError(
+                    f"setup.sh failed for {self.task_id} (rc={r.exit_code}): "
+                    f"{(r.stderr or r.stdout)[-800:]}"
+                )
         sbx.run("mkdir -p /workspace /output /logs/verifier", 30)
         sbx.run(
             "mkdir -p /workspace /root && "

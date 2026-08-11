@@ -234,6 +234,14 @@ class TerminalCfg:
                                     # 环境变量。A800→162 用
                                     # unix:///tmp/docker162.sock(先跑
                                     # ~/dockfwd.sh 建转发;ControlMaster 必须关)
+    snapshot_root: str = ""         # TERMINAL_SNAPSHOTS:per-task 环境快照目录
+                                    # (<root>/<task_id>.tgz)。非空且该任务有
+                                    # 快照 ⇒ **跳过 setup.sh**,改为起基底容器
+                                    # + 解开快照(实测 provision 107s→~3s,
+                                    # 文件树/md5/用户身份与原生 setup 逐一致)。
+                                    # 复刻 TMax 官方"预建镜像"设计;快照在
+                                    # docker 宿主本地,经 bind-mount 进容器,
+                                    # 客户端零传输。缺快照的任务自动回落 setup.sh
     task_data_root: str = ""        # TERMINAL_TASK_DATA(解包的 per-task 资产根:
                                     # <root>/<task_id>/{setup.sh,tests/,instruction.md})
     kubeconfig: str = ""            # TERMINAL_KUBECONFIG(集群 kubeconfig 路径)
