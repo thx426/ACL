@@ -77,7 +77,9 @@ def split_seed42(items: list[dict], n_train: int = 200, n_test: int = 200):
     return pool[:n_train], pool[n_train:n_train + n_test]
 
 
-def make_row(item: dict, split: str, data_root: str) -> dict:
+def make_row(
+    item: dict, split: str, data_root: str, source_name: str = "spreadsheetbench"
+) -> dict:
     answer_position = str(item.get("answer_position", ""))
     answer_sheet = str(item.get("answer_sheet", "") or "")
     if answer_position and answer_sheet and "!" not in answer_position:
@@ -117,7 +119,7 @@ def make_row(item: dict, split: str, data_root: str) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": protocol.truncate_obs(extra_info["initial_obs"])},
         ],
-        "data_source": "spreadsheetbench" if split == "train" else f"spreadsheetbench/{split}",
+        "data_source": source_name if split == "train" else f"{source_name}/{split}",
         "agent_name": "trace_opd",
         "reward_model": {"style": "env", "ground_truth": ""},
         "extra_info": extra_info,

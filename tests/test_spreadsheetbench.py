@@ -386,3 +386,52 @@ def test_ssb_external_researcher_path_still_expressible(deploy_env, tmp_path):
     cfg = load_config(f)
     assert cfg.research.backend == "external" and not cfg.research_rl.enabled
     assert cfg.steering.enabled and cfg.steering.adv_mode == "asym"   # 机制仍是 v3.3
+
+
+# ---------- Spreadsheet-RL 引入件(2026-08-11) ----------
+
+def test_find_test_cases_srl_naming(tmp_path):
+    """SRL 目录形态 input/target ⇒ 单 case;output.xlsx(oracle 中间产物)
+    不得干扰发现;SSB 三种存量命名优先级不受影响。"""
+    td = tmp_path / "excelforum" / "sub" / "task-job-x"
+    td.mkdir(parents=True)
+    _wb(td / "input.xlsx", {"A1": 1})
+    _wb(td / "target.xlsx", {"A1": 1, "B1": 2})
+    _wb(td / "output.xlsx", {"A1": 1})
+    cases = find_test_cases(str(td))
+    assert len(cases) == 1
+    no, ip, ap = cases[0]
+    assert no == "1" and ip.endswith("input.xlsx") and ap.endswith("target.xlsx")
+
+
+def test_normalize_answer_position_forms():
+    """实测三形态:A 单区域缺前引号 / B 多区域首段缺 / D 合法撇号不动;
+    完好输入恒等。"""
+    from trace_opd.envs.spreadsheetbench.build_dataset_srl import (
+        normalize_answer_position as norm,
+    )
+    assert norm("Sheet1'!C3:C545") == "'Sheet1'!C3:C545"                    # A
+    assert norm("Total'!G2,'Total'!H2") == "'Total'!G2,'Total'!H2"          # B
+    assert norm("'RYAN'S ORDERS'!M6:M42") == "'RYAN'S ORDERS'!M6:M42"       # D
+    assert norm("'Sheet1'!K2:K71") == "'Sheet1'!K2:K71"                     # 恒等
+    assert norm("B2:C160") == "B2:C160"                                     # 无 sheet 段
+
+
+def test_preview_workbook_chartsheet(tmp_path):
+    """含 Chartsheet 的 workbook(SRL Charting 任务实测形态)preview 不炸,
+    输出占位行;普通 sheet 输出不变。"""
+    from openpyxl.chart import BarChart, Reference
+
+    p = tmp_path / "chart.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = 7
+    cs = wb.create_chartsheet("MyChart")
+    chart = BarChart()  # 空 chartsheet openpyxl 自己写完读不回,挂真 chart
+    chart.add_data(Reference(ws, min_col=1, min_row=1, max_row=1))
+    cs.add_chart(chart)
+    wb.save(p)
+    wb.close()
+    text = preview_workbook(str(p))
+    assert "A1=7" in text
+    assert "MyChart" in text and "no cell grid" in text
