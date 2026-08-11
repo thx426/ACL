@@ -248,6 +248,51 @@ class TerminalCfg:
 
 
 @dataclass
+class SweCfg:
+    """SWE 域(R2E-Gym-Subset × ACS 云沙箱;envs/swe/,协商稿
+    2026-08-11-swe-env-proposal.md)。三工具 FC(str_replace_editor/
+    execute_bash/submit,openhands 套件)+ 容器内 pytest 判分(judge.py
+    移植 R2E _calculate_reward_r2e,二值)。特权(GT patch/期望输出)在
+    privileged_root,judge 从此读 expected_output_json,不进 agent 面。"""
+
+    protocol: str = "fncall"        # SWE 域 FC 原生
+    data_root: str = ""             # SWE_DATA(dataset 根:train.parquet +
+                                    # privileged/<instance_id>.json)
+    kubeconfig: str = ""            # SWE_KUBECONFIG(集群 kubeconfig)
+    namespace: str = "default"
+    image_registry: str = ""        # SWE_IMAGE_REGISTRY(ACR 前缀,拼
+                                    # <registry>/<repo>_final:<hash>;空则用
+                                    # 数据集原 docker_image = dockerhub)
+    image_pull_secret: str = "acr-zjk"
+    run_label: str = ""             # Pod label trace-run=<值>(残留清理)
+    pod_cpu: str = "2"              # SWE 单任务 ~1 core(NeMo Gym 实测)+ 余量
+    pod_memory: str = "4Gi"
+    spawn_concurrency: int = 16     # 沙箱创建全局并发门
+    create_timeout_s: float = 300.0  # 创建→Running(SWE 镜像 0.3-0.5GB 压缩)
+    command_timeout_s: float = 120.0  # 单条工具命令(R2E CMD_TIMEOUT=120)
+    test_timeout_s: float = 300.0   # 判分 pytest 超时(R2E reward_timeout=300)
+    test_grace_s: float = 60.0      # 判分外层墙钟余量(外层=test_timeout+此值)
+    max_obs_chars: int = 10000      # observation 截断(R2E 工具内部 10k 字符
+                                    # 同量级;execute_bash 上游不截断,我们补)
+    max_steps: int = 50             # episode 工具调用预算(4B 起点,深读 §5.3;
+                                    # 影响效果的限制,预算档位待用户裁定)
+    tests_visible: bool = True      # True = R2E 训练 setting(r2e_tests 软链
+                                    # 对 agent 可见,DeepSWE/SWE-Master 同款);
+                                    # False = 对齐 SWE-bench Verified 评测口径
+                                    # (F2P 测试不可见),供消融
+    allow_git: bool = False         # git 封禁(先例意图=agent 完全无 git);
+                                    # True 仅供调试,正式实验恒 False
+
+    def _validate(self) -> None:
+        for k in ("spawn_concurrency", "max_steps", "max_obs_chars"):
+            if getattr(self, k) <= 0:
+                raise ValueError(f"swe.{k} must be > 0")
+        for k in ("command_timeout_s", "test_timeout_s", "create_timeout_s"):
+            if getattr(self, k) <= 0:
+                raise ValueError(f"swe.{k} must be > 0")
+
+
+@dataclass
 class WebArenaCfg:
     """WebArena 域(WebArena-Verified 812 × 站点池;envs/webarena/,引入
     裁定 2026-08-10 webarena-env-proposal.md §9)。评测桥钉死
@@ -608,6 +653,7 @@ class Config:
     scienceworld: SciworldCfg
     terminal: TerminalCfg
     webarena: WebArenaCfg
+    swe: SweCfg
     train: TrainCfg
     eval: EvalCfg
     steering: SteeringCfg
@@ -634,7 +680,7 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
-    "scienceworld", "terminal", "webarena",
+    "scienceworld", "terminal", "webarena", "swe",
 }
 
 
@@ -670,6 +716,12 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"webarena.pool 必须是 static|acs,得到 {cfg.webarena.pool!r}"
         )
+    if cfg.swe.protocol != "fncall":
+        raise ValueError(
+            f"swe.protocol 仅支持 fncall(R2E openhands 三工具,无 text 档),"
+            f"得到 {cfg.swe.protocol!r}"
+        )
+    cfg.swe._validate()
     import math as _math
     if cfg.webarena.spawn_concurrency < 1:
         raise ValueError("webarena.spawn_concurrency 必须 >= 1")
@@ -1332,6 +1384,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
         scienceworld=_build(SciworldCfg, data.get("scienceworld") or {}),
         terminal=_build(TerminalCfg, data.get("terminal") or {}),
         webarena=_build(WebArenaCfg, data.get("webarena") or {}),
+        swe=_build(SweCfg, data.get("swe") or {}),
         train=_build(TrainCfg, data.get("train") or {}),
         eval=_build(EvalCfg, data.get("eval") or {}),
         steering=_build(SteeringCfg, steering_raw),

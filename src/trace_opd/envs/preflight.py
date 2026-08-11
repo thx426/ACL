@@ -69,7 +69,7 @@ def main() -> int:
     # 都是 text 环境 + text researcher,曾整体漏过 FC 门)。
     _fc_active = (
         cfg.environment.name in {"spreadsheetbench", "math", "scienceworld",
-                                 "terminal", "webarena"}
+                                 "terminal", "webarena", "swe"}
         or (cfg.environment.name == "alfworld" and cfg.alfworld.protocol == "fncall")
         or (cfg.research.enabled and cfg.research.tool_protocol == "text")
     )

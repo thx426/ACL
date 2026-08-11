@@ -80,6 +80,14 @@ def _build_terminal(config: "Config", workers: int) -> "EnvFactory":
         cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
 
 
+def _build_swe(config: "Config", workers: int) -> "EnvFactory":
+    from .swe.adapter import SweEnvFactory
+
+    cfg = config.swe
+    return SweEnvFactory(_fork_cfg(
+        cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
+
+
 def _build_webarena(config: "Config", workers: int) -> "EnvFactory":
     """⚠ spawn_concurrency 是 **per-worker** 折算值(全局 cap / workers,
     向上取整、下限 1)——workers > cap 时总并发会超过名义 cap;真正的
@@ -98,6 +106,7 @@ _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "scienceworld": _build_scienceworld,
     "terminal": _build_terminal,
     "webarena": _build_webarena,
+    "swe": _build_swe,
 }
 
 
