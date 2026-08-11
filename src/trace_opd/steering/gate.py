@@ -24,9 +24,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import logging
+
 import numpy as np
 
-__all__ = ["GateDecision", "GateThresholdTracker", "IntensityGate", "SteeringGate"]
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "THETA_WARMUP", "GateDecision", "GateThresholdTracker", "IntensityGate",
+    "SteeringGate",
+]
 
 
 @dataclass(frozen=True)
@@ -244,19 +251,45 @@ def robust_quantile_update(current_theta: float, d_samples: np.ndarray, q: float
     return ema * current_theta + (1.0 - ema) * target
 
 
+#: 自标定 warmup 哨兵阈值(``theta_init<=0`` 即「无先验,首个 step 边界从
+#: 真实分布分位落地」)。取有限大数而非 inf:JSON/wire 可安全传输,且
+#: IntensityGate 下 w = H/θ ≈ 1e-9 < w_min ⇒ 全 bypass、零 rng draw、零干预
+#: ——warmup 期 steered 臂行为与 bare 逐位一致(rng 对齐:bypass 位不 draw),
+#: G-E 段级 bypass 还会跳过教师 verify(零额外开销)。剂量控制通用化
+#: (2026-08-11 用户裁定,MENTOR「首步 γ_p=999」同款先例):绝对 nats 阈值
+#: 是 benchmark 锚定的(1.28 占位值事故),分位自标定是无量纲的。
+THETA_WARMUP = 1.0e9
+
+
 class GateThresholdTracker:
     """worker 进程级的 θ_D 率控自适应追踪器(线程安全)。
 
     生命周期:agent-loop worker 进程单例。每条轨迹结束时 ``observe()`` 并入
     该轨迹的 D 直方图;检测到 global_step 前进时(``maybe_step_update``)
-    用**累积直方图**做一次 EMA 更新——同一 step 内所有轨迹用同一个 θ_D
+    用**累积直方图**做一次更新——同一 step 内所有轨迹用同一个 θ
     (步内冻结,因果性;滞后一步,分布稳定则无害)。
+
+    两种更新模式(2026-08-11 剂量通用化):
+
+    * ``direct``:θ ← 分位直标(quantile_{1−rate};MENTOR 每步 set 同款,
+      无 EMA 时延——EMA β=0.1 曾让错误起点 24 步收敛不到位,门率全程
+      3× 超标)。``ratchet=True`` 时 θ 不低于首次标定值:策略熵坍缩时
+      w=H/θ 全体下降、教师自动淡出,而不是阈值跟着坍缩把门变宽——
+      取代绝对值硬地板(floor),后者是 benchmark 锚定的。
+    * ``ema``:历史行为(robust-EMA 慢更新),复现旧 run 用;要求显式
+      theta_init(>0)与 floor。
 
     直方图分位数:线性桶内插值。累积观测不足 ``min_obs`` 时**保留累积、
     继续跨 step 攒**,攒够才更新并清空——verl 多 worker 拓扑下每个进程
     只见全批的 1/N(162 s1 实测 16 worker × ~160 obs/step),逐 step 清空
-    会让阈值永久冻结在初值(2026-08-05 s1 事故);跨 k 步合并更新时 β 按
-    ``1-(1-β)^k`` 复利折算,时间常数与逐步更新等价。
+    会让阈值永久冻结在初值(2026-08-05 s1 事故);ema 模式跨 k 步合并更新
+    时 β 按 ``1-(1-β)^k`` 复利折算,时间常数与逐步更新等价。
+
+    率告警(``alarm_bounds``):每次更新时用本步直方图估计旧 θ 生效期的
+    非零干预率 P(H ≥ w_min·θ),超出预注册区间即 logger.warning + 写入
+    ``last_info``(spec [5%,25%] 防线此前只接 adaptive 硬门,熵门不在环上
+    是 2026-08-11 事故的防线缺口)。只告警不降级——自动降级是影响效果的
+    干预,须另行裁定。
     """
 
     def __init__(
@@ -269,6 +302,10 @@ class GateThresholdTracker:
         bins: int,
         min_obs: int = 500,
         floor: float = 0.0,
+        update_mode: str = "ema",
+        ratchet: bool = False,
+        alarm_bounds: tuple[float, float] | None = None,
+        alarm_w_min: float = 1.0,
     ) -> None:
         import threading
 
@@ -276,10 +313,32 @@ class GateThresholdTracker:
             raise ValueError(f"target_rate must be in (0,1), got {target_rate}")
         if not (0.0 < ema_beta <= 1.0):
             raise ValueError(f"ema_beta must be in (0,1], got {ema_beta}")
-        # v3.3 M4:硬地板(熵门用;防阈值追着分布坍缩跑,MENTOR
-        # max(q80, 1.5) 先例)。D 门语境传 0 保持历史行为。
+        if update_mode not in ("direct", "ema"):
+            raise ValueError(f"update_mode must be direct|ema, got {update_mode!r}")
+        if update_mode == "ema" and float(theta_init) <= 0.0:
+            raise ValueError(
+                "ema update_mode requires an explicit calibrated theta_init "
+                "(>0) — auto warmup (theta_init<=0) is a direct-mode feature"
+            )
+        # v3.3 M4:硬地板(ema 模式用;防阈值追着分布坍缩跑,MENTOR
+        # max(q80, 1.5) 先例)。direct 模式由 ratchet 承担该语义(自标定,
+        # 无绝对刻度),config 校验拒绝 direct+floor 组合。
         self.floor = float(floor)
-        self.theta = max(float(theta_init), self.floor)
+        self._warmup = float(theta_init) <= 0.0
+        self.theta = (
+            THETA_WARMUP if self._warmup else max(float(theta_init), self.floor)
+        )
+        self.update_mode = update_mode
+        self.ratchet = bool(ratchet)
+        self._ratchet_floor: float | None = None
+        self.alarm_bounds = (
+            (float(alarm_bounds[0]), float(alarm_bounds[1]))
+            if alarm_bounds is not None else None
+        )
+        self.alarm_w_min = float(alarm_w_min)
+        #: 最近一次 step 更新的观测快照(theta/分位/率估计/告警),供
+        #: 调用方拉曲线;更新前为空 dict。
+        self.last_info: dict = {}
         self.target_rate = float(target_rate)
         self.ema_beta = float(ema_beta)
         self.d_hist_max = float(d_hist_max)
@@ -298,7 +357,7 @@ class GateThresholdTracker:
             self._acc_count += int(d_count)
 
     def maybe_step_update(self, global_step: int | None) -> None:
-        """step 边界检测 + EMA 更新(worker 内每个 rollout 入口调一次)。"""
+        """step 边界检测 + 阈值更新(worker 内每个 rollout 入口调一次)。"""
         if global_step is None:
             return
         with self._lock:
@@ -313,15 +372,67 @@ class GateThresholdTracker:
             # (多 worker 分片下单 step 观测不足,逐 step 清空会永久冻结)。
             if self._acc_count < self.min_obs:
                 return
-            k = self._last_step - (self._last_update_step or self._last_step)
-            beta_eff = 1.0 - (1.0 - self.ema_beta) ** max(k, 1)
             target = self._hist_quantile(1.0 - self.target_rate)
-            self.theta = max(
-                (1.0 - beta_eff) * self.theta + beta_eff * target, self.floor
-            )
+            # 率告警:旧 θ 生效期的非零干预率估计(本步分布上 P(H≥w_min·θ);
+            # warmup 哨兵期恒 0,天然不触上界,下界告警同样抑制——零干预
+            # 是 warmup 的设计语义,不是失控)。
+            rate_at_old = self._tail_mass(self.alarm_w_min * self.theta)
+            if self.update_mode == "direct" or self._warmup:
+                # 直标(MENTOR 每步 set 同款):EMA 从错误起点(占位值/
+                # warmup 哨兵)出发要几十步才收敛,直标一步落位。
+                new_theta = target
+            else:
+                k = self._last_step - (self._last_update_step or self._last_step)
+                beta_eff = 1.0 - (1.0 - self.ema_beta) ** max(k, 1)
+                new_theta = (1.0 - beta_eff) * self.theta + beta_eff * target
+            if self.ratchet:
+                if self._ratchet_floor is None:
+                    self._ratchet_floor = new_theta
+                new_theta = max(new_theta, self._ratchet_floor)
+            self.theta = max(new_theta, self.floor)
+            alarm: str | None = None
+            if self.alarm_bounds is not None and not self._warmup:
+                lo, hi = self.alarm_bounds
+                if rate_at_old > hi:
+                    alarm = (
+                        f"steering open-rate {rate_at_old:.3f} above the "
+                        f"pre-registered ceiling {hi} (theta was lagging the "
+                        "distribution) — dosage overshoot, inspect before "
+                        "trusting this step's steered rows"
+                    )
+                elif rate_at_old < lo:
+                    alarm = (
+                        f"steering open-rate {rate_at_old:.3f} below the "
+                        f"pre-registered floor {lo} — intervention starved"
+                    )
+            self._warmup = False
+            self.last_info = {
+                "step": self._last_step,
+                "theta": self.theta,
+                "quantile_target": target,
+                "open_rate_at_old_theta": rate_at_old,
+                "alarm": alarm,
+            }
+            if alarm:
+                logger.warning("gate tracker step %d: %s", self._last_step, alarm)
             self._acc = [0] * self.bins
             self._acc_count = 0
             self._last_update_step = self._last_step
+
+    def _tail_mass(self, threshold: float) -> float:
+        """累积直方图上 P(X ≥ threshold) 的桶级估计(线性桶内插值,与
+        ``_hist_quantile`` 同坐标系;threshold 超直方图上界 ⇒ 0)。"""
+        if self._acc_count <= 0:
+            return 0.0
+        if threshold <= 0.0:
+            return 1.0
+        width = self.d_hist_max / self.bins
+        if threshold >= self.d_hist_max:
+            return 0.0
+        idx = int(threshold / width)
+        frac_below = (threshold - idx * width) / width
+        tail = self._acc[idx] * (1.0 - frac_below) + sum(self._acc[idx + 1:])
+        return tail / self._acc_count
 
     def _hist_quantile(self, q: float) -> float:
         target = q * self._acc_count

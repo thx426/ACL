@@ -205,8 +205,10 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                         config.steering.theta_d,
                     )
                 if config.steering.gate_mode in ("entropy", "soft_or"):
-                    # v3.3 M4:H_q 率控自适应(同一 tracker 基建换信号源;
-                    # floor = 硬地板,防阈值追熵坍缩)。
+                    # v3.3 M4:H_q 率控自适应(同一 tracker 基建换信号源)。
+                    # 2026-08-11 剂量通用化:默认 direct 分位直标 + 自标定
+                    # warmup(init=0)+ ratchet 坍缩防线 + 预注册率带告警
+                    # (此前 rate_bounds 只接 adaptive 硬门,熵门不在环上)。
                     ent_tracker = GateThresholdTracker(
                         theta_init=config.steering.entropy_theta_init,
                         target_rate=config.steering.entropy_target_rate,
@@ -214,12 +216,24 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                         d_hist_max=ENT_HIST_MAX,
                         bins=ENT_HIST_BINS,
                         floor=config.steering.entropy_floor,
+                        update_mode=config.steering.entropy_theta_update,
+                        ratchet=(
+                            config.steering.entropy_theta_ratchet
+                            and config.steering.entropy_theta_update == "direct"
+                        ),
+                        alarm_bounds=tuple(config.steering.gate_rate_bounds),
+                        alarm_w_min=config.steering.intensity_w_min,
                     )
                     logger.info(
-                        "entropy gate tracking on: rate=%.2f init=%.3f floor=%.3f",
+                        "entropy gate tracking on: rate=%.2f init=%s update=%s "
+                        "ratchet=%s floor=%.3f bounds=%s",
                         config.steering.entropy_target_rate,
-                        config.steering.entropy_theta_init,
+                        ("auto-warmup" if config.steering.entropy_theta_init <= 0
+                         else f"{config.steering.entropy_theta_init:.3f}"),
+                        config.steering.entropy_theta_update,
+                        config.steering.entropy_theta_ratchet,
                         config.steering.entropy_floor,
+                        tuple(config.steering.gate_rate_bounds),
                     )
         delta = TemplateDelta(tokenizer)
         # FC dialect 随模板家族注入(qwen35_xml/hermes;文本层解析与服务端
@@ -902,12 +916,19 @@ class TraceAgentLoop(AgentLoopBase):
             steer_fields["steer_theta_d"] = (
                 theta_used if math.isfinite(theta_used) else 0.0
             )
-            # v3.3 M4:本轨迹实际使用的 H_q(熵档快照;非熵档 0.0 哨兵)
-            steer_fields["steer_entropy_theta"] = (
+            # v3.3 M4:本轨迹实际使用的 H_q(熵档快照;非熵档 0.0 哨兵;
+            # 自标定 warmup 哨兵(THETA_WARMUP)写 -1.0——审计可辨且不拉爆
+            # swanlab 数值曲线量程)
+            from ..steering.gate import THETA_WARMUP
+
+            _ent_theta_snap = (
                 state.gate.entropy_theta
                 if state is not None
                 and self.cfg.steering.gate_mode in ("entropy", "soft_or")
                 else 0.0
+            )
+            steer_fields["steer_entropy_theta"] = (
+                -1.0 if _ent_theta_snap >= THETA_WARMUP else _ent_theta_snap
             )
             if state is not None:
                 alarm = state.gate.rate_alarm()

@@ -57,7 +57,9 @@ def test_only_machine_and_base_model_differ(env):
     assert c.steering.steered_adv_decay_steps == a.steering.steered_adv_decay_steps == 240
     assert c.steering.steered_adv_decay_mode == a.steering.steered_adv_decay_mode
     assert c.steering.epsilon == a.steering.epsilon == 0.05
-    # 熵门参数
+    # 熵门参数(2026-08-11 剂量通用化:分位自标定,两机同为 direct+ratchet)
+    assert c.steering.entropy_theta_update == a.steering.entropy_theta_update
+    assert c.steering.entropy_theta_ratchet == a.steering.entropy_theta_ratchet
     assert c.steering.entropy_theta_init == a.steering.entropy_theta_init
     assert c.steering.entropy_floor == a.steering.entropy_floor
     assert c.steering.entropy_target_rate == a.steering.entropy_target_rate
@@ -90,12 +92,14 @@ def test_capacity_invariants_hold_on_4gpu(env):
     assert c.train.train_batch_size == c.train.agent_num_workers
 
 
-def test_entropy_theta_init_is_a_4b_calibration(env):
-    """⚠ 已知风险:entropy_theta_init=1.28 是在 **4B** 语境标定的
-    (s3 dump step25/47/51 的 P95)。1.7B 的熵分布未必相同,起步几步的
-    干预量可能偏高或偏低。不改是为了保住两机对照;靠 gate_adaptive 的
-    EMA 自适应收敛,并以 entropy_floor 兜底。训练期需盯
-    steer_entropy_theta 与 steer_n_base_open 的走向。"""
+def test_entropy_theta_self_calibrates(env):
+    """2026-08-11 剂量通用化:熵阈值分位自标定(direct+warmup+ratchet),
+    绝对 nats 常数禁用——本测试旧版锁定的"1.28 是 4B 标定值,1.7B 熵分布
+    未必相同,起步干预量可能偏"正是被该方案根治的风险(ssb engine run
+    双降事故:占位起点 + EMA 慢收敛 → 门率全程 3× 超标)。"""
     c = load_config(C162)
-    assert c.steering.gate_adaptive is True, "1.7B 语境靠自适应纠偏,不能关"
-    assert c.steering.entropy_floor > 0, "必须有硬地板防阈值追熵坍缩"
+    assert c.steering.gate_adaptive is True, "自标定依赖 tracker,不能关"
+    assert c.steering.entropy_theta_update == "direct"
+    assert c.steering.entropy_theta_ratchet is True, "坍缩防线(取代绝对 floor)"
+    assert c.steering.entropy_theta_init == 0.0, "零干预 warmup 起步,无先验锚定"
+    assert c.steering.entropy_floor == 0.0, "绝对 nats 地板已废(benchmark 锚定)"

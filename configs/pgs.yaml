@@ -268,10 +268,13 @@ steering:
   # n=1,433,050):P50≈0 / P75=.014 / P90=.822 / **P95=1.28** / P99=1.89。
   entropy_target_rate: 0.05 # 满强度位置目标占比(H_q 追踪 P_{1−rate};
                             # MENTOR entropy_p=0.95 同款)
-  entropy_theta_init: 0.0   # H_q 初值(entropy/soft_or 档必填>0;上述语境
-                            # 用 1.28 = P95)
-  entropy_floor: 0.0        # H_q 硬地板(防阈值追熵坍缩,MENTOR max(·,1.5)
-                            # 先例;上述语境建议 0.6 ≈「至少 78/22 犹豫」)
+  # H_q 分位自标定(2026-08-11 剂量通用化):首步零干预 warmup,step 边界从
+  # 真实熵分布 P_{1−rate} 直标;ratchet = θ 不低于首次标定值(熵坍缩时干预
+  # 自动淡出)。绝对 nats 常数(1.28/0.6 占位)已禁——benchmark 锚定是
+  # ssb_4b_selfres_engine 双降事故三因子之一(docs/diagnosis/2026-08-11)。
+  # 复现旧 run:entropy_theta_update: ema + 显式 init/floor(指纹逐字节不变)。
+  entropy_theta_update: direct
+  entropy_theta_ratchet: true
   intensity_w_min: 0.05     # w<w_min 视为关门(bypass;entropy 档整段全
                             # bypass 时跳过 verify——工程红利)
   budget_pacing: false      # true: unlocked(t)=U0+(B−U0)·[1−(1−t/T_max)^p],花费只动

@@ -169,8 +169,13 @@ steering:
   steered_adv_decay_mode: cosine_steps
   steered_adv_cap: 0.0
   entropy_target_rate: 0.05
-  entropy_theta_init: 1.28  # ⚠ ALFWorld-4B 占位值,SSB 未标定 —— step-1 后须按实测重标
-  entropy_floor: 0.6
+  # H_q 分位自标定(2026-08-11 剂量通用化):首步零干预 warmup,step 边界从
+  # 真实熵分布 P_{1−rate} 直标;ratchet = θ 不低于首次标定值(熵坍缩时干预
+  # 自动淡出)。绝对 nats 常数(1.28/0.6 占位)已禁——benchmark 锚定是
+  # ssb_4b_selfres_engine 双降事故三因子之一(docs/diagnosis/2026-08-11)。
+  # 复现旧 run:entropy_theta_update: ema + 显式 init/floor(指纹逐字节不变)。
+  entropy_theta_update: direct
+  entropy_theta_ratchet: true
   intensity_w_min: 0.05
   steered_fraction: 0.5
   budget_pacing: false

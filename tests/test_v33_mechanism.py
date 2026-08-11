@@ -293,15 +293,30 @@ def test_asym_requires_estimator_and_arms(tmp_path, monkeypatch):
     assert cfg.steering.adv_mode == "asym"
 
 
-def test_entropy_gate_requires_calibration(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match="entropy_theta_init"):
-        _load(tmp_path, monkeypatch, steer_extra=", gate_mode: entropy")
+def test_entropy_gate_calibration_rules(tmp_path, monkeypatch):
+    """2026-08-11 剂量通用化:direct 档(默认)自标定,裸 entropy 合法;
+    绝对 nats 常数(floor)在 direct 档被拒;ema 档保留旧标定纪律。"""
+    cfg = _load(tmp_path, monkeypatch, steer_extra=", gate_mode: entropy")
+    assert cfg.steering.entropy_theta_update == "direct"
+    assert cfg.steering.entropy_theta_init == 0.0      # 自标定 warmup
     with pytest.raises(ValueError, match="entropy_floor"):
         _load(tmp_path, monkeypatch,
-              steer_extra=", gate_mode: entropy, entropy_theta_init: 1.2")
+              steer_extra=", gate_mode: entropy, entropy_floor: 0.4")
+    # direct + 自标定依赖 tracker:关 gate_adaptive 必须显式给起点
+    with pytest.raises(ValueError, match="gate_adaptive"):
+        _load(tmp_path, monkeypatch,
+              steer_extra=", gate_mode: entropy, gate_adaptive: false")
+    # ema 档 = 历史行为完整复现,旧标定纪律原样在
+    with pytest.raises(ValueError, match="entropy_theta_init"):
+        _load(tmp_path, monkeypatch,
+              steer_extra=", gate_mode: entropy, entropy_theta_update: ema")
+    with pytest.raises(ValueError, match="entropy_floor"):
+        _load(tmp_path, monkeypatch,
+              steer_extra=(", gate_mode: entropy, entropy_theta_update: ema"
+                           ", entropy_theta_init: 1.2"))
     cfg = _load(tmp_path, monkeypatch,
-                steer_extra=(", gate_mode: entropy, entropy_theta_init: 1.2"
-                             ", entropy_floor: 0.4"))
+                steer_extra=(", gate_mode: entropy, entropy_theta_update: ema"
+                             ", entropy_theta_init: 1.2, entropy_floor: 0.4"))
     assert cfg.steering.gate_mode == "entropy"
 
 
@@ -313,14 +328,17 @@ def test_fingerprint_legacy_defaults_unchanged_new_knobs_append(tmp_path, monkey
                  train_extra=", adv_estimator: pgs_asym_grpo",
                  steer_extra=(", adv_mode: asym, steered_fraction: 0.5"
                               ", steered_adv_decay_steps: 200"))
-    ent = _load(tmp_path, monkeypatch,
-                steer_extra=(", gate_mode: entropy, entropy_theta_init: 1.2"
-                             ", entropy_floor: 0.4"))
+    ent = _load(tmp_path, monkeypatch, steer_extra=", gate_mode: entropy")
+    # 剂量通用化:direct(新默认)与 ema(历史行为)是不同的行为分布 b
+    ent_ema = _load(tmp_path, monkeypatch,
+                    steer_extra=(", gate_mode: entropy"
+                                 ", entropy_theta_update: ema"
+                                 ", entropy_theta_init: 1.2, entropy_floor: 0.4"))
     shaped = _load(tmp_path, monkeypatch,
                    steer_extra=", w_beh_mode: shaped_reject")
     fps = {fp0, objective_fingerprint(asym), objective_fingerprint(ent),
-           objective_fingerprint(shaped)}
-    assert len(fps) == 4       # 每个 v3.3 开关都改变优化目标指纹
+           objective_fingerprint(ent_ema), objective_fingerprint(shaped)}
+    assert len(fps) == 5       # 每个开关(含 theta 更新范式)都改变优化目标指纹
 
 
 # --------------------------------------------------- E. steered 臂停产

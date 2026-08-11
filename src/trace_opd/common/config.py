@@ -515,11 +515,23 @@ class SteeringCfg:
     entropy_target_rate: float = 0.05  # 满强度位置的目标占比(阈值 H_q 追踪
                                    # 熵分布的 P_{1−rate};MENTOR entropy_p=0.95
                                    # 即 rate=0.05)
-    entropy_theta_init: float = 0.0    # H_q 的 EMA 初值(目标语境标定回填;
-                                   # entropy/soft_or 档校验拒 0——标定纪律
-                                   # 与 theta_d 同款)
-    entropy_floor: float = 0.0     # H_q 硬地板(防阈值追着熵坍缩跑,MENTOR
-                                   # max(q80,1.5) 先例;entropy/soft_or 档须 >0)
+    entropy_theta_init: float = 0.0    # H_q 起点。0 = 自标定(默认;warmup
+                                   # 哨兵起步、零干预,首个 step 边界从真实熵
+                                   # 分布分位落地——MENTOR 首步 γ_p=999 同款,
+                                   # 无 benchmark 锚定);>0 = 显式标定起点。
+                                   # ⚠ 绝对 nats 值跨 benchmark/模型不可迁移
+                                   # (1.28 占位值事故,2026-08-11 诊断)。
+    entropy_theta_update: str = "direct"  # H_q 更新方式:direct=分位直标
+                                   # (每 step set,无 EMA 时延;通用化默认)
+                                   # | ema=历史 robust-EMA 慢更(复现旧 run;
+                                   # 要求显式 theta_init 与 floor)。进指纹。
+    entropy_theta_ratchet: bool = True  # direct 档:θ 不低于首次标定值——
+                                   # 策略熵坍缩时干预自动淡出而非门变宽,
+                                   # 取代绝对值 floor(自标定,无量纲)。
+                                   # 仅 direct 档生效;进指纹。
+    entropy_floor: float = 0.0     # H_q 硬地板(仅 ema 档;防阈值追着熵坍缩
+                                   # 跑,MENTOR max(q80,1.5) 先例;ema 档须 >0,
+                                   # direct 档必须保持 0——ratchet 取代)
     intensity_w_min: float = 0.05  # w<w_min 的位置视为关门(bypass;entropy 档
                                    # 整段全 bypass 时跳过教师 verify——工程红利)
 
@@ -693,18 +705,41 @@ def _validate(cfg: "Config") -> None:
                 f"得到 {st.gate_mode!r}"
             )
         if st.gate_mode in ("entropy", "soft_or"):
-            # 软强度档标定纪律(theta_d 同款):熵阈值初值与硬地板必须显式
-            # 用目标语境标定回填,拒绝未标定占位。
-            if st.entropy_theta_init <= 0:
+            if st.entropy_theta_update not in ("direct", "ema"):
                 raise ValueError(
-                    "steering.entropy_theta_init 未标定(<=0)——先用目标语境"
-                    "dump 的 pi_topk 熵分布定 P_{1−rate} 初值"
+                    "steering.entropy_theta_update 必须是 direct|ema,"
+                    f"得到 {st.entropy_theta_update!r}"
                 )
-            if st.entropy_floor <= 0:
-                raise ValueError(
-                    "steering.entropy_floor 必须 > 0(防阈值追熵坍缩的硬地板,"
-                    "MENTOR max(q80,1.5) 先例)"
-                )
+            if st.entropy_theta_update == "ema":
+                # 历史行为完整复现档:标定纪律(theta_d 同款)——初值与
+                # 硬地板必须显式用目标语境标定回填,拒绝未标定占位。
+                if st.entropy_theta_init <= 0:
+                    raise ValueError(
+                        "steering.entropy_theta_init 未标定(<=0)——ema 档"
+                        "先用目标语境 dump 的 pi_topk 熵分布定 P_{1−rate} 初值,"
+                        "或改用 entropy_theta_update: direct(分位自标定)"
+                    )
+                if st.entropy_floor <= 0:
+                    raise ValueError(
+                        "steering.entropy_floor 必须 > 0(ema 档防阈值追熵坍缩"
+                        "的硬地板,MENTOR max(q80,1.5) 先例)"
+                    )
+            else:
+                # direct 档(2026-08-11 剂量通用化):绝对 nats 常数一律拒绝
+                # ——floor 由 ratchet(θ 不低于首次标定值)取代;theta_init
+                # 0=自标定 warmup(零干预起步),>0=显式起点。
+                if st.entropy_floor > 0:
+                    raise ValueError(
+                        "steering.entropy_floor 仅 ema 档有语义——direct 档的"
+                        "坍缩防线是 entropy_theta_ratchet(自标定,无量纲),"
+                        "请删除 entropy_floor 或改 entropy_theta_update: ema"
+                    )
+                if st.entropy_theta_init <= 0 and not st.gate_adaptive:
+                    raise ValueError(
+                        "steering.entropy_theta_init=0(自标定)依赖 tracker "
+                        "(gate_adaptive: true)在 step 边界落定阈值——固定阈值"
+                        "运行请显式给 entropy_theta_init"
+                    )
             if not (0.0 < st.entropy_target_rate < 1.0):
                 raise ValueError(
                     f"steering.entropy_target_rate 必须在 (0,1),得到 {st.entropy_target_rate}"
@@ -1153,6 +1188,14 @@ def objective_fingerprint(cfg: "Config") -> str:
             f"|entropy_gate={st.entropy_target_rate}:{st.entropy_theta_init}"
             f":{st.entropy_floor}"
         )
+        # 剂量通用化(2026-08-11):direct 分位直标改变 θ 轨迹 = 改变行为
+        # 分布 b,必须进指纹;条件追加——ema(历史行为)不改 material,
+        # 显式配 ema 的旧 run 指纹逐字节不变,可继续 resume。
+        if st.entropy_theta_update != "ema":
+            material += (
+                f"|entropy_theta_update={st.entropy_theta_update}"
+                f":{int(st.entropy_theta_ratchet)}"
+            )
     if st.enabled and st.gate_mode in ("entropy", "d_var", "soft_or"):
         material += f"|intensity_w_min={st.intensity_w_min}"
     # v3.3 M1/M2 不对称 advantage 改变优化目标;条件追加(legacy_shared 不改
