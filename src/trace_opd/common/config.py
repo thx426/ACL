@@ -242,6 +242,14 @@ class TerminalCfg:
                                     # 复刻 TMax 官方"预建镜像"设计;快照在
                                     # docker 宿主本地,经 bind-mount 进容器,
                                     # 客户端零传输。缺快照的任务自动回落 setup.sh
+    snapshot_index: str = ""        # TERMINAL_SNAPSHOT_INDEX:**客户端可见**的
+                                    # 快照清单(每行一个 task_id)。必需项 ——
+                                    # snapshot_root 是 **docker 宿主侧**路径
+                                    # (bind-mount 由宿主解析),客户端(A800)
+                                    # 看不到那个目录,不能用 is_file() 判存在;
+                                    # 而 docker 对不存在的 bind 源会**自动建空
+                                    # 目录**,静默把 tar 弄坏。索引为空时退回
+                                    # 本地存在性检查(客户端==宿主的场景)
     task_data_root: str = ""        # TERMINAL_TASK_DATA(解包的 per-task 资产根:
                                     # <root>/<task_id>/{setup.sh,tests/,instruction.md})
     kubeconfig: str = ""            # TERMINAL_KUBECONFIG(集群 kubeconfig 路径)

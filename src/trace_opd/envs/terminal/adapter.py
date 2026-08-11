@@ -260,7 +260,9 @@ class TerminalTaskAdapter:
         cfg: TerminalCfg,
         *,
         spawn_gate: threading.Semaphore,
+        factory=None,
     ) -> None:
+        self._factory = factory
         self._item = item
         self._cfg = cfg
         self._gate = spawn_gate
@@ -301,11 +303,17 @@ class TerminalTaskAdapter:
         return SYSTEM_PROMPT
 
     def _snapshot_path(self):
-        """该任务的环境快照(存在才返回);仅 docker 后端有意义(快照须与
-        docker 宿主同机才能 bind-mount)。"""
+        """该任务的环境快照路径(**宿主侧**;有才返回)。
+
+        存在性判定走 factory 预载的索引 —— snapshot_root 是 docker 宿主的
+        路径,客户端(A800)看不到;而 docker 对不存在的 bind 源会自动建**空
+        目录**,会静默把还原弄坏。索引缺省时退回本地检查(客户端==宿主)。"""
         root = self._cfg.snapshot_root
         if not root or self._cfg.backend != "docker":
             return None
+        idx = self._factory.snapshot_ids if self._factory is not None else None
+        if idx is not None:
+            return (Path(root) / f"{self.task_id}.tgz") if self.task_id in idx else None
         p = Path(root) / f"{self.task_id}.tgz"
         return p if p.is_file() else None
 
@@ -537,6 +545,23 @@ class TerminalEnvFactory:
             )
         self._cfg = cfg
         self._gate = threading.Semaphore(cfg.spawn_concurrency)
+        #: 快照索引(客户端可见的 task_id 集合;None = 未提供,退回本地检查)。
+        #: snapshot_root 是 **docker 宿主侧**路径,客户端看不到那个目录,而
+        #: docker 对不存在的 bind 源会自动建空目录 ⇒ 必须靠索引判存在。
+        self.snapshot_ids = None
+        if cfg.snapshot_index:
+            idx = Path(cfg.snapshot_index)
+            if not idx.is_file():
+                raise ValueError(
+                    f"terminal.snapshot_index 不存在: {idx}(在 docker 宿主上跑 "
+                    "`ls <snapshot_root>/*.tgz | xargs -n1 basename | sed s/.tgz//` "
+                    "生成后传到客户端)"
+                )
+            self.snapshot_ids = {
+                ln.strip() for ln in idx.read_text().splitlines() if ln.strip()
+            }
+            logger.info("terminal snapshot index: %d tasks", len(self.snapshot_ids))
 
     def adapter_from_item(self, item: dict) -> TerminalTaskAdapter:
-        return TerminalTaskAdapter(item, self._cfg, spawn_gate=self._gate)
+        return TerminalTaskAdapter(item, self._cfg, spawn_gate=self._gate,
+                                   factory=self)
