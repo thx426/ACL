@@ -278,3 +278,91 @@ def test_timeout_exit124_is_rendered():
     ep, _sbx = _episode(exit_code=124, cmd_out="")
     body, code = ep.exec_in_testbed("sleep 999")
     assert code == 124 and "timed out" in body
+
+
+# ----------------------------------------------------- 评测侧(SWE-bench Verified)
+
+def test_eval_dataset_contract():
+    """评测 parquet:同一 prompt 真源、source=swebench、零 GT 泄漏。"""
+    from pathlib import Path
+    ds = Path("experiments/bench_env/data/swe/eval/test.parquet")
+    if not ds.is_file():
+        pytest.skip("eval dataset not built")
+    from trace_opd.envs.swe.prompts import SYSTEM_PROMPT
+    df = pd.read_parquet(ds)
+    assert len(df) == 500                      # Verified 官方规模
+    ids = set()
+    for _, r in df.iterrows():
+        assert r["data_source"] == "swe_verified"
+        assert r["prompt"][0]["content"] == SYSTEM_PROMPT   # 与训练同一真源
+        ei = r["extra_info"]
+        assert ei["source"] == "swebench"
+        assert ei["docker_image"].startswith("slimshetty/swebench-verified:")
+        ids.add(ei["instance_id"])
+        blob = json.dumps([dict(m) for m in r["prompt"]], ensure_ascii=False)
+        assert "FAIL_TO_PASS" not in blob and "PASS_TO_PASS" not in blob
+    assert len(ids) == 500                     # instance_id 唯一(harness 按它对齐)
+
+
+def test_eval_privileged_holds_gt_and_tests():
+    from pathlib import Path
+    pdir = Path("experiments/bench_env/data/swe/eval/privileged")
+    if not pdir.is_dir():
+        pytest.skip("eval dataset not built")
+    sample = json.loads(sorted(pdir.glob("*.json"))[0].read_text())
+    for k in ("patch", "test_patch", "FAIL_TO_PASS", "PASS_TO_PASS",
+              "environment_setup_commit"):
+        assert k in sample and sample[k]
+
+
+def test_swebench_episode_setup_and_conda_prefix():
+    """swebench 源:用另一套 setup(无 r2e_tests)+ 命令前缀激活 conda。"""
+    from trace_opd.common.config import SweCfg
+    from trace_opd.envs.swe.adapter import SweEpisode
+    sbx = FakeSandbox(script_out="__SETUP_OK__")
+    item = {"initial_obs": "issue", "instance_id": "astropy__astropy-12907",
+            "repo_name": "astropy", "repo": "astropy/astropy",
+            "source": "swebench",
+            "docker_image": "slimshetty/swebench-verified:sweb.eval.x86_64.x"}
+    ep = SweEpisode(sbx, item, SweCfg(data_root="x"), 5)
+    setup = sbx.polled[0]
+    assert "safe.directory /testbed" in setup      # 否则收 patch 静默失败
+    assert "envs/testbed" in setup                 # 镜像身份哨兵
+    assert "r2e_tests" not in setup                # 与 R2E 分支互斥
+    ep.exec_in_testbed("ls")
+    assert "conda activate testbed" in sbx.cmds[-1]
+
+
+def test_swebench_deferred_grading_collects_patch_scores_zero():
+    """deferred:episode 只收 patch、分数 0(权威分离线出)。"""
+    from trace_opd.common.config import SweCfg
+    from trace_opd.envs.swe.adapter import SweEpisode, SweTaskAdapter
+    sbx = FakeSandbox(cmd_out="diff --git a/x.py b/x.py\n+fix")
+    item = {"initial_obs": "issue", "instance_id": "astropy__astropy-12907",
+            "repo_name": "astropy", "repo": "astropy/astropy",
+            "source": "swebench", "docker_image": "ns/img:tag"}
+    cfg = SweCfg(data_root="x", grading_mode="deferred")
+    ep = SweEpisode(sbx, item, cfg, 5)
+    ad = SweTaskAdapter(item, cfg, factory=None)
+    out = ad.react(ep, '<tool_call>\n{"name": "submit", "arguments": {}}\n</tool_call>')
+    assert out.done and out.score == 0.0
+    assert "diff --git" in ad.last_patch and ad.last_patch == ep.final_patch
+    assert "Submitted." in out.feedback          # 零判分信息回流
+
+
+def test_write_predictions_official_contract(tmp_path):
+    from trace_opd.envs.swe.judge_swebench import write_predictions
+    out = write_predictions(
+        [{"instance_id": "astropy__astropy-12907", "patch": "diff --git a/x"},
+         {"instance_id": "django__django-11039", "patch": ""}],   # 空 patch 也必须写
+        tmp_path / "predictions.jsonl", model_name="trace-opd-9b")
+    lines = [json.loads(x) for x in out.read_text().splitlines()]
+    assert len(lines) == 2
+    assert set(lines[0]) == {"instance_id", "model_name_or_path", "model_patch"}
+    assert lines[1]["model_patch"] == ""
+
+
+def test_grading_mode_validation():
+    from trace_opd.common.config import SweCfg
+    with pytest.raises(ValueError, match="grading_mode"):
+        SweCfg(data_root="x", grading_mode="bogus")._validate()

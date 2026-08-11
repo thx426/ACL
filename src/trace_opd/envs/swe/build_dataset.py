@@ -32,24 +32,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from .prompts import SYSTEM_PROMPT, build_instruction
+
 _ISSUE_RE = re.compile(r"\[ISSUE\](.*)\[/ISSUE\]", re.DOTALL)
 
 #: pilot 子集:5 个最小镜像 repo(压缩 0.31-0.50GB,纯 Python 无 xvfb)。
 #: orange3 需 xvfb 排除;pandas/numpy 体积大排除(扩量期收编)。
 PILOT_REPOS = ("coveragepy", "tornado", "scrapy", "pyramid", "aiohttp")
-
-#: 与四域同构的 system prompt(openhands 套件,来自 SWE-Master
-#: config/openhands/edit_fn_calling.yaml,单句)。工具块不在此手写,由 chat
-#: template 按 adapter.tools() 原生渲染。
-SYSTEM_PROMPT = (
-    "You are a helpful assistant that can interact with a computer to solve "
-    "tasks. You are provided with a local git repository and a GitHub issue. "
-    "Your goal is to identify, implement, and verify a solution to the issue "
-    "while documenting your reasoning process. You have access to tools for "
-    "viewing and editing files, executing bash commands, and submitting your "
-    "final solution."
-)
-
 
 def strip_issue(problem_statement: str, instance_id: str) -> str:
     """剥 [ISSUE]..[/ISSUE] 壳,与官方 get_task_instruction 同语义
@@ -77,22 +66,6 @@ def instance_id_of(row: dict) -> str:
     img = str(row["docker_image"])
     tag = img.split(":")[-1]
     return f"{row['repo_name']}__{tag}"
-
-
-def build_instruction(issue: str) -> str:
-    """instance_prompt(openhands 套件逐字;含"测试已就位、只改非测试文件"
-    契约 —— 与 tests_visible=true 一致)。"""
-    return (
-        "I have uploaded a python code repository in the /testbed directory.\n\n"
-        "Now consider the following GitHub issue:\n\n"
-        f"<github_issue>\n{issue}\n</github_issue>\n\n"
-        "Can you help me implement the necessary changes to the repository to "
-        "fix the <github_issue>? I have already taken care of all changes to "
-        "any of the test files described in the <github_issue>. This means you "
-        "DON'T have to modify the testing logic or any of the tests in any "
-        "way! Your task is to make changes to non-test files in the /testbed "
-        "directory to ensure the <github_issue> is resolved."
-    )
 
 
 def _to_list(v) -> list:

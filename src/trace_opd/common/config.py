@@ -283,6 +283,12 @@ class SweCfg:
                                     # (先例 0.5,动机=约 20% 轨迹撞墙、其中
                                     # 近 1/4 已修好;设 1.0 关闭惩罚)
                                     # ⚠ 影响效果的参数,档位待用户确认
+    grading_mode: str = "deferred"  # swebench(Verified)判分:deferred =
+                                    # episode 只收 patch、分数离线由官方
+                                    # harness 出(**报表口径**,训练环境零
+                                    # swebench 依赖);inline = 沙箱内跑官方
+                                    # eval_script 判(给 in-loop val 曲线,
+                                    # 需装 swebench 包)。r2e 源不受此影响
     tests_visible: bool = True      # True = R2E 训练 setting(r2e_tests 软链
                                     # 对 agent 可见,DeepSWE/SWE-Master 同款);
                                     # False = 对齐 SWE-bench Verified 评测口径
@@ -298,6 +304,10 @@ class SweCfg:
                   "setup_timeout_s"):
             if getattr(self, k) <= 0:
                 raise ValueError(f"swe.{k} must be > 0")
+        if self.grading_mode not in ("deferred", "inline"):
+            raise ValueError(
+                f"swe.grading_mode 必须是 deferred|inline,得到 {self.grading_mode!r}"
+            )
         if not 0.0 <= self.budget_exhaust_reward_scale <= 1.0:
             raise ValueError(
                 "swe.budget_exhaust_reward_scale 必须在 [0,1](R2E α;1.0=不罚)"

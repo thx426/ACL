@@ -34,21 +34,11 @@ from ...core.adapter import ActionOutcome
 from ..cloudbox import CloudSandbox, CloudboxError
 from . import tools as T
 from .judge import run_tests_command, score_from_logs
+from .prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
 TESTBED = "/testbed"
-
-#: openhands system prompt(SWE-Master config/openhands/edit_fn_calling.yaml:1
-#: 逐字;工具块由 chat template 按 tools() 原生渲染,不手写)。
-SYSTEM_PROMPT = (
-    "You are a helpful assistant that can interact with a computer to solve "
-    "tasks. You are provided with a local git repository and a GitHub issue. "
-    "Your goal is to identify, implement, and verify a solution to the issue "
-    "while documenting your reasoning process. You have access to tools for "
-    "viewing and editing files, executing bash commands, and submitting your "
-    "final solution."
-)
 
 _OBS_HEAD = 5000
 _OBS_TAIL = 5000
@@ -109,6 +99,25 @@ __TESTS_LINK__
 [ -d /root/r2e_tests ] && echo __SETUP_OK__ || echo __SETUP_NO_TESTS__
 """
 
+#: **SWE-bench Verified 镜像的 setup**(与 R2E 完全不同的一套):仓库在
+#: /testbed 停在 base_commit、conda 环境名 `testbed`、**没有 r2e_tests**
+#: (F2P 测试由 harness 在判分前才打入 —— 这正是 Verified 的评测语义)。
+#: `safe.directory` 必须设:否则 harness 侧收 patch 的 git 命令会因
+#: dubious ownership 失败,而那是静默丢结果(patch 空 = 判 0)。
+_SETUP_SWEBENCH = r"""set -u
+git config --global --add safe.directory /testbed 2>/dev/null || true
+if [ -d /testbed/.git ] && [ -d /opt/miniconda3/envs/testbed ]; then
+  echo __SETUP_OK__
+else
+  echo __SETUP_NOT_SWEBENCH_IMAGE__
+fi
+"""
+
+#: swebench 镜像里 agent 命令必须先激活 conda 环境,否则 `python` 是 base 环境
+#: (mini-swe-agent 用 BASH_ENV=/root/.bashrc 达到同样效果;我们的沙箱 exec
+#: 不传 env,故显式 source —— swebench.yaml:125-127 记录了这个坑)。
+_SWEBENCH_ACTIVATE = "source /opt/miniconda3/bin/activate && conda activate testbed"
+
 #: tests_visible=True ⇒ 软链回 /testbed(R2E 训练 setting:测试对 agent 可见,
 #: 官方 instance_prompt 亦声明"测试已就位");False ⇒ 不建软链(对齐
 #: SWE-bench Verified 评测口径,判分侧临时建链不受影响)。
@@ -150,6 +159,8 @@ class SweEpisode:
         self._initial_obs = str(item["initial_obs"])
         self._max_env_steps = max_env_steps
         self._steps = 0
+        self._source = str(item.get("source", "r2e"))
+        self.final_patch = ""      # episode 终局 patch(评测导出用)
         self.infra_failure = ""
         self.closed = False
         self._setup_env()
@@ -157,18 +168,21 @@ class SweEpisode:
     def _setup_env(self) -> None:
         """容器内准备(见 _SETUP_FULL 注释)。测试目录缺失 = 镜像不对,
         fail loud(否则每条轨迹静默判 0,是 reward 语义事故)。"""
-        tmpl = _SETUP_PREBAKED if self._cfg.prebaked_setup else _SETUP_FULL
-        script = tmpl.replace(
-            "__TESTS_LINK__",
-            _TESTS_LINK if self._cfg.tests_visible else "true",
-        )
+        if self._source == "swebench":
+            script = _SETUP_SWEBENCH
+        else:
+            tmpl = _SETUP_PREBAKED if self._cfg.prebaked_setup else _SETUP_FULL
+            script = tmpl.replace(
+                "__TESTS_LINK__",
+                _TESTS_LINK if self._cfg.tests_visible else "true",
+            )
         # 分钟级长命令走 run_polled(2026-08-11 实测:单次长 exec 在 157-184s
         # 处流中断且不可重试;分离执行+短轮询根治)。
         r = self._sbx.run_polled(script, self._cfg.setup_timeout_s)
         if "__SETUP_OK__" not in r.stdout:
             raise CloudboxError(
-                f"swe setup failed for {self._item.get('instance_id')}: "
-                f"/root/r2e_tests missing after setup "
+                f"swe setup failed for {self._item.get('instance_id')} "
+                f"(source={self._source}): environment sentinel not met "
                 f"(image={self._item.get('docker_image')!r}; "
                 f"out={r.stdout[-300:]!r} err={r.stderr[-300:]!r})"
             )
@@ -194,7 +208,10 @@ class SweEpisode:
         """在 /testbed 下跑一条命令,返回 (合并输出, exit_code);计一步预算。
         无状态子 shell(cd/env 不持久),故显式 cd /testbed。"""
         self._steps += 1
-        wrapped = f"cd {TESTBED} && ( {command} )"
+        if self._source == "swebench":
+            wrapped = f"{_SWEBENCH_ACTIVATE} && cd {TESTBED} && ( {command} )"
+        else:
+            wrapped = f"cd {TESTBED} && ( {command} )"
         r = self._sbx.run(wrapped, self._cfg.command_timeout_s)
         body = r.stdout if not r.stderr else f"{r.stdout}\n{r.stderr}".strip()
         if r.exit_code == 124:  # 沙箱内 timeout 命中(cloudbox 约定)
@@ -210,6 +227,16 @@ class SweEpisode:
             self._cfg.command_timeout_s,
         )
         return r.stdout
+
+    def run_swebench_eval(self, eval_script: str) -> str:
+        """SWE-bench 官方 eval_script 在沙箱内跑,返回日志(inline 判分用)。
+        脚本自身会 checkout 测试文件 + apply test_patch + 跑 F2P/P2P。"""
+        self._sbx.write_file("/eval_script.sh", eval_script)
+        r = self._sbx.run_polled(
+            "bash /eval_script.sh", self._cfg.test_timeout_s,
+            grace_s=self._cfg.test_grace_s,
+        )
+        return r.stdout if not r.stderr else f"{r.stdout}\n{r.stderr}"
 
     def run_and_score(self, expected_output_json: str, repo_name: str) -> float:
         """无条件对当前仓库状态判分(R2E _calculate_reward_r2e 语义)。"""
@@ -238,6 +265,9 @@ class SweTaskAdapter:
         self._cfg = cfg
         self._factory = factory
         self._priv: dict | None = None
+        #: 最近一次 episode 的终局 patch —— core 的 run_episode 内部持有
+        #: EnvHandle,调用方拿不到;一个 adapter 绑一个任务,评测导出从这里取。
+        self.last_patch = ""
 
     # ---- 身份面 ----------------------------------------------------------
 
@@ -392,6 +422,25 @@ class SweTaskAdapter:
                 False, 0.0, rc == 0)
 
     def _score(self, env: SweEpisode) -> float:
+        """终局判分 —— **两套口径按 source 分派**(harness-comparison §5):
+
+        * ``r2e``(训练):容器内跑 r2e_tests,expected_output 逐 key 比对;
+        * ``swebench``(评测):官方 F2P∧P2P。默认 ``deferred`` —— 只收 patch、
+          返回 0.0,权威分数由离线官方 harness 出(报表只认它);
+          ``inline`` 用官方 eval_script+parser 在沙箱内判,给 in-loop val 曲线。
+
+        无论哪套,先收 patch 存 env.final_patch(评测导出与失败分析都要)。"""
+        env.final_patch = env.collect_patch()
+        self.last_patch = env.final_patch
+        if self._item.get("source") == "swebench":
+            if self._cfg.grading_mode == "deferred":
+                return 0.0
+            from .judge_swebench import (  # noqa: PLC0415 — 惰性:deferred 不需 swebench 包
+                eval_script_for, resolved_from_log,
+            )
+            priv = self._privileged()
+            log = env.run_swebench_eval(eval_script_for(priv, self._item))
+            return resolved_from_log(priv, self._item, log)
         priv = self._privileged()
         return env.run_and_score(
             priv["expected_output_json"], str(self._item["repo_name"])
