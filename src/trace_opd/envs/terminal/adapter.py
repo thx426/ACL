@@ -297,6 +297,35 @@ class TerminalTaskAdapter:
     def executor_scaffold(self) -> str:
         return SYSTEM_PROMPT
 
+    def _spawn_sandbox(self):
+        """按 cfg.backend 造沙箱 —— acs(阿里云)/ docker(162 环境池)。
+        两者方法面与错误类型完全一致(dockerbox 复用 ExecResult/CloudboxError),
+        故 episode 交互语义零变化。"""
+        cfg = self._cfg
+        if cfg.backend == "docker":
+            from ..dockerbox import DockerSandbox  # noqa: PLC0415
+
+            return DockerSandbox(
+                image=cfg.image,
+                task_id=self.task_id,
+                cpus=cfg.pod_cpu,
+                memory=cfg.pod_memory,
+                docker_host=cfg.docker_host,
+                create_timeout_s=cfg.create_timeout_s,
+                run_label=cfg.run_label,
+            )
+        return CloudSandbox(
+            kubeconfig=cfg.kubeconfig,
+            namespace=cfg.namespace,
+            image=cfg.image,
+            image_pull_secret=cfg.image_pull_secret,
+            cpu=cfg.pod_cpu,
+            memory=cfg.pod_memory,
+            task_id=self.task_id,
+            create_timeout_s=cfg.create_timeout_s,
+            run_label=cfg.run_label,
+        )
+
     def open_episode(self) -> TerminalEnvHandle:
         assets = Path(self._cfg.task_data_root) / self.task_id
         if not (assets / "tests" / "test.sh").is_file():
@@ -305,17 +334,7 @@ class TerminalTaskAdapter:
                 f"{assets}/[setup.sh, tests/test.sh] (check terminal.task_data_root)"
             )
         with self._gate:
-            sbx = CloudSandbox(
-                kubeconfig=self._cfg.kubeconfig,
-                namespace=self._cfg.namespace,
-                image=self._cfg.image,
-                image_pull_secret=self._cfg.image_pull_secret,
-                cpu=self._cfg.pod_cpu,
-                memory=self._cfg.pod_memory,
-                task_id=self.task_id,
-                create_timeout_s=self._cfg.create_timeout_s,
-                run_label=self._cfg.run_label,
-            )
+            sbx = self._spawn_sandbox()
         try:
             self._provision(sbx, assets)
         except Exception:
@@ -468,14 +487,17 @@ class TerminalEnvFactory:
     """Mints per-task adapters sharing one sandbox-create gate (per process)."""
 
     def __init__(self, cfg: TerminalCfg) -> None:
-        missing = [
-            k for k in ("task_data_root", "kubeconfig", "image")
-            if not getattr(cfg, k)
-        ]
+        # 必填键按后端分:acs 需 kubeconfig(k8s API);docker 走 DOCKER_HOST
+        # (空则取环境变量,故不强制填 cfg.docker_host)。
+        required = ["task_data_root", "image"]
+        if cfg.backend == "acs":
+            required.append("kubeconfig")
+        missing = [k for k in required if not getattr(cfg, k)]
         if missing:
             raise ValueError(
-                f"terminal config incomplete: {missing} required "
-                "(set TERMINAL_TASK_DATA / TERMINAL_KUBECONFIG / TERMINAL_IMAGE)"
+                f"terminal config incomplete (backend={cfg.backend}): {missing} "
+                "required (set TERMINAL_TASK_DATA / TERMINAL_KUBECONFIG / "
+                "TERMINAL_IMAGE,或 backend=docker 时设 DOCKER_HOST)"
             )
         if not Path(cfg.task_data_root).is_dir():
             raise ValueError(

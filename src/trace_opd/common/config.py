@@ -225,6 +225,15 @@ class TerminalCfg:
     路径)是 TMax 忠实字面量,故意**不做**配置——改它们=改任务表面。"""
 
     protocol: str = "fncall"        # 终端域 FC 原生,无 text 档
+    backend: str = "acs"            # acs = 阿里云 Agent Sandbox(cloudbox);
+                                    # docker = 162 环境池(dockerbox)。
+                                    # A800 本机不可跑环境(LXC/CapEff=0/mount
+                                    # 被拦,TMax 任务 100% 需 root),故 A800
+                                    # 训练时**必须** docker + 162
+    docker_host: str = ""           # backend=docker 时的 DOCKER_HOST;空则取
+                                    # 环境变量。A800→162 用
+                                    # unix:///tmp/docker162.sock(先跑
+                                    # ~/dockfwd.sh 建转发;ControlMaster 必须关)
     task_data_root: str = ""        # TERMINAL_TASK_DATA(解包的 per-task 资产根:
                                     # <root>/<task_id>/{setup.sh,tests/,instruction.md})
     kubeconfig: str = ""            # TERMINAL_KUBECONFIG(集群 kubeconfig 路径)
@@ -744,6 +753,10 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"terminal.protocol 仅支持 fncall(TMax 语料即 FC 单工具 bash,"
             f"无 text 档),得到 {cfg.terminal.protocol!r}"
+        )
+    if cfg.terminal.backend not in ("acs", "docker"):
+        raise ValueError(
+            f"terminal.backend 必须是 acs|docker,得到 {cfg.terminal.backend!r}"
         )
     if cfg.terminal.test_timeout_s < 600.0:
         raise ValueError(
