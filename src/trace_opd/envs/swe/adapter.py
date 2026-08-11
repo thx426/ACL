@@ -8,8 +8,9 @@ R2E-Gym / SWE-Master 的 openhands scaffold(三工具 FC),但执行走 ACS 沙�
 
 判分(judge.py 移植 R2E _calculate_reward_r2e,二值):episode 结束(submit
 或预算耗尽)后无条件对当前仓库状态跑 r2e_tests,逐 key 比对 expected_output。
-预算耗尽的 reward×0.5 与环境故障 mask=0 的分层由训练侧终止原因分类处理
-(深读 §5.2);adapter 只报 score∈[0,1] 与 infra_failure。
+预算三件套(R2E/SWE-Master "forced submission",深读 §5.2)已实现在 adapter:
+①逐步预算文案;②到点无条件判分;③超预算 score×α(cfg,先例 0.5)。
+环境故障不在此处理——抛 CloudboxError 由 core 归 ENV_ERROR(mask 语义)。
 
 信息状态红线(SSB/SRL 同款):
   * expected_output_json / GT patch 只经 privileged 文件进 judge,绝不进
@@ -77,42 +78,129 @@ def _format_reminder() -> str:
     return protocol.fc_format_reminder("str_replace_editor", "execute_bash")
 
 
+#: **容器内 setup(raw R2E 镜像必需)** —— 移植 R2E `docker.py:538-590`
+#: setup_env。镜像事实(Dockerfile.numpy:24,44):判分脚本在
+#: `/testbed/run_tests.sh`(agent 可见 = 泄漏判分入口)、测试在 **`/r2e_tests`
+#: 而不是 `/testbed/r2e_tests`** —— 不做这步,判分命令找不到测试、环境根本
+#: 跑不起来。R2E 用 10+ 次 exec 逐条跑,我们合并成一条(每 episode 省 10 次
+#: 往返)。逐条 `|| true`:个别 symlink 失败不该炸 episode(R2E 同为
+#: try/except),但**测试目录缺失 fail loud**(末行哨兵)。
+_SETUP_FULL = r"""set -u
+ln -sfn /testbed/.venv /root/.venv 2>/dev/null || true
+mkdir -p /root/.local/bin
+ln -sf /testbed/.venv/bin/python /root/.local/bin/python 2>/dev/null || true
+ln -sf /testbed/.venv/bin/python /root/.local/bin/python3 2>/dev/null || true
+find /testbed/.venv/bin -type f -executable -exec ln -sf {} /root/.local/bin/ \; 2>/dev/null || true
+timeout 60 uv pip install chardet >/dev/null 2>&1 || true
+find /testbed -name '*.pyc' -delete 2>/dev/null || true
+find /testbed -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+find /r2e_tests -name '*.pyc' -delete 2>/dev/null || true
+find /r2e_tests -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+[ -f /testbed/run_tests.sh ] && mv -f /testbed/run_tests.sh /root/run_tests.sh
+[ -d /r2e_tests ] && mv -f /r2e_tests /root/r2e_tests
+__TESTS_LINK__
+[ -d /root/r2e_tests ] && echo __SETUP_OK__ || echo __SETUP_NO_TESTS__
+"""
+
+#: 预烘镜像(M2 后)只需按 tests_visible 决定软链 + 校验。
+_SETUP_PREBAKED = r"""set -u
+rm -f /testbed/r2e_tests 2>/dev/null || true
+__TESTS_LINK__
+[ -d /root/r2e_tests ] && echo __SETUP_OK__ || echo __SETUP_NO_TESTS__
+"""
+
+#: tests_visible=True ⇒ 软链回 /testbed(R2E 训练 setting:测试对 agent 可见,
+#: 官方 instance_prompt 亦声明"测试已就位");False ⇒ 不建软链(对齐
+#: SWE-bench Verified 评测口径,判分侧临时建链不受影响)。
+_TESTS_LINK = "ln -sfn /root/r2e_tests /testbed/r2e_tests"
+
+#: 判分:确保软链在位(tests_visible=False 时临时建)→ 优先跑镜像自带的
+#: run_tests.sh(该镜像的权威命令),缺失才回落 judge 的 per-repo 模板。
+_GRADE_TMPL = (
+    "cd __TESTBED__ && "
+    "{ [ -e r2e_tests ] || ln -sfn /root/r2e_tests r2e_tests; }; "
+    "if [ -f /root/run_tests.sh ]; then bash /root/run_tests.sh; "
+    "else __FALLBACK__; fi"
+)
+
+#: 逐步预算文案(R2E/SWE-Master `swe_agent.py:136-156` 同语义)。
+_BUDGET_LINE = "This is step {k} of a maximum of {n}. Steps Remaining: {left}."
+_BUDGET_END = (
+    "You have reached the maximum number of steps. The episode has ended and "
+    "your current repository state has been submitted for grading."
+)
+
+
 class SweEpisode:
     """One live ACS sandbox episode. score∈{0.0,1.0}, 仅在评分路径产生。
 
     基建故障(Pod 死/exec 通道丢)抛 CloudboxError,由 core 归 ENV_ERROR
-    (审阅 P0-5 纪律:不返回 done+0,否则基建压力被当模型失败入训)。"""
+    (审阅 P0-5 纪律:不返回 done+0,否则基建压力被当模型失败入训)。
 
-    def __init__(self, sandbox: CloudSandbox, item: dict, cfg: SweCfg) -> None:
+    预算语义(R2E/SWE-Master "forced submission" 三件套,深读 §5.2):
+    ①逐步预算文案注入;②到点**无条件判分**(不管有没有 submit);
+    ③超预算 reward × α(cfg.budget_exhaust_reward_scale,先例 0.5)——
+    动机是实测约 20% 轨迹撞预算、其中近 1/4 其实已修好 issue。"""
+
+    def __init__(self, sandbox: CloudSandbox, item: dict, cfg: SweCfg,
+                 max_env_steps: int) -> None:
         self._sbx = sandbox
         self._item = item
         self._cfg = cfg
         self._initial_obs = str(item["initial_obs"])
+        self._max_env_steps = max_env_steps
+        self._steps = 0
         self.infra_failure = ""
         self.closed = False
-        if not cfg.tests_visible:
-            self._hide_tests()
+        self._setup_env()
 
-    def _hide_tests(self) -> None:
-        """对齐 SWE-bench Verified 口径:移除 r2e_tests 对 agent 的可见软链
-        (判分脚本引用 /root 路径,不受影响)。默认 tests_visible=True 不走此。"""
-        try:
-            self._sbx.run("rm -f /testbed/r2e_tests", self._cfg.command_timeout_s)
-        except CloudboxError as err:  # noqa: BLE001 — 非致命,记账
-            logger.warning("hide_tests failed for %s: %s",
-                           self._item.get("instance_id"), err)
+    def _setup_env(self) -> None:
+        """容器内准备(见 _SETUP_FULL 注释)。测试目录缺失 = 镜像不对,
+        fail loud(否则每条轨迹静默判 0,是 reward 语义事故)。"""
+        tmpl = _SETUP_PREBAKED if self._cfg.prebaked_setup else _SETUP_FULL
+        script = tmpl.replace(
+            "__TESTS_LINK__",
+            _TESTS_LINK if self._cfg.tests_visible else "true",
+        )
+        # 分钟级长命令走 run_polled(2026-08-11 实测:单次长 exec 在 157-184s
+        # 处流中断且不可重试;分离执行+短轮询根治)。
+        r = self._sbx.run_polled(script, self._cfg.setup_timeout_s)
+        if "__SETUP_OK__" not in r.stdout:
+            raise CloudboxError(
+                f"swe setup failed for {self._item.get('instance_id')}: "
+                f"/root/r2e_tests missing after setup "
+                f"(image={self._item.get('docker_image')!r}; "
+                f"out={r.stdout[-300:]!r} err={r.stderr[-300:]!r})"
+            )
 
     @property
     def initial_obs(self) -> str:
         return self._initial_obs
 
+    @property
+    def steps_used(self) -> int:
+        return self._steps
+
+    def budget_exhausted(self) -> bool:
+        return self._steps >= self._max_env_steps
+
+    def budget_line(self) -> str:
+        return _BUDGET_LINE.format(
+            k=self._steps, n=self._max_env_steps,
+            left=max(0, self._max_env_steps - self._steps),
+        )
+
     def exec_in_testbed(self, command: str) -> tuple[str, int]:
-        """在 /testbed 下跑一条命令,返回 (合并输出, exit_code)。
+        """在 /testbed 下跑一条命令,返回 (合并输出, exit_code);计一步预算。
         无状态子 shell(cd/env 不持久),故显式 cd /testbed。"""
+        self._steps += 1
         wrapped = f"cd {TESTBED} && ( {command} )"
         r = self._sbx.run(wrapped, self._cfg.command_timeout_s)
         body = r.stdout if not r.stderr else f"{r.stdout}\n{r.stderr}".strip()
-        return body, r.returncode
+        if r.exit_code == 124:  # 沙箱内 timeout 命中(cloudbox 约定)
+            body = (f"Command timed out after {self._cfg.command_timeout_s:.0f}s "
+                    f"and was killed.\n{body}".strip())
+        return body, r.exit_code
 
     def collect_patch(self) -> str:
         """episode 末收 patch(harness 侧执行,不经 agent 工具/不受 git 封禁)。
@@ -125,8 +213,10 @@ class SweEpisode:
 
     def run_and_score(self, expected_output_json: str, repo_name: str) -> float:
         """无条件对当前仓库状态判分(R2E _calculate_reward_r2e 语义)。"""
-        r = self._sbx.run(
-            f"cd {TESTBED} && {run_tests_command(repo_name)}",
+        # 判分 pytest 可达分钟级 ⇒ 同样走 run_polled(见 _setup_env 注释)。
+        r = self._sbx.run_polled(
+            _GRADE_TMPL.replace("__TESTBED__", TESTBED)
+                       .replace("__FALLBACK__", run_tests_command(repo_name)),
             self._cfg.test_timeout_s,
             grace_s=self._cfg.test_grace_s,
         )
@@ -195,6 +285,11 @@ class SweTaskAdapter:
             "Grading: the hidden test suite is run; the task is solved (score "
             "1.0) only if every expected test status matches — binary, no "
             "partial credit. The executor never sees grading feedback.\n"
+            f"Budget: {protocol.MAX_ENV_STEPS} tool calls per episode; each "
+            "observation states the steps remaining. If the budget runs out "
+            "the repository is graded as-is (a reduced score), so the "
+            "executor should get to a working fix early rather than "
+            "exploring indefinitely.\n"
             f"Issue:\n{self.initial_obs}"
         )
 
@@ -212,7 +307,13 @@ class SweTaskAdapter:
     def open_episode(self) -> SweEpisode:
         image = self._factory.image_for(self._item)
         sbx = self._factory.spawn(image, self.task_id)
-        return SweEpisode(sbx, self._item, self._cfg)
+        try:
+            # 步数预算权威值 = protocol.MAX_ENV_STEPS(core 实际执行的那个;
+            # 不设第二真源 —— param-truth 教训)。
+            return SweEpisode(sbx, self._item, self._cfg, protocol.MAX_ENV_STEPS)
+        except Exception:
+            sbx.kill()   # setup 失败也必须回收沙箱,否则并发下泄漏
+            raise
 
     # ---- 交互面(function-calling react)--------------------------------
 
@@ -277,10 +378,18 @@ class SweTaskAdapter:
             f"execute_bash, submit." + extra), False, 0.0, False
 
     def _run(self, env: SweEpisode, command: str, extra: str):
+        """执行一步 + 预算语义(文案注入 / 到点无条件判分 / α 缩放)。"""
         out, rc = env.exec_in_testbed(command)  # 可抛 CloudboxError → core ENV_ERROR
         body = out if rc == 0 else f"[exit {rc}]\n{out}"
         clipped = truncate_observation(body, self._cfg.max_obs_chars)
-        return protocol.tool_response_wrap(clipped + extra), False, 0.0, rc == 0
+        if env.budget_exhausted():
+            # R2E "forced submission":预算耗尽也对当前仓库状态判分,
+            # 再乘 α(先例 0.5)—— 撞墙轨迹里有相当比例其实已修好。
+            score = self._score(env) * self._cfg.budget_exhaust_reward_scale
+            return (protocol.tool_response_wrap(f"{clipped}\n{_BUDGET_END}{extra}"),
+                    True, score, rc == 0)
+        return (protocol.tool_response_wrap(f"{clipped}\n{env.budget_line()}{extra}"),
+                False, 0.0, rc == 0)
 
     def _score(self, env: SweEpisode) -> float:
         priv = self._privileged()

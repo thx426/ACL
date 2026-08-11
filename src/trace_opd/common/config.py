@@ -270,12 +270,19 @@ class SweCfg:
     spawn_concurrency: int = 16     # 沙箱创建全局并发门
     create_timeout_s: float = 300.0  # 创建→Running(SWE 镜像 0.3-0.5GB 压缩)
     command_timeout_s: float = 120.0  # 单条工具命令(R2E CMD_TIMEOUT=120)
+    setup_timeout_s: float = 300.0  # episode 开局容器内 setup(symlink/pyc 清理/
+                                    # r2e_tests 归位;raw 镜像必需,见 adapter)
     test_timeout_s: float = 300.0   # 判分 pytest 超时(R2E reward_timeout=300)
     test_grace_s: float = 60.0      # 判分外层墙钟余量(外层=test_timeout+此值)
     max_obs_chars: int = 10000      # observation 截断(R2E 工具内部 10k 字符
                                     # 同量级;execute_bash 上游不截断,我们补)
-    max_steps: int = 50             # episode 工具调用预算(4B 起点,深读 §5.3;
-                                    # 影响效果的限制,预算档位待用户裁定)
+    prebaked_setup: bool = False    # True = 镜像已烘 setup(M2 后),开局只按
+                                    # tests_visible 建/撤软链;False = raw 镜像
+                                    # 走完整 setup(每 episode 一次合并 exec)
+    budget_exhaust_reward_scale: float = 0.5  # R2E α:预算耗尽仍判分,分数 ×α
+                                    # (先例 0.5,动机=约 20% 轨迹撞墙、其中
+                                    # 近 1/4 已修好;设 1.0 关闭惩罚)
+                                    # ⚠ 影响效果的参数,档位待用户确认
     tests_visible: bool = True      # True = R2E 训练 setting(r2e_tests 软链
                                     # 对 agent 可见,DeepSWE/SWE-Master 同款);
                                     # False = 对齐 SWE-bench Verified 评测口径
@@ -284,12 +291,17 @@ class SweCfg:
                                     # True 仅供调试,正式实验恒 False
 
     def _validate(self) -> None:
-        for k in ("spawn_concurrency", "max_steps", "max_obs_chars"):
+        for k in ("spawn_concurrency", "max_obs_chars"):
             if getattr(self, k) <= 0:
                 raise ValueError(f"swe.{k} must be > 0")
-        for k in ("command_timeout_s", "test_timeout_s", "create_timeout_s"):
+        for k in ("command_timeout_s", "test_timeout_s", "create_timeout_s",
+                  "setup_timeout_s"):
             if getattr(self, k) <= 0:
                 raise ValueError(f"swe.{k} must be > 0")
+        if not 0.0 <= self.budget_exhaust_reward_scale <= 1.0:
+            raise ValueError(
+                "swe.budget_exhaust_reward_scale 必须在 [0,1](R2E α;1.0=不罚)"
+            )
 
 
 @dataclass

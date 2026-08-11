@@ -160,3 +160,121 @@ def test_pilot_dataset_contract(tmp_path):
         blob = json.dumps({k: str(v) for k, v in dict(ei).items()})
         assert "parsed_commit_content" not in blob
         assert "expected_output_json" not in blob
+
+
+# ----------------------------------------------------- episode:setup / 预算 / 判分
+# FakeSandbox 覆盖容器交互全路径(不需要真容器):记录命令、按前缀给回放。
+
+class FakeSandbox:
+    def __init__(self, script_out="__SETUP_OK__", cmd_out="ok", exit_code=0,
+                 grade_log=""):
+        self.cmds: list[str] = []
+        self.polled: list[str] = []
+        self._script_out = script_out
+        self._cmd_out = cmd_out
+        self._exit = exit_code
+        self._grade_log = grade_log
+        self.killed = False
+
+    def _res(self, out, code=0):
+        from trace_opd.envs.cloudbox import ExecResult
+        return ExecResult(stdout=out, stderr="", exit_code=code)
+
+    def run(self, command, timeout_s, grace_s=None):
+        self.cmds.append(command)
+        return self._res(self._cmd_out, self._exit)
+
+    def run_polled(self, command, timeout_s, poll_s=5.0, grace_s=None):
+        self.polled.append(command)
+        if "__SETUP_OK__" in command:      # setup 脚本自带哨兵 echo
+            return self._res(self._script_out)
+        return self._res(self._grade_log)  # 判分
+
+    def kill(self):
+        self.killed = True
+
+
+def _episode(**cfgkw):
+    from trace_opd.common.config import SweCfg
+    from trace_opd.envs.swe.adapter import SweEpisode
+    sbx = FakeSandbox(**{k: v for k, v in cfgkw.items() if k in
+                         ("script_out", "cmd_out", "exit_code", "grade_log")})
+    cfg = SweCfg(data_root="x", **{k: v for k, v in cfgkw.items() if k not in
+                                   ("script_out", "cmd_out", "exit_code",
+                                    "grade_log", "max_env_steps")})
+    item = {"initial_obs": "issue text", "instance_id": "repo__abc",
+            "repo_name": "coveragepy", "docker_image": "ns/coveragepy_final:abc"}
+    ep = SweEpisode(sbx, item, cfg, cfgkw.get("max_env_steps", 3))
+    return ep, sbx
+
+
+def test_setup_raw_image_moves_tests_and_hides_grader():
+    """raw 镜像必需的三件:r2e_tests 从 / 归位、run_tests.sh 藏走、软链回 testbed。
+    (镜像事实:Dockerfile COPY r2e_tests /r2e_tests;不做则判分找不到测试)"""
+    _ep, sbx = _episode()
+    script = sbx.polled[0]
+    assert "mv -f /r2e_tests /root/r2e_tests" in script
+    assert "mv -f /testbed/run_tests.sh /root/run_tests.sh" in script
+    assert "ln -sfn /root/r2e_tests /testbed/r2e_tests" in script
+    assert "-name '*.pyc' -delete" in script          # 陈旧 pyc 会掩盖修复
+
+
+def test_setup_tests_invisible_skips_symlink():
+    _ep, sbx = _episode(tests_visible=False)
+    script = sbx.polled[0]
+    assert "ln -sfn /root/r2e_tests /testbed/r2e_tests" not in script
+    assert "mv -f /r2e_tests /root/r2e_tests" in script  # 判分侧仍需要
+
+
+def test_setup_fail_loud_when_tests_missing():
+    """测试目录缺失 = 镜像不对 ⇒ 抛(否则每条轨迹静默判 0 = reward 事故)。"""
+    from trace_opd.envs.cloudbox import CloudboxError
+    with pytest.raises(CloudboxError, match="setup failed"):
+        _episode(script_out="__SETUP_NO_TESTS__")
+
+
+def test_prebaked_setup_is_short():
+    _ep, sbx = _episode(prebaked_setup=True)
+    script = sbx.polled[0]
+    assert "mv -f /r2e_tests" not in script      # 已烘进镜像
+    assert "__SETUP_OK__" in script              # 但仍校验
+
+
+def test_budget_line_and_forced_grading():
+    """预算三件套:逐步文案 → 到点无条件判分 → score×α。"""
+    from trace_opd.common.config import SweCfg
+    from trace_opd.envs.swe.adapter import SweTaskAdapter
+
+    grade_log = "\n".join([
+        "=== short test summary info ===",
+        "PASSED r2e_tests/test_1.py::test_a",
+    ])
+    ep, sbx = _episode(max_env_steps=2, grade_log=grade_log)
+    cfg = SweCfg(data_root="x")
+    item = {"instance_id": "repo__abc", "repo_name": "coveragepy",
+            "initial_obs": "issue", "docker_image": "ns/coveragepy_final:abc"}
+    ad = SweTaskAdapter(item, cfg, factory=None)
+    ad._priv = {"expected_output_json": json.dumps({"test_a": "PASSED"})}
+
+    call = '<tool_call>\n{"name": "execute_bash", "arguments": {"command": "ls"}}\n</tool_call>'
+    out1 = ad.react(ep, call)
+    assert "Steps Remaining: 1" in out1.feedback and not out1.done
+    out2 = ad.react(ep, call)                      # 第 2 步 = 预算耗尽
+    assert out2.done is True
+    assert out2.score == pytest.approx(0.5)        # 1.0 × α(默认 0.5)
+    assert "maximum number of steps" in out2.feedback
+
+
+def test_grading_command_ensures_symlink_and_prefers_image_script():
+    ep, sbx = _episode(grade_log="")
+    ep.run_and_score(json.dumps({"t": "PASSED"}), "coveragepy")
+    grade_cmd = sbx.polled[-1]
+    assert "ln -sfn /root/r2e_tests r2e_tests" in grade_cmd   # tests_visible=False 时也能判
+    assert "bash /root/run_tests.sh" in grade_cmd             # 优先镜像自带
+    assert "pytest -rA r2e_tests" in grade_cmd                # 缺失时回落
+
+
+def test_timeout_exit124_is_rendered():
+    ep, _sbx = _episode(exit_code=124, cmd_out="")
+    body, code = ep.exec_in_testbed("sleep 999")
+    assert code == 124 and "timed out" in body
