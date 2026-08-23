@@ -1,3 +1,7 @@
+# ⚠ DEPRECATED(2026-08-23 宿主无关化):新发车一律用 webshop_7b_pgs.yaml +
+# scripts/classic/host_162.env(经 launch_classic.sh 注入;指纹已验证逐位同源
+# f2bb626e6f2d)。本文件仅为 162 在跑 run(classic_ws7b_pgs)的历史见证保留;
+# 162 现场副本继续服役至该 run 完成,勿删勿改。
 # WebShop × Qwen2.5-7B-Instruct — PGS 机制臂 @162 宿主变体(2026-08-23 用户裁定:
 # 35B researcher 留 A800 现有卡,162 四卡跑机制臂)。
 # 与 webshop_7b_pgs.yaml 差异仅 3 处宿主路径;模型与 parquet 已 md5 对拍同源。

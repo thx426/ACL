@@ -42,12 +42,12 @@ eval:
   temperature: 0.6
   n: 3
 train:
-  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
-  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/train_3553.parquet
+  model_path: ${TRACE_MODELS}/Qwen2.5-7B-Instruct
+  train_file: ${TRACE_DATA}/classic_alfworld_data/train_3553.parquet
   # 列表 ⇒ verl 逐文件分列上报(裁定①:seen/unseen 双列)
   val_files:
-    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_seen.parquet
-    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_unseen.parquet
+    - ${TRACE_DATA}/classic_alfworld_data/valid_seen.parquet
+    - ${TRACE_DATA}/classic_alfworld_data/valid_unseen.parquet
   experiment_name: classic_alf7b_pgs
   project_name: trace_opd
   n_gpus: 4                  # 用户指令:机制臂 4 卡(CVD 0-3),基线臂另 4 卡

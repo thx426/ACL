@@ -10,13 +10,22 @@
 #   - 重启依赖 resume_mode=auto + objective_fingerprint 守门(指纹不符会 FATAL 拒绝,
 #     那是保护不是故障 —— 此时 watchdog 停手并告警,绝不 --set 绕过)
 set -u
-W=/fs/fast/u2021000902/wushang/workspace/TRACE-OPD-TERM
+# ---- 宿主档案注入(2026-08-23 宿主无关化;字面量只在 host_*.env)----
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ -z "${TRACE_HOST:-}" ]; then
+  if   [ -d /fs/fast/u2021000902 ]; then TRACE_HOST=a800
+  elif [ -d /data4/wushang ];       then TRACE_HOST=162
+  else echo "FATAL 未知宿主:export TRACE_HOST=a800|162" >&2; exit 1; fi
+fi
+source "$HERE/host_${TRACE_HOST}.env"
+: "${TRACE_TREE:?}" "${TRACE_PYX:?}"
+W=$TRACE_TREE
 # 任务对由 RUN_PREFIX 指定(classic_alf7b / classic_sqa7b …),看护逻辑不变
 RUN_PREFIX=${RUN_PREFIX:?need RUN_PREFIX, e.g. classic_sqa7b}
 RAY_TAG=${RAY_TAG:-$RUN_PREFIX}
 CFG_STEM=${CFG_STEM:?need CFG_STEM, e.g. searchqa_7b}
 TOTAL_STEPS=${TOTAL_STEPS:?need TOTAL_STEPS, e.g. 2650}
-PYX=/fs/fast/u2021000902/wushang/workspace/TRACE-OPD/env_sglang_train/bin/python
+PYX=$TRACE_PYX
 LOG=$W/runs/watchdog_${RUN_PREFIX}.log
 STOP=$W/runs/watchdog_${RUN_PREFIX}.stop
 INTERVAL=300           # 检查周期 5 分钟
@@ -128,30 +137,21 @@ probe_35b() {
   for port in 8880 8881; do
     code=$(curl -s -m 12 -o /dev/null -w "%{http_code}" \
       -H "Authorization: Bearer ${TRACE_35B_KEY:-token-abc123}" \
-      "http://10.77.110.162:${port}/v1/models" 2>/dev/null || echo 000)
+      "http://127.0.0.1:${port}/v1/models" 2>/dev/null || echo 000)
     [ "$code" = "200" ] && ok=$((ok+1))
   done
   echo "$ok"
 }
 
-fire() {  # fire <arm> <cvd> <raydir> <sglport>
+fire() {  # fire <arm> <cvd> <raydir> <sglport> —— 统一走 launch_classic.sh
+  # (发车逻辑单一真源:env 入口/预检/GPU 清场门都在发射器里,watchdog 不再复制;
+  #  raydir 参数保留签名兼容,发射器按 TAG_ARM 自建同名目录)
   local arm=$1 cvd=$2 raydir=$3 sglport=$4
   local name="${RUN_PREFIX}_${arm}"
-  mkdir -p "$raydir"
-  cd "$W" || return 1
-  # 入口脚本是编译前置硬规则,重启同样必须 source
-  source /fs/fast/u2021000902/wushang/workspace/TRACE-OPD-PGS/env_pgs_sglang_a800.sh >/dev/null 2>&1
-  export ALFWORLD_DATA=/fs/fast/u2021000902/wushang/workspace/data/alfworld_data
-  export ALFWORLD_WORKER_PYTHON=/fs/fast/u2021000902/wushang/workspace/alfworld-venv/bin/python
-  export TRACE_35B_KEY=token-abc123
-  export SWANLAB_API_KEY=${SWANLAB_API_KEY:?export 真值后再发车(密钥不入库;A800 部署副本内联真值)}
-  setsid env CUDA_VISIBLE_DEVICES=$cvd RAY_TMPDIR=$raydir \
-    "$PYX" scripts/launch_train.py \
-      --config "$W/configs/classic/${CFG_STEM}_${arm}.yaml" \
-      --run-name "$name" \
-      "+actor_rollout_ref.rollout.engine_kwargs.sglang.port=${sglport}" \
-    >> "$W/runs/${name}.launch.log" 2>&1 < /dev/null &
-  log "  → 已重发 $name (cvd=$cvd port=$sglport pid=$!)"
+  local out
+  out=$(bash "$HERE/launch_classic.sh" "$name" "$CFG_STEM" "$arm" "$cvd" "$sglport" "$RAY_TAG" 2>&1)
+  log "  → launch_classic: $out"
+  echo "$out" | grep -q "^FIRED" || log "  ?? 重发未确认(预检拦截?)上行输出已录"
 }
 
 # 2026-08-14 单臂化:臂集合与 CVD/端口由环境变量给(SearchQA 只剩 pgs 用 0-3,

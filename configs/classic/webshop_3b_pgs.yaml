@@ -79,10 +79,10 @@ eval:
   temperature: 0.6
   n: 3
 train:
-  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-3B-Instruct
-  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_webshop_data_v4/train.parquet
+  model_path: ${TRACE_MODELS}/Qwen2.5-3B-Instruct
+  train_file: ${TRACE_DATA}/classic_webshop_data_v4/train.parquet
   val_files:
-    - /fs/fast/u2021000902/wushang/data/classic/classic_webshop_data_v4/test.parquet
+    - ${TRACE_DATA}/classic_webshop_data_v4/test.parquet
   experiment_name: classic_ws3b_pgs
   project_name: trace_opd
   n_gpus: 4

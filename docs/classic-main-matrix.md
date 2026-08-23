@@ -47,31 +47,37 @@ SQA batch128×8、SQA 数据源(Search-R1 processed)、WS AgentGym 栈、文本�
 5. SEED 有 SFT 冷启动(1440 条 GLM-5.2 标注 skill 轨迹);我们零 SFT 纯 RL(对我方有利,明写)。
 6. KL:SEED 0.01,我们无 KL(Dr.GRPO 底座);SEED lr warmup 0.1,我们 constant。
 
-## 3. 发车手册(A800 通用)
+## 3. 发车手册(宿主无关;2026-08-23 起统一)
 
-发射器(库内归档 `scripts/classic/`,部署副本在 A800 `$W/probe/`;W=TRACE-OPD-TERM 树):
-```
-# ALFWorld(含 ALFWORLD_DATA/worker python 资产 export 与存在性预检)
-probe/launch_single_alf.sh classic_alf3b_pgs alfworld_3b pgs <CVD> <PORT> alf3b
-probe/launch_single_alf.sh classic_alf7b_pgs alfworld_7b pgs <CVD> <PORT> alf7b
-# SearchQA(发车前先过 §3.1 拓扑检查)
-probe/launch_single.sh classic_sqa3b_pgs searchqa_3b pgs <CVD> <PORT> sqa3b
-probe/launch_single.sh classic_sqa7b_pgs searchqa_7b pgs <CVD> <PORT> sqa7b
-# WebShop(内置 webshop 分片 /meta 预检)
-probe/launch_single_ws.sh classic_ws3b_pgs webshop_3b pgs <CVD> <PORT> ws3b
-# 干跑(只算指纹与命令,不写盘):DRY_RUN=1 <同上>
-# 看护:probe/watchdog_single.sh(参数化);162 变体见 launch_ws7b_pgs_162.sh/watchdog_ws7b_162.sh
-```
+**同一份配置在 A800 / 162 发车零改动**:yaml 内一切宿主路径为 `${TRACE_MODELS}/${TRACE_DATA}`
+插值(config `_expand` 于 load 时展开);宿主字面量只存在于 `scripts/classic/host_{a800,162}.env`
+(树/env 入口/venv python/模型与数据根/ALF 资产);发射器自动探测宿主并注入。
+`_162` 变体 yaml 自此废弃(在跑 WS7B 的现场副本除外,服役至 run 完成)。
 
-发车前检查清单(每格必过):
-- [ ] GPU 清场(发射器内置 >500MiB 拦截;残留时先按 exe 路径清理,严禁 pkill 模式匹配)
-- [ ] 35B 三端点真实往返(curl completion ×3 端口;162 宿主还须验反向隧道 + A800 tunnel_guard 在位)
-- [ ] 域服务:WS=webshop 32 分片 /meta 全绿(池 64);SQA=retriever :8000 真实查询往返(§3.1)
-- [ ] 数据/模型路径按宿主核对(A800 = /fs/fast;162 = /data4;162 需 `_162` 变体 yaml)
-- [ ] `SWANLAB_API_KEY` 已 export(库内脚本已脱敏,fail-loud)
-- [ ] DRY_RUN=1 干跑,确认指纹与 §1 表一致
-- [ ] resume 语义:重启用同 run_name(resume_mode auto + 指纹守门;遇指纹不合必须停手)
-- [ ] watchdog 布防 + 本地 Monitor 巡检挂载
+统一发射器(库内 `scripts/classic/`,两机部署于 `$TRACE_TREE/scripts/classic/`):
+```
+launch_classic.sh <run_name> <cfg_stem> <arm> <cvd> <sglport> <raytag>
+# 例:  launch_classic.sh classic_alf3b_pgs alfworld_3b pgs 4,5,6,7 34000 alf3b
+# 干跑: DRY_RUN=1 launch_classic.sh ...(不写盘不占卡;预检+指纹全链照走)
+# 宿主: 自动探测;TRACE_HOST=a800|162 可显式覆盖
+# 看护: RUN_PREFIX=classic_alf3b CFG_STEM=alfworld_3b TOTAL_STEPS=444 ARMS=pgs \
+#        CVD_PGS=4,5,6,7 PORT_PGS=34000 setsid bash watchdog_single.sh &
+#        (watchdog 重启统一走 launch_classic.sh,发车逻辑单一真源)
+```
+内置预检(fail-loud,dry 也全走):模型/数据路径(插值展开后存在性)→ 35B 三端点
+**真实往返**(127.0.0.1:8880-8882,两宿主同地址:A800 直连/162 经隧道)→ 域预检
+(alfworld*=资产存在性;webshop*=逐分片 /meta+option_fix+槽位;searchqa*=retriever
+真实查询)→ GPU 清场门(>500MiB 拒发)。
+
+双机验收记录(2026-08-23):A800 DRY alfworld_3b → 指纹 88a3c7172848 ✓;
+162 DRY webshop_7b → 指纹 **f2bb626e6f2d(与在跑 run 逐位一致)**+ 32 分片/2048 槽位 ✓。
+
+发车前人工项(发射器管不到的):
+- [ ] `SWANLAB_API_KEY` export 真值(库内脱敏,缺失即拒发)
+- [ ] 162 宿主:A800 侧 tunnel_guard 在位(35B 预检失败时先查隧道)
+- [ ] 162 首发 ALF 格前:ALF 数据+worker venv 落地并填 host_162.env(现留空,硬门拒发)
+- [ ] resume 用同 run_name(指纹守门 FATAL = 保护,绝不 --set 绕过)
+- [ ] 跨宿主指纹不同(路径展开进指纹)= 预期;单 run 一生只在一台宿主 resume
 
 ### 3.1 SQA 发车专项(拓扑硬约束)
 
@@ -106,6 +112,10 @@ yaml 的 `retriever_url` 仍写 162:8000,发车前:
 
 ## 6. 变更台账
 
+- 2026-08-23(二):宿主无关化 —— 6 格 yaml 路径参数化(${TRACE_MODELS}/${TRACE_DATA},
+  双语境指纹逐位复现:A800 全 6 格不变、162 复现 f2bb626e6f2d);host_{a800,162}.env 宿主档案;
+  launch_classic.sh 统一发射器(吸收三域全部实战预检);watchdog_single.sh 宿主化且重启改走
+  统一发射器;旧发射器 5 件入 attic;webshop_7b_pgs_162.yaml 标 DEPRECATED。双机 DRY_RUN 验收绿。
 - 2026-08-23:创建;SQA3B yaml 新建;ALF7B 修 avg@3(漏改)与 max_ckpt 3→1(违纪);
   全线 epsilon→0.0;A800 版 WS 重试窗 8/15s(429 事故同步);端点统一 127.0.0.1×3;
   发射器 6 件收编 scripts/classic/(SWANLAB key 脱敏)。6 格指纹经 load_config 复核与本表一致。

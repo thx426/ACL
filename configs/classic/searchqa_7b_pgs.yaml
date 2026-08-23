@@ -59,18 +59,18 @@ eval:
   temperature: 0.6
   n: 3
 train:
-  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  model_path: ${TRACE_MODELS}/Qwen2.5-7B-Instruct
   # train_trainer = 原 train.parquet + verl trainer 必需的两字段(2026-08-13
   # 冒烟拦下):agent_name='trace_opd'(选 agent loop)+ reward_model.style=
   # 'env'(reward 由 AgentLoop 提供;原 'rule' 会让 verl 去查 reward_score
   # 注册表,而 data_source 'searchqa/*' 不在其中 ⇒ NotImplementedError)。
   # 判分不受影响:EM 内嵌 adapter,读 extra_info.golden_answers。
-  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_searchqa_data/train_trainer.parquet
+  train_file: ${TRACE_DATA}/classic_searchqa_data/train_trainer.parquet
   # val = test 集 shuffle(seed42)后固定 2048 条(用户裁定 2026-08-13:
   # 「如果 test 集必须固定,则取大一点」)。固定集合而非每次重采——否则跨
   # step 不是同一批任务、曲线不可比。七源按比例分布;同样带 trainer 两字段。
   val_files:
-    - /fs/fast/u2021000902/wushang/data/classic/classic_searchqa_data/val_shuf2048.parquet
+    - ${TRACE_DATA}/classic_searchqa_data/val_shuf2048.parquet
   experiment_name: classic_sqa7b_pgs
   project_name: trace_opd
   n_gpus: 4                   # 机制臂 CVD 0-3
