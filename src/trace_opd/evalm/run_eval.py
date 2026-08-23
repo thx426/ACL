@@ -99,6 +99,14 @@ def summarize(results: list[dict], arm: str) -> tuple[dict[str, Any], bool]:
             "attempts": len(attempts),
             "won": wins,
             "success_rate": round(wins / len(attempts), 4) if attempts else 0.0,
+            # 连续终评的均值。won(=score>=1.0)在加权 reward 下低估真实答对率
+            # ——math single 档 score=0.9 表示"答对但格式错",won 记 0。
+            # 二值环境上 mean_score 与 success_rate 恒等,无解读负担。
+            "mean_score": (
+                round(sum(float(r.get("score", 0.0)) for r in attempts)
+                      / len(attempts), 4)
+                if attempts else 0.0
+            ),
             "env_errors": len(errs),
             "mean_env_steps": (
                 round(sum(r["env_steps"] for r in attempts) / len(attempts), 1)
@@ -121,6 +129,7 @@ async def main_async(args) -> int:
         config.episode.max_tokens_per_turn,
     )
     template_delta.configure_thinking(config.episode.enable_thinking)
+    protocol.configure_reasoning_tag(config.episode.reasoning_tag)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     delta = TemplateDelta(tokenizer)
     protocol.configure_fc_dialect(delta.fc_dialect)
@@ -223,9 +232,14 @@ async def main_async(args) -> int:
 
     summary, incomplete = summarize(results, args.arm)
     for split, s in summary["splits"].items():
+        # ★ 双报 Score + Succ.(2026-08-16 用户要求,对齐 WebShop 文献表头)。
+        # Score 按文献惯例乘 100 显示(论文里是 79.8 不是 0.798);内部值
+        # (summary.json 的 mean_score)保持 [0,1],与环境 reward 同尺度。
+        # 二值环境(ALFWorld/SearchQA)下两列恒等,重复显示无解读负担。
         line = (
-            f"[{args.arm}] {split}: {s['won']}/{s['attempts']} = "
-            f"{s['success_rate']:.2%} (mean_env_steps={s['mean_env_steps']})"
+            f"[{args.arm}] {split}: Score {s['mean_score'] * 100:.1f} | "
+            f"Succ. {s['success_rate']:.2%} ({s['won']}/{s['attempts']}) "
+            f"(mean_env_steps={s['mean_env_steps']})"
         )
         if s["env_errors"]:
             line += f"  !! env_errors={s['env_errors']} (excluded from denominator)"

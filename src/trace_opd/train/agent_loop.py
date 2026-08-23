@@ -63,7 +63,8 @@ from ..steering.arms import (
     steered_arm_count,
     steered_retired,
 )
-from .backends import EngineGenerate, EngineResearcherChat, engine_narrate_fn
+from .backends import (EngineGenerate, EngineResearcherChat, engine_narrate_fn,
+                       external_narrate_fn)
 from .selfres import CoordRegistry, TaskCoord, run_research_row
 
 #: v4 executor 行的 research 记账零占位(键集必须与 selfres.run_research_row
@@ -147,6 +148,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         config.episode.max_tokens_per_turn,
     )
         template_delta.configure_thinking(config.episode.enable_thinking)
+        protocol.configure_reasoning_tag(config.episode.reasoning_tag)
         workers = int(os.environ.get("TRACE_AGENT_WORKERS", config.train.agent_num_workers))
         doc_table: dict[str, str] = {}
         gate_tracker = None
@@ -186,6 +188,40 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                         1, len([e for e in role.endpoint.split(",") if e.strip()])
                     ),
                 )
+        # narration external 档的客户端(2026-08-13 用户裁定:与 researcher
+        # 同端点)。优先用独立的 roles.narrator(可单独调并发/模型);未配置
+        # 时复用 researcher 的 role 定义另建一个 client —— **不复用同一个
+        # client 实例**:researcher 的并发额度是按会话数标定的,narration
+        # 调用量是它的 ~10 倍(每 episode 一次),共用会互相饿死。
+        narrator_client = None
+        if config.narration.backend == "external":
+            nrole = None
+            if "narrator" in config.roles:
+                nrole = config.role("narrator")
+            elif "researcher" in config.roles:
+                import copy as _copy
+                nrole = _copy.deepcopy(config.role("researcher"))
+            if nrole is None:
+                raise RuntimeError(
+                    "narration.backend=external 需要 roles.narrator 或 roles.researcher"
+                )
+            nrole.max_concurrency = _per_worker(nrole.max_concurrency, workers)
+            narrator_client = make_client(
+                "narrator", nrole,
+                tape=(TapeWriter(run_dir / "tape" / f"narrator.{os.getpid()}.jsonl")
+                      if config.run.tape else None),
+                pool_start_index=_agent_loop_worker_index(),
+            )
+            logger.info(
+                "external narrator ready: model=%s concurrency/worker=%d",
+                nrole.model, nrole.max_concurrency,
+            )
+        # 门控 tracker 只在 steering 启用时构造:基线臂(steering.enabled=false)
+        # 不做任何干预,门阈无语义。2026-08-13 回归修复——插入 narrator client
+        # 时误覆盖了本层 `if config.steering.enabled:`,使 gate_adaptive(默认
+        # True)单独成条件,基线臂也去构造 tracker,撞上 gate.py 的
+        # "ema + theta_init<=0" 校验直接崩(块体 16 空格缩进即原两层结构的证据)。
+        if config.steering.enabled:
             if config.steering.gate_adaptive:
                 from ..steering.gate import GateThresholdTracker
                 from ..steering.ledger import D_HIST_BINS, ENT_HIST_BINS, ENT_HIST_MAX
@@ -241,11 +277,13 @@ def _shared_state(tokenizer) -> dict[str, Any]:
         # 审阅:训练进程绕过 preflight 起跑时 'none' 曾被静默安装,首个
         # 解析在 worker 深处才炸成 ENV_ERROR 假象)。
         _fc_needed = (
-            config.environment.name in {"spreadsheetbench", "math",
+            config.environment.name in {"spreadsheetbench",
                                         "scienceworld", "terminal", "webarena",
                                         "swe"}
             or (config.environment.name == "alfworld"
                 and config.alfworld.protocol == "fncall")
+            or (config.environment.name == "math"
+                and config.math.protocol == "fncall")
             or (config.research.enabled and config.research.tool_protocol == "text")
         )
         if _fc_needed and delta.fc_dialect == "none":
@@ -266,6 +304,7 @@ def _shared_state(tokenizer) -> dict[str, Any]:
                 "ent_tracker": ent_tracker,
                 "archive": ResearchArchive(run_dir),
                 "researcher_client": researcher_client,
+                "narrator_client": narrator_client,
                 # 同一 worker/event loop 内按(step,task)共享一次 producer。
                 "research_tasks": {},
                 # v4 自体研究员:worker 级 (step,task)→TaskCoord 注册表
@@ -291,6 +330,7 @@ class TraceAgentLoop(AgentLoopBase):
         self.ent_tracker = state["ent_tracker"]
         self.archive: ResearchArchive = state["archive"]
         self.researcher_client = state["researcher_client"]
+        self.narrator_client = state.get("narrator_client")
         self.research_tasks: dict = state["research_tasks"]
         self._v4_registry: CoordRegistry = state["v4_registry"]
         self.executor_model_name: str = state["executor_model_name"]
@@ -304,7 +344,23 @@ class TraceAgentLoop(AgentLoopBase):
                 or self.rollout_config.response_length)
 
     def _narrate_fn(self, route: str):
-        """叙述始终复用当前 rollout engine，兼容 SGLang EngineGenerate 面。"""
+        """叙述后端:engine(policy 自述,历史默认)| external(外部强模型)。
+
+        external 档动因(2026-08-13 用户裁定):narration 每个 researcher
+        episode 调一次,实测 1415 次/步 × (1141 prefill + 308 decode)
+        ⇒ 每步压给 7B 引擎 1.62M prefill + 0.44M decode,是单项最大的
+        prefill 来源;搬到外部端点把这部分吞吐还给 rollout。
+        """
+        if self.cfg.narration.backend == "external":
+            if self.narrator_client is None:
+                raise RuntimeError(
+                    "narration.backend=external 但 narrator client 未构造"
+                    "(需要 roles.narrator 或 roles.researcher)"
+                )
+            return external_narrate_fn(
+                self.narrator_client,
+                max_prompt_tokens=self.cfg.narration.max_prompt_tokens,
+            )
         return engine_narrate_fn(
             self.server_manager, self.tokenizer, request_id=route,
             max_prompt_tokens=self.cfg.narration.max_prompt_tokens,
@@ -640,6 +696,10 @@ class TraceAgentLoop(AgentLoopBase):
         # 不匹配 ⇒ IndexError 崩整步(2026-08-07 162 v4 冒烟 step1 实测)。
         output.extra_fields["reward_extra_info"] = {
             "won": int(bool(fields.get("won", 0))),
+            # research 行没有 episode 终评;填这一行实际拿到的 reward 标量,
+            # 语义与 executor 行的 score 一致("该行的终评")。**必须在场** ——
+            # 上面那段注释讲的锯齿字典就是缺 key 造成的。
+            "score": float(rowres.reward_score),
             "env_steps": int(fields.get("env_steps", 0) or 0),
             "invalid_format": int(bool(fields.get("invalid_format", 0))),
             "truncated": int(bool(fields.get("truncated", 0))),
@@ -942,12 +1002,24 @@ class TraceAgentLoop(AgentLoopBase):
             prompt_ids=tokens.prompt_ids,
             response_ids=tokens.response_ids,
             response_mask=tokens.response_mask,
-            reward_score=1.0 if traj.won else 0.0,
+            # reward 取数口径(train.reward_from_score,2026-08-16 用户裁定):
+            # False = 历史二值行为;True = 直接用 ActionOutcome 透传的连续
+            # 终评(math single 档对齐 MENTOR 的 0.9·acc + 0.1·format)。
+            # 二值环境下两者恒等(score ∈ {0,1}),故开关只在连续 score 的
+            # 环境上产生差异。
+            reward_score=(
+                float(traj.score) if self.cfg.train.reward_from_score
+                else (1.0 if traj.won else 0.0)
+            ),
             num_turns=2 * result.assistant_turns + 1,
             metrics=metrics,
             extra_fields={
                 "task_id": adapter.task_id,
                 "won": traj.won,
+                # 连续终评透传:won(=score>=1.0)在加权 reward 下会低估答对率,
+                # 曲线与事后分解都要看 score 本身。math single 档的
+                # score ∈ {0, w, 1-w, 1} 与 (acc, fmt) 一一对应,可无损反推。
+                "score": float(traj.score),
                 "turn_spans": [list(x) for x in result.tokens.turn_spans],
                 "outcome": traj.outcome,
                 "env_steps": env_steps,
@@ -961,6 +1033,7 @@ class TraceAgentLoop(AgentLoopBase):
         # 曲线通道:数值标量 → swanlab(train: rollout_extra/<key>/mean)。
         output.extra_fields["reward_extra_info"] = {
             "won": int(traj.won),
+            "score": float(traj.score),
             "env_steps": env_steps,
             "invalid_format": int(result.invalid_format),
             "truncated": int(result.truncated),
@@ -983,6 +1056,9 @@ class TraceAgentLoop(AgentLoopBase):
                     "global_step": global_step,
                     "outcome": traj.outcome,
                     "won": traj.won,
+                    # 连续终评(加权 reward 下 won 会低估答对率;math single 档
+                    # 的 score∈{0,w,1-w,1} 可无损反推 (acc, fmt))
+                    "score": float(traj.score),
                     "env_steps": env_steps,
                     "assistant_turns": result.assistant_turns,
                     "invalid_format": result.invalid_format,

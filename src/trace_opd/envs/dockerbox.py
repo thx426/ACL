@@ -98,6 +98,8 @@ class DockerSandbox:
         network: str = "bridge",
         pool_size: int = _DEFAULT_POOL,
         volumes: dict | None = None,
+        environment: dict | None = None,
+        extra_hosts: dict | None = None,
     ) -> None:
         self._cli = _client(docker_host, pool_size)
         self._name = f"{_NAME_PREFIX}-{task_id[:32]}-{uuid.uuid4().hex[:6]}"
@@ -117,6 +119,8 @@ class DockerSandbox:
                 mem_limit=memory,
                 network_mode=network,
                 volumes=volumes or None,
+                environment=environment or None,
+                extra_hosts=extra_hosts or None,
                 # 任务 setup.sh 会 useradd/chown/apt —— 容器内 root 是必需的
                 # (TMax 任务的既定前提);容器边界即隔离边界。
                 user="root",

@@ -37,6 +37,30 @@ def counts_as_attempt(outcome: str) -> bool:
 
 GUIDANCE_HEADER = "## Task guidance"
 
+#: 特权块的框(2026-08-11 裁定)。**为什么需要它**:guidance 与任务陈述都是
+#: 大段自然语言,拼在一起后没有任何标记区分"参考资料"与"要做的事"。任务陈述
+#: 越长(终端域实测 3.4-6.5k 字符),这个歧义越贵:执行体要么把 guidance 当成
+#: 新任务去照做,要么把它当噪声略过。同一个歧义在 researcher 侧已实证有害
+#: (角色段被 9 倍长的任务陈述压过,模型滑回 executor 身份)。
+#:
+#: 框里同时消解**特权幻觉**:guidance 由研究者从若干次尝试里蒸馏而来,可能
+#: 过时或本就观察有偏;执行体每个 episode 从零开始,无法核对这些断言。明说
+#: "这是建议不是事实、依赖前先自己确认",让它保持自行查证的习惯 —— 与文档
+#: 侧的信息状态规则(prompts.DOC_RULES_TEMPLATE)是同一约束的两端。
+#:
+#: 协议级常量:teacher 前缀与 +doc 评测臂共用这一份,改动会改变两者的字节
+#: (guidance_hash 只对 guidance 正文取值,不含框,故指纹口径不受影响)。
+GUIDANCE_FRAME_OPEN = (
+    "(Reference notes distilled by a researcher from earlier attempts at this "
+    "same task. They are advisory background, NOT the task and NOT commands to "
+    "replay: they may be incomplete, stale, or wrong, so confirm anything you "
+    "rely on with your own actions before trusting it.)"
+)
+GUIDANCE_FRAME_CLOSE = (
+    "(End of reference notes. Your task is the one stated in the user message; "
+    "carry that out — the notes only inform how you go about it.)"
+)
+
 
 def inject_guidance(system_base: str, guidance: str) -> str:
     """Append the guidance block to an executor system prompt.
@@ -47,7 +71,10 @@ def inject_guidance(system_base: str, guidance: str) -> str:
     guidance = (guidance or "").strip()
     if not guidance:
         return system_base
-    return f"{system_base}\n\n{GUIDANCE_HEADER}\n{guidance}"
+    return (
+        f"{system_base}\n\n{GUIDANCE_HEADER}\n"
+        f"{GUIDANCE_FRAME_OPEN}\n\n{guidance}\n\n{GUIDANCE_FRAME_CLOSE}"
+    )
 
 
 def guidance_hash(guidance: str) -> str:

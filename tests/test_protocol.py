@@ -34,7 +34,18 @@ def test_alfworld_scaffold_guidance_injection():
     assert GUIDANCE_HEADER not in SYSTEM_PROMPT_BARE
     privileged = inject_guidance(SYSTEM_PROMPT_BARE, "Always go to the shelf first.")
     assert privileged.startswith(SYSTEM_PROMPT_BARE)
-    assert f"\n\n{GUIDANCE_HEADER}\nAlways go to the shelf first." in privileged
+    # header 起特权块,正文被"参考资料/非任务"的框包住(2026-08-11 裁定):
+    # 任务陈述与 guidance 都是大段自然语言,无框时执行体会把建议当任务照做,
+    # 或把它当噪声略过;框同时要求执行体自行核实,防特权幻觉。
+    from trace_opd.core.types import GUIDANCE_FRAME_CLOSE, GUIDANCE_FRAME_OPEN
+
+    assert f"\n\n{GUIDANCE_HEADER}\n{GUIDANCE_FRAME_OPEN}\n\n" in privileged
+    assert "Always go to the shelf first." in privileged
+    assert privileged.rstrip().endswith(GUIDANCE_FRAME_CLOSE)
+    # 框在正文两侧,不混进正文
+    body_at = privileged.index("Always go to the shelf first.")
+    assert privileged.index(GUIDANCE_FRAME_OPEN) < body_at < privileged.index(
+        GUIDANCE_FRAME_CLOSE)
 
 
 def test_parse_tool_calls_hermes_format():
@@ -88,8 +99,17 @@ def test_configure_episode_caps_installs_and_validates():
         assert protocol.GEN_MAX_TOKENS_PER_TURN == 4096
         import pytest as _pytest
 
+        # turns == steps 是**合法**配置(2026-08-13 用户裁定把 `turns > steps`
+        # 放开为 `>=`:原不等式强制留 format-failure slack,而裁定明确「不管
+        # 是不是有效格式,总轮次就是 N 轮」——slack 正是被推翻的对象)。
+        # 本断言此前仍写着 "turns must exceed steps",是裁定后没跟上的陈旧
+        # 用例;math 的 MENTOR 单轮档(1/1)是它的首个真实使用者。
+        protocol.configure_episode_caps(30, 30, 2048)
+        assert (protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS) == (30, 30)
+        protocol.configure_episode_caps(1, 1, 8192)          # 单轮档
+        assert (protocol.MAX_ENV_STEPS, protocol.MAX_ASSISTANT_TURNS) == (1, 1)
         with _pytest.raises(ValueError, match="episode caps"):
-            protocol.configure_episode_caps(30, 30, 2048)  # turns must exceed steps
+            protocol.configure_episode_caps(10, 5, 2048)     # turns < steps 仍非法
         with _pytest.raises(ValueError, match="episode caps"):
             protocol.configure_episode_caps(0, 10, 2048)
         with _pytest.raises(ValueError, match="max_tokens_per_turn"):

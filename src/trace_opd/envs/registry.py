@@ -72,6 +72,22 @@ def _build_scienceworld(config: "Config", workers: int) -> "EnvFactory":
         cfg, spawn_concurrency=_per_worker(cfg.spawn_concurrency, workers)))
 
 
+def _build_searchqa(config: "Config", workers: int) -> "EnvFactory":
+    from .searchqa.adapter import SearchQAEnvFactory
+
+    cfg = config.searchqa
+    return SearchQAEnvFactory(_fork_cfg(
+        cfg, search_concurrency=_per_worker(cfg.search_concurrency, workers)))
+
+
+def _build_webshop(config: "Config", workers: int) -> "EnvFactory":
+    from .webshop.adapter import WebshopEnvFactory
+
+    cfg = config.webshop
+    return WebshopEnvFactory(_fork_cfg(
+        cfg, request_concurrency=_per_worker(cfg.request_concurrency, workers)))
+
+
 def _build_terminal(config: "Config", workers: int) -> "EnvFactory":
     from .terminal.adapter import TerminalEnvFactory
 
@@ -103,6 +119,8 @@ _BUILDERS: dict[str, Callable[["Config", int], "EnvFactory"]] = {
     "alfworld": _build_alfworld,
     "spreadsheetbench": _build_spreadsheetbench,
     "math": _build_math,
+    "searchqa": _build_searchqa,
+    "webshop": _build_webshop,
     "scienceworld": _build_scienceworld,
     "terminal": _build_terminal,
     "webarena": _build_webarena,

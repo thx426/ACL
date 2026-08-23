@@ -1,9 +1,15 @@
-"""SpreadsheetBench TaskAdapter — native function-calling executor.
+"""SpreadsheetBench TaskAdapter — 双协议 executor(fncall | text)。
 
-用户裁定(2026-08-07):SSB 不用 `<action>` 文本协议(那是 ALFWorld 特定
-形态),executor 走 Qwen 原生 function-calling:两个工具
-``run_python(code)`` / ``submit()``。react 自写(协议抽象的预期用法),
-解析用 core 通用件 ``protocol.parse_tool_calls``。
+fncall(用户裁定 2026-08-07,Qwen3 系验证档):executor 走 Qwen 原生
+function-calling,两个工具 ``run_python(code)`` / ``submit()``,解析用
+core 通用件 ``protocol.parse_tool_calls``。
+
+text(用户裁定 2026-08-17,经典线 Qwen2.5 档):```python 围栏 +
+```output 回注 + ```submit 终局,one-shot worked example 内嵌 system。
+形态与 envs/math/adapter.py 的文本 TIR 档同构(ToRL/SimpleTIR/
+Qwen2.5-Math-TIR 家族);裁定依据 = Math 域实测 FC→text +21.6pp(同为
+写代码任务)、SQA 域 Qwen2.5 FC 违规率 11.8%、大段代码进 JSON 转义是
+Qwen2.5 已证痛点。解析翻译成与 FC 同构的 call dict,`_dispatch` 复用。
 
 信息状态红线(全部继承旧实现纪律):
   * 评估结果永不进 executor 可见流(submit 反馈恒 "Submitted.");
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -115,6 +122,151 @@ SYSTEM_PROMPT = (
 )
 
 
+# --- 文本协议(2026-08-17 用户裁定:经典线 Qwen2.5 直接 text 化)----------
+# 形态 = envs/math/adapter.py 文本 TIR 档同构(ToRL arXiv 2503.23383 /
+# SimpleTIR arXiv 2509.02479 / Qwen2.5-Math-TIR 家族):```python 围栏代码
+# → 环境回注 ```output\nOBS\n``` → 终局 ```submit```(SSB 与 Math 的差异:
+# Math 的终答 \boxed{} 自带内容,SSB 的终局是无参提交声明,取 fence 家族
+# 形态与代码块对称、误触发面最小)。one-shot worked example 内嵌 system
+# (SearchQA/Math 同款纪律;Qwen2.5 zero-shot 不服从自定义标签,system
+# 单示例 0%→99.9% 实证)。多轮承载:代码块作为 assistant 轮结束,执行
+# 结果以 user 轮回注(PG-3 评测训练同构)。
+SYSTEM_PROMPT_TEXT = (
+    "You are a spreadsheet-manipulation specialist working in a sandboxed "
+    "directory. Solve the task by editing a workbook with Python, then "
+    "submit.\n\n"
+    "Files (fixed names, relative to the working directory):\n"
+    "- input.xlsx — the task workbook, already present; read from here.\n"
+    "- output.xlsx — your deliverable; create it. Grading reads ONLY this "
+    "file.\n\n"
+    "Each reply, reason first, then do exactly one of the following:\n"
+    "(1) Write ONE fenced Python code block — a complete standalone "
+    "script (including imports; openpyxl is available) that uses print() "
+    "to show what you need to see. Variables do NOT persist between "
+    "blocks: every script must re-read any file it needs. End your reply "
+    "right after the closing ``` and never guess the output — the real "
+    "execution result is returned to you wrapped as:\n"
+    "```output\n"
+    "...\n"
+    "```\n"
+    "(2) When output.xlsx is written and verified, end the episode with a "
+    "reply that contains no Python block, only the marker:\n"
+    "```submit\n"
+    "```\n"
+    "Grading happens after submission; no grading feedback is ever "
+    "returned.\n\n"
+    "Worked example — task: put the sum of A2:A4 of Sheet1 into B2.\n"
+    "Your reply:\n"
+    "I need to see the data first.\n"
+    "```python\n"
+    "import openpyxl\n"
+    "wb = openpyxl.load_workbook('input.xlsx')\n"
+    "ws = wb['Sheet1']\n"
+    "print([ws.cell(row=r, column=1).value for r in range(2, 5)])\n"
+    "```\n"
+    "You then receive:\n"
+    "```output\n"
+    "[10, 20, 30]\n"
+    "```\n"
+    "Your next reply:\n"
+    "The sum is 60. I write it to B2 and save output.xlsx.\n"
+    "```python\n"
+    "import openpyxl\n"
+    "wb = openpyxl.load_workbook('input.xlsx')\n"
+    "wb['Sheet1']['B2'] = 60\n"
+    "wb.save('output.xlsx')\n"
+    "print('saved')\n"
+    "```\n"
+    "After the output confirms it, your next reply is just:\n"
+    "```submit\n"
+    "```\n\n"
+    "How your work is graded:\n"
+    "- Only the cells inside the answer position stated in the task are "
+    "checked; keep every other cell exactly as it is in input.xlsx.\n"
+    "- The workbook is opened and formulas are recalculated before "
+    "grading, so writing Excel formulas and writing pre-computed values "
+    "are both acceptable.\n"
+    "- openpyxl itself never evaluates formulas: reading a formula cell "
+    "back in a later script returns the formula string, not its value — "
+    "verify formula results by recomputing them in Python, not by reading "
+    "them back."
+)
+
+#: 围栏代码块(与 envs/math/adapter.py 的 _TEXT_CODE_RE 同款:要求
+#: ```python/```py 标注;裸 ``` 不收——可能是伪代码或输出转贴)。
+_TEXT_CODE_RE = re.compile(r"```(?:python|py)\b[^\n]*\n(.*?)```",
+                           re.DOTALL | re.IGNORECASE)
+#: 终局标记(fence 形态;内容留空,宽松吞吸空白/杂字直到闭栏)。
+_TEXT_SUBMIT_RE = re.compile(r"```submit\b[^`]*```", re.IGNORECASE)
+
+
+def parse_text_action(assistant_text: str) -> dict | None:
+    """文本回复 → 与 FC 同构的 call dict(下游 _dispatch 零改动)。
+
+    优先级:**代码块 > submit**(Math 档同理):模型常在同一回复里写
+    "运行这段并提交"——那是对未执行结果的乐观断言;先执行代码、忽略
+    submit,真实输出回注后模型下一轮再提交,防止代码失败仍白白终局。
+    多代码块取**最后一个**(ToRL 同款:执行 latest)。
+    """
+    t = assistant_text or ""
+    blocks = _TEXT_CODE_RE.findall(t)
+    if blocks:
+        return {"name": "run_python", "arguments": {"code": blocks[-1].strip()}}
+    if _TEXT_SUBMIT_RE.search(t):
+        return {"name": "submit", "arguments": {}}
+    return None
+
+
+def text_extra_note(assistant_text: str) -> str:
+    """同轮多动作的忽略说明(FC 档 extra_note 的文本档对应物):
+    多代码块提醒 + 代码/submit 同现提醒(后者尤其重要——不说明的话
+    模型会以为已经提交,下一轮凭空等待终局)。"""
+    t = assistant_text or ""
+    notes = []
+    n = len(_TEXT_CODE_RE.findall(t))
+    if n > 1:
+        notes.append(
+            f"{n - 1} earlier code block(s) in the same reply were "
+            "ignored — one block per reply, the last one runs"
+        )
+    if n >= 1 and _TEXT_SUBMIT_RE.search(t):
+        notes.append(
+            "the ```submit``` marker was ignored because a code block was "
+            "present — the code ran instead; to finish, send ```submit``` "
+            "alone in a reply without any code block"
+        )
+    return "".join(f"\n(note: {s})" for s in notes)
+
+
+def text_thought(assistant_text: str, call: dict | None) -> str:
+    """thought 记账:代码轮取最后一个围栏之前的正文;终局/无动作轮取全文。"""
+    t = (assistant_text or "").strip()
+    if call and call.get("name") == "run_python":
+        m = None
+        for m in _TEXT_CODE_RE.finditer(assistant_text or ""):
+            pass
+        if m is not None:
+            return (assistant_text[: m.start()]).strip()
+    return t
+
+
+def text_format_reminder() -> str:
+    """void turn(无代码亦无终局标记)的格式提醒。"""
+    return (
+        "\n(Your reply contained neither a ```python code block nor a "
+        "```submit``` marker. To work on the task, write one complete "
+        "standalone script inside a fenced block that starts with "
+        "```python and ends with ```. To finish after output.xlsx is "
+        "written, reply with only ```submit``` on its own fenced line. "
+        "Let me try again.)\n"
+    )
+
+
+def text_obs_wrap(body: str) -> str:
+    """执行结果包裹:ToRL/Qwen2.5-Math-TIR 同款 ```output 围栏。"""
+    return f"```output\n{body}\n```"
+
+
 def initial_obs_of(item: dict, preview: str) -> str:
     """初始观察(build_dataset 捕获与 live episode 同源,逐字节一致)。
     文件路径约定已在 scaffold 声明,此处只给任务变量与工作簿预览。"""
@@ -202,19 +354,37 @@ class SpreadsheetbenchTaskAdapter:
 
     # ---- researcher 面 ---------------------------------------------------
 
+    def _text_mode(self) -> bool:
+        return getattr(self._cfg, "protocol", "fncall") == "text"
+
     def task_brief(self) -> str:
         n_cases = len(self._test_cases())
+        if self._text_mode():
+            actions = (
+                "Executor actions (one per reply):\n"
+                "  (1) one fenced ```python code block — a complete "
+                "standalone script run in the sandbox (openpyxl available; "
+                "fresh interpreter each time, no state carries over); its "
+                "printed output is returned wrapped in an ```output block\n"
+                "  (2) a fenced ```submit``` marker in a reply without any "
+                "code block — ends the episode; the produced output.xlsx "
+                "is then graded\n"
+            )
+        else:
+            actions = (
+                "Executor tools (one call per turn):\n"
+                "  run_python(code) — run a standalone Python script in the "
+                "sandbox (openpyxl available; fresh interpreter per call, no "
+                "state carries over between calls)\n"
+                "  submit() — end the episode; the produced output.xlsx is "
+                "then graded\n"
+            )
         return (
             "Environment: SpreadsheetBench — one Excel-workbook manipulation "
             "task. The executor works in a sandbox directory holding "
             "input.xlsx (a copy of the task workbook) and must produce "
             "output.xlsx.\n"
-            "Executor tools (one call per turn):\n"
-            "  run_python(code) — run a standalone Python script in the "
-            "sandbox (openpyxl available; fresh interpreter per call, no "
-            "state carries over between calls)\n"
-            "  submit() — end the episode; the produced output.xlsx is then "
-            "graded\n"
+            + actions +
             f"Grading: cell values in the answer region(s) "
             f"[{self._item['answer_position']}] are compared against the "
             f"expected result on {n_cases} test case(s); score = fraction "
@@ -230,14 +400,22 @@ class SpreadsheetbenchTaskAdapter:
             "returns the formula string, not its value.\n"
             f"Task instruction ({self._item['instruction_type']}): "
             f"{self._item['instruction']}\n"
-            f"Budget: the executor has {protocol.MAX_ENV_STEPS} tool calls "
-            "per episode."
+            f"Budget: the executor has {protocol.MAX_ENV_STEPS} "
+            + ("actions (code executions or submit)"
+               if self._text_mode() else "tool calls")
+            + " per episode."
         )
 
     def executor_scaffold(self) -> str:
+        if self._text_mode():
+            return SYSTEM_PROMPT_TEXT
         return SYSTEM_PROMPT
 
     def tools(self) -> list[dict] | None:
+        # 文本协议不渲染 tools(否则 chat template 同时教 FC 语法,与
+        # 围栏协议打架;Math/SearchQA 同款处理)。
+        if self._text_mode():
+            return None
         return TOOLS
 
     def gt_text(self) -> str | None:
@@ -253,9 +431,45 @@ class SpreadsheetbenchTaskAdapter:
         cases = self._test_cases()
         return SpreadsheetEpisode(cases[0][1], self._item)
 
-    # ---- 交互面(function-calling react) --------------------------------
+    # ---- 交互面(fncall | text react)------------------------------------
 
     def react(self, env: SpreadsheetEpisode, assistant_text: str) -> ActionOutcome:
+        if self._text_mode():
+            return self._react_text(env, assistant_text)
+        return self._react_fncall(env, assistant_text)
+
+    def _react_text(self, env: SpreadsheetEpisode, assistant_text: str) -> ActionOutcome:
+        """文本协议(Math 文本 TIR 档同构)。执行与判分完全复用
+        _dispatch —— 只是把围栏代码/```submit 翻译成同构 call dict。"""
+        call = parse_text_action(assistant_text)
+        if call is None:
+            return ActionOutcome(
+                thought=assistant_text.strip(),
+                action_raw="",
+                action_norm="",
+                feedback=text_format_reminder(),
+                done=False,
+                score=0.0,
+                acted=False,
+                valid=False,
+                consumed_env_step=False,
+            )
+        feedback, done, score, valid = self._dispatch(
+            env, call, text_extra_note(assistant_text), text_mode=True
+        )
+        return ActionOutcome(
+            thought=text_thought(assistant_text, call) or assistant_text.strip(),
+            action_raw=json.dumps(call, ensure_ascii=False),
+            action_norm=_norm_call(call),
+            feedback=feedback,
+            done=done,
+            score=score,
+            acted=True,
+            valid=valid,
+            consumed_env_step=True,
+        )
+
+    def _react_fncall(self, env: SpreadsheetEpisode, assistant_text: str) -> ActionOutcome:
         calls = protocol.parse_tool_calls(assistant_text, tools=self.tools())
         thought = protocol.strip_tool_calls(assistant_text)
         if not calls:
@@ -291,38 +505,53 @@ class SpreadsheetbenchTaskAdapter:
 
     def replay_action(self, env: SpreadsheetEpisode, action_norm: str) -> tuple[str, bool]:
         call = json.loads(action_norm)
-        feedback, done, _score, _valid = self._dispatch(env, call, "")
+        feedback, done, _score, _valid = self._dispatch(
+            env, call, "", text_mode=self._text_mode()
+        )
         return feedback, done
 
     def _dispatch(
-        self, env: SpreadsheetEpisode, call: dict, extra_note: str
+        self, env: SpreadsheetEpisode, call: dict, extra_note: str,
+        text_mode: bool = False,
     ) -> tuple[str, bool, float, bool]:
-        """(feedback, done, score, valid) — react 与 replay 共用的执行核。"""
+        """(feedback, done, score, valid) — react 与 replay 共用的执行核。
+
+        观察包裹随协议切换:FC 用 <tool_response>,文本档用 ```output 围栏
+        (ToRL 同款)。文本档的 extra_note 放围栏**外**——放进去会伪装成
+        程序输出(Math 档同款处理)。"""
+        if text_mode:
+            def wrap_obs(body: str) -> str:
+                return text_obs_wrap(body) + extra_note
+
+            def wrap_msg(body: str) -> str:
+                return body + extra_note
+        else:
+            def wrap_obs(body: str) -> str:
+                return protocol.tool_response_wrap(body + extra_note)
+
+            wrap_msg = wrap_obs
         name = call.get("name")
         if name == "run_python":
             code = str(call.get("arguments", {}).get("code", "") or "")
             if not code.strip():
-                return protocol.tool_response_wrap("run_python: empty code." + extra_note), False, 0.0, False
+                return wrap_msg("run_python: empty code."), False, 0.0, False
             out_text, rc = self._run_python(env.workdir, code)
             body = out_text if rc == 0 else f"[exit {rc}]\n{out_text}"
-            return protocol.tool_response_wrap(self._clip(body) + extra_note), False, 0.0, rc == 0
+            return wrap_obs(self._clip(body)), False, 0.0, rc == 0
         if name == "submit":
             if not os.path.exists(env.output_path):
                 return (
-                    protocol.tool_response_wrap(
+                    wrap_msg(
                         "submit: output.xlsx not found in the working "
-                        "directory — write it first, then submit." + extra_note
+                        "directory — write it first, then submit."
                     ),
                     False, 0.0, False,
                 )
             score = self._score_output(env.output_path)
             # 信息状态红线:评估结果不反馈(轨迹终态另行记账)。
-            return protocol.tool_response_wrap("Submitted." + extra_note), True, score, True
+            return wrap_msg("Submitted."), True, score, True
         return (
-            protocol.tool_response_wrap(
-                f"unknown tool: {name!r}. Available: run_python, submit."
-                + extra_note
-            ),
+            wrap_msg(f"unknown tool: {name!r}. Available: run_python, submit."),
             False, 0.0, False,
         )
 
@@ -377,6 +606,8 @@ class SpreadsheetbenchTaskAdapter:
         return False
 
     def format_reminder(self) -> str:
+        if self._text_mode():
+            return text_format_reminder()
         return _format_reminder()
 
 

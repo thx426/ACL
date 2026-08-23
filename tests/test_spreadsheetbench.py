@@ -30,10 +30,14 @@ from trace_opd.envs import registry
 from trace_opd.envs.spreadsheetbench.adapter import (
     _format_reminder,
     SYSTEM_PROMPT,
+    SYSTEM_PROMPT_TEXT,
     TOOLS,
     SpreadsheetbenchEnvFactory,
     SpreadsheetbenchTaskAdapter,
     initial_obs_of,
+    parse_text_action,
+    text_extra_note,
+    text_format_reminder,
 )
 from trace_opd.envs.spreadsheetbench.evaluator import (
     _compare_cell_value,
@@ -86,8 +90,10 @@ def _make_task(tmp_path: Path, *, answers: list[dict[str, object]]) -> dict:
     return item
 
 
-def _adapter(tmp_path: Path, item: dict) -> SpreadsheetbenchTaskAdapter:
-    cfg = SpreadsheetbenchCfg(data_root=str(tmp_path))
+def _adapter(
+    tmp_path: Path, item: dict, protocol: str = "fncall"
+) -> SpreadsheetbenchTaskAdapter:
+    cfg = SpreadsheetbenchCfg(data_root=str(tmp_path), protocol=protocol)
     return SpreadsheetbenchTaskAdapter(item, cfg, threading.Semaphore(4))
 
 
@@ -162,8 +168,8 @@ def test_tools_schema_native_rendering_contract(tmp_path):
 
 # ------------------------------------------------------- episode 端到端(真执行)
 
-def _episode(item, tmp_path, texts):
-    adapter = _adapter(tmp_path, item)
+def _episode(item, tmp_path, texts, protocol: str = "fncall"):
+    adapter = _adapter(tmp_path, item, protocol=protocol)
     return _run(run_episode(
         adapter=adapter,
         generate=ScriptedGenerate(TOK, texts),
@@ -219,6 +225,101 @@ def test_episode_format_failure_and_premature_submit(tmp_path):
     assert traj.steps[0].observation == _format_reminder()
     assert traj.steps[1].acted and not traj.steps[1].valid
     assert "not found" in traj.steps[1].observation
+    assert traj.won and traj.score == 1.0
+    assert result.invalid_format == 1
+
+
+# ------------------------------------------------- 文本协议(2026-08-17 裁定)
+
+def _py_block(code: str) -> str:
+    return f"let me work\n```python\n{code}```\n"
+
+
+def test_parse_text_action_priority():
+    # 代码块提取(标注必需;裸 ``` 不收)
+    call = parse_text_action(_py_block("print(1)\n"))
+    assert call == {"name": "run_python", "arguments": {"code": "print(1)"}}
+    assert parse_text_action("```\nprint(1)\n```") is None
+    # 多块取最后(ToRL 同款)
+    two = "```python\nprint(1)\n```\nthen\n```py\nprint(2)\n```"
+    assert parse_text_action(two)["arguments"]["code"] == "print(2)"
+    # submit 识别(独立回复;fence 内空白/换行宽容)
+    assert parse_text_action("done.\n```submit\n```")["name"] == "submit"
+    assert parse_text_action("```submit```")["name"] == "submit"
+    # 同现优先级:代码 > submit(乐观断言防线)
+    both = _py_block("print(3)\n") + "\n```submit\n```"
+    assert parse_text_action(both)["name"] == "run_python"
+    # void turn
+    assert parse_text_action("I think the answer is 42.") is None
+    # 思考正文里提到 submit 单词不触发
+    assert parse_text_action("I will submit soon.") is None
+
+
+def test_text_extra_note_states_ignored_submit():
+    both = _py_block("print(3)\n") + "\n```submit\n```"
+    note = text_extra_note(both)
+    assert "ignored" in note and "submit" in note
+    # 多块 + submit:两条 note 都在
+    tri = "```python\nprint(1)\n```\n```python\nprint(2)\n```\n```submit\n```"
+    note2 = text_extra_note(tri)
+    assert "earlier code block" in note2 and "```submit```" in note2
+    assert text_extra_note(_py_block("print(1)\n")) == ""
+
+
+def test_text_mode_contract(tmp_path):
+    item = _make_task(tmp_path, answers=[{"B1": 3}])
+    ad = _adapter(tmp_path, item, protocol="text")
+    # 文本协议不渲染 tools(与围栏协议打架);scaffold 换 one-shot 版
+    assert ad.tools() is None
+    assert ad.executor_scaffold() is SYSTEM_PROMPT_TEXT
+    assert "```submit" in SYSTEM_PROMPT_TEXT and "```python" in SYSTEM_PROMPT_TEXT
+    assert "Worked example" in SYSTEM_PROMPT_TEXT      # one-shot(用户裁定)
+    assert ad.format_reminder() == text_format_reminder()
+    brief = ad.task_brief()
+    assert "```python" in brief and "```submit" in brief
+    assert "run_python(code)" not in brief
+    # fncall 档回归:契约不变
+    ad_fc = _adapter(tmp_path, item)
+    assert ad_fc.tools() is TOOLS
+    assert ad_fc.executor_scaffold() is SYSTEM_PROMPT
+    assert "run_python(code)" in ad_fc.task_brief()
+
+
+def test_episode_text_protocol_win(tmp_path):
+    item = _make_task(tmp_path, answers=[{"B1": 3}])
+    result = _episode(item, tmp_path, [
+        _py_block(SUM_CODE),
+        "verified.\n```submit\n```",
+    ], protocol="text")
+    traj = result.trajectory
+    assert traj.won and traj.score == 1.0
+    # 观察 = ```output 围栏,不是 <tool_response>
+    assert traj.steps[0].observation.startswith("```output\n")
+    assert "saved" in traj.steps[0].observation
+    assert "<tool_response>" not in traj.steps[0].observation
+    assert "Submitted." in traj.steps[1].observation
+    # action_norm 与 FC 同构(replay 契约共用)
+    assert json.loads(traj.steps[0].action_norm)["name"] == "run_python"
+
+
+def test_episode_text_void_premature_and_cosubmit(tmp_path):
+    item = _make_task(tmp_path, answers=[{"B1": 3}])
+    result = _episode(item, tmp_path, [
+        "thinking out loud, no action",               # void turn
+        "done!\n```submit\n```",                      # output 未写:不终局
+        _py_block(SUM_CODE) + "\n```submit\n```",     # 同现:执行代码,不终局
+        "now finish.\n```submit\n```",
+    ], protocol="text")
+    traj = result.trajectory
+    assert traj.steps[0].acted is False
+    assert traj.steps[0].observation == text_format_reminder()
+    assert traj.steps[1].acted and not traj.steps[1].valid
+    assert "not found" in traj.steps[1].observation
+    # 同现轮:代码执行了,note 在围栏外说明 submit 被忽略
+    obs2 = traj.steps[2].observation
+    assert obs2.startswith("```output\n") and "saved" in obs2
+    assert obs2.rstrip().endswith(")")                # note 在闭栏之后
+    assert "ignored" in obs2.split("```", 2)[-1]
     assert traj.won and traj.score == 1.0
     assert result.invalid_format == 1
 

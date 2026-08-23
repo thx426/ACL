@@ -561,14 +561,19 @@ def main() -> int:
             {
                 "backend": cfg.research.backend,
                 "tool_protocol": cfg.research.tool_protocol,
-                "model": cfg.role("researcher").model,
-                "endpoint": cfg.role("researcher").endpoint,
+                # v4 自体研究员没有 external 角色面(researcher 就是被训练的
+                # policy 本身)——强取 roles["researcher"] 会 KeyError 拦死启动。
+                "model": (cfg.roles["researcher"].model
+                          if "researcher" in cfg.roles else "<selfres:engine>"),
+                "endpoint": (cfg.roles["researcher"].endpoint
+                             if "researcher" in cfg.roles else ""),
                 "n_exp": cfg.research.n_exp,
                 "k_default": cfg.research.k_default,
                 "k_max": cfg.research.k_max,
                 "max_turns": cfg.research.max_turns,
                 "session_timeout_s": cfg.research.session_timeout_s,
-                "thinking": cfg.role("researcher").extra_body.get(
+                "thinking": (cfg.roles["researcher"].extra_body
+                             if "researcher" in cfg.roles else {}).get(
                     "chat_template_kwargs", {}
                 ).get("enable_thinking"),
             }

@@ -152,6 +152,7 @@ def main() -> int:
             cfg_all.episode.max_tokens_per_turn,
         )
         template_delta.configure_thinking(cfg_all.episode.enable_thinking)
+        protocol.configure_reasoning_tag(cfg_all.episode.reasoning_tag)
     else:
         cfg = SciworldCfg()
     cfg.worker_python = args.worker_python

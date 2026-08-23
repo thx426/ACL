@@ -184,6 +184,14 @@ class SpreadsheetbenchCfg:
                                     # soffice 路径走 SSB_SOFFICE/PATH)
     obs_max_chars: int = 3500       # 工具输出截断(< protocol 全局 4000,
                                     # 保 <tool_response> 包裹完整)
+    #: 交互协议:fncall(CD-010 原档,run_python+submit 两工具,Qwen3 系
+    #: 验证)| text(2026-08-17 用户裁定,经典线 Qwen2.5 直接 text 化:
+    #: ```python 围栏 + ```output 回注 + ```submit 终局,one-shot 内嵌
+    #: system;依据 = Math 域 FC→text +21.6pp 同为写代码任务、SQA 域
+    #: Qwen2.5 FC 违规率 11.8% 实测、大段代码进 JSON 转义是已证痛点)。
+    #: 默认保持 fncall(Math 同款纪律:裁定只在 configs/classic/ 显式
+    #: 写落地,不静默改变旧配置行为)。
+    protocol: str = "fncall"
 
 
 
@@ -194,7 +202,123 @@ class MathCfg:
 
     exec_concurrency: int = 32      # run_python 子进程全局并发门(按 worker 折算)
     python_timeout_s: int = 30      # 数学计算脚本超时(短;SSB 是 120)
+    verify_timeout_s: float = 20.0  # math-verify 子进程硬超时(2026-08-13:
+                                    # 病态表达式 sympy 满核自旋拖死整臂;
+                                    # signal 超时装不进 to_thread ⇒ 子进程击杀)
     obs_max_chars: int = 3500       # 工具输出截断(保 <tool_response> 包裹)
+    #: 交互协议:fncall(CD-010 原档,run_python+submit 两工具)| text
+    #: (2026-08-13 用户裁定,经典线 Qwen2.5:```python 围栏 + ```output 回注
+    #: + \boxed{} 终答,对照 ToRL/SimpleTIR/Qwen2.5-Math-TIR)| single
+    #: (2026-08-16 用户裁定,对齐 MENTOR arXiv 2510.04140 ICLR2026 的单轮
+    #: setting:无工具、无沙箱,一次 completion 即终局;<think></think> +
+    #: \boxed{} 两标签)。默认保持 fncall(镜像 alfworld:裁定只在
+    #: configs/classic/ 显式写落地,不静默改变旧配置行为)。
+    protocol: str = "fncall"
+    #: single 档的格式分权重。MENTOR 的 outcome:format = 9:1 ⇒ 0.1
+    #: (论文 Appx C p18;代码 examples/reward_function/math.py 的
+    #: `format_weight=0.1`,score = (1-w)·accuracy + w·format)。
+    #: ⚠ >0 时 score 变连续值({0, w, 1-w, 1}),而 core 的
+    #: `won = score >= 1.0` 会把「答对但格式错」(1-w) 判成失败 ⇒ 必须
+    #: 同时开 train.reward_from_score,否则装配期 fail loud(_validate)。
+    #: 置 0 = 纯二值答案正确率(格式仍记账进 valid/score,只是不进 reward)。
+    #: 仅 single 档消费;fncall/text 档的终答走 submit,无格式分概念。
+    format_weight: float = 0.1
+
+
+@dataclass
+class WebshopCfg:
+    """WebShop(1000 商品社区 RL 小集;经典转向 2026-08-12 裁定,见
+    envs/webshop/adapter.py)。无 data_root——环境是 162 上的薄 HTTP 服务
+    (classic_bench/webshop_service.py),goal 经 parquet goal_idx 绑定。"""
+
+    # 输出协议:"text"(<reasoning> + <action>search[q]/click[t]</action>,
+    # 动作语法为 WebShop 原生、与 GiGPO/verl-agent 逐字同款)| "fncall"
+    # (OpenAI 格式两工具 search/click)。2026-08-16 用户裁定默认 text,与
+    # ALFWorld/SearchQA/Math 三域对齐:Qwen2.5 系对 FC 遵循不足(SearchQA
+    # FC 档实测 11.8% 轨迹因连续格式违规判 DEGENERATE;Math 上 FC→text
+    # 协议效应 +21.6pp),且两家相关工作在 WebShop 上都用文本动作。
+    # 协议进 objective_fingerprint(无条件追加——WebShop 无历史训练 run)。
+    protocol: str = "text"
+    #: 服务基址。**逗号分隔可给多个分片** —— 单进程 stdlib http.server 受
+    #: GIL 限制,正式训练的 128 级并发(16×8,文献口径见 OPS-LOG §9)需要多
+    #: 进程分片;episode 按 goal_idx 取模确定性绑定到某个分片(sid 是分片
+    #: 本地的,reset/step/release 必须同分片)。
+    service_url: str = "http://127.0.0.1:8310"
+    reset_timeout_s: float = 60.0   # /reset 超时(服务端 acquire 上限 30s)
+    step_timeout_s: float = 30.0    # /step /release 超时
+    request_concurrency: int = 32   # HTTP 并发门(≈服务端实例池大小;按
+                                    # worker 折算)
+    obs_max_chars: int = 3500       # 页面文本截断(商品列表页很长)
+    preflight: bool = True          # 装配期 /meta 真实校验(fail loud)
+    #: ★ 修复 vendored 判分器的 option 匹配 bug(2026-08-16 用户裁定,默认开)。
+    #: 病灶:`get_reward` 把 `goal_options.items()`(tuple)传给期望 str 的
+    #: `get_option_reward`,而 `normalize_color` 里的 `in` 在 str 上是子串、
+    #: 在 tuple 上是成员 ⇒ 只有 purchased 侧被归一化,两侧对不上 ⇒
+    #: **6.63% 的 goal 连 gold 答案自己都拿不到满分**(上限 0.667–0.889),
+    #: 二值 reward 下 won 恒 False、该组零梯度。
+    #: 修复后实测(400 goals):gold 满分率 94.1%→**100%**,错选项 p50 0.714、
+    #: 错商品 p50 0.000 **均不变** ⇒ 区分度保持。
+    #: ⚠ 这**改变 reward 定义** ⇒ 无条件进 objective_fingerprint;且与
+    #: GiGPO/verl-agent/SEED 的口径断裂(他们跑的是有 bug 的版本),报数对拍
+    #: 必须标注。开关必须与服务端 `--option-fix` 一致,preflight 逐分片校验。
+    fix_option_matching: bool = True
+    # 重试/退避:服务端池满回 429(忙,不是坏)⇒ 客户端指数退避而非判故障。
+    # 2026-08-16 与服务端的 30s 快速 429 + sid TTL 回收配套落地(修 2026-08-12
+    # 的 52/60 ENV_ERROR 池泄漏事故)。
+    max_retries: int = 4
+    retry_backoff_s: float = 1.0
+    retry_backoff_max_s: float = 8.0
+
+
+@dataclass
+class SearchQACfg:
+    """SearchQA(Search-R1 风格 wiki-search QA;经典转向 2026-08-12 裁定,
+    见 envs/searchqa/adapter.py)。无 data_root——任务自足于 extra_info;
+    检索是远端 HTTP 服务(162 wiki-18 + e5,只读共享)。"""
+
+    # 输出协议:"text"(Search-R1/SEED 同款 <think>/<search>/<answer> 标签)
+    # | "fncall"(OpenAI 格式两工具)。2026-08-13 用户裁定回退 text:
+    # Qwen2.5 系(2024)对 function-call 遵循不足,FC 档实测 11.8% 轨迹因连续
+    # 格式违规被判 DEGENERATE:format,而 4 步预算下一次失误即 25%;两家相关
+    # 工作也都用文本标签并在 prompt 内置 one-shot。协议进 objective_fingerprint。
+    protocol: str = "text"
+    retriever_url: str = "http://127.0.0.1:8300"  # /retrieve 服务基址
+    topk: int = 3                   # Search-R1 论文口径 topk=3
+    # 单批检索超时(含 e5 编码)。2026-08-13 冒烟 v4:162 上 **35B researcher
+    # 与 faiss retriever 共享同样 4 张 GPU**(每卡 35B 58.8G + 索引 10G),
+    # 机制臂 128 个 researcher 会话打满 35B 时,retriever 响应从 0.1s 退化到
+    # 12s。此时服务端只是**慢**不是**坏**(failure=0,重试均成功),而 30s
+    # 超时会把慢误判成故障 ⇒ episode 白白重试、丢弃已生成 token。放宽到 90s
+    # (batcher 等待上限 = 3×+30 = 300s),让排队自然消化。
+    search_timeout_s: float = 90.0
+    # 在途批请求上限(批量化后语义=并发"批"数,不是并发 query 数)。
+    # ⚠ 2026-08-13 冒烟 v3 事故:此值曾为 64,双臂即 128 批 × 64 query =
+    # 8192 query 同时在途,队列深度爆炸 ⇒ 服务端单发往返从 0.10s 退化到
+    # 13.7s(136×),客户端大面积 batcher 超时。实测容量曲线(batch=64):
+    #   在途 1/2/4/8/16/32 → 507/687/669/729/700/711 q/s
+    #   中位延迟 0.10/0.18/0.39/0.68/1.19/2.09s
+    # ⇒ 吞吐在在途 2 即饱和,再加只涨延迟不涨吞吐。
+    # 再扫单请求批大小(服务端内部 retrieval_batch_size=512,原配 64 没吃满):
+    #   批 64/128/256/512 × 在途2 → 632/897/1123/**1384** q/s
+    # ⇒ 最优点 = **批 512 × 在途 2**(1384 q/s,中位 0.62s/最大 0.86s);
+    # 双臂合计 4 批在途 × 512 = 2048 query,服务端仍在最优区。
+    # 需求侧:每步 1024 eps × ~2.7 检索 = 2765 query ÷ 1384 ≈ 2s,
+    # 占每步总时长(3-5 分钟)不到 1% ⇒ 检索已彻底不是瓶颈。
+    search_concurrency: int = 2
+    # --- micro-batching(2026-08-13 实测,162 retriever;用户裁定"环境侧
+    # 吞吐调到最大以支撑高 RL rollout 并发")---------------------------------
+    # 服务端 /retrieve 原生收 queries 数组,而原实现每 episode 单 query 单请求,
+    # 吞吐被请求开销封死:并发 16→14.6 q/s、并发 256→15.7 q/s(拉并发无用)。
+    # 批量后:batch8→90.5、batch32→331.9、**batch64 并发16→498.1 q/s(34×)**。
+    # RL rollout 下 1024 episodes × ~2.7 次检索 = 2765 次/步:单 query 模式
+    # 检索独占 184s/步,批量后 5.6s/步。
+    search_max_batch: int = 512     # 单请求合并的 query 数;对齐服务端内部
+                                    # retrieval_batch_size=512(实测 1.95× 于 64)
+    search_batch_wait_ms: float = 15.0  # 攒批等待窗口;高并发下瞬间攒满,
+                                    # 该值只在稀疏尾部生效(不拖长整体)
+    obs_max_chars: int = 3500       # 工具输出截断(同 MathCfg 语义)
+    preflight: bool = True          # 装配期真实检索一次(fail loud:服务
+                                    # 不可达时零分会伪装成能力问题)
 
 
 @dataclass
@@ -268,6 +392,20 @@ class TerminalCfg:
     test_timeout_s: float = 600.0   # 判分沙箱内 timeout(TMax _MIN_TEST_TIMEOUT_S)
     test_grace_s: float = 300.0     # 判分外层墙钟余量:外层 = test_timeout_s +
                                     # 此值(默认 900,修 TMax 120<600 倒挂)
+    #: 注入 episode 容器的环境变量(``K=V`` 逗号分隔)。TB 的 tests/test.sh
+    #: 用 ``uvx -p 3.13 -w pytest…`` 判分,uv 默认从 github.com 取 Python
+    #: standalone 与包 —— GitHub 在 162 不可达,不改走国内镜像则**每个 TB
+    #: 任务 reward 恒 0**(2026-08-12 golden 实测:官方参考解也 0 分;注入后
+    #: 同一任务 reward=1)。test.sh 一字不改。TMax 任务不消费这些变量。
+    container_env: str = ""
+    #: 注入容器 /etc/hosts 的条目(``host=ip`` 逗号分隔)。**为什么值得**:
+    #: test.sh 无条件 `curl https://astral.sh/uv/...|sh`,该脚本再去 github.com
+    #: 拉二进制;GitHub 不可达时 curl 要**空等 129 秒 TCP 超时**才放弃,而 uv
+    #: 早已预置在镜像里 —— 这 129s 是每次判分的纯浪费。把 github.com 指到
+    #: 127.0.0.1 后 curl 立即 refused,实测单次判分 **122-786s → 26s**
+    #: (reward 仍正确产出 1)。当前无境外通路,黑洞化不损失能力;将来接了
+    #: 代理清空此项即可。
+    container_hosts: str = ""
     score_at_budget: bool = False   # False = TMax 训练语义(不提交 ⇒ 0,不跑
                                     # verifier);True = TB 式末步仍判分(评测近似)
 
@@ -412,15 +550,36 @@ class EpisodeCfg:
     #: ⚠ 开启会显著抬高 token 消耗(历史实测同答案 8 → 167 token),
     #: session_token_budget / max_tokens_per_turn 须随之重估。
     enable_thinking: bool = False
+    #: 跨 benchmark 的推理标签(输出协议面;真源 core/protocol.REASONING_TAG,
+    #: 入口经 configure_reasoning_tag 注入)。2026-08-16 用户裁定:全线弃用
+    #: `<think>` 统一 `<reasoning>` —— thinking-family 模板(Qwen3.5/3.6,含
+    #: 拟用作分布干预教师的 35B)会**剥离历史 assistant 轮的 `<think>` 块**
+    #: (推理静默丢失),且其 non-thinking 模式是预填空 think 块、与"模型自己
+    #: 写 `<think>`"直接冲突;`<think>` 在该族词表里还是特殊 token。
+    #: 取证:scripts/probe_think_tags.py、scripts/probe_strip_scope.py。
+    #: 设成 "think" 可回退(复现历史 run / 与相关工作逐字对拍),会打告警。
+    #: ⚠ 改的是任务表面 ⇒ 进 objective_fingerprint(按 env 的历史默认条件
+    #:   追加,既有 run 指纹逐字节不变;见 objective_fingerprint)。
+    reasoning_tag: str = "reasoning"
 
 
 @dataclass
 class AlfworldCfg:
-    #: 输出协议:"fncall"(统一 Function Call,2026-08-08 用户裁定的正式
-    #: 方向,默认)| "text"(历史 <reasoning>/<action> 协议——仅供在跑
-    #: text run 续跑与 text-vs-FC A/B 对照,新 run 勿用)。协议改变任务
-    #: 表面(system prompt/输出格式/观察包裹),进 objective_fingerprint
-    #: (条件追加,text 保历史指纹)。
+    #: 输出协议:"text"(<reasoning>/<action> ReAct 协议)| "fncall"(统一
+    #: Function Call)。协议改变任务表面(system prompt/输出格式/观察包裹),
+    #: 进 objective_fingerprint(条件追加,text 保历史指纹)。
+    #:
+    #: 2026-08-13 用户裁定:经典 benchmark 线(Qwen2.5-7B × ALFWorld)**回退
+    #: text/ReAct**,不再用 FC——与相关工作对齐(verl-agent/GiGPO、OPID
+    #: 〔On-Policy Skill Distillation,arXiv 2606.26790〕、SEED 三家 ALFWorld
+    #: prompt 逐字节同源,均为 <think>+<action> 文本协议;RAGEN 为
+    #: <think>+<answer>;ReAct/Reflexion 原版为 "> think:"/裸命令)。我方标签
+    #: 用 <reasoning> 而非 <think> 是硬约束:连续对话流下 Qwen chat template
+    #: 会剥离历史轮 content 里的字面 <think> 块(见 core/protocol.py 头注),
+    #: 相关工作每轮重建 prompt 故不受影响。
+    #: **默认值仍保持 fncall**:configs/experiments/ 下 15 个 PGS 线历史配置
+    #: 不写该键、吃默认值,改默认会把它们静默切协议(param-truth 第四层事故
+    #: 型)。裁定只在 configs/classic/ 两臂显式写 `protocol: text` 落地。
     protocol: str = "fncall"
     data_root: str = ""
     worker_python: str = ""
@@ -553,6 +712,17 @@ class TrainCfg:
     agent_num_workers: int = 16     # **必须 = train_batch_size**(用户长期裁定):
                                     # 每 worker 恰好领一个任务的全部 rollout_n 副本
                                           # concurrency caps are divided by this
+    #: 训练 reward 的取数口径。False(历史行为,全部既有 run)= 二值
+    #: `1.0 if traj.won else 0.0`;True = 直接用 `traj.score`(ActionOutcome.score
+    #: 透传的连续终评)。
+    #: 2026-08-16 用户裁定引入,为 math single 档对齐 MENTOR 的
+    #: `0.9·accuracy + 0.1·format` —— 二值通道会把 0.9(答对/格式错)判成 0,
+    #: 比 MENTOR 更严。开启后 won 退化为纯观察指标(仍是 score>=1.0),
+    #: 曲线要看 rollout_extra/score。
+    #: ⚠ 改的是优化目标本身 ⇒ 进 objective_fingerprint(条件追加,
+    #:   False 时不改 material,既有 run 指纹逐字节不变)。
+    #: ⚠ 只有 score 天然连续的环境该开;二值环境开了等价于原行为(score∈{0,1})。
+    reward_from_score: bool = False
 
 
 @dataclass
@@ -607,7 +777,7 @@ class SteeringCfg:
                                    # EMA 追踪目标门率;标定 run 必须置 false 冻结哨兵)
     gate_target_rate: float = 0.10 # 目标门率 q(用户裁定默认 10%;消融 {5,10,20}%)
     gate_ema_beta: float = 0.1     # EMA 慢速率 β
-    epsilon: float = 0.05          # ε 探针概率
+    epsilon: float = 0.0   # ε 探针默认关(2026-08-17 用户裁定;因果归因读数按需显式开)          # ε 探针概率
     gate_rate_bounds: tuple = (0.05, 0.25)   # spec 预注册区间
     r_max: int = 0                 # 每轮拒绝上限;0=无上限(v3.2 默认,用户裁定
                                    # 2026-08-06:干预不受轮内拒绝数限制,bare 臂+
@@ -723,6 +893,8 @@ class Config:
     alfworld: AlfworldCfg
     spreadsheetbench: SpreadsheetbenchCfg
     math: MathCfg
+    searchqa: SearchQACfg
+    webshop: WebshopCfg
     scienceworld: SciworldCfg
     terminal: TerminalCfg
     webarena: WebArenaCfg
@@ -753,7 +925,7 @@ def _build(dc, d: dict[str, Any]):
 _KNOWN_SECTIONS = {
     "run", "research", "research_rl", "narration", "roles", "episode", "alfworld",
     "train", "eval", "steering", "environment", "spreadsheetbench", "math",
-    "scienceworld", "terminal", "webarena", "swe",
+    "scienceworld", "terminal", "webarena", "swe", "searchqa", "webshop",
 }
 
 
@@ -765,6 +937,36 @@ def _validate(cfg: "Config") -> None:
         raise ValueError(
             f"alfworld.protocol 必须是 fncall|text,得到 {cfg.alfworld.protocol!r}"
         )
+    if cfg.math.protocol not in ("fncall", "text", "single"):
+        raise ValueError(
+            f"math.protocol 必须是 fncall|text|single,得到 {cfg.math.protocol!r}"
+        )
+    if cfg.webshop.protocol not in ("fncall", "text"):
+        raise ValueError(
+            f"webshop.protocol 必须是 fncall|text,得到 {cfg.webshop.protocol!r}"
+        )
+    if cfg.environment.name == "math" and cfg.math.protocol == "single":
+        # 单轮语义:一次 completion 即终局(adapter 恒 done=True)。caps 大于 1
+        # 不会改变行为,但会让配置读起来像多轮 —— 参数真值必须一眼可读
+        # (记忆 config-vs-manifest-truth),故显式钉死。
+        if (cfg.episode.max_env_steps, cfg.episode.max_assistant_turns) != (1, 1):
+            raise ValueError(
+                "math.protocol=single 是单轮协议,episode.max_env_steps 与 "
+                "max_assistant_turns 必须都为 1,得到 "
+                f"{cfg.episode.max_env_steps}/{cfg.episode.max_assistant_turns}"
+            )
+        if not 0.0 <= cfg.math.format_weight < 1.0:
+            raise ValueError(
+                f"math.format_weight 必须在 [0,1),得到 {cfg.math.format_weight}"
+            )
+        if cfg.math.format_weight > 0.0 and not cfg.train.reward_from_score:
+            # 静默降级的后果:格式错但答对的样本 score=0.9 ⇒ won=False ⇒
+            # reward=0,format 分不但没生效,还把正确答案打成完全失败。
+            raise ValueError(
+                f"math.format_weight={cfg.math.format_weight} > 0 需要同时设 "
+                "train.reward_from_score=true —— 否则 core 的 won=score>=1.0 "
+                "会把「答对但格式错」(score=1-w) 判成 reward 0,比 MENTOR 更严"
+            )
     if cfg.terminal.protocol != "fncall":
         raise ValueError(
             f"terminal.protocol 仅支持 fncall(TMax 语料即 FC 单工具 bash,"
@@ -1135,36 +1337,74 @@ def _validate(cfg: "Config") -> None:
                     "narration.max_prompt_tokens 必配(>0;叙述 prompt 上限,"
                     "超出截轨迹渲染段)"
                 )
-            # 保险丝不等式(FAIL 级):
+            # 保险丝不等式(FAIL 级)——**仅 selfres(自体研究员)**:
             # ① prompt+流 ≤ 模型上下文(否则引擎必爆);
             # ② research 行 stream 进 verl response padding 维度(只补不截),
             #    budget 超维度 = 超长行不截静默进训练;
             # ③ research 行 prompt 进 verl prompt padding 维度,同理。
-            if (rcfg.session_token_budget > 0 and rcfg.max_prompt_tokens > 0
-                    and rcfg.session_token_budget + rcfg.max_prompt_tokens
-                    > t.rollout_max_model_len):
+            # external 外部研究员(2026-08-13 用户裁定):会话 token 流是外部
+            # 模型(35B/256K 级上下文)生成、不进训练 batch 的任何 padding
+            # 维度,预算只受外部服务 max_model_len 约束(preflight/运行时由
+            # 端点自拒),不得绑到 policy 的训练维度上压低会话预算。
+            if selfres:
+                if (rcfg.session_token_budget > 0 and rcfg.max_prompt_tokens > 0
+                        and rcfg.session_token_budget + rcfg.max_prompt_tokens
+                        > t.rollout_max_model_len):
+                    problems.append(
+                        f"research.session_token_budget({rcfg.session_token_budget})"
+                        f" + max_prompt_tokens({rcfg.max_prompt_tokens}) 超过 "
+                        f"train.rollout_max_model_len({t.rollout_max_model_len})"
+                    )
+                if rcfg.session_token_budget > t.response_length:
+                    problems.append(
+                        f"research.session_token_budget({rcfg.session_token_budget})"
+                        f" 超过 train.response_length({t.response_length})——research "
+                        "行 stream 进该 padding 维度且 verl 只补不截"
+                    )
+                if rcfg.max_prompt_tokens > t.max_prompt_length:
+                    problems.append(
+                        f"research.max_prompt_tokens({rcfg.max_prompt_tokens}) 超过 "
+                        f"train.max_prompt_length({t.max_prompt_length})(research 行 "
+                        "prompt 的 padding 维度)"
+                    )
+            # narration 后端(2026-08-13 用户裁定放开 external):
+            #   engine   — policy 自述自己的轨迹(历史默认;researcher 读到的是
+            #              "学生眼中的轨迹")
+            #   external — 外部强模型叙述,与 researcher 同端点。动因是吞吐:
+            #              narration 每个 researcher episode 调一次,实测
+            #              1415 次/步 ×(1141 prefill + 308 decode)⇒ 每步给
+            #              7B 引擎压上 1.62M prefill + 0.44M decode,是单项最大
+            #              的 prefill 来源。不引入新特权(researcher 本就有权
+            #              看该轨迹全文),但叙述视角由学生变为强模型。
+            if cfg.narration.backend not in ("engine", "external"):
                 problems.append(
-                    f"research.session_token_budget({rcfg.session_token_budget})"
-                    f" + max_prompt_tokens({rcfg.max_prompt_tokens}) 超过 "
-                    f"train.rollout_max_model_len({t.rollout_max_model_len})"
+                    f"narration.backend 必须是 engine|external,得到 "
+                    f"{cfg.narration.backend!r}"
                 )
-            if rcfg.session_token_budget > t.response_length:
+            if cfg.narration.backend == "external" and not (
+                "narrator" in cfg.roles or "researcher" in cfg.roles
+            ):
                 problems.append(
-                    f"research.session_token_budget({rcfg.session_token_budget})"
-                    f" 超过 train.response_length({t.response_length})——research "
-                    "行 stream 进该 padding 维度且 verl 只补不截"
+                    "narration.backend=external 需要 roles.narrator 或 roles.researcher"
                 )
-            if rcfg.max_prompt_tokens > t.max_prompt_length:
+            # 同任务副本必须落同一 worker(steering 组内配对 + 每 task 只跑一次
+            # researcher)。**准确条件是整除而非相等**(2026-08-13 查清 verl 语义):
+            # verl 对已 repeat n 次的 batch(batch_size×n 行)按 worker 数**连续
+            # 切块**(agent_loop.py: prompts.chunk(len(workers))),而
+            # DataProto.repeat 默认 interleave=True ⇒ 行序为 [t0×n, t1×n, …]。
+            # 于是每 worker 拿 batch_size×n/workers 行,只要它是 n 的整数倍,
+            # 每个 worker 就恰好拿到整数个**完整 task 组** ⇒ 条件即
+            # batch_size % workers == 0(相等只是其特例)。
+            # 放宽的动因:每个 worker 是独立进程、各持一个检索 batcher;
+            # workers=batch_size=128 时每进程只见 1/128 的稀疏 query 流,
+            # 实测 avg_batch=1(合批完全失效)且 128×在途 = 256 并发小请求,
+            # 检索退化到 15 q/s、wait 恶化到 47s(冒烟 v5)。
+            if t.agent_num_workers < 1 or t.train_batch_size % t.agent_num_workers:
                 problems.append(
-                    f"research.max_prompt_tokens({rcfg.max_prompt_tokens}) 超过 "
-                    f"train.max_prompt_length({t.max_prompt_length})(research 行 "
-                    "prompt 的 padding 维度)"
-                )
-            if cfg.narration.backend != "engine":
-                problems.append("narration.backend 必须为 engine")
-            if t.train_batch_size != t.agent_num_workers:
-                problems.append(
-                    "train.train_batch_size 必须等于 agent_num_workers，保证同任务副本同 worker"
+                    f"train.train_batch_size({t.train_batch_size}) 必须能被 "
+                    f"agent_num_workers({t.agent_num_workers}) 整除,"
+                    "保证同任务副本同 worker(verl 按 worker 数对 interleave 后的 "
+                    "batch 连续切块)"
                 )
             if t.agent_task_timeout_s and t.agent_task_timeout_s <= rcfg.session_timeout_s:
                 problems.append(
@@ -1375,6 +1615,54 @@ def objective_fingerprint(cfg: "Config") -> str:
     # 在跑 text run 的指纹逐字节不变,误用新代码续跑旧 run 会被 resume 守卫拦下。
     if cfg.environment.name == "alfworld" and cfg.alfworld.protocol != "text":
         material += f"|alfworld_protocol={cfg.alfworld.protocol}"
+    # SearchQA 同理(2026-08-13):文本标签协议 vs FC 是两套任务表面
+    # (system prompt / 输出格式 / 观察包裹 <information> vs <tool_response>),
+    # 换协议 = 换优化目标。**无条件追加**——SearchQA 是新域,无需保护历史
+    # 指纹,无条件写入才能保证两种协议的 run 指纹必然不同(alfworld 那条是
+    # 条件式,只为兼容既有 text run)。
+    if cfg.environment.name == "searchqa":
+        material += f"|searchqa_protocol={cfg.searchqa.protocol}"
+    # Math 同理(2026-08-13 文本 TIR 裁定):围栏协议 vs FC 是两套任务表面
+    # (system prompt / ```python vs tool_call / ```output vs <tool_response>
+    # / \boxed 终答 vs submit 参数)。本树无 math 历史训练 run,无条件追加
+    # (searchqa 同款)。
+    # WebShop 同理(2026-08-16 用户裁定 text 档):文本动作 vs FC 是两套任务
+    # 表面(system prompt / <action>search[q]</action> vs tool_call / 裸观察
+    # vs <tool_response> 包裹)。本树无 webshop 历史训练 run,无条件追加。
+    if cfg.environment.name == "webshop":
+        material += f"|webshop_protocol={cfg.webshop.protocol}"
+        # option 修复直接改变 reward 的定义(6.63% 的任务从"恒 won=False"
+        # 变成"可达满分")⇒ **无条件**追加,两种口径的 run 指纹必然不同。
+        material += f"|webshop_option_fix={int(cfg.webshop.fix_option_matching)}"
+    if cfg.environment.name == "math":
+        material += f"|math_protocol={cfg.math.protocol}"
+        # single 档的 reward 由 (1-w)·acc + w·format 定义 ⇒ 权重是优化目标的
+        # 一部分。条件追加(仅 single),fncall/text 的既有指纹逐字节不变。
+        if cfg.math.protocol == "single":
+            material += f"|math_format_weight={cfg.math.format_weight}"
+    # SSB 同理(2026-08-17 用户裁定 text 档):围栏协议 vs FC 是两套任务表面
+    # (system prompt one-shot / ```python vs tool_call / ```output vs
+    # <tool_response> / ```submit vs submit())。**条件追加**(alfworld 同款
+    # 方向反转:SSB 历史 run 全是 fncall,fncall 不改 material 保既有指纹
+    # 逐字节不变;text 追加,误用新协议续跑旧 run 被 resume 守卫拦下)。
+    if (cfg.environment.name == "spreadsheetbench"
+            and cfg.spreadsheetbench.protocol != "fncall"):
+        material += f"|ssb_protocol={cfg.spreadsheetbench.protocol}"
+    # reward 取数口径(二值 won vs 连续 score)直接定义"优化什么";
+    # 条件追加以保 False(全部既有 run)的指纹逐字节不变。
+    if cfg.train.reward_from_score:
+        material += "|reward_from_score=1"
+    # 推理标签是任务表面的一部分(system prompt / one-shot / 解析)⇒ 换标签
+    # = 换优化目标。**按 env 的历史实际值**条件追加:每个 env 保持其历史
+    # 默认时不改 material(既有 run 指纹逐字节不变),换掉才追加。
+    #   alfworld 历史 = reasoning(它一直用 <reasoning>)
+    #   searchqa / math 历史 = think(SearchQA 沿用 Search-R1 原生标签;
+    #     math single 档初版逐字移植 MENTOR)
+    # ⇒ 2026-08-16 统一到 reasoning 后,alfworld 指纹不变、searchqa/math
+    #   指纹改变 —— 后者正是我们要的(换协议 = 新曲线,旧 ckpt 被守卫拦下)。
+    _legacy_rtag = {"alfworld": "reasoning", "searchqa": "think", "math": "think"}
+    if cfg.episode.reasoning_tag != _legacy_rtag.get(cfg.environment.name, "reasoning"):
+        material += f"|reasoning_tag={cfg.episode.reasoning_tag}"
     # thinking 模式改变每轮生成的形状(空 think 块 vs 模型自写思考),
     # 是协议面而非执行档:两种模式的 run 不可混为同一条曲线。条件追加
     # 以保 non-thinking 历史 run 的指纹逐字节不变。
@@ -1431,7 +1719,24 @@ def objective_fingerprint(cfg: "Config") -> str:
             )
         )
     if st.doc_source == "researcher":
-        rcfg, ncfg, role = cfg.research, cfg.narration, cfg.role("researcher")
+        rcfg, ncfg = cfg.research, cfg.narration
+        # v4 自体研究员(research_rl.enabled)没有 external 角色面 —— researcher
+        # 就是被训练的 policy 本身,连接参数(endpoint/model/temperature/
+        # sidecar)整体不存在。此处强取 roles["researcher"] 会 KeyError 直接
+        # 拦死 selfres 的启动(2026-08-12 实测)。自体档改记一个稳定标记:
+        # 它同样能把 external↔selfres 的切换体现成指纹变化(角色面消失本身
+        # 就是优化目标的改变),而 selfres 自己的超参已在上面的 research_rl
+        # 段进入 material。
+        role = cfg.roles.get("researcher")
+        role_material = ({
+            "model": role.model,
+            "temperature": role.temperature,
+            "max_tokens": role.max_tokens,
+            "extra_body": role.extra_body,
+            "mode": role.mode,
+            "sidecar_sleep": role.sidecar_sleep,
+            "dp_size": role.dp_size,
+        } if role is not None else {"mode": "selfres_engine"})
         research_material = {
             "source": "researcher",
             # M2(2026-08-08)重写了 text 通道的 researcher 表面:schema 块
@@ -1462,15 +1767,7 @@ def objective_fingerprint(cfg: "Config") -> str:
                 "max_words": ncfg.max_words,
                 "temperature": ncfg.temperature,
             },
-            "role": {
-                "model": role.model,
-                "temperature": role.temperature,
-                "max_tokens": role.max_tokens,
-                "extra_body": role.extra_body,
-                "mode": role.mode,
-                "sidecar_sleep": role.sidecar_sleep,
-                "dp_size": role.dp_size,
-            },
+            "role": role_material,
         }
         import json
 
@@ -1508,6 +1805,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
             SpreadsheetbenchCfg, data.get("spreadsheetbench") or {}
         ),
         math=_build(MathCfg, data.get("math") or {}),
+        searchqa=_build(SearchQACfg, data.get("searchqa") or {}),
+        webshop=_build(WebshopCfg, data.get("webshop") or {}),
         scienceworld=_build(SciworldCfg, data.get("scienceworld") or {}),
         terminal=_build(TerminalCfg, data.get("terminal") or {}),
         webarena=_build(WebArenaCfg, data.get("webarena") or {}),

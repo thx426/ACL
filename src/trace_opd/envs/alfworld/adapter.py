@@ -201,6 +201,16 @@ SYSTEM_PROMPT_BARE = (
     "On every turn respond with exactly this format and nothing else:\n"
     "<reasoning>brief reasoning about the current situation</reasoning>\n"
     "<action>one command</action>\n\n"
+    # one-shot 格式示例(2026-08-13 用户裁定"加入格式 few-shot 示例"):
+    # Qwen2.5-7B zero-shot 对自定义 XML 标签不服从(greedy 确定性输出
+    # `reasoning>…action.…` 破碎形态,step0 val 274/274 全灭 DEGENERATE:
+    # format;transformers 本地 A/B 复现,probe/fmt_ab.py)。单条 system 内
+    # 示例即完美服从(B 变体),纯指令重申无效(C 变体)。示例为单步通用
+    # 常识,不含任务解法——不触信息状态红线;bare/特权臂共用同一 scaffold。
+    "Example of a correctly formatted reply (for an unrelated task):\n"
+    "<reasoning>I need to find a mug. The countertop is a likely place, so I "
+    "will go there first.</reasoning>\n"
+    "<action>go to countertop 1</action>\n\n"
     "The episode ends automatically when the task goal is reached; there is "
     "no submit command and no partial credit."
 )

@@ -187,6 +187,7 @@ def main() -> int:
         cfg.episode.max_tokens_per_turn,
     )
         template_delta.configure_thinking(cfg.episode.enable_thinking)
+        protocol.configure_reasoning_tag(cfg.episode.reasoning_tag)
     else:
         env_cfg = AlfworldCfg()
 

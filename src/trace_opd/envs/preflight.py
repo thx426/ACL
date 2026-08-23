@@ -55,6 +55,7 @@ def main() -> int:
             cfg.episode.max_tokens_per_turn,
         )
         template_delta.configure_thinking(cfg.episode.enable_thinking)
+        protocol.configure_reasoning_tag(cfg.episode.reasoning_tag)
     except BaseException as err:  # noqa: BLE001
         return _fail("config load (check env vars referenced by the yaml)", err)
     _ok("config", f"environment={cfg.environment.name}")

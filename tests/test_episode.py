@@ -65,7 +65,9 @@ async def test_guidance_injected_into_system_prompt():
     adapter = ScriptedAdapter()
     result, _ = await run(adapter, [reply("w", "do the thing")], guidance="Go straight to it.")
     rendered = TOK.decode(result.tokens.prompt_ids, skip_special_tokens=False)
-    assert f"{GUIDANCE_HEADER}\nGo straight to it." in rendered
+    # 特权块 = header + 框(参考资料/非任务/需自行核实)+ 正文,见 core.types
+    assert GUIDANCE_HEADER in rendered
+    assert "Go straight to it." in rendered
     assert result.trajectory.guidance_hash != "bare"
 
 

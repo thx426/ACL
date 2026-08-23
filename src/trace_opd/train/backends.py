@@ -244,6 +244,48 @@ class EngineResearcherChat:
         )
 
 
+def external_narrate_fn(client, *, max_prompt_tokens: int = 0):
+    """外部模型叙述(2026-08-13 用户裁定:与 researcher 同端点)。
+
+    动因(实测,SearchQA/batch128):narration 对**每个 researcher episode**
+    调用一次 ⇒ 1415 次/步,输入(轨迹渲染)均 1141 token、输出均 308 token
+    ⇒ 每步给 7B 引擎压上 **1.62M prefill + 0.44M decode**,是单项最大的
+    prefill 来源。搬到外部 35B 可把这部分吞吐还给 rollout。
+
+    语义变更须知:默认 engine 档是「policy 自述自己的轨迹」(历史用户裁定),
+    researcher 读到的是"学生眼中的轨迹";换外部强模型后读到的是"强模型眼中
+    的轨迹"。不引入新特权(researcher 本就有权看该轨迹全文),但叙述视角变了。
+
+    截断语义与 engine 档一致:超长时对轨迹渲染段截中重渲(叙述本就是压缩,
+    截输入优于 fail);此处按字符估算(外部端点无本地 tokenizer),用
+    4 字符≈1token 的保守折算。
+    """
+
+    async def narrate(messages: list[dict[str, Any]], temperature: float,
+                      max_tokens: int) -> str:
+        msgs = list(messages)
+        if max_prompt_tokens > 0:
+            approx = sum(len(str(m.get("content") or "")) for m in msgs) / 4.0
+            if approx > max_prompt_tokens:
+                from ..narrate.preprocess import truncate_middle
+                body = str(msgs[-1].get("content") or "")
+                keep = max(512, int(len(body) * max_prompt_tokens / approx * 0.9))
+                msgs = msgs[:-1] + [
+                    {"role": msgs[-1]["role"], "content": truncate_middle(body, keep)}
+                ]
+        res = await client.chat(msgs, temperature=temperature, max_tokens=max_tokens)
+        text = res.content
+        if not text:
+            # NarrateFn 契约:失败必须 raise(narrator 会软着陆到 mechanical log)
+            raise RuntimeError(
+                f"external narrator returned empty content "
+                f"(finish_reason={res.finish_reason!r})"
+            )
+        return text
+
+    return narrate
+
+
 def engine_narrate_fn(server_manager, tokenizer, request_id: str | None = None,
                       max_prompt_tokens: int = 0):
     """在当前 rollout engine 上做单轮轨迹叙述；不假设 vLLM 私有接口。

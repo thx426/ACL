@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import re
 
 from .types import inject_guidance
@@ -64,12 +65,19 @@ def configure_episode_caps(
     第三参强制传(2026-08-08 CD-006 P0:`episode.max_tokens_per_turn` 曾是
     dead config——键读得到、无注入点,消费方一直用硬编码 2048,用户
     2026-08-07「2048→4096」裁定从未生效。可选参数会重演同型事故,故不设
-    默认值,新调用点必须显式给全三项)。"""
+    默认值,新调用点必须显式给全三项)。
+
+    2026-08-13 用户裁定放开 `turns > steps` 为 `turns >= steps`:原不等式
+    强制留 format-failure slack,而裁定明确「不管是不是有效工具格式调用,
+    总的轮次就是 30 轮」——slack 本身正是被推翻的对象。turns == steps 即
+    「无效轮与有效轮共享同一预算」,是合法配置形态(依据:classic ALFWorld
+    step0 val 274 条实测,60 轮档下废轮占总轮次 22.7%、p75 达 21 轮)。
+    turns < steps 仍然非法(环境步预算永远吃不满,是配置笔误)。"""
     global MAX_ENV_STEPS, MAX_ASSISTANT_TURNS, GEN_MAX_TOKENS_PER_TURN
-    if max_env_steps < 1 or max_assistant_turns <= max_env_steps:
+    if max_env_steps < 1 or max_assistant_turns < max_env_steps:
         raise ValueError(
             f"episode caps invalid: max_env_steps={max_env_steps}, "
-            f"max_assistant_turns={max_assistant_turns} (need >=1 and turns > steps)"
+            f"max_assistant_turns={max_assistant_turns} (need >=1 and turns >= steps)"
         )
     if max_tokens_per_turn < 1:
         raise ValueError(
@@ -85,18 +93,89 @@ def configure_episode_caps(
 # 无关的输出协议(<reasoning>/<action> 契约、解析、通用格式提醒)。
 # executor 提示词一律经 adapter.executor_scaffold() 获取。
 
+# 推理标签 —— 跨 benchmark 的输出协议面,单一真源 -----------------------------
+# 2026-08-16 用户裁定:全线弃用 `<think>`,统一 `<reasoning>`。
+#
+# 动因(实测取证 scripts/probe_think_tags.py + probe_strip_scope.py,
+# Qwen2.5-7B-Instruct vs Qwen3.6-35B-A3B):
+#   1. ★ thinking-family 模板(Qwen3.5/3.6 全系,含拟用作分布干预教师的
+#      35B)渲染**历史 assistant 轮**时,把 content 截断到最后一个
+#      `</think>` 之后 —— 协议里的推理被整段静默删除。实测:
+#      `<think>X</think>\nact` → `act`;单独一个 `</think>` 也触发;
+#      `<reasoning>` / `<thought>` 不受影响。只剥 assistant 历史轮
+#      (末轮 / user 轮 / system 轮均保留)。
+#   2. 这些模板的 non-thinking 模式 = **预填空 think 块**
+#      (`assistant\n<think>\n\n</think>\n\n`),与"要模型自己写 <think>"
+#      直接打架 —— 模型会看到一个已闭合的空块再被要求写第二个。
+#   3. `<think>` 在 Qwen3.5/3.6 词表里是**特殊 token**(id 248068),在
+#      Qwen2.5 里是 3 个普通碎片 —— 同一字面在两族模型里不是同一个东西。
+#
+# 消费方在**运行时**读本模块属性(与 MAX_ENV_STEPS 同款),故 benchmark 的
+# scaffold 里凡含推理标签的,一律用下面的 helper 在调用时求值,不要固化成
+# 模块常量(`from … import X` 会绑定旧值,configure 后不更新)。
+# ⚠ ALFWorld 的 scaffold 仍是字面量 `<reasoning>` —— 与本默认值相同,故
+#   行为逐字节一致;它正在跑正式实验,不为统一而改其代码路径。
+REASONING_TAG = "reasoning"
+
+
+def rtag_open() -> str:
+    return f"<{REASONING_TAG}>"
+
+
+def rtag_close() -> str:
+    return f"</{REASONING_TAG}>"
+
+
+def reasoning_block_re() -> "re.Pattern[str]":
+    """`<tag>…</tag>` 的抓取正则(调用时按当前标签构造)。"""
+    return re.compile(
+        rf"<{REASONING_TAG}>(.*?)</{REASONING_TAG}>", re.DOTALL | re.IGNORECASE
+    )
+
+
+def configure_reasoning_tag(tag: str) -> None:
+    """安装 yaml 配置的推理标签(单一真源:configs 的 episode.reasoning_tag)。
+
+    幂等;必须在任何 adapter/runner 使用前执行(与 configure_episode_caps /
+    configure_thinking 同期)。改的是**任务表面**(system prompt / one-shot /
+    解析),⇒ 进 objective_fingerprint。
+    """
+    global REASONING_TAG, _REASONING_RE, DEFAULT_FORMAT_REMINDER
+    tag = (tag or "").strip().strip("<>")
+    if not tag or not tag.replace("_", "").isalnum():
+        raise ValueError(
+            f"episode.reasoning_tag 必须是字母数字标识符,得到 {tag!r}"
+        )
+    if tag.lower() == "think":
+        # 不禁止(复现历史 run / 与相关工作逐字对拍时需要),但必须显式且响亮。
+        logging.getLogger(__name__).warning(
+            "reasoning_tag=think:thinking-family 模板会剥离历史 assistant 轮的 "
+            "<think> 块(推理静默丢失),且与其 non-thinking 预填空块冲突。"
+            "仅用于复现历史 run 或与相关工作逐字对拍。"
+        )
+    REASONING_TAG = tag
+    _REASONING_RE = reasoning_block_re()
+    DEFAULT_FORMAT_REMINDER = _default_format_reminder()
+
+
 # Assistant output parsing --------------------------------------------------
 
 _ACTION_RE = re.compile(r"<action>(.*?)</action>", re.DOTALL | re.IGNORECASE)
 _REASONING_RE = re.compile(r"<reasoning>(.*?)</reasoning>", re.DOTALL | re.IGNORECASE)
 
+def _default_format_reminder() -> str:
+    return (
+        "(Your reply had no <action>...</action> block — respond "
+        f"with {rtag_open()}...{rtag_close()} then "
+        "<action>one command</action>.)"
+    )
+
+
 #: 通用格式提醒(输出协议自身的内容,无环境语感)。benchmark 可在
 #: adapter.format_reminder() 里加环境习语前缀(如 ALFWorld 的
 #: "Nothing happens. " 开头),使提醒读起来像一次正常环境响应。
-DEFAULT_FORMAT_REMINDER = (
-    "(Your reply had no <action>...</action> block — respond "
-    "with <reasoning>...</reasoning> then <action>one command</action>.)"
-)
+#: 随 configure_reasoning_tag 重建;默认值与历史逐字节一致。
+DEFAULT_FORMAT_REMINDER = _default_format_reminder()
 
 
 def parse_action(assistant_text: str) -> str | None:

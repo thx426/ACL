@@ -136,6 +136,18 @@ def truncate_observation(output: str) -> str:
     )
 
 
+def _parse_env(spec: str) -> dict | None:
+    """``K=V,K2=V2`` → dict;空串/无等号项忽略。值里允许含 ``=``(只切首个)。"""
+    env = {}
+    for kv in (spec or "").split(","):
+        kv = kv.strip()
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            if k.strip():
+                env[k.strip()] = v.strip()
+    return env or None
+
+
 def format_error_message(error: str) -> str:
     return _FORMAT_ERROR_TEMPLATE.replace("{{error}}", error)
 
@@ -278,20 +290,56 @@ class TerminalTaskAdapter:
         return "terminal"
 
     @property
+    def image(self) -> str:
+        """该任务的容器镜像。
+
+        两种语料的环境交付方式不同,故镜像来源分两档:
+        * **TMax-15K**(训练语料):共享胖基底 + per-task 增量快照 ⇒ 全语料同一
+          个 `cfg.image`,差异在快照里。
+        * **Terminal-Bench**(测试集):官方就是逐任务一个镜像
+          (`environment/Dockerfile`,基底各异),没有共享基底可言 ⇒ 镜像名随
+          数据行走(`extra_info.image`),由 build_tb_dataset 写入。
+        缺省回落 `cfg.image`,故 TMax 侧零行为变化。
+        """
+        return str(self._item.get("image") or self._cfg.image)
+
+    @property
     def initial_obs(self) -> str:
         return str(self._item["user_prompt"])
 
     # ------------------------------------------------------------- protocol
 
     def task_brief(self) -> str:
+        """给 researcher 的任务简介。
+
+        **代词消歧是刚需(2026-08-11 实测)**:TMax 的任务说明书是**以第二
+        人称写给 executor 的**("You are tasked with fixing…"),而终端域的
+        说明书长达 3.4-6.5k 字符 —— 实测占 researcher system prompt 的
+        **44%**,是角色段(4.9%)的 9 倍,且位置更靠后(recency)。裸嵌进去
+        会让两个 "you" 打架:角色段说"你是研究员,从不亲自操作环境",说明书
+        说"你要去修这个 pipeline"。后果实测可见:9B 每个会话都有 1-2 轮去调
+        不存在的 `bash` 工具(6 会话 10 个废轮),把自己当成了 executor。
+        ALFWorld 不暴露此问题(任务描述仅一句话),故这是**终端域特有的接入
+        适配**,在 adapter 侧处理,通用 prompts.py 零改动。
+        """
         return (
             "Environment: a Linux terminal sandbox (Ubuntu). The executor "
             "solves a coding/ops task by issuing bash commands through the "
             "bash(command) tool, one command per turn; cd/export persist "
             "between turns (persistent shell). It submits by running "
             f"`echo {SUBMIT_MARKER}`.\n\n"
-            "Exactly what the executor sees at episode start:\n"
-            f"{self.initial_obs}\n\n"
+            "The block below is the task statement **handed to the executor**, "
+            "quoted verbatim. It is written in the second person addressing "
+            "the EXECUTOR: every \"you\"/\"your\" inside the block refers to "
+            "the executor, never to you. You do not carry out any of these "
+            "instructions yourself — you study them, then dispatch the "
+            "executor to attempt them.\n"
+            "<<<EXECUTOR_TASK_STATEMENT\n"
+            f"{self.initial_obs}\n"
+            "EXECUTOR_TASK_STATEMENT>>>\n\n"
+            "(End of the executor's task statement. You are the RESEARCHER "
+            "again: your only actions are the research instruments — you have "
+            "no shell of your own.)\n\n"
             "Evaluation: binary — hidden tests run only after the executor "
             "submits; no submission means score 0 (no partial credit). "
             f"Episode step budget: {protocol.MAX_ENV_STEPS} tool calls; "
@@ -331,7 +379,7 @@ class TerminalTaskAdapter:
                 # 快照与 docker 同在宿主 ⇒ bind-mount,客户端零传输
                 vols = {str(snap): {"bind": _SNAP_IN_CONTAINER, "mode": "ro"}}
             return DockerSandbox(
-                image=cfg.image,
+                image=self.image,
                 task_id=self.task_id,
                 cpus=cfg.pod_cpu,
                 memory=cfg.pod_memory,
@@ -340,11 +388,19 @@ class TerminalTaskAdapter:
                 run_label=cfg.run_label,
                 pool_size=max(16, cfg.spawn_concurrency),
                 volumes=vols,
+                # 逐 episode 注入的环境变量(terminal.container_env)。TB 判分
+                # 用 `uvx -p 3.13 -w pytest…`,uv 默认从 github.com 取 Python
+                # standalone 与包 —— GitHub 在 162 不可达,不注入国内镜像则**每个
+                # TB 任务 reward 恒 0**(2026-08-12 golden 实测:官方参考解也 0 分;
+                # 注入后同一任务 reward=1)。TMax 任务不消费,置空即原行为。
+                environment=_parse_env(cfg.container_env),
+                # github.com → 127.0.0.1:让注定失败的 curl 秒退而非等 129s 超时
+                extra_hosts=_parse_env(cfg.container_hosts),
             )
         return CloudSandbox(
             kubeconfig=cfg.kubeconfig,
             namespace=cfg.namespace,
-            image=cfg.image,
+            image=self.image,
             image_pull_secret=cfg.image_pull_secret,
             cpu=cfg.pod_cpu,
             memory=cfg.pod_memory,
@@ -536,7 +592,7 @@ class TerminalEnvFactory:
             raise ValueError(
                 f"terminal config incomplete (backend={cfg.backend}): {missing} "
                 "required (set TERMINAL_TASK_DATA / TERMINAL_KUBECONFIG / "
-                "TERMINAL_IMAGE,或 backend=docker 时设 DOCKER_HOST)"
+                "TERMINAL_IMAGE; with backend=docker set DOCKER_HOST instead)"
             )
         if not Path(cfg.task_data_root).is_dir():
             raise ValueError(
@@ -553,9 +609,9 @@ class TerminalEnvFactory:
             idx = Path(cfg.snapshot_index)
             if not idx.is_file():
                 raise ValueError(
-                    f"terminal.snapshot_index 不存在: {idx}(在 docker 宿主上跑 "
-                    "`ls <snapshot_root>/*.tgz | xargs -n1 basename | sed s/.tgz//` "
-                    "生成后传到客户端)"
+                    f"terminal.snapshot_index not found: {idx} (generate it on the docker "
+                    "host with `ls <snapshot_root>/*.tgz | xargs -n1 basename | "
+                    "sed s/.tgz//` and copy it to the client)"
                 )
             self.snapshot_ids = {
                 ln.strip() for ln in idx.read_text().splitlines() if ln.strip()

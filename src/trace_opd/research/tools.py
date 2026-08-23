@@ -127,9 +127,16 @@ class ToolRouter:
                 return self._fetch_raw(call.arguments)
             if call.name == "finalize":
                 return self._finalize(call.arguments)
+            # 角色纠正而非单纯报错:实测(2026-08-11,终端域 9B)调错工具
+            # 几乎总是同一种——模型把自己当成 executor 去调环境工具(`bash`)。
+            # 只说"未知工具"不纠正身份,模型下一轮还会再犯(每会话 1-2 个废轮)。
             return (
-                f"Unknown tool '{call.name}'. Available tools: run_experiment, "
-                "fetch_raw, finalize."
+                f"Unknown tool '{call.name}' — you are the RESEARCHER, not the "
+                "executor. You have no environment access of your own: you "
+                "cannot run commands, read files, or edit anything directly. "
+                "To make something happen in the environment, dispatch the "
+                "executor with run_experiment(guidance=...) and read what comes "
+                "back. Available tools: run_experiment, fetch_raw, finalize."
             )
         except Exception as err:  # noqa: BLE001 — tool faults must not kill the session
             return f"TOOL ERROR ({call.name}): {type(err).__name__}: {err}"

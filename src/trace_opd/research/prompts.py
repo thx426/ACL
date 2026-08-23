@@ -81,11 +81,45 @@ spending every experiment.
 # +60pp):verified solution 一节不再是必须——只有会话内真有成功才写;
 # 零正例改写"理解+已排除方向 / 失败模式与教训",并显式禁止 verified 断言。
 DOC_RULES_TEMPLATE = """\
-Markdown, at most {doc_max_words} words. The section layout depends on what
-your experiments ACTUALLY verified — never present an approach as verified,
-confirmed, or working unless at least one of your own runs succeeded with it.
+Markdown, at most {doc_max_words} words.
 
-IF at least one of your runs succeeded, write exactly these three sections:
+=== READ THIS BEFORE YOU WRITE ANYTHING: THE INFORMATION-STATE RULE ===
+You saw this environment through many episodes. The executor starts each
+episode BLIND: it has the task statement and nothing else, and everything it
+knows it must obtain with its own actions. A document that hands over findings
+the executor cannot see for itself teaches it to act on information it does not
+have — it stops looking, and when your finding is stale, partial, or wrong (you
+observed a few runs; the environment may differ) it now acts confidently on
+something false. A half-remembered secret ("the token is X", "the flag is
+roughly Y") is worse than no secret at all.
+
+So the document is EXACTLY the two sections named below and NOTHING ELSE.
+Do not append a third section under any name — not "Facts", not "Notes", not
+"Reusable Notes", not "Reference", not "Environment", not "Key Details", and
+not a closing bullet list of what you found. If you catch yourself starting a
+bullet list of paths, file names, flags, tokens, signatures, option lists, or
+constants, stop: that list is the failure mode this rule exists to prevent.
+
+Where such a detail genuinely matters, convert it into the act of finding it:
+  BAD  — "The header is at /app/foo/foo.h; the entry point is
+          double bar(const char*, int*); the API token is Bearer abc-123;
+          supported operators are + - * / ^"
+  GOOD — "WHEN you need the header and the entry signature DO locate the header
+          first (a find over the source tree) and read the declaration out of it
+          rather than assuming a name — runs that guessed the signature failed
+          to compile. WHEN an endpoint rejects your request DO look for the
+          credential where the service reads it from, rather than assuming a
+          literal value."
+Naming a path or symbol inside a WHEN/DO step is fine when the step also tells
+the executor how to confirm it there and then. Naming it as a standalone fact
+is not.
+
+=== THE TWO SECTIONS ===
+The layout depends on what your experiments ACTUALLY verified — never present
+an approach as verified, confirmed, or working unless at least one of your own
+runs succeeded with it.
+
+IF at least one of your runs succeeded, write exactly these two sections:
 
 # Understanding & Approach
 What this task requires and the way to solve it that a successful run
@@ -95,11 +129,8 @@ verified.
 Observed error patterns -> how to recognize each -> what to do; mark which
 remedies you verified by experiment.
 
-# Facts & Reusable Notes
-Verified environment facts and transferable tips.
-
 IF none of your runs succeeded (zero successes), you have no verified
-solution and must not invent one — write exactly these three sections:
+solution and must not invent one — write exactly these two sections:
 
 # Current Understanding & Ruled-Out Directions
 What the task appears to require, what you tried, and which directions your
@@ -109,14 +140,17 @@ runs ruled out (with the observed evidence for each).
 Observed error patterns -> how to recognize each -> what you would try next
 and why, marked as untested.
 
-# Facts & Reusable Notes
-Directly observed environment facts only.
-
 Write task-anchored, situation-level knowledge: "WHEN <observable
 situation> DO <specific action pattern>", with the task's real action
-vocabulary and real observed symptoms. Do not write abstract slogans; do not paste a long verbatim
-action sequence as the whole answer; do not mention this training or
-tooling context inside the document."""
+vocabulary and real observed symptoms. Anchor every claim to what the
+executor can observe in-episode. Do not write abstract slogans; do not paste a
+long verbatim action sequence as the whole answer; do not mention this
+training or tooling context inside the document.
+
+Before you submit, re-read your draft once and check: does it have exactly the
+two required sections and no third one? Does any line state an environment
+detail as a bare fact instead of telling the executor how to find it? If yes,
+rewrite that line as a WHEN/DO step or drop it."""
 
 GT_BLOCK_TEMPLATE = """
 === REFERENCE SOLUTION (privileged — the executor NEVER sees this) ===

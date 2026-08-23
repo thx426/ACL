@@ -94,7 +94,7 @@ def _cached(key: str, d: Path, builder):
     return out
 
 
-def _meta_cached(path: str) -> dict:
+def _meta_cached(path: str) -> dict | None:
     """单文件元数据 memo(按 mtime+size 失效)。
 
     一条 rollout 写完就不再变,进行中的 step 只是追加新文件 —— 但整步聚合的
@@ -111,8 +111,15 @@ def _meta_cached(path: str) -> dict:
         hit = _meta_cache.get(path)
         if hit and hit[0] == key:
             return hit[1]
-    with open(path) as fh:
-        meta = _meta_of(json.load(fh))
+    try:
+        with open(path) as fh:
+            meta = _meta_of(json.load(fh))
+    except (json.JSONDecodeError, OSError, ValueError):
+        # 盯在跑的 run 时必然会撞上**正在写入的半条 rollout**(0 字节或截断
+        # JSON):2026-08-18 实证——api/run 遍历全部 step 目录,单个坏文件就让
+        # 整个首页 500,前端表现为"看不见任何数据"。返回 None 让调用方跳过
+        # (不计进分母,避免读数被半写文件稀释);不进缓存,写完后自然被重读。
+        return None
     with _lock:
         _meta_cache[path] = (key, meta)
         while len(_meta_cache) > _META_CACHE_MAX:
@@ -185,6 +192,8 @@ def api_run() -> dict:
                     tot = dict(n=0, won=0, seen_n=0, seen_w=0, un_n=0, un_w=0)
                     for f in fs:
                         j = _meta_cached(f)
+                        if j is None:      # 半写文件:跳过,下次刷新再计
+                            continue
                         tot["n"] += 1
                         tot["won"] += bool(j.get("won"))
                         if "unseen" in (j.get("split") or ""):
@@ -205,7 +214,7 @@ def api_run() -> dict:
                 def sb(fs, name=d.name):
                     # 聚合口径唯一定义在 M.build_step_entry(导出器同源);
                     # _meta_of 的轻量 dict 覆盖它消费的全部键。
-                    metas = [_meta_cached(f) for f in fs]
+                    metas = [m for m in (_meta_cached(f) for f in fs) if m is not None]
                     return M.build_step_entry(
                         int(name.split("_")[1]), name, metas, CONFIG
                     )
@@ -246,7 +255,7 @@ def api_step(dirname: str) -> dict:
         return {"error": "no such step"}
 
     def lb(fs):
-        return {"trajs": [_meta_cached(f) for f in fs]}
+        return {"trajs": [m for m in (_meta_cached(f) for f in fs) if m is not None]}
     return _cached("list:" + dirname, d, lb)
 
 

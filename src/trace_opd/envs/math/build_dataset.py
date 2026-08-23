@@ -31,7 +31,26 @@ from pathlib import Path
 import pandas as pd
 
 from ...core import protocol
-from .adapter import SYSTEM_PROMPT, initial_obs_of
+from .adapter import (
+    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_TEXT,
+    initial_obs_of,
+    system_prompt_single,
+)
+
+#: parquet 的 `prompt` 字段按协议选 scaffold。
+#: ⚠ 参数真值分层提醒(记忆 config-vs-manifest-truth):**运行时并不读这个
+#: 字段** —— executor 的 system prompt 一律经 adapter.executor_scaffold()
+#: 现取(core/episode.py:107、train/agent_loop.py:519)。它只是 schema 记录
+#: 与 verl 侧的长度维度。因此换协议**不需要重建 parquet**;这里对齐只是
+#: 为了让事后读 parquet 的人不被旧 scaffold 误导。
+#: single 档的 scaffold 含推理标签 ⇒ **调用时求值**(标签由
+#: protocol.configure_reasoning_tag 在入口注入,模块常量会绑定旧值)。
+_SCAFFOLDS = {
+    "fncall": lambda: SYSTEM_PROMPT,
+    "text": lambda: SYSTEM_PROMPT_TEXT,
+    "single": system_prompt_single,
+}
 
 _DAPO_PREFIX = (
     "Solve the following math problem step by step. The last line of your "
@@ -53,7 +72,8 @@ def strip_dapo_template(content: str) -> str:
     return content[len(_DAPO_PREFIX):-len(_DAPO_SUFFIX)].strip()
 
 
-def _row(problem: str, ground_truth: str, task_id: str, task_type: str, split: str) -> dict:
+def _row(problem: str, ground_truth: str, task_id: str, task_type: str, split: str,
+         protocol_name: str = "fncall") -> dict:
     extra_info = {
         "task_id": task_id,
         "task_type": task_type,
@@ -64,7 +84,7 @@ def _row(problem: str, ground_truth: str, task_id: str, task_type: str, split: s
     extra_info["initial_obs"] = initial_obs_of(extra_info)
     return {
         "prompt": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": _SCAFFOLDS[protocol_name]()},
             {"role": "user", "content": protocol.truncate_obs(extra_info["initial_obs"])},
         ],
         "data_source": "math" if split == "train" else f"math/{task_type}",
@@ -74,7 +94,7 @@ def _row(problem: str, ground_truth: str, task_id: str, task_type: str, split: s
     }
 
 
-def build_train(src: str) -> list[dict]:
+def build_train(src: str, protocol_name: str = "fncall") -> list[dict]:
     from datasets import load_dataset  # noqa: PLC0415
 
     ds = load_dataset(src, split="train", streaming=True)
@@ -91,7 +111,8 @@ def build_train(src: str) -> list[dict]:
         gt = str(rec["reward_model"]["ground_truth"]).strip()
         if not gt:
             continue
-        rows.append(_row(problem, gt, f"dapo/{h[:12]}", "math", "train"))
+        rows.append(_row(problem, gt, f"dapo/{h[:12]}", "math", "train",
+                         protocol_name))
     print(f"[math] train: scanned {scanned} rows -> {len(rows)} unique problems")
     return rows
 
@@ -125,7 +146,7 @@ def _extract_answer(bench: str, rec: dict) -> str | None:
     return None
 
 
-def build_valid() -> list[dict]:
+def build_valid(protocol_name: str = "fncall") -> list[dict]:
     from datasets import load_dataset  # noqa: PLC0415
 
     rows: list[dict] = []
@@ -141,7 +162,8 @@ def build_valid() -> list[dict]:
             if gt is None or not gt:
                 skipped += 1
                 continue
-            rows.append(_row(problem, gt, f"{bench}/{i}", bench, "valid"))
+            rows.append(_row(problem, gt, f"{bench}/{i}", bench, "valid",
+                             protocol_name))
             kept += 1
         print(f"[math] valid/{bench}: kept {kept}, skipped {skipped}")
     return rows
@@ -152,20 +174,25 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--train-src", default="BytedTsinghua-SIA/DAPO-Math-17k")
     ap.add_argument("--skip-train", action="store_true")
+    ap.add_argument("--protocol", default="fncall",
+                    choices=sorted(_SCAFFOLDS),
+                    help="写进 parquet prompt 字段的 scaffold 档;运行时并不"
+                         "读它(见 _SCAFFOLDS 注释),换协议无需重建数据")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_train:
-        train_rows = build_train(args.train_src)
+        train_rows = build_train(args.train_src, args.protocol)
         pd.DataFrame(train_rows).to_parquet(out / "train.parquet")
         print(f"[math] train -> {out / 'train.parquet'} ({len(train_rows)})")
-    valid_rows = build_valid()
+    valid_rows = build_valid(args.protocol)
     pd.DataFrame(valid_rows).to_parquet(out / "valid.parquet")
     print(f"[math] valid -> {out / 'valid.parquet'} ({len(valid_rows)})")
     (out / "manifest.json").write_text(json.dumps({
         "train_src": None if args.skip_train else args.train_src,
         "dedupe": "sha1(problem) unique",
+        "protocol": args.protocol,
         "valid_sources": [(b, h, s) for b, h, s, _, _ in _VALID_SOURCES],
         "counts": {"valid": len(valid_rows)},
     }, ensure_ascii=False, indent=2), encoding="utf-8")

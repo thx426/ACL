@@ -134,12 +134,19 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--keep-unreliable", action="store_true",
                     help="保留 reward 恒零的任务(仅用于复现旧数据集或重新审计;"
-                         "正式实验一律不加 —— 用户裁定 2026-08-09)")
+                         "训练侧一律不加 —— 用户裁定 2026-08-09。经典线终评"
+                         "口径为 400 全集报数(用户裁定 2026-08-17):终评"
+                         "parquet 用 --n-train 0 --n-test 400 --keep-unreliable,"
+                         "分母对齐官方 leaderboard 与 SRL 论文)")
+    ap.add_argument("--n-train", type=int, default=200,
+                    help="划分 train 数(默认 200 = 旧行为;0 = 不产 train)")
+    ap.add_argument("--n-test", type=int, default=200,
+                    help="划分 valid 数(默认 200;400 = 全集单档)")
     args = ap.parse_args()
 
     items = load_items(args.items)
     print(f"[ssb] union: {len(items)} tasks")
-    train, test = split_seed42(items)
+    train, test = split_seed42(items, args.n_train, args.n_test)
     excluded_doc = None
     if args.keep_unreliable:
         print("[ssb] ⚠ --keep-unreliable:保留 reward 恒零任务,不得用于正式实验")
@@ -153,6 +160,9 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for split, part in (("train", train), ("valid", test)):
+        if not part:
+            print(f"[ssb] {split}: 0 tasks — skipped (empty split)")
+            continue
         rows = [make_row(it, split, args.data_root) for it in part]
         fams: dict[str, int] = {}
         n_multi = 0
@@ -168,7 +178,8 @@ def main() -> int:
         print(f"[ssb]   instruction_type: {fams}; multi-case tasks: {n_multi}")
     manifest = {
         "source_items": args.items,
-        "method": ("union -> sort(id) -> random.Random(42).shuffle -> (200, 200)"
+        "method": ("union -> sort(id) -> random.Random(42).shuffle -> "
+                   f"({args.n_train}, {args.n_test})"
                    + ("" if args.keep_unreliable
                       else " -> 剔除 reward 恒零任务(切分后剔除,故为原划分子集)")),
         "counts": {"train": len(train), "valid": len(test)},
