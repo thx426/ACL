@@ -94,7 +94,12 @@ yaml 的 `retriever_url` 仍写 162:8000,发车前:
 主口径 = 训练内 val 曲线的 avg@3@0.6(mean@3),主表取**终点步**读数;另需离线终评批补:
 1. ALF:by-family(Pick/Look/Clean/Heat/Cool/Pick2)分项 + 6-family macro-avg,seen 与 unseen
    双表(与 SEED Table 1/Table 7 同构;我们 val 上报的是 micro,macro 须由轨迹重聚合)。
-2. SQA:val_shuf2048 按 data_source 拆七集分项 + macro-avg(SEED 同构);混采 micro 同时保留。
+2. SQA:训练内 val = **val_eq320**(七源等额分层:每源 320、bamboogle 全量 125,共 2045;
+   2026-08-23 用户裁定取代旧 val_shuf2048——旧集按比例抽,bamboogle 仅 4 条/musique 108,
+   小源分项曲线纯噪声,且比例抽样与 per-source 等权 macro 口径失配;生成脚本
+   scripts/classic/make_sqa_val7.py,seed42)。verl 按 data_source 自动分列七源曲线,
+   macro=等权均值。**主表数字 = 终评跑 test.parquet 全量 51,713 条七源分项**(SEED 同口径),
+   训练内 val_eq320 只作监控曲线。
 3. WS:Score 与 Succ 双指标;另跑 SEED 同款 128-task 子集读数(供脚注直接可比)。
 4. 附带 SEED 口径组(temp0.4 单次)作对拍参考,成本低(离线)。
 终评脚本:待第一格跑完前落地(evalm/ 入口扩分项聚合;本文件先立规格)。
@@ -112,6 +117,9 @@ yaml 的 `retriever_url` 仍写 162:8000,发车前:
 
 ## 6. 变更台账
 
+- 2026-08-23(三):SQA val 抽样方案重做 —— val_eq320 七源等额(动机与规则见 §4.2);
+  指纹不变(val_files 不进指纹,实测);A800 已生成并 DRY 验证(retriever 预检如设计拦截,
+  服务未启);162 yaml 已同步、数据未生成(届时脚本一键复现)。
 - 2026-08-23(二):宿主无关化 —— 6 格 yaml 路径参数化(${TRACE_MODELS}/${TRACE_DATA},
   双语境指纹逐位复现:A800 全 6 格不变、162 复现 f2bb626e6f2d);host_{a800,162}.env 宿主档案;
   launch_classic.sh 统一发射器(吸收三域全部实战预检);watchdog_single.sh 宿主化且重启改走
