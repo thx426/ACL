@@ -1,0 +1,52 @@
+# Classic-bench SearchQA(Search-R1 口径:topk=3、max 4 次搜索;EM 二值)
+# ⚠ retriever_url 默认 8300 是错的,必须显式指 162:8000(faiss 4 卡分片服务)。
+run:
+  name: classic_searchqa
+environment:
+  name: searchqa
+episode:
+  max_env_steps: 5           # 4 次 search + submit 余量(Search-R1/SEED 口径)
+  max_assistant_turns: 8
+  max_tokens_per_turn: 1024
+searchqa:
+  retriever_url: "http://10.77.110.162:8000"
+  topk: 3
+  search_concurrency: 64
+eval:
+  response_budget: 8192
+  temperature: 0.0
+train:
+  # 仅为过 config 校验(eval 探针不消费 train 段);正式训练 config 另立
+  model_path: "/fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct"
+
+# --- researcher 探针段(Phase3 门C-R:35B 外部研究员走机制代码 research/*)---
+# 部署事实(端点/模型名)由驱动 CLI 覆盖;此处为默认值与机制参数真源。
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6                    # 终端域实测均值 3.7 次即 finalize,6 为宽松上限
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500          # 经典域任务说明短于终端域(800),500 上限
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: engine             # 离线驱动以 narrate_fn 注入 policy 叙述(engine 离线等价)
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 64
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600

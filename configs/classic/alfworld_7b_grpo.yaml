@@ -1,0 +1,88 @@
+# ALFWorld × Qwen2.5-7B-Instruct — GRPO 基线对照臂(2026-08-13)
+# train 段与机制臂逐键一致(程序化派生自 alfworld_7b_pgs.yaml,对照公平);
+# 差异仅:adv_estimator=grpo、steering/research 关、无 roles、timeout 降。
+# 消耗口径:batch 16×n8(GiGPO 同构)× total_epochs 2(用户指令,≈444 步)。
+run:
+  name: classic_alf7b_grpo
+environment:
+  name: alfworld
+episode:
+  # 2026-08-13 用户裁定:总交互轮次硬上限 30,无效格式轮同样计数。
+  # 依据同机制臂(step0 val 274 条实测,ops[11]);两臂必须逐键一致。
+  max_env_steps: 30
+  max_assistant_turns: 30
+  max_tokens_per_turn: 1024
+alfworld:
+  # 2026-08-13 用户裁定:回退 text/ReAct(<reasoning>+<action>);依据与
+  # 相关工作对照见机制臂 yaml 同位注释。两臂必须逐键一致。
+  protocol: text
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  # 双臂并行(各 4 卡)共用 64 核:每臂 gate 32,合计 boot 并发 64(压测
+  # ops[8]:单臂 512eps/gate64 load峰133;双臂各128eps/gate32 更宽裕)。
+  spawn_concurrency: 32
+eval:
+  # 30 轮档实测需求 p99=3534/max=8194(ops[11]);取 2× 余量。与机制臂同值。
+  response_budget: 16384
+  temperature: 0.0           # 训练内 val = greedy(val 口径脚注:Search-R1 同,
+  n: 1                       # GiGPO/SEED 系为 temp0.4 采样,对拍时注意)
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/train_3553.parquet
+  # 列表 ⇒ verl 逐文件分列上报(裁定①:seen/unseen 双列)
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_seen.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_unseen.parquet
+  experiment_name: classic_alf7b_grpo
+  project_name: trace_opd
+  n_gpus: 4                  # 用户指令:基线臂 4 卡(CVD 4-7)
+  rollout_tp: 1
+  train_batch_size: 16       # GiGPO 同构(16 任务 × n8 = 128 eps/step)
+  rollout_n: 8
+  agent_num_workers: 16      # 必须 == train_batch_size(同任务副本同 worker)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6                 # GiGPO 全参口径
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo            # 基线臂:纯 GRPO 底座
+  norm_adv_by_std: false     # Dr.GRPO 形态(底座裁定 IF-04;GiGPO 用 mean_std,脚注)
+  max_prompt_length: 4096    # ReAct scaffold(COMMAND_REFERENCE)+ 初始 obs ≈2k,留量
+  # Qwen2.5 max_position_embeddings=32768 是架构硬墙:prompt+response 必须
+  # ≤32768(冒烟实测 36864 被 SGLang server 启动校验拒绝)。
+  response_length: 16384     # 与 eval.response_budget 同源(30 轮档,实测 max 8194 的 2×)
+  max_token_len_per_gpu: 20480   # = max_prompt_length 4096 + response_length 16384
+  # 冒烟 v3 事故回退:关 fused kernels ⇒ logits 全量物化,per-gpu token 预算
+  # 回到历史已验证档 8192(PGS 4B 系全部 run 同值,7B vocab 152k 更大 ⇒ 只会更该保守)。
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2              # 32k 序列 / 7B / 4 卡;rmpad+FA2 profile
+  # ✗ 不可开:use_fused_kernels + fsdp2 在本 verl 版本不兼容(冒烟 v3 实证)。
+  # 本臂即首个撞上者:compute_log_prob → torch_functional.py:33 → aten.mm.default
+  # got mixed torch.Tensor and DTensor(lm_head.weight 是 fsdp2 DTensor)。
+  use_fused_kernels: false
+  rollout_max_model_len: 20480   # 同 max_token_len_per_gpu;KV cache 较 32768 降 1.6×
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 3600 # 基线无 research 段拖长
+  total_epochs: 2            # 用户指令:完整训练集 2 epochs(3553/16≈222 步/epoch)
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 3
+  val_before_train: true     # step0 基线读数
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- 基线臂:零特权信号,与 GRPO 底座逐字节一致 ----
+steering:
+  enabled: false
+  doc_source: static
+research:
+  enabled: false

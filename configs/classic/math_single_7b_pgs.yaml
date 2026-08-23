@@ -1,0 +1,186 @@
+# Math × Qwen2.5-7B-Instruct — **MENTOR 单轮档** PGS 机制臂
+# (2026-08-16 用户裁定;由 math_7b_pgs.yaml 程序化派生,除协议维度外逐键一致)
+#
+# 对齐 MENTOR(arXiv 2510.04140 / ICLR 2026,代码 commit b1cc4c6 逐行核实):
+#   单轮 completion,无工具/无沙箱/无 observation(EasyR1 单轮 RLHF 数据流)
+#   system prompt 逐字移植(其 verl/utils/dataset.py:174-176 硬编码,不在
+#     jinja 里 —— train.sh 传的 no.jinja 是空模板;论文 Appx C p18 复述)
+#   <think></think> + \boxed{} 两标签;reward = 0.9·acc + 0.1·format
+#   单轮 8192 token(其 train.sh data.max_response_length)
+#   训练 temperature 1.0 / batch 128 × n8 / lr 1e-6(其 config.yaml + 论文)
+#
+# 刻意不对齐(用户裁定,记账):基座 Instruct(非 Base)/ 数据 DAPO-17k+六源
+#   (非 MATH L3-5+MATH-500,与 TIR 多轮臂同源以便跨协议对照)/ 判分
+#   math-verify 子进程(非 mathruler)/ 评测 avg@3 @0.6(非 greedy@1 @0)
+#
+# 与 math_7b_pgs.yaml(TIR 多轮档)的**全部**差异 = 协议维度本身:
+#   protocol text→single, caps 6/8→1/1, 单轮 4096→8192,
+#   response 16384→8704, 相应的 token/gpu 维度, + format_weight/reward_from_score
+# 机制段(steering/research/narration)与 lr/batch/n/temp 逐键相同 ⇒
+# 跨协议对照是单变量的。
+run:
+  name: classic_math_single_7b_pgs
+environment:
+  name: math
+episode:
+  # 单轮:MENTOR 的 setting 里一次 completion 即终局。config._validate 钉死
+  # 1/1(adapter 恒 done=True,更大的 caps 不改变行为却会让配置读起来像多轮)。
+  max_env_steps: 1
+  max_assistant_turns: 1
+  max_tokens_per_turn: 8192   # = MENTOR train.sh 的 data.max_response_length
+math:
+  protocol: single            # 2026-08-16 用户裁定:MENTOR 单轮档
+  format_weight: 0.1          # MENTOR outcome:format = 9:1(其 compute_score)
+  # 单轮无工具 ⇒ run_python 不会被调用;两键留着只为 MathCfg 字段完整,
+  # 且 math-verify 判分子进程仍复用 exec_concurrency 这道并发门。
+  python_timeout_s: 30
+  exec_concurrency: 32
+eval:
+  # 单轮 ⇒ 总预算 = 单轮上限 8192 + slack(episode.py 的 budget 检查扣 64;
+  # 512 余量保证首轮能满额生成 8192)。
+  response_budget: 8704
+  # 2026-08-14 用户裁定:测试集一律 avg@3(所有任务实验通用)。
+  # temperature 必须 >0——config 校验强制(n>1 时 greedy 三次逐字节相同,
+  # avg@3 退化成 mean@1 却付 3 倍成本)。取 0.6:社区 avg@k 评测主流值,
+  # 高于 SEED 的 val temp 0.4、远低于训练 rollout 的 1.0(避免过度发散)。
+  # ⚠ 口径断裂:此前的 val 曲线是 greedy@1(GRPO 35.2→48.6),与 avg@3
+  # 不可直接比;verl 另给 best@3/worst@3,信息量高于单次 greedy。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  # schema 自带 agent_name='trace_opd' + reward_model.style='env'
+  # (build_dataset._row 原生写入,SearchQA 那次的 trainer 两字段坑已预防)
+  train_file: /fs/fast/u2021000902/wushang/data/classic_math/train.parquet
+  # val = 六源全量 1304(aime24/25/26 各30、amc 40、math500 500、olympiad 674),
+  # data_source=math/<bench> 分桶出 by-family 曲线(CD-010 裁定:全量 greedy@1)
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic_math/valid.parquet
+  experiment_name: classic_math_single_7b_pgs
+  project_name: trace_opd
+  n_gpus: 4                   # 机制臂 CVD 0-3
+  rollout_tp: 1
+  train_batch_size: 128
+  rollout_n: 8
+  agent_num_workers: 16       # batch % workers == 0;同 task 8 副本同 worker
+  ppo_mini_batch_size: 128
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false      # Dr.GRPO 形态(IF-04)
+  max_prompt_length: 4096     # 题面短(几百 tok)+ system(~700)+ doc 臂余量
+  response_length: 8704       # 与 eval.response_budget 同源
+  # format_weight>0 的前置条件:二值通道会把「答对但格式错」(0.9)判成
+  # reward 0,比 MENTOR 更严 ⇒ _validate 在 weight>0 而此键 false 时 fail loud。
+  # 开启后 won(=score>=1.0)退化为观察指标,曲线看 rollout_extra/score。
+  reward_from_score: true
+  max_token_len_per_gpu: 12800       # = prompt 4096 + response 8704
+  ppo_max_token_len_per_gpu: 12288   # 冒烟首验项(SP=2 下历史档可行)
+  log_prob_max_token_len_per_gpu: 12288
+  ulysses_sp: 2
+  use_fused_kernels: false    # 与 fsdp2 不兼容(ALFWorld 实证)
+  rollout_max_model_len: 12800
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 512   # 单轮序列短一半(8.7k vs 16k),KV 预算回到 512
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400  # > research.session_timeout_s(2400)
+  total_epochs: 2             # ≈270 步
+  # 270 步的短跑:test_freq 10 ⇒ 27 个 val 点(1304 条约 5 分钟/次);
+  # save_freq 20 ⇒ 13 次存盘、滚动保 3。(2026-08-13 用户确认)
+  test_freq: 10
+  save_freq: 20
+  max_ckpt_to_keep: 1        # 用户裁定:只留最新一个(2026-08-14 磁盘配额
+                              # 爆炸事故——3×86G/臂 常驻撑爆;滚动逻辑本身正常)
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(与 SearchQA/ALFWorld 正式 run 同配;仅退火期按总步数缩放)----
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 285   # α cosine 周期 = 总步数 270 × 1.05(≈batch 128 × 2 epochs);
+  # ★ 必须 ≥ 实际总步数:steered_retired 判据是 gs >= decay_steps,
+  # 周期短于总步数会在中途**阶跃停产** steered 臂(256 行→0),
+  # 同时突变 LOO 基线样本数与有效 batch ⇒ 等效学习率跳变。
+  # 5% 余量吸收步数估算误差(cosine 末端极平,末尾 α≈0.006≈0)。
+  # 2026-08-17 用户裁定,取代此前全线沿用的 2/3 约定。
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0     # v3.4 warmup 自标定(step1 哨兵零干预)
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5       # 每组 4 steered + 4 bare(组内配对对照)
+
+# ---- 在线研究员(35B 外部;gt_text=None,答案零进 researcher)----
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: external           # 与 SearchQA 同裁定(2026-08-13)
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  narrator:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 512
+    temperature: 0.3
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128      # = worker 数 × 每 worker task 数(零排队,SearchQA 实证)
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

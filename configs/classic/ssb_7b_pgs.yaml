@@ -1,0 +1,193 @@
+# SpreadsheetBench(SRL train)× Qwen2.5-7B-Instruct — PGS 机制臂(2026-08-17 起草)
+# 第四域引入(用户三裁定 2026-08-17):①探针先行,正式 run 排 P0 后;
+# ②协议直接 text 化 + one-shot(不做 FC 对照);③终评 400 全集报数。
+# 规划真源:experiments/bench_env/docs/2026-08-17-ssb-classic-integration-plan.md
+#
+# 数据(SRL 引入定稿 2026-08-11,A800 重建):
+#   train = Spreadsheet-RL(arXiv:2605.22642)excelforum 四级质量门后 5,373
+#           (oracle_unreliable 剔除按 **A800 LO 7.6.7.2 重判**清单,非 162 版)
+#   val   = SSB verified-400 全集 + SRL held-out 123(data_source 分组报数;
+#           400 里 28 个 golden 过不了 LO 重算链 ⇒ 监控曲线自带 ~7% 噪声地板,
+#           与终评同构——终评口径=400 全集(用户裁定,分母对齐官方与 SRL 论文))
+#   ⚠ verified-400 全库单 case、SRL train 单 case ⇒ soft ≡ hard,reward 二值,
+#     与 SRL 论文的 Pass@1 全区域精确匹配语义天然同口径。
+# 对拍锚(唯一同域 RL 报告,SRL 论文自报):Qwen3-4B-Thinking 19.3→23.4
+#   (60 步 RL +4.1pp)/ SRL-8B 16.7→22.3(35 步 +5.6pp)。基座不同须脚注。
+run:
+  name: classic_ssb7b_pgs
+environment:
+  name: spreadsheetbench
+episode:
+  max_env_steps: 20           # 用户裁定 2026-08-07 的 SSB 默认(动作=代码执行/提交)
+  max_assistant_turns: 24     # 步预算 + 4 轮格式失败余量
+  max_tokens_per_turn: 2048   # 2026-08-17 用户裁定 4096→2048:smoke 实测
+                              # p50 episode 全程仅 413 tok,而长尾每轮打满
+                              # 4096 是尾部墙钟主项之一;2048 对中位形态零影响   # SSB 每轮写 openpyxl 脚本,远长于动作型域
+                              # (旧 ssb-9b run 实测档;text 档思考正文+代码同轮)
+  session_token_budget: 24576 # executor 流预算(旧 run 经验值;冒烟后按分布回调)
+spreadsheetbench:
+  # 2026-08-17 用户裁定:直接 text 化(```python 围栏 + ```output 回注 +
+  # ```submit 终局,one-shot 内嵌 system)。依据:Math 域同为写代码任务实测
+  # FC→text +21.6pp;SQA 域 Qwen2.5 FC 违规率 11.8%;大段代码进 JSON 转义
+  # 是 Qwen2.5 已证痛点。经典四域(ALF/WS/SQA/Math)已全线 text,本域补齐。
+  # 协议进指纹(config.py objective_fingerprint 条件追加)。
+  protocol: text
+  data_root: "${SSB_DATA}"    # 单根:spreadsheet/(SSB 400)与 excelforum/(SRL)并排
+  exec_concurrency: 32        # run_python 子进程全局并发门(per-worker 折算)。
+                              # 旧 run 单臂 8 卡裁定 64=物理核;经典双臂同机
+                              # (pgs+grpo 各 4 卡)⇒ 各 32,合计恰满。CPU 饥饿
+                              # 教训:环境子进程不得饿死推理引擎。
+  python_timeout_s: 30    # 2026-08-17 用户裁定 120→30:smoke 实测长尾 =
+                          # 死循环型代码每轮跑满 timeout(370-43 逐轮 100%
+                          # 烧核实证);合法 openpyxl 操作绝大多数 <5s,
+                          # 30s 误杀率见离线重放普查(runbook 登记)
+  recalc_timeout_s: 120       # 评分前 LibreOffice 公式重算(缺后端装配期即死;
+                              # A800 = /fs/.../opt/libreoffice7.6,SSB_SOFFICE 注入)
+  obs_max_chars: 3500
+eval:
+  response_budget: 24576      # 训评同构:与 episode.session_token_budget 一致
+  # 测试集一律 avg@3(用户裁定 2026-08-14 全任务通用);n>1 必须 temp>0。
+  # SSB reward 二值且起点未知,3 次采样给 0/.33/.67/1 分辨率。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  # parquet 必带 trainer 两字段(agent_name='trace_opd' + reward_model.style=
+  # 'env');build_dataset.make_row 已内建(SQA 冒烟教训预防)。
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/train_srl.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/test_ssb400.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/val_srl123.parquet
+  experiment_name: classic_ssb7b_pgs
+  project_name: trace_opd
+  n_gpus: 4
+  rollout_tp: 1
+  # batch 64(× n8 = 512 eps/步):SSB episode 重(10+ 轮 python 执行 + LO 重算),
+  # 5,373 训练集 ⇒ 84 步/epoch × 2 epochs = 168 步,落 SRL(35-60 步即报增量)
+  # 与 SEED 惯例(150)之间。⚠ 待冒烟墙钟定稿(备选 128 对齐他域,则 84 步
+  # ×2ep,decay_steps 同步改)。
+  train_batch_size: 64
+  rollout_n: 8                # 组内 4 steered + 4 bare(steered_fraction 0.5)
+  agent_num_workers: 16       # SQA 教训:worker 数决定 researcher/exec 并发折算
+  ppo_mini_batch_size: 64
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false      # Dr.GRPO 形态(底座裁定 IF-04)
+  max_prompt_length: 8192     # SSB initial_obs 含 workbook 预览,比动作域长
+  response_length: 24576      # 20 轮 ×(代码+观察)经验上界(旧 run 同档)
+  max_token_len_per_gpu: 16384   # (8192+24576)/sp2
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  use_fused_kernels: false    # fsdp2 不兼容(ALFWorld 冒烟实证);Qwen2.5 词表小
+  rollout_max_model_len: 32768
+  rollout_max_num_batched_tokens: 32768   # SSB context 随轮次增长快(SQA 同款裁定)
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256   # 512 eps/步、序列长,并发档保守起步
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400  # 必须显著 > research.session_timeout_s(2400)
+  total_epochs: 2             # ≈168 步(84 步/epoch × 2);SSB 域 RL 饱和快
+                              # (SRL 官方 35-60 步),2 epochs 留足余量
+  test_freq: 20               # 单次 val = (400+123)×3 ≈ 1569 episodes,SSB
+                              # episode 贵 ⇒ 点距放宽(168 步 ⇒ ~9 个 val 点)
+  save_freq: 20
+  max_ckpt_to_keep: 1         # 用户硬要求(磁盘配额事故)
+  val_before_train: true      # step0 基线读数(= bare 探针的正式对照锚)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(采样端特权;损失 = native GRPO,无教师/蒸馏/critic)----
+# 机制真值沿革:v3.3 asym + v3.4 熵门自标定,与 ALFWorld/WebShop/SQA 正式
+# run 逐键同构。SSB 特有风险预注册(规划 §六):答案密度型 doc 的特权行为
+# 克隆(ssb_4b_selfres_engine 双降三因子之一;v3.4 已根治门率因子,本域
+# 观测面 = 快提交率分臂 / val 校准差 / doc 答案密度审计 / 干预词数曲线;
+# 停手判据 = val 连续 3 点下行 且 快提交率分臂裂开)。
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0    # 探针关(2026-08-17 用户裁定,全线默认)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 180  # α cosine 周期 = 总步数 168 × 1.05(≈177,取整 180)。
+  # ★ 必须 ≥ 实际总步数(2026-08-17 用户裁定,取代 2/3 约定):周期短于总步数
+  # 会中途阶跃停产 steered 臂(组内 4+4 → 0+8),突变 LOO 基线样本数与有效
+  # batch ⇒ 等效学习率跳变。batch 若冒烟后改 128(84 步),本值改 90。
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0     # v3.4 warmup 自标定(占位常数已禁——engine 双降教训)
+  entropy_theta_update: direct
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+
+# ---- 在线研究员(35B 外部;162 双端点;gt 恒 None:golden=测试答案本体)----
+# SSB researcher 会话重(task_brief + 实验轨迹含代码与表格观察),预算取
+# SQA 档上限;C-R 探针实测后回调。
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: external           # SQA 裁定同款:narration 走 35B,吞吐还给 rollout
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  narrator:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # 2026-08-17 用户裁定:35B 迁 A800 本机卡 1/2/3(TP1×3 端点),不再用 162
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128      # narration 突发大但单卡端点 KV 小;超出部分服务端排队(慢非坏)
+    temperature: 0.3
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  researcher:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # 2026-08-17 用户裁定:35B 迁 A800 本机卡 1/2/3(TP1×3 端点),不再用 162
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 96       # 3 端点 × max_num_seqs 32 = 96 服务位;batch64 的 64 会话/步 < 96 零排队
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

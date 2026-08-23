@@ -1,0 +1,90 @@
+# ALFWorld × Qwen2.5-3B — **纯 GRPO 基线臂**(2026-08-16 用户指令)
+#
+# 由 alfworld_3b_pgs.yaml 程序化派生(scripts/derive_alf3b_grpo.py,锚点唯一即中止):
+# train 段的 batch/n/lr/caps/model/数据/eval/存盘**逐键不动**,与 PGS 臂的差异
+# 恰好等于机制本身 —— adv_estimator / steering / researcher-doc 三项。
+#
+# 对照对象:classic_alf3b_pgs(CVD 4-7,同时在跑)。
+# 取代原 SEED loss 对照臂(classic_alf3b_seed,2026-08-16 19:30 停于 step 43;
+# 其 val@0/20/40 = seen 3.57→26.43→30.24% 保留可引用)。
+#
+run:
+  name: classic_alf3b_grpo
+environment:
+  name: alfworld
+episode:
+  # 与 7B 臂同(2026-08-13 用户裁定:总交互轮次硬上限 30,无效格式轮同样计数)。
+  max_env_steps: 30
+  max_assistant_turns: 30
+  max_tokens_per_turn: 1024
+alfworld:
+  protocol: text
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  # 双臂并行(各 4 卡)共用 64 核 ⇒ 每臂 32。
+  spawn_concurrency: 32
+eval:
+  response_budget: 16384
+  # ★ 2026-08-13 用户裁定:所有任务的测试集一律 avg@3(n>1 必须配 temp>0)。
+  # 与 7B 臂的 greedy@1 读数口径断裂,跨 run 比较须标注。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-3B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/train_3553.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_seen.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_unseen.parquet
+  experiment_name: classic_alf3b_grpo
+  project_name: trace_opd
+  n_gpus: 4                  # CVD 0-3(PGS 机制臂占 4-7)
+  rollout_tp: 1
+  train_batch_size: 16       # GiGPO 同构(16 任务 × n8 = 128 eps/step)
+  rollout_n: 8
+  agent_num_workers: 16      # 必须 == train_batch_size(同任务副本同 worker)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo        # 基线臂:纯 GRPO 底座
+  norm_adv_by_std: false
+  max_prompt_length: 4096
+  # Qwen2.5 max_position_embeddings=32768 是架构硬墙:prompt+response ≤32768。
+  # 3B 与 7B 同为 32768(已实测 config.json),故序列档逐项沿用 7B 臂。
+  response_length: 16384
+  max_token_len_per_gpu: 20480
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2              # 沿用 7B 臂已验证的 rmpad+FA2 profile
+  use_fused_kernels: false   # fsdp2 下 lm_head 是 DTensor,与融合 kernel 不兼容
+  rollout_max_model_len: 20480
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 3600 # 基线无 research 段拖长
+  total_epochs: 2            # 3553/16 ≈ 222 步/epoch ⇒ ≈444 步
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1        # ★ 用户硬要求(设 3 曾致配额爆炸、ckpt 写坏)
+  val_before_train: true     # step0 基线读数
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(采样端特权;损失 = native GRPO,无教师/蒸馏/critic)----
+# 本段逐字沿用 7B 臂,只改 steered_adv_decay_steps 的注释(步数相同故值不变)。
+# ---- 基线臂:无 steering(纯 GRPO 底座)----
+steering:
+  enabled: false
+  doc_source: static         # enabled=false 下不消费;置 static 免 researcher 校验
+  doc_table: ""
+
+# ---- 基线臂:无 researcher / 无 narration / 无外部角色 ----
+research:
+  enabled: false

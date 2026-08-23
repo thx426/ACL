@@ -1,0 +1,140 @@
+# WebShop × Qwen2.5-7B-Instruct — **纯 GRPO 基线臂**(2026-08-23 开 WS7B 格)
+# 派生自 webshop_3b_grpo.yaml:仅改 run 名与 model_path(显存档 3B/7B 同值,
+# 见 webshop_7b_pgs.yaml 头注);与 classic_ws7b_pgs 的差异 = 机制本身。
+#
+# 由 webshop_3b_pgs.yaml 程序化派生(scripts/derive_ws3b_grpo.py,锚点唯一
+# 即中止):train 段的 batch/n/lr/caps/model/数据/eval/存盘**逐键不动**,
+# 与机制臂的差异恰好等于机制本身 —— adv_estimator / steering /
+# researcher-doc 三项。对照对象:classic_ws3b_pgs。
+#
+# 派生自 alfworld_3b_pgs.yaml(同期在跑的机制臂):**机制段 steering 与
+# researcher 段逐字不动**,train 段除下述三处按域调整外逐键沿用 ⇒ 跨域读数
+# 的差异可归因到域本身,而不是超参漂移。
+#
+# 按域调整的四处(每处都有实测/裁定依据):
+#   ① episode 预算 30→15 步(GiGPO/verl-agent 的 WebShop 文献口径);
+#   ② 数据换 classic_webshop_data_v4(2026-08-16 goals 确定性根治后重建,
+#      见 docs/webshop-runbook.md §3);
+#   ③ **batch 16×n8 → 32×n16**(用户裁定,见 train 段);
+#   ④ total_epochs 2→1(6,410/32 ≈ 200 步/epoch),steered_adv_decay_steps
+#      随之调到 133(仍是总步数的 2/3)。
+#
+# 序列档**逐项沿用 ALFWorld 3B 臂**,依据是实测而非照抄
+# (classic_bench/ws_token_budget.py,Qwen2.5-3B tokenizer,真实服务):
+#   scaffold 284 token / initial_obs p50 72 / 每轮观察 p50 716 p90 793 max 849
+#   / 13 步整 episode max 9,320 ⇒ 15 步外推约 12,000–16,000。
+#   WebShop 每轮观察比 ALFWorld 长约 7×,但步数只有一半,总量相当。
+run:
+  name: classic_ws7b_grpo
+environment:
+  name: webshop
+episode:
+  # 15 = GiGPO/verl-agent 的 WebShop 口径。turns == steps 沿用 2026-08-13
+  # 用户裁定的纪律(总交互轮次硬上限,**无效格式轮同样计数**)——与 ALFWorld
+  # 30/30 同构。注:探针档 configs/classic/webshop.yaml 仍是 15/20(旧口径),
+  # 跨口径比对探针读数时须标注。
+  max_env_steps: 15
+  max_assistant_turns: 15
+  max_tokens_per_turn: 1024
+webshop:
+  protocol: text             # 2026-08-16 用户裁定的默认档
+  # ★ 32 分片 × pool 32 = **1024 槽**(2026-08-17 定档)。
+  #
+  # ★★ 关键约束:**路由按 `goal_idx % 分片数`,同一 goal 的全部 rollout_n
+  # 个副本落在同一分片** ⇒ 一步只用到 ≈ batch_size 个分片,**分片数超过
+  # train_batch_size 就没有收益**,多出来的纯闲置。
+  # 32 个 goal 扔进 N 个桶必然碰撞,碰撞的桶要装 2×rollout_n=32 个副本,
+  # 所以**决定排队与否的是 pool 而不是分片数**。模拟(300 次抽样,单臂):
+  #     48 分片 × pool16(768 槽):用到 23.5/48 分片,**超载 6.89 个/步**
+  #     32 分片 × pool32(1024 槽):用到 20.6/32 分片,**超载 2.40 个/步**
+  #     48 分片 × pool32(1536 槽):超载 1.22 个/步(内存不够,162 只有 ~96GB)
+  # ⇒ 同等内存下 32×32 明显优于 48×16。要再降超载只能加 pool(吃内存)
+  # 或改路由(会破坏"同 goal 同分片"的确定性,不做)。
+  #
+  # 为什么是**分片数**而不是池大小:WebShop 的 env.step 是纯 Python
+  # (BeautifulSoup 解析占 37% + Jinja2 渲染 22%),进程内多实例全程争同一把
+  # GIL ⇒ **池只提供槽位隔离,不提供并行**。实测单分片无论 pool 多大都只有
+  # ~20 step/s(并发 1 即饱和,并发 2-32 反而降到 15.7)。
+  #   ⇒ 分片数 = 真实并行度(每分片一个进程一把独立 GIL,近似一个 CPU 核)
+  #   ⇒ 总槽位 = 并发容量(episode 从 reset 到 close 一直占槽)
+  # 两者必须**分别**满足;同样 128 个 env 实例、同样内存,16×8 的吞吐是
+  # 8×16 的两倍。
+  #
+  # 实测(162,16 分片):峰值 234 step/s(单进程客户端)/ 290 step/s(多进程
+  # 客户端);128 并发 + 每步生成 2s 的真实节奏下,环境额外开销仅 **+9.6%**
+  # (4 分片时是 +323% —— 槽位不足导致 episode 分批排队)。
+  #
+  # episode 按 goal_idx % 32 确定性绑定分片;preflight 会逐分片验通并核对
+  # 各分片 num_goals 一致。启动命令见 docs/webshop-runbook.md §2。
+  service_url: "http://10.77.110.162:8310,http://10.77.110.162:8311,http://10.77.110.162:8312,http://10.77.110.162:8313,http://10.77.110.162:8314,http://10.77.110.162:8315,http://10.77.110.162:8316,http://10.77.110.162:8317,http://10.77.110.162:8318,http://10.77.110.162:8319,http://10.77.110.162:8320,http://10.77.110.162:8321,http://10.77.110.162:8322,http://10.77.110.162:8323,http://10.77.110.162:8324,http://10.77.110.162:8325,http://10.77.110.162:8326,http://10.77.110.162:8327,http://10.77.110.162:8328,http://10.77.110.162:8329,http://10.77.110.162:8330,http://10.77.110.162:8331,http://10.77.110.162:8332,http://10.77.110.162:8333,http://10.77.110.162:8334,http://10.77.110.162:8335,http://10.77.110.162:8336,http://10.77.110.162:8337,http://10.77.110.162:8338,http://10.77.110.162:8339,http://10.77.110.162:8340,http://10.77.110.162:8341"
+  request_concurrency: 512   # 全局值,运行时按 agent_num_workers 分摊
+                             # (registry._per_worker)⇒ 每 worker 16,
+                             # 恰好覆盖它领到的 16 个副本
+  obs_max_chars: 3500        # 实测每轮观察 p90 793 token,该截断很少触发
+  reset_timeout_s: 60.0
+  step_timeout_s: 30.0
+  max_retries: 4             # 429(池忙)指数退避 1→2→4→8s,耗尽才 fail loud
+  retry_backoff_s: 1.0
+  retry_backoff_max_s: 8.0
+  preflight: true
+eval:
+  response_budget: 16384
+  # ★ 2026-08-13 用户裁定:所有任务的测试集一律 avg@3(n>1 必须配 temp>0)。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_webshop_data_v4/train.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_webshop_data_v4/test.parquet
+  experiment_name: classic_ws7b_grpo
+  project_name: trace_opd
+  n_gpus: 4
+  rollout_tp: 1
+  # ★ 2026-08-16 用户裁定:32 任务 × 16 rollout = **512 episode/step**
+  # (16 rollout = bare 8 + 分布干预 8,由 steered_fraction 0.5 切分)。
+  # 比 ALFWorld 臂(16×8=128)大 4 倍 —— 组内配对对照更稳,但 rollout 与
+  # 环境负载同步变 4 倍,单步墙钟预计从 ~90s 拉到 200-300s。
+  train_batch_size: 32
+  rollout_n: 16
+  agent_num_workers: 32      # 必须 == train_batch_size(同任务副本同 worker)
+  ppo_mini_batch_size: 32
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo        # 基线臂:纯 GRPO 底座
+  norm_adv_by_std: false
+  max_prompt_length: 4096
+  response_length: 16384
+  max_token_len_per_gpu: 20480
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  use_fused_kernels: false   # fsdp2 下 lm_head 是 DTensor,与融合 kernel 不兼容
+  rollout_max_model_len: 20480
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  total_epochs: 1            # 6410/32 ≈ 200 步(batch 翻倍 ⇒ 步数减半)
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1        # ★ 用户硬要求(设 3 曾致配额爆炸、ckpt 写坏)
+  val_before_train: true     # step0 基线读数
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- 基线臂:无采样端干预、无特权 advantage ----
+steering:
+  enabled: false
+
+# ---- 基线臂:无 researcher / 无 narration / 无外部角色 ----
+research:
+  enabled: false

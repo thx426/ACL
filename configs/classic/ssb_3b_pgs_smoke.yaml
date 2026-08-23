@@ -1,0 +1,159 @@
+# SpreadsheetBench(SRL train)× Qwen2.5-3B-Instruct — 机制链路测试运行(smoke)
+# 2026-08-17 用户指令:"用最新方案机制代码测试运行 Spreadsheet 训练实验任务,
+# 用 Qwen2.5-3B 模型"。目的 = 全链冒烟(text 协议解析→python 执行→LO 重算
+# 判分→35B researcher 在线产 doc→熵门 warmup 自标定→asym 训练 update→ckpt),
+# 顺带产出:①3B bare 起点(val_before_train 的 step0 = 400 全集 avg@3);
+# ②单步墙钟(为正式 run 的 batch 裁定供数)。**非正式读数,不进论文。**
+#
+# 与 ssb_7b_pgs.yaml 的差异:模型 3B/batch 64→16(快出步)/3B 显存 profile
+# (照 classic_alf3b_pgs 已验证档)/loggers 去 swanlab/save_freq 2(验存盘链路)。
+# 机制段(steering/research/narration)与 7B 正式档逐键相同。
+run:
+  name: ssb3b_smoke
+environment:
+  name: spreadsheetbench
+episode:
+  max_env_steps: 20
+  max_assistant_turns: 24
+  max_tokens_per_turn: 2048   # 2026-08-17 用户裁定 4096→2048:smoke 实测
+                              # p50 episode 全程仅 413 tok,而长尾每轮打满
+                              # 4096 是尾部墙钟主项之一;2048 对中位形态零影响
+  session_token_budget: 24576
+spreadsheetbench:
+  protocol: text              # 2026-08-17 裁定:text 化 + one-shot(首个真模型消费)
+  data_root: "${SSB_DATA}"
+  exec_concurrency: 32
+  python_timeout_s: 30    # 2026-08-17 用户裁定 120→30:smoke 实测长尾 =
+                          # 死循环型代码每轮跑满 timeout(370-43 逐轮 100%
+                          # 烧核实证);合法 openpyxl 操作绝大多数 <5s,
+                          # 30s 误杀率见离线重放普查(runbook 登记)
+  recalc_timeout_s: 120
+  obs_max_chars: 3500
+eval:
+  response_budget: 24576
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-3B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/train_srl.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/test_ssb400.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/val_srl123.parquet
+  experiment_name: ssb3b_smoke
+  project_name: trace_opd
+  n_gpus: 4                   # CVD 4-7(卡 0 有他人进程,1-3 留白)
+  rollout_tp: 1
+  train_batch_size: 16        # 测试档:16 任务 × n8 = 128 eps/步,快出步
+  rollout_n: 8                # 组内 4 steered + 4 bare
+  agent_num_workers: 16       # == batch(同任务副本同 worker;alf3b 同款)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false
+  max_prompt_length: 8192     # SSB initial_obs 含 workbook 预览
+  response_length: 24576      # prompt 8192 + response 24576 = 32768 恰为 Qwen2.5 系 max_position_embeddings 上限(40960 超限,sglang 装配期实证拒绝)
+  max_token_len_per_gpu: 16384   # (8192+24576)/sp2
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  use_fused_kernels: false
+  rollout_max_model_len: 32768
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  total_epochs: 1             # smoke:跑 2-3 步人工停,不受此限
+  test_freq: 50               # smoke 期内不触发第二次 val(step0 已够)
+  save_freq: 2                # 验证 ckpt 存盘链路(max_ckpt_to_keep=1 滚动)
+  max_ckpt_to_keep: 1
+  val_before_train: false     # 首次 smoke 已产出 step0 bare 读数(7.5%),
+                              # 重发不重跑 16min val,直接进训练段
+  resume_mode: auto
+  loggers: [console]          # smoke 不进 swanlab
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(与 ssb_7b_pgs 逐键同;v3.3 asym + v3.4 熵门自标定)----
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0    # 探针关(2026-08-17 用户裁定,全线默认)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 700  # smoke 不会跑到;若正式 3B batch16(334 步/ep×2)
+                                # 则 668×1.05≈700,恰为该档正式值
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0     # v3.4 warmup 自标定(smoke 首要验证点之一)
+  entropy_theta_update: direct
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: external
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  narrator:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 512
+    temperature: 0.3
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

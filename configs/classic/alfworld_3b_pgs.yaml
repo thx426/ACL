@@ -1,0 +1,155 @@
+# ALFWorld × Qwen2.5-3B-Instruct — PGS 机制臂(2026-08-16)
+#
+# 派生自 alfworld_7b_pgs.yaml,只改基座与三处纪律项;机制段(steering)逐字不动。
+# 本 run 的对照臂 = mixed-objective 线的 SEED loss 臂(classic_alf3b_seed),
+# 两臂可比性已实证到位(2026-08-16):
+#   ① 任务集同源:两线 train_3553 / valid_seen 140 / valid_unseen 134 按
+#      extra_info.gamefile 与 task_id 交集 100%,schema/agent_name/data_source/
+#      reward_model(style=env)逐字段相同;
+#   ② 协议同源:两线 runtime 都从 adapter.executor_scaffold() 取 scaffold
+#      (parquet 里烘焙的那份是构建快照,不参与训练),补齐 one-shot 后
+#      sha256 = a52f598579f98f7f(1675 字符)完全相同;
+#   ③ episode 预算 / 序列预算 / batch×n / lr / researcher 参数逐项对齐(见下)。
+# 差异只剩机制本身:PGS(采样端保尾核倾斜 + 分离式校正 GRPO,损失无教师)
+#   vs SEED(gated logp-shift OPD + GRPO 混合损失)。
+run:
+  name: classic_alf3b_pgs
+environment:
+  name: alfworld
+episode:
+  # 与 7B 臂同(2026-08-13 用户裁定:总交互轮次硬上限 30,无效格式轮同样计数)。
+  max_env_steps: 30
+  max_assistant_turns: 30
+  max_tokens_per_turn: 1024
+alfworld:
+  protocol: text
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  # 双臂并行(各 4 卡)共用 64 核 ⇒ 每臂 32。
+  spawn_concurrency: 32
+eval:
+  response_budget: 16384
+  # ★ 2026-08-13 用户裁定:所有任务的测试集一律 avg@3(n>1 必须配 temp>0)。
+  # 与 7B 臂的 greedy@1 读数口径断裂,跨 run 比较须标注。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-3B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/train_3553.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_seen.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_unseen.parquet
+  experiment_name: classic_alf3b_pgs
+  project_name: trace_opd
+  n_gpus: 4                  # CVD 4-7(SEED 对照臂占 0-3)
+  rollout_tp: 1
+  train_batch_size: 16       # GiGPO 同构(16 任务 × n8 = 128 eps/step)
+  rollout_n: 8
+  agent_num_workers: 16      # 必须 == train_batch_size(同任务副本同 worker)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false
+  max_prompt_length: 4096
+  # Qwen2.5 max_position_embeddings=32768 是架构硬墙:prompt+response ≤32768。
+  # 3B 与 7B 同为 32768(已实测 config.json),故序列档逐项沿用 7B 臂。
+  response_length: 16384
+  max_token_len_per_gpu: 20480
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2              # 沿用 7B 臂已验证的 rmpad+FA2 profile
+  use_fused_kernels: false   # fsdp2 下 lm_head 是 DTensor,与融合 kernel 不兼容
+  rollout_max_model_len: 20480
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  total_epochs: 2            # 3553/16 ≈ 222 步/epoch ⇒ ≈444 步
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1        # ★ 用户硬要求(设 3 曾致配额爆炸、ckpt 写坏)
+  val_before_train: true     # step0 基线读数
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(采样端特权;损失 = native GRPO,无教师/蒸馏/critic)----
+# 本段逐字沿用 7B 臂,只改 steered_adv_decay_steps 的注释(步数相同故值不变)。
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0    # 探针关(2026-08-17 用户裁定,全线默认;alf3b 旧 run 为 0.05)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 470   # α cosine 周期 = 总步数 444 × 1.05(≈3553/16 × 2 epochs);
+  # ★ 必须 ≥ 实际总步数:steered_retired 判据是 gs >= decay_steps,
+  # 周期短于总步数会在中途**阶跃停产** steered 臂(256 行→0),
+  # 同时突变 LOO 基线样本数与有效 batch ⇒ 等效学习率跳变。
+  # 5% 余量吸收步数估算误差(cosine 末端极平,末尾 α≈0.006≈0)。
+  # 2026-08-17 用户裁定,取代此前全线沿用的 2/3 约定。
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0    # v3.4:0=warmup 自标定(哨兵期零干预)
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5      # 每组 8 行 = 4 steered + 4 bare(组内配对对照)
+
+# ---- 在线研究员(35B 外部;训练态无特权 GT——信息状态红线,强校验)----
+# 用 162 直连的 35B 实例;SEED 对照臂走 zkgy 隧道的另一个实例(同模型
+# Qwen3.6-35B-A3B,不同部署)⇒ 两臂 researcher 负载天然隔离,不再互抢并发。
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: engine
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # A800 本机 35B 三端点;162 宿主经反向隧道同地址即达(2026-08-23 统一,旧 162 双端点已下线)
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 64
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

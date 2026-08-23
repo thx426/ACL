@@ -1,0 +1,152 @@
+# SpreadsheetBench(SRL train)× Qwen2.5-7B-Instruct — 纯 GRPO 基线臂(2026-08-17 起草)
+# 与 ssb_7b_pgs.yaml 的差异只有机制开关(经典双臂对照定式),其余逐键相同:
+#   steering.enabled   true → false(无引导/无分臂)
+#   train.adv_estimator pgs_asym_grpo → grpo_loo(config 守卫强制联动 adv_mode)
+#   research/narration enabled/无关(文档无人消费)
+# 数据/协议/预算/评测口径见 pgs 版头注(单一真源,不重复)。
+run:
+  name: classic_ssb7b_grpo
+environment:
+  name: spreadsheetbench
+episode:
+  max_env_steps: 20
+  max_assistant_turns: 24
+  max_tokens_per_turn: 2048   # 2026-08-17 用户裁定 4096→2048:smoke 实测
+                              # p50 episode 全程仅 413 tok,而长尾每轮打满
+                              # 4096 是尾部墙钟主项之一;2048 对中位形态零影响
+  session_token_budget: 24576
+spreadsheetbench:
+  protocol: text
+  data_root: "${SSB_DATA}"
+  exec_concurrency: 32
+  python_timeout_s: 30    # 2026-08-17 用户裁定 120→30:smoke 实测长尾 =
+                          # 死循环型代码每轮跑满 timeout(370-43 逐轮 100%
+                          # 烧核实证);合法 openpyxl 操作绝大多数 <5s,
+                          # 30s 误杀率见离线重放普查(runbook 登记)
+  recalc_timeout_s: 120
+  obs_max_chars: 3500
+eval:
+  response_budget: 24576
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/train_srl.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/test_ssb400.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/val_srl123.parquet
+  experiment_name: classic_ssb7b_grpo
+  project_name: trace_opd
+  n_gpus: 4
+  rollout_tp: 1
+  train_batch_size: 64
+  rollout_n: 8
+  agent_num_workers: 16
+  ppo_mini_batch_size: 64
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo_loo     # 原生 GRPO(与 steering.enabled=false 强制联动)
+  norm_adv_by_std: false
+  max_prompt_length: 8192
+  response_length: 24576
+  max_token_len_per_gpu: 16384
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  use_fused_kernels: false
+  rollout_max_model_len: 32768
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  total_epochs: 2
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+steering:
+  enabled: false              # 纯 GRPO 对照:无引导/无分臂
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0    # 探针关(2026-08-17 用户裁定,全线默认)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: legacy_shared     # steering 关闭时的合法取值(config 守卫)
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 180
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0
+  entropy_theta_update: direct
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+
+research:
+  enabled: false              # 纯 GRPO:文档无人消费
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: external
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  narrator:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # 2026-08-17 用户裁定:35B 迁 A800 本机卡 1/2/3(TP1×3 端点),不再用 162
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128      # narration 突发大但单卡端点 KV 小;超出部分服务端排队(慢非坏)
+    temperature: 0.3
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  researcher:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # 2026-08-17 用户裁定:35B 迁 A800 本机卡 1/2/3(TP1×3 端点),不再用 162
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

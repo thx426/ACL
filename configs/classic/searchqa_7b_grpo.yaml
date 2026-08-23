@@ -1,0 +1,133 @@
+# SearchQA(Search-R1 风格)× Qwen2.5-7B-Instruct — GRPO 基线对照臂(2026-08-13)
+# train/episode/searchqa/eval 段与机制臂逐键一致(程序化派生自
+# searchqa_7b_pgs.yaml,对照公平);差异仅:adv_estimator=grpo、steering/
+# research 关、无 roles、n_gpus 注释改 CVD 4-7、timeout 降。
+#
+# 口径对照(三家实测代码,非转述):
+#   Search-R1 官方 v0.3:batch512 × n_agent5、max_turns4、1005 步、kl 0.001
+#   SEED(arXiv 2607.14777)SEED臂:3B、batch128 × n8、150 步、kl 0.001、
+#     val 512 条 temp0.4;基线臂:7B、batch256 × n5、adv=gigpo
+#   本 run(用户裁定 2026-08-13):batch128 × n8、2 epochs(≈2650 步)、
+#     val 2048 条 greedy、无 KL(Dr.GRPO 底座 IF-04,与 ALFWorld 自洽)
+run:
+  name: classic_sqa7b_grpo
+environment:
+  name: searchqa
+episode:
+  # 三家一致:每 episode 4 次工具调用。turns 给 2 轮格式失败余量
+  # (protocol.py 校验 turns >= steps)。
+  max_env_steps: 4
+  max_assistant_turns: 6
+  max_tokens_per_turn: 1024
+searchqa:
+  # 2026-08-13 用户裁定:回退**文本标签协议**(Search-R1/SEED 同款),不用 FC。
+  # 依据:两家代码级核实——Search-R1(scripts/data_process/nq_search.py)与
+  # SEED(prompts/search.py)都是 <think>/<search>/<answer>/<information>,
+  # 且 prompt 内置 one-shot("For example, <answer> Beijing </answer>")。
+  # 动因:Qwen2.5(2024)对 FC 遵循不足,FC 档实测 11.8% 轨迹因连续格式违规
+  # 判 DEGENERATE:format(均每条 3 次),4 步预算下一次失误即 25%。
+  # 标签沿用原生 <think>(不同于 ALFWorld 的 <reasoning>):已实测 Qwen2.5 的
+  # chat template 不剥离历史轮 <think> 块(Qwen3 系才剥离)。
+  protocol: text
+  retriever_url: "http://10.77.110.162:8000"   # 162 wiki-18 + e5,faiss 4 卡分片
+  topk: 3                     # Search-R1 论文口径
+  # 环境侧吞吐(用户裁定"调到最大"):micro-batching 实测 40×
+  # (320 queries/160 并发 = 600 q/s;单 query 单请求天花板 ~15 q/s,拉并发无效)。
+  # ⚠ "最大"指**吞吐**不是**并发**:冒烟 v3 用在途 64(双臂 128 批 / 8192
+  # query 在途)把服务端打到单发 13.7s、客户端全面超时。实测最优点是
+  # **批 512 × 在途 2**(1384 q/s;批 64 时只有 632-722)——512 正好对齐
+  # 服务端内部 retrieval_batch_size。双臂合计 4 批在途,仍在最优区。
+  # 需求 2765 query/步 ÷ 1384 ≈ 2s,占每步总时长不到 1%。
+  search_concurrency: 2
+  # 512 是服务端内部 batch;但客户端能否攒满取决于单进程 query 密度,
+  # 16 worker 下现实批约几十 ⇒ 设 128,攒不满即按 wait 窗口发出(不白等)。
+  search_max_batch: 128
+  # ⚠ 162 上 35B researcher 与 retriever **共享同样 4 张 GPU**(每卡 35B
+  # 58.8G + 索引 10G)。机制臂 researcher 满负荷时 retriever 响应 0.1s→12s
+  # ——服务端只是慢不是坏(failure=0)。90s 超时避免把慢误判成故障。
+  search_timeout_s: 90.0
+  search_batch_wait_ms: 15.0
+eval:
+  response_budget: 8192       # 4 轮 × (1024 生成 + ~900 检索观察),留 2× 余量
+  # 2026-08-14 用户裁定:测试集一律 avg@3(与 PGS 臂同口径,可比性前提)
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  # train_trainer = 原 train.parquet + verl trainer 必需的两字段(2026-08-13
+  # 冒烟拦下):agent_name='trace_opd'(选 agent loop)+ reward_model.style=
+  # 'env'(reward 由 AgentLoop 提供;原 'rule' 会让 verl 去查 reward_score
+  # 注册表,而 data_source 'searchqa/*' 不在其中 ⇒ NotImplementedError)。
+  # 判分不受影响:EM 内嵌 adapter,读 extra_info.golden_answers。
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_searchqa_data/train_trainer.parquet
+  # val = test 集 shuffle(seed42)后固定 2048 条(用户裁定 2026-08-13:
+  # 「如果 test 集必须固定,则取大一点」)。固定集合而非每次重采——否则跨
+  # step 不是同一批任务、曲线不可比。七源按比例分布;同样带 trainer 两字段。
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_searchqa_data/val_shuf2048.parquet
+  experiment_name: classic_sqa7b_grpo
+  project_name: trace_opd
+  n_gpus: 4                   # 基线臂 CVD 4-7
+  rollout_tp: 1
+  train_batch_size: 128       # 用户裁定,对齐 SEED 的 SEED 臂
+  rollout_n: 8                # 对齐 SEED 的 GROUP_SIZE=8
+  # ⚠ 不是"必须 == train_batch_size"(2026-08-13 冒烟 v5 查清 verl 语义):
+  # verl 对**已 repeat n 次的 batch(1024 行)按 worker 数连续切块**
+  # (agent_loop.py: prompts.chunk(len(workers))),而 DataProto.repeat 默认
+  # interleave=True ⇒ 顺序是 [t0×8, t1×8, …]。所以只要 1024 能被 worker 数
+  # 整除,同 task 的 8 个副本必落同一 worker,组内配对不受影响。
+  # 取 16 而非 128 的原因:**每个 worker 是独立进程、各持一个检索 batcher**。
+  # 128 进程 ⇒ 每个只见 1/128 的稀疏 query 流,实测 avg_batch=1(合批完全
+  # 失效),同时 128×在途2 = 256 个并发小请求砸在容量曲线最差档(15 q/s),
+  # wait 从 4s 恶化到 47s。16 worker ⇒ 每 worker 8 个 task,query 密度 ×8、
+  # 全局在途批 256→32。researcher 并发本就按 worker 分摊(_per_worker),同步收窄。
+  agent_num_workers: 16
+  ppo_mini_batch_size: 128
+  lr: 1.0e-6                  # 三家一致
+  lr_scheduler_type: constant # SEED 用 warmup 0.1 / Search-R1 用 0.285;
+                              # 我们保持 ALFWorld 同款 constant,差异记脚注
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: grpo            # 基线臂:纯 GRPO 底座
+  norm_adv_by_std: false      # Dr.GRPO 形态(底座裁定 IF-04)
+  max_prompt_length: 4096     # 三家一致
+  response_length: 8192       # 与 eval.response_budget 同源
+  max_token_len_per_gpu: 12288
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  # ✗ 不可开 use_fused_kernels:与 fsdp2 不兼容(ALFWorld 冒烟实证,
+  # compute_log_prob → aten.mm.default got mixed torch.Tensor and DTensor)。
+  use_fused_kernels: false
+  rollout_max_model_len: 12288
+  # 与机制臂同步(两臂 train 段必须逐键一致):8192→32768,见机制臂 yaml 同位注释。
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 512   # 1024 eps/步(128×8),SearchQA 序列短、可开大
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 3600  # 基线无 research 段拖长
+  total_epochs: 2             # 用户裁定:不设步数上限,按 2 epochs
+                              # (169615/128 ≈ 1325 步/epoch ⇒ ≈2650 步)
+  # val 集 2048 条(是 ALFWorld 274 的 7.5×)⇒ 每次 val 双臂各跑 2048 个
+  # episode、约 5 分钟。test_freq=25 会让 2650 步跑 106 次 val ≈ 9 小时纯评测;
+  # 放宽到 50 ⇒ 53 个 val 点,画曲线足够,且 2048 条的统计功效远强于 274
+  # (MDE 由 ~7.8pp 降到 ~3pp),点稀一些不损判别力。
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1        # 用户裁定:只留最新一个(2026-08-14 磁盘配额
+                              # 爆炸事故——3×86G/臂 常驻撑爆;滚动逻辑本身正常)
+  val_before_train: true      # step0 基线读数(SEED 关掉了,我们要)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- 基线臂:零特权信号,与 GRPO 底座逐字节一致 ----
+steering:
+  enabled: false
+  doc_source: static
+research:
+  enabled: false

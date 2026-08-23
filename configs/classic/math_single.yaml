@@ -1,0 +1,82 @@
+# Classic-bench Math — **MENTOR 单轮档**(2026-08-16 用户裁定)
+#
+# 对齐对象:MENTOR "Selective Expert Guidance for Effective and Diverse
+# Exploration in RL of LLMs"(arXiv 2510.04140,ICLR 2026;代码
+# github.com/Jiangzs1028/MENTOR commit b1cc4c6,已逐行核实)。
+#
+# 逐项对齐(左=MENTOR 出处,右=本档):
+#   单轮 completion,无工具/无沙箱/无 observation           → protocol: single
+#     (EasyR1 标准单轮 RLHF 数据流;他们整个仓库没有环境层)
+#   system prompt(verl/utils/dataset.py:174-176 硬编码,     → adapter
+#     不在 jinja 里——train.sh 的 no.jinja 是空模板;             SYSTEM_PROMPT_SINGLE
+#     论文 Appx C p18 逐字复述)                                 (逐字移植)
+#   <think></think> + \boxed{} 两标签                        → 同
+#   reward = 0.9·accuracy + 0.1·format                      → format_weight: 0.1
+#     (examples/reward_function/math.py:compute_score)          + reward_from_score
+#   max_response_length 8192(train.sh)                      → max_tokens_per_turn
+#   temperature 1.0 训练采样(config.yaml)                   → train 档设 1.0
+#
+# 刻意不对齐(经用户裁定,记账):
+#   基座    Qwen2.5-7B-**Instruct**(我们主线)vs 他们的 Base
+#   数据    DAPO-17k + 六源 valid(我们既有,与 TIR 多轮臂同源可跨协议对照)
+#           vs 他们的 MATH L3-5 8888 + MATH-500
+#   判分    math-verify 子进程(我们既有,防过 sympy 满核自旋)vs mathruler
+#           ★ 论文 Appx C 写的是 "Math-Verify",与其代码不符
+#   评测    avg@3 @ temp 0.6(用户长期裁定,全任务通用)vs greedy@1 @ temp 0
+run:
+  name: classic_math_single
+environment:
+  name: math
+episode:
+  # 单轮:config._validate 钉死 1/1(adapter 恒 done=True,更大的 caps 不会
+  # 改变行为但会让配置读起来像多轮)。
+  max_env_steps: 1
+  max_assistant_turns: 1
+  max_tokens_per_turn: 8192   # = MENTOR data.max_response_length(train.sh)
+math:
+  protocol: single
+  format_weight: 0.1          # MENTOR outcome:format = 9:1
+eval:
+  # 单轮 ⇒ 总预算 = 单轮上限 + slack(episode.py 的 budget 检查扣 64,
+  # 512 余量保证首轮能满额生成 8192)
+  response_budget: 8704
+  # 2026-08-14 用户裁定:测试集一律 avg@3;n>1 必须配 temperature>0
+  temperature: 0.6
+  n: 3
+train:
+  # 仅为过 config 校验(eval 探针不消费 train 段);正式训练 config 另立
+  model_path: "/fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct"
+  # format_weight>0 的前置条件:否则 won=score>=1.0 会把「答对但格式错」
+  # (0.9)判成 reward 0,比 MENTOR 更严 —— _validate 会 fail loud
+  reward_from_score: true
+
+# --- researcher 探针段(门C-R:35B 外部研究员走机制代码 research/*)---
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: engine
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 64
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600

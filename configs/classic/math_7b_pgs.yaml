@@ -1,0 +1,173 @@
+# Math(DAPO-17k × 六竞赛源)× Qwen2.5-7B-Instruct — PGS 机制臂正式训练草案
+# (2026-08-13 冒烟全绿后用户确认为**默认配置**;运行脚本=probe/launch_dual_math7b.sh)
+#
+# 口径对照(TIR 相关工作,一手核实):
+#   ToRL(2503.23383):Qwen2.5-Math base、batch128 × n16、C=1(每响应 1 次
+#     工具调用;C=2 +2% 但墙钟 +21%)、temp1、无 KL、reward ±1
+#   SimpleTIR(2509.02479):Qwen2.5-7B base、batch512、max 5 交互轮、
+#     响应 16384、void-turn 轨迹过滤
+#   本 run:batch128 × n8(与 SearchQA/ALFWorld 自洽)、2 epochs
+#     (17255/128 ≈ 135 步/epoch ⇒ ≈270 步)、val 全量 1304 六源 greedy@1
+#     (CD-010 裁定沿用)、无 KL(Dr.GRPO 底座 IF-04)
+run:
+  name: classic_math7b_pgs
+environment:
+  name: math
+episode:
+  # 预算档(2026-08-13 用户确认):ToRL C=1-2 / SimpleTIR 5 轮 / 探针档 12 步16轮。
+  # 训练草案取 6 步 8 轮:比 SimpleTIR 宽(给 RL 长出多轮验算行为的空间),
+  # 比探针档省一半最坏长度。探针实测(strat60):轮数中位 1-2、码轮/ep ≤0.6,
+  # 6 步在行为分布的 p99 之外。
+  max_env_steps: 6
+  max_assistant_turns: 8
+  max_tokens_per_turn: 4096   # 数学长推理单轮(math.yaml 探针同款)
+math:
+  protocol: text              # 2026-08-13 用户裁定:文本 TIR(ToRL/SimpleTIR 型)
+  python_timeout_s: 30
+  exec_concurrency: 32        # ⇒ 2/worker;子进程勿饿死引擎(CPU 纪律)
+eval:
+  # 16384(SimpleTIR 同款;2026-08-13 用户确认)。探针在 32768 下实测:strat60 截断仅
+  # 1/60,轨迹长度分布远低于 16384(math500 全量的 token 分布见探针报告)。
+  # 旧 math.yaml 注释"16384 撞墙"是 FC 档 12 步的行为,文本档不复现。
+  response_budget: 16384
+  # 2026-08-14 用户裁定:测试集一律 avg@3(所有任务实验通用)。
+  # temperature 必须 >0——config 校验强制(n>1 时 greedy 三次逐字节相同,
+  # avg@3 退化成 mean@1 却付 3 倍成本)。取 0.6:社区 avg@k 评测主流值,
+  # 高于 SEED 的 val temp 0.4、远低于训练 rollout 的 1.0(避免过度发散)。
+  # ⚠ 口径断裂:此前的 val 曲线是 greedy@1(GRPO 35.2→48.6),与 avg@3
+  # 不可直接比;verl 另给 best@3/worst@3,信息量高于单次 greedy。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  # schema 自带 agent_name='trace_opd' + reward_model.style='env'
+  # (build_dataset._row 原生写入,SearchQA 那次的 trainer 两字段坑已预防)
+  train_file: /fs/fast/u2021000902/wushang/data/classic_math/train.parquet
+  # val = 六源全量 1304(aime24/25/26 各30、amc 40、math500 500、olympiad 674),
+  # data_source=math/<bench> 分桶出 by-family 曲线(CD-010 裁定:全量 greedy@1)
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic_math/valid.parquet
+  experiment_name: classic_math7b_pgs
+  project_name: trace_opd
+  n_gpus: 4                   # 机制臂 CVD 0-3
+  rollout_tp: 1
+  train_batch_size: 128
+  rollout_n: 8
+  agent_num_workers: 16       # batch % workers == 0;同 task 8 副本同 worker
+  ppo_mini_batch_size: 128
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false      # Dr.GRPO 形态(IF-04)
+  max_prompt_length: 4096     # 题面短(几百 tok)+ system(~700)+ doc 臂余量
+  response_length: 16384      # 与 eval.response_budget 同源(已确认)
+  max_token_len_per_gpu: 20480       # = prompt 4096 + response 16384
+  ppo_max_token_len_per_gpu: 12288   # 冒烟首验项(SP=2 下历史档可行)
+  log_prob_max_token_len_per_gpu: 12288
+  ulysses_sp: 2
+  use_fused_kernels: false    # 与 fsdp2 不兼容(ALFWorld 实证)
+  rollout_max_model_len: 20480
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256   # 序列比 SearchQA 长(16k vs 8k),KV 预算减半持平
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400  # > research.session_timeout_s(2400)
+  total_epochs: 2             # ≈270 步
+  # 270 步的短跑:test_freq 10 ⇒ 27 个 val 点(1304 条约 5 分钟/次);
+  # save_freq 20 ⇒ 13 次存盘、滚动保 3。(2026-08-13 用户确认)
+  test_freq: 10
+  save_freq: 20
+  max_ckpt_to_keep: 1        # 用户裁定:只留最新一个(2026-08-14 磁盘配额
+                              # 爆炸事故——3×86G/臂 常驻撑爆;滚动逻辑本身正常)
+  val_before_train: true
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(与 SearchQA/ALFWorld 正式 run 同配;仅退火期按总步数缩放)----
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.05
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 285   # α cosine 周期 = 总步数 270 × 1.05(≈batch 128 × 2 epochs);
+  # ★ 必须 ≥ 实际总步数:steered_retired 判据是 gs >= decay_steps,
+  # 周期短于总步数会在中途**阶跃停产** steered 臂(256 行→0),
+  # 同时突变 LOO 基线样本数与有效 batch ⇒ 等效学习率跳变。
+  # 5% 余量吸收步数估算误差(cosine 末端极平,末尾 α≈0.006≈0)。
+  # 2026-08-17 用户裁定,取代此前全线沿用的 2/3 约定。
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0     # v3.4 warmup 自标定(step1 哨兵零干预)
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5       # 每组 4 steered + 4 bare(组内配对对照)
+
+# ---- 在线研究员(35B 外部;gt_text=None,答案零进 researcher)----
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: external           # 与 SearchQA 同裁定(2026-08-13)
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  narrator:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 512
+    temperature: 0.3
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128      # = worker 数 × 每 worker task 数(零排队,SearchQA 实证)
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

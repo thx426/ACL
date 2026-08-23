@@ -1,0 +1,244 @@
+# SearchQA(Search-R1 风格)× Qwen2.5-7B-Instruct — PGS 机制臂正式训练(2026-08-13)
+# 机制真值沿革:steering 段沿用 ALFWorld 正式 run 同配(v3.3 asym + v3.4 熵门
+# 自标定);doc_source=researcher 在线(35B 外部,162 双端点),训练态
+# research.gt=off —— SearchQA 的 gt_text 恒 None(golden_answers 即评测本体,
+# 绝不进 researcher),信息状态红线在 adapter 层已闭合。
+#
+# 口径对照(三家实测代码,非转述):
+#   Search-R1 官方 v0.3:batch512 × n_agent5、max_turns4、1005 步、kl 0.001
+#   SEED(arXiv 2607.14777)SEED臂:3B、batch128 × n8、150 步、kl 0.001、
+#     val 512 条 temp0.4;基线臂:7B、batch256 × n5、adv=gigpo
+#   本 run(用户裁定 2026-08-13):batch128 × n8、2 epochs(≈2650 步)、
+#     val 2048 条 greedy、无 KL(Dr.GRPO 底座 IF-04,与 ALFWorld 自洽)
+run:
+  name: classic_sqa7b_pgs
+environment:
+  name: searchqa
+episode:
+  # 三家一致:每 episode 4 次工具调用。turns 给 2 轮格式失败余量
+  # (protocol.py 校验 turns >= steps)。
+  max_env_steps: 4
+  max_assistant_turns: 6
+  max_tokens_per_turn: 1024
+searchqa:
+  # 2026-08-13 用户裁定:回退**文本标签协议**(Search-R1/SEED 同款),不用 FC。
+  # 依据:两家代码级核实——Search-R1(scripts/data_process/nq_search.py)与
+  # SEED(prompts/search.py)都是 <think>/<search>/<answer>/<information>,
+  # 且 prompt 内置 one-shot("For example, <answer> Beijing </answer>")。
+  # 动因:Qwen2.5(2024)对 FC 遵循不足,FC 档实测 11.8% 轨迹因连续格式违规
+  # 判 DEGENERATE:format(均每条 3 次),4 步预算下一次失误即 25%。
+  # 标签沿用原生 <think>(不同于 ALFWorld 的 <reasoning>):已实测 Qwen2.5 的
+  # chat template 不剥离历史轮 <think> 块(Qwen3 系才剥离)。
+  protocol: text
+  retriever_url: "http://10.77.110.162:8000"   # 162 wiki-18 + e5,faiss 4 卡分片
+  topk: 3                     # Search-R1 论文口径
+  # 环境侧吞吐(用户裁定"调到最大"):micro-batching 实测 40×
+  # (320 queries/160 并发 = 600 q/s;单 query 单请求天花板 ~15 q/s,拉并发无效)。
+  # ⚠ "最大"指**吞吐**不是**并发**:冒烟 v3 用在途 64(双臂 128 批 / 8192
+  # query 在途)把服务端打到单发 13.7s、客户端全面超时。实测最优点是
+  # **批 512 × 在途 2**(1384 q/s;批 64 时只有 632-722)——512 正好对齐
+  # 服务端内部 retrieval_batch_size。双臂合计 4 批在途,仍在最优区。
+  # 需求 2765 query/步 ÷ 1384 ≈ 2s,占每步总时长不到 1%。
+  search_concurrency: 2
+  # 512 是服务端内部 batch;但客户端能否攒满取决于单进程 query 密度,
+  # 16 worker 下现实批约几十 ⇒ 设 128,攒不满即按 wait 窗口发出(不白等)。
+  search_max_batch: 128
+  # ⚠ 162 上 35B researcher 与 retriever **共享同样 4 张 GPU**(每卡 35B
+  # 58.8G + 索引 10G)。机制臂 researcher 满负荷时 retriever 响应 0.1s→12s
+  # ——服务端只是慢不是坏(failure=0)。90s 超时避免把慢误判成故障。
+  search_timeout_s: 90.0
+  search_batch_wait_ms: 15.0
+eval:
+  response_budget: 8192       # 4 轮 × (1024 生成 + ~900 检索观察),留 2× 余量
+  # 2026-08-14 用户裁定:测试集一律 avg@3(所有任务实验通用)。
+  # temperature 必须 >0——config 校验强制(n>1 时 greedy 三次逐字节相同,
+  # avg@3 退化成 mean@1 却付 3 倍成本)。取 0.6:社区 avg@k 评测主流值,
+  # 高于 SEED 的 val temp 0.4、远低于训练 rollout 的 1.0(避免过度发散)。
+  # ⚠ 口径断裂:此前 val 曲线是 greedy@1(GRPO 35.2→44.8→45.3→46.5→48.6),
+  # 与 avg@3 不可直接比;verl 另给 best@3/worst@3,信息量高于单次 greedy。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  # train_trainer = 原 train.parquet + verl trainer 必需的两字段(2026-08-13
+  # 冒烟拦下):agent_name='trace_opd'(选 agent loop)+ reward_model.style=
+  # 'env'(reward 由 AgentLoop 提供;原 'rule' 会让 verl 去查 reward_score
+  # 注册表,而 data_source 'searchqa/*' 不在其中 ⇒ NotImplementedError)。
+  # 判分不受影响:EM 内嵌 adapter,读 extra_info.golden_answers。
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_searchqa_data/train_trainer.parquet
+  # val = test 集 shuffle(seed42)后固定 2048 条(用户裁定 2026-08-13:
+  # 「如果 test 集必须固定,则取大一点」)。固定集合而非每次重采——否则跨
+  # step 不是同一批任务、曲线不可比。七源按比例分布;同样带 trainer 两字段。
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_searchqa_data/val_shuf2048.parquet
+  experiment_name: classic_sqa7b_pgs
+  project_name: trace_opd
+  n_gpus: 4                   # 机制臂 CVD 0-3
+  rollout_tp: 1
+  train_batch_size: 128       # 用户裁定,对齐 SEED 的 SEED 臂
+  rollout_n: 8                # 对齐 SEED 的 GROUP_SIZE=8
+  # ⚠ 不是"必须 == train_batch_size"(2026-08-13 冒烟 v5 查清 verl 语义):
+  # verl 对**已 repeat n 次的 batch(1024 行)按 worker 数连续切块**
+  # (agent_loop.py: prompts.chunk(len(workers))),而 DataProto.repeat 默认
+  # interleave=True ⇒ 顺序是 [t0×8, t1×8, …]。所以只要 1024 能被 worker 数
+  # 整除,同 task 的 8 个副本必落同一 worker,组内配对不受影响。
+  # 取 16 而非 128 的原因:**每个 worker 是独立进程、各持一个检索 batcher**。
+  # 128 进程 ⇒ 每个只见 1/128 的稀疏 query 流,实测 avg_batch=1(合批完全
+  # 失效),同时 128×在途2 = 256 个并发小请求砸在容量曲线最差档(15 q/s),
+  # wait 从 4s 恶化到 47s。16 worker ⇒ 每 worker 8 个 task,query 密度 ×8、
+  # 全局在途批 256→32。researcher 并发本就按 worker 分摊(_per_worker),同步收窄。
+  agent_num_workers: 16
+  ppo_mini_batch_size: 128
+  lr: 1.0e-6                  # 三家一致
+  lr_scheduler_type: constant # SEED 用 warmup 0.1 / Search-R1 用 0.285;
+                              # 我们保持 ALFWorld 同款 constant,差异记脚注
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false      # Dr.GRPO 形态(底座裁定 IF-04)
+  max_prompt_length: 4096     # 三家一致
+  response_length: 8192       # 与 eval.response_budget 同源
+  max_token_len_per_gpu: 12288
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  # ✗ 不可开 use_fused_kernels:与 fsdp2 不兼容(ALFWorld 冒烟实证,
+  # compute_log_prob → aten.mm.default got mixed torch.Tensor and DTensor)。
+  use_fused_kernels: false
+  rollout_max_model_len: 12288
+  # 2026-08-13 用户裁定调大。SearchQA 的 context 随轮次增长很快(每次检索返回
+  # <information> 约 900 tok):第1轮~450 → 第4轮~4050。8192 的批预算在后期轮次
+  # 一批只装得下 2 个满 context prefill(即便有 prefix cache 只 prefill 增量
+  # ~1200 tok,也只有 6-7 个),而我们有 1024 个 episode 并发推进 ⇒ prefill 被
+  # 切成很多小批、GPU 利用率上不去。ALFWorld 用同样的 8192 没暴露,是因为它每轮
+  # 观察只有几十 tok、context 增长慢。
+  # 显存代价主要在激活,不在 KV cache(KV 由 max_num_seqs × max_model_len 决定,
+  # 未变);rollout_gpu_mem=0.55 ⇒ 44G/卡,7B 权重 15G,余量充足。
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 512   # 1024 eps/步(128×8),SearchQA 序列短、可开大
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400  # 必须显著 > research.session_timeout_s(2400)
+  total_epochs: 2             # 用户裁定:不设步数上限,按 2 epochs
+                              # (169615/128 ≈ 1325 步/epoch ⇒ ≈2650 步)
+  # val 集 2048 条(是 ALFWorld 274 的 7.5×)⇒ 每次 val 双臂各跑 2048 个
+  # episode、约 5 分钟。test_freq=25 会让 2650 步跑 106 次 val ≈ 9 小时纯评测;
+  # 放宽到 50 ⇒ 53 个 val 点,画曲线足够,且 2048 条的统计功效远强于 274
+  # (MDE 由 ~7.8pp 降到 ~3pp),点稀一些不损判别力。
+  test_freq: 20              # 用户裁定 2026-08-14:密化 val 点
+  save_freq: 20              # 用户裁定 2026-08-14:密化存盘(配合
+                              # max_ckpt_to_keep=1,崩溃最多损失 20 步)
+  max_ckpt_to_keep: 1        # 用户裁定:只留最新一个(2026-08-14 磁盘配额
+                              # 爆炸事故——3×86G/臂 常驻撑爆;滚动逻辑本身正常)
+  val_before_train: true      # step0 基线读数(SEED 关掉了,我们要)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(采样端特权;损失 = native GRPO,无教师/蒸馏/critic)----
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0    # 探针关(2026-08-17 用户裁定,全线默认;sqa7b 旧 run 为 0.05)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 2800   # α cosine 周期 = 总步数 2650 × 1.05(≈batch 128 × 2 epochs);
+  # ★ 必须 ≥ 实际总步数:steered_retired 判据是 gs >= decay_steps,
+  # 周期短于总步数会在中途**阶跃停产** steered 臂(256 行→0),
+  # 同时突变 LOO 基线样本数与有效 batch ⇒ 等效学习率跳变。
+  # 5% 余量吸收步数估算误差(cosine 末端极平,末尾 α≈0.006≈0)。
+  # 2026-08-17 用户裁定,取代此前全线沿用的 2/3 约定。
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0     # v3.4 warmup 自标定
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5       # 每组 8 行 = 4 steered + 4 bare(组内配对对照)
+
+# ---- 在线研究员(35B 外部;训练态无特权 GT)----
+# 注意负载:batch128 ⇒ 每步 128 个 researcher 会话。并发已调至零排队(见 roles);
+# SearchQA 的 executor episode 比 ALFWorld 短得多(4 步 vs 30),
+# 会话本身更快。
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  # 2026-08-13 用户裁定:改用外部端点(与 researcher 同端点)。
+  # 动因(实测 SearchQA/batch128):narration 对**每个 researcher episode**
+  # 调用一次 ⇒ 1415 次/步,输入(轨迹渲染)均 1141 tok、输出均 308 tok
+  # ⇒ 每步给 7B 引擎压上 **1.62M prefill + 0.44M decode**,是单项最大的
+  # prefill 来源。搬到 35B 后这部分吞吐还给 rollout。
+  # 语义变更:engine 档是"policy 自述自己的轨迹"(researcher 读到的是学生
+  # 眼中的轨迹);external 档读到的是强模型眼中的轨迹。**不引入新特权**
+  # (researcher 本就有权看该轨迹全文),但叙述视角变了 —— 进 A/B 对照观察。
+  backend: external
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  # narrator 与 researcher 同端点/同模型,但**独立 client 与并发额度**:
+  # researcher 是每 task 一次会话(128/步),narration 是每 episode 一次
+  # (~1415/步,约 11×)。共用一个 client 会互相饿死,故分开配。
+  narrator:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # A800 本机 35B 三端点;162 宿主经反向隧道同地址即达(2026-08-23 统一,旧 162 双端点已下线)
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    # narration 调用量约为 researcher 的 11×(每 episode 一次,~1415/步 vs 128/步),
+    # 每 worker 约 88 次。给 512(_per_worker ⇒ 32/worker)避免它成为新的同步等待点;
+    # 外部 35B 侧吞吐充裕(用户确认),真实上限由 35B 的 max_num_seqs 兜底。
+    max_concurrency: 512
+    temperature: 0.3          # 与 narration.temperature 同义(client 侧默认)
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false   # 叙述不需要思考模式,省 token
+  researcher:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # A800 本机 35B 三端点;162 宿主经反向隧道同地址即达(2026-08-23 统一,旧 162 双端点已下线)
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    # 2026-08-13 用户裁定调大。verl 的 AgentLoopWorker 对分到的 64 行
+    # (8 task × 8 副本)是 asyncio.create_task 一次性全发、gather 等待,
+    # **worker 内零分批** ⇒ 串行等待完全来自下游 client 的并发信号量。
+    # 旧值 64 经 _per_worker(64,16) 只剩 4/worker,而每 worker 有 8 个 task
+    # ⇒ 8 抢 4 个名额,researcher 阶段墙钟翻倍。128 ⇒ 每 worker 恰好 8,零排队。
+    max_concurrency: 128
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false

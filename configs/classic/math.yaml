@@ -1,0 +1,52 @@
+# Classic-bench Math(DAPO train / MATH500+AIME valid;run_python+submit 两工具)
+run:
+  name: classic_math
+environment:
+  name: math
+episode:
+  max_env_steps: 12
+  max_assistant_turns: 16
+  max_tokens_per_turn: 4096  # 数学长推理
+math:
+  protocol: text             # 2026-08-13 用户裁定:文本 TIR(```python 围栏 +
+                             # ```output 回注 + \boxed 终答;对照 ToRL/SimpleTIR)
+  python_timeout_s: 30
+eval:
+  response_budget: 32768   # 16384 时 4096×4 轮即撞墙:输局全是 truncated+
+                           # NO-SUBMIT(预算墙伪装能力差,探针实测),加倍
+  temperature: 0.0
+train:
+  # 仅为过 config 校验(eval 探针不消费 train 段);正式训练 config 另立
+  model_path: "/fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct"
+
+# --- researcher 探针段(Phase3 门C-R:35B 外部研究员走机制代码 research/*)---
+# 部署事实(端点/模型名)由驱动 CLI 覆盖;此处为默认值与机制参数真源。
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6                    # 终端域实测均值 3.7 次即 finalize,6 为宽松上限
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500          # 经典域任务说明短于终端域(800),500 上限
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: engine             # 离线驱动以 narrate_fn 注入 policy 叙述(engine 离线等价)
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 64
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600

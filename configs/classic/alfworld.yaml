@@ -1,0 +1,56 @@
+# Classic-bench ALFWorld(经典文献口径:GiGPO/SEED,50 步)
+# 探针与评测共用;数据/venv 路径经环境变量注入(A800 见 ops 文档)。
+run:
+  name: classic_alfworld
+environment:
+  name: alfworld
+episode:
+  max_env_steps: 50          # GiGPO/SEED 口径
+  max_assistant_turns: 60    # 步预算 + 格式失败余量
+  max_tokens_per_turn: 1024
+alfworld:
+  protocol: fncall
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  # 2026-08-13 A800(64核)512并发压测定标(ops[8]):episode 并发 512 时
+  # gate=64 零失败、load峰133、共存生成吞吐仅 -5%;gate=128 则 load 166、
+  # 吞吐 -23%。勿沿用代码默认 128(那是 80 核机器的旧裁定)。
+  spawn_concurrency: 64
+eval:
+  response_budget: 32768     # 宽预算防截断假象(50 步会话累计)
+  temperature: 0.0
+train:
+  # 仅为过 config 校验(eval 探针不消费 train 段);正式训练 config 另立
+  model_path: "/fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct"
+
+# --- researcher 探针段(Phase3 门C-R:35B 外部研究员走机制代码 research/*)---
+# 部署事实(端点/模型名)由驱动 CLI 覆盖;此处为默认值与机制参数真源。
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6                    # 终端域实测均值 3.7 次即 finalize,6 为宽松上限
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500          # 经典域任务说明短于终端域(800),500 上限
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: engine             # 离线驱动以 narrate_fn 注入 policy 叙述(engine 离线等价)
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  researcher:
+    endpoint: "http://10.77.110.162:8880/v1,http://10.77.110.162:8881/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 64
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600

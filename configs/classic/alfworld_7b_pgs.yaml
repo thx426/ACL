@@ -1,0 +1,172 @@
+# ALFWorld × Qwen2.5-7B-Instruct — PGS 机制臂正式训练(2026-08-13)
+# 机制真值沿革:steering 段 = pgs_v33_4braw_asym.step8_final 的 effective_config
+# 实配 + v3.4 剂量通用化改两值(entropy_theta_init/floor 1.28/0.6 → 0 自标定,
+# 698d69b 裁定"16 yaml 废 1.28/0.6");doc_source=researcher 在线(35B 外部,
+# 162 双端点),训练态 research.gt=off(信息状态红线,config 强校验)。
+# 消耗口径:batch 16×n8(GiGPO 同构)× total_epochs 2(用户指令,≈444 步)。
+run:
+  name: classic_alf7b_pgs
+environment:
+  name: alfworld
+episode:
+  # 2026-08-13 用户裁定:总交互轮次硬上限 30,无效格式轮同样计数。
+  # 依据(step0 val 274 条实测,ops[11]):60 轮档下废轮占总轮次 22.7%
+  # (p75 达 21 轮),模型自认完成后在"宣布完成↔look"间空转到打满;
+  # 30 轮保住 18/23 条赢轨迹(78%),且 30~35 区间无赢轨迹⇒切点干净。
+  # 与 GiGPO/SEED 的 50 env-step 口径的差异记入脚注(对拍时注明)。
+  max_env_steps: 30
+  max_assistant_turns: 30
+  max_tokens_per_turn: 1024
+alfworld:
+  # 2026-08-13 用户裁定:回退 text/ReAct(<reasoning>+<action>),不再用 FC。
+  # 相关工作对齐:verl-agent(GiGPO)/OPID(On-Policy Skill Distillation,
+  # arXiv 2606.26790)/SEED 三家 ALFWorld prompt 逐字节同源,均 <think>+
+  # <action>;我方用 <reasoning> 是硬约束(连续对话流下 Qwen 模板会剥离历史
+  # <think> 块);admissible-actions 列表相关工作全给、我方不给(那正是特权
+  # 文档要填的面,core/protocol.py 头注)。协议进 objective_fingerprint。
+  protocol: text
+  data_root: "${ALFWORLD_DATA}"
+  worker_python: "${ALFWORLD_WORKER_PYTHON}"
+  # 双臂并行(各 4 卡)共用 64 核:每臂 gate 32,合计 boot 并发 64(压测
+  # ops[8]:单臂 512eps/gate64 load峰133;双臂各128eps/gate32 更宽裕)。
+  spawn_concurrency: 32
+eval:
+  # 30 轮档的实测需求(step0 val 274 条,ops[11]):p99=3534、max=8194 tok。
+  # 取 16384 = 实测 max 的 2×(不取 12288 是因为协议刚从 FC 切 text,余量
+  # 要压过外推不确定性——预算墙会把"预算不足"伪装成"机制不可行")。
+  # 相对旧值 28672(按 50 轮配)降 1.75×:padding 维度、KV cache、CPU 内存同降。
+  response_budget: 16384
+  # ★ 2026-08-13 用户裁定:所有任务的测试集一律 avg@3(n>1 必须配 temp>0)。
+  # 2026-08-23 补齐:本文件定稿早于该裁定,一直漏改停在 greedy@1;
+  # 6 格主实验统一复跑(2026-08-23 裁定)时对齐其余 5 格。
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-7B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/train_3553.parquet
+  # 列表 ⇒ verl 逐文件分列上报(裁定①:seen/unseen 双列)
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_seen.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_alfworld_data/valid_unseen.parquet
+  experiment_name: classic_alf7b_pgs
+  project_name: trace_opd
+  n_gpus: 4                  # 用户指令:机制臂 4 卡(CVD 0-3),基线臂另 4 卡
+  rollout_tp: 1
+  train_batch_size: 16       # GiGPO 同构(16 任务 × n8 = 128 eps/step)
+  rollout_n: 8
+  agent_num_workers: 16      # 必须 == train_batch_size(同任务副本同 worker)
+  ppo_mini_batch_size: 16
+  lr: 1.0e-6                 # GiGPO 全参口径
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo   # v3.3 asym(steered 超额单向正推,α 调度见 steering)
+  norm_adv_by_std: false     # Dr.GRPO 形态(底座裁定 IF-04;GiGPO 用 mean_std,脚注)
+  max_prompt_length: 4096    # ReAct scaffold(COMMAND_REFERENCE)+ 初始 obs ≈2k,留量
+  # Qwen2.5 max_position_embeddings=32768 是架构硬墙:prompt+response 必须
+  # ≤32768(冒烟实测 36864 被 SGLang server 启动校验拒绝)。
+  response_length: 16384     # 与 eval.response_budget 同源(30 轮档,实测 max 8194 的 2×)
+  max_token_len_per_gpu: 20480   # = max_prompt_length 4096 + response_length 16384
+  # 冒烟 v3 事故回退:关 fused kernels ⇒ logits 全量物化,per-gpu token 预算
+  # 回到历史已验证档 8192(PGS 4B 系全部 run 同值,7B vocab 152k 更大 ⇒ 只会更该保守)。
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2              # 32k 序列 / 7B / 4 卡;rmpad+FA2 profile
+  # ✗ 不可开:use_fused_kernels + fsdp2 在本 verl 版本不兼容(冒烟 v3 实证)。
+  # lm_head.weight 在 fsdp2 下是 DTensor,而 _fused_linear_for_ppo_fwd 用普通
+  # Tensor 与之 mm ⇒ compute_log_prob 阶段 RuntimeError: aten.mm.default got
+  # mixed torch.Tensor and DTensor(verl/utils/experimental/torch_functional.py:33)。
+  # 显存代价由 entropy_checkpointing + entropy_from_logits_with_chunking 承接。
+  use_fused_kernels: false
+  rollout_max_model_len: 20480   # 同 max_token_len_per_gpu;KV cache 较 32768 降 1.6×
+  rollout_max_num_batched_tokens: 8192
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 256
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400 # 必须显著 > research.session_timeout_s(2400)
+  total_epochs: 2            # 用户指令:完整训练集 2 epochs(3553/16≈222 步/epoch)
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1        # ★ 用户硬要求(设 3 曾致配额爆炸、ckpt 写坏;2026-08-23 对齐全线)
+  val_before_train: true     # step0 基线读数
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(采样端特权;损失 = native GRPO,无教师/蒸馏/critic)----
+steering:
+  enabled: true
+  doc_source: researcher     # 在线 35B 外部研究员,每 (step,task) 一次,n=8 共享 doc
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf                # v33 实配(熵门档轨迹预算交给门控,不设 nats 硬顶)
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0               # 熵门档不消费 D 门阈(gate_mode=entropy 合法)
+  gate_mode: entropy         # v3.3 组件化熵门 G-E
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0    # 探针关(2026-08-17 用户裁定,全线默认;alf7b 旧 run 为 0.05)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"          # v3.3 裁定:W 三档默认 off
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 470   # α cosine 周期 = 总步数 444 × 1.05(≈3553/16 × 2 epochs);
+  # ★ 必须 ≥ 实际总步数:steered_retired 判据是 gs >= decay_steps,
+  # 周期短于总步数会在中途**阶跃停产** steered 臂(256 行→0),
+  # 同时突变 LOO 基线样本数与有效 batch ⇒ 等效学习率跳变。
+  # 5% 余量吸收步数估算误差(cosine 末端极平,末尾 α≈0.006≈0)。
+  # 2026-08-17 用户裁定,取代此前全线沿用的 2/3 约定。
+                                 # 本 run 444 步 ⇒ 等比 ≈300
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0    # v3.4:0=warmup 自标定(哨兵期零干预,首步直标落位)
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0         # v3.4:废固定地板(随 1.28/0.6 一并出清)
+  intensity_w_min: 0.05
+  steered_fraction: 0.5      # v3.1 分臂采样:每组 8 行 = 4 steered + 4 bare
+
+# ---- 在线研究员(35B 外部;训练态无特权 GT——信息状态红线,强校验)----
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  # 外部 35B researcher(2026-08-13 用户裁定):会话流不进训练 padding,预算
+  # 不绑 7B 维度(config 校验已按 selfres/external 分派)。上限只受 162 服务
+  # max-model-len 65536:50000+8000=58000 < 65536 ✓(门C-R 探针原值)。
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: engine
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  researcher:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # A800 本机 35B 三端点;162 宿主经反向隧道同地址即达(2026-08-23 统一,旧 162 双端点已下线)
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 64
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false   # researcher 关 thinking(历史裁定;强校验必查)

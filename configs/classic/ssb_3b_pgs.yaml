@@ -1,0 +1,161 @@
+# SpreadsheetBench(SRL train)× Qwen2.5-3B-Instruct — PGS 机制臂【正式】(2026-08-17 发车)
+# 用户裁定(2026-08-17 深夜):①正式启动 3B;②batch 32 × n16(组内 bare 8 +
+# steered 8,LOO 基线样本 8);③探针关(epsilon=0,全线默认);④researcher/
+# narration 用 A800 本机 35B 三端点(卡 1/2/3,max_num_seqs 32/端点);
+# ⑤worker 内 LLM 并发与环境交互并发上调支撑高并发 rollout(CPU/内存充足)。
+# smoke 验收依据 runs/ssb3b_smoke(全链验证+三刀:2048/30s/32768 贴上限)。
+# 步数账:train 5,347 ÷ 32 ≈ 167 步/epoch × 1 epoch = 167 步;decay=176(×1.05)。
+# (2026-08-18 驱动楔死中断后重发,epochs 2→1 见 train.total_epochs 注释)
+run:
+  name: classic_ssb3b_pgs
+environment:
+  name: spreadsheetbench
+episode:
+  max_env_steps: 20
+  max_assistant_turns: 24
+  max_tokens_per_turn: 2048   # 用户裁定(smoke:p50 episode 全程 413 tok,长尾每轮打满是墙钟主项)
+  session_token_budget: 24576
+spreadsheetbench:
+  protocol: text              # 2026-08-17 裁定:text + one-shot(smoke 实测违规 0.3% 步级)
+  data_root: "${SSB_DATA}"
+  exec_concurrency: 64        # 用户裁定上调:=A800 物理核名义值(旧单臂裁定先例);
+                              # per-worker 折算 64/32=2/worker;训练只占 4 卡,CPU 充足
+  python_timeout_s: 30        # 用户裁定(离线重放 409 段:30s 新杀率 0.00%,分布双峰)
+  recalc_timeout_s: 120
+  obs_max_chars: 3500
+eval:
+  response_budget: 24576
+  temperature: 0.6
+  n: 3
+train:
+  model_path: /fs/fast/u2021000902/wushang/model/Qwen/Qwen2.5-3B-Instruct
+  train_file: /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/train_srl.parquet
+  val_files:
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/test_ssb400.parquet
+    - /fs/fast/u2021000902/wushang/data/classic/classic_ssb_data/val_srl123.parquet
+  experiment_name: classic_ssb3b_pgs
+  project_name: trace_opd
+  n_gpus: 4                   # CVD 4-7(0=他人;1-3=35B 三端点)
+  rollout_tp: 1
+  train_batch_size: 32        # 用户裁定:32 任务 × n16 = 512 eps/步
+  rollout_n: 16               # 组内 8 bare + 8 steered(steered_fraction 0.5)
+  agent_num_workers: 32       # 用户裁定上调:512 行 ÷ 32 = 16 行/worker =
+                              # 1 任务 × 16 副本同 worker(组内配对不破);
+                              # researcher/exec 并发按 worker 折算同步放大
+  ppo_mini_batch_size: 32
+  lr: 1.0e-6
+  lr_scheduler_type: constant
+  lr_warmup_steps_ratio: 0.0
+  adv_estimator: pgs_asym_grpo
+  norm_adv_by_std: false
+  max_prompt_length: 8192
+  response_length: 24576      # +prompt 8192 = 32768 恰贴 Qwen2.5 max_position_embeddings
+  max_token_len_per_gpu: 16384   # (8192+24576)/sp2
+  ppo_max_token_len_per_gpu: 8192
+  log_prob_max_token_len_per_gpu: 8192
+  ulysses_sp: 2
+  use_fused_kernels: false
+  rollout_max_model_len: 32768
+  rollout_max_num_batched_tokens: 32768
+  rollout_backend: sglang
+  rollout_gpu_mem: 0.55
+  rollout_max_num_seqs: 512   # 用户裁定上调:512 eps/步全并发推进(3B 权重 6G,
+                              # KV 池 ~35G,paged 按需分配,512 为调度上限)
+  rollout_temperature: 1.0
+  loss_agg_mode: seq-mean-token-mean
+  vllm_rpc_timeout_ms: 300000
+  agent_task_timeout_s: 5400
+  total_epochs: 1             # 2026-08-18 裁定 2→1:实测每步 800 episodes
+                              # (512 rollout + 288 researcher 实验)⇒ 28-46 分钟/步,
+                              # 334 步需 8-11 天不可接受。167 步 × 800 = 134k episodes,
+                              # 仍是 SRL 论文训练量(60 步 × 1024 = 61k)的 2 倍;
+                              # save_freq=20 保证可按 val 曲线随时提前停。
+  test_freq: 20
+  save_freq: 20
+  max_ckpt_to_keep: 1
+  val_before_train: true      # step0 基线(400 全集 + SRL122,avg@3)
+  resume_mode: auto
+  loggers: [console, swanlab]
+  fsdp_strategy: fsdp2
+  param_offload: true
+  reshard_after_forward: true
+
+# ---- PGS 机制(v3.3 asym + v3.4 熵门自标定;探针关)----
+steering:
+  enabled: true
+  doc_source: researcher
+  doc_table: ""
+  eta_max: 0.5
+  c: 2.5
+  b_max: .inf
+  topk: 64
+  obs_topk: 256
+  theta_d: 0.0
+  gate_mode: entropy
+  gate_adaptive: true
+  gate_target_rate: 0.10
+  gate_ema_beta: 0.1
+  epsilon: 0.0                # 探针关(2026-08-17 用户裁定,全线默认)
+  gate_rate_bounds: [0.05, 0.25]
+  r_max: 0
+  w_beh_mode: "off"
+  adv_mode: asym
+  steered_adv_weight: 1.0
+  steered_adv_decay_steps: 176  # 总步数 167 × 1.05(随 total_epochs 1 同步改;
+                                # 必须 ≥ 实际总步数,否则中途阶跃停产 steered 臂)
+  steered_adv_decay_mode: cosine_steps
+  steered_adv_cap: 0.0
+  entropy_target_rate: 0.05
+  entropy_theta_init: 0.0     # v3.4 warmup 自标定(smoke 逐字验证)
+  entropy_theta_update: direct
+  entropy_theta_ratchet: true
+  entropy_floor: 0.0
+  intensity_w_min: 0.05
+  steered_fraction: 0.5
+
+# ---- 在线研究员 + 叙述(均走 A800 本机 35B 三端点;独立 client 独立额度)----
+research:
+  enabled: true
+  backend: external
+  tool_protocol: fncall
+  n_exp: 6
+  k_default: 2
+  k_max: 4
+  max_turns: 24
+  wrapup_buffer: 2
+  doc_max_words: 500
+  researcher_max_tokens: 4096
+  session_timeout_s: 2400
+  session_token_budget: 50000
+  max_prompt_tokens: 8000
+narration:
+  backend: external
+  max_words: 600
+  temperature: 0.3
+  max_prompt_tokens: 12000
+roles:
+  narrator:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 128
+    temperature: 0.3
+    max_tokens: 2048
+    timeout_s: 300
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  researcher:
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"
+    model: qwen3.6-35b-a3b
+    mode: external_pool
+    api_key_env: TRACE_35B_KEY
+    max_concurrency: 96       # 3 端点 × max_num_seqs 32 = 96 服务位;
+                              # batch32 的 32 会话/步 < 96 零排队
+    temperature: 1.0
+    max_tokens: 4096
+    timeout_s: 600
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
