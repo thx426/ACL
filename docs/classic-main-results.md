@@ -66,3 +66,26 @@ step0 bare 基线 Succ = **15.33%**(3B 同点 4.0%)。**step160 单点回落 −
 
 1. **watchdog 完成盲区**(2026-08-25 13:03–15:41):训练正常完成退出后,watchdog 仅凭 `procs=0` 判为崩溃,连环重启 10 次(每次 resume→跑一遍全量 val→见 `global_step≥total` 即退出),触顶上限才停。代价 ≈2.6h×4 卡空转;**副产品 = 上表 n=10 的重复评测**。后续 5 格发车前须修完成门。
 2. **发车早期 429**(2026-08-23,已知):日志前 2,355 行为前两发的 429 fail-loud 中止(残次归档于 `rollouts.aborted_429_1349/`);第三发(13:49)起至完成**全程零错误**。
+
+---
+
+## SQA7B — SearchQA × Qwen2.5-7B-Instruct × PGS ⏳ 在跑
+
+**身份**:run `classic_sqa7b_pgs` @162 卡 0-3 · 指纹 `5a524cc3a2eb`(162 语境;A800 语境 47c6734f849b)
+**发车**:2026-08-26 22:25(第四发;前三发事故见总控 §6 / runbook 事故两则)
+**协议**:batch 128×n8 = 1024 eps/步 · **1 epoch = 1325 步**(2026-08-26 用户裁定方案 B;decay 1400)· lr 1e-6 constant · Dr.GRPO · pgs_asym_grpo · 熵门 v3.4 · steered_fraction 0.5 · epsilon 0.0 · 零 SFT · 文本标签协议 + one-shot · retriever wiki-18 e5 topk3 · 交互 4 轮
+**监控 val**:`val_eq320.parquet`(七源等额 6×320 + bamboogle 125 = 2045,md5 `1abbb5155ee8e6ef56147ab93c0adfd8`,两机一致);**论文数字出自 test 全量 51,713 终评,监控读数不进论文**
+
+### step0 基线(训练前,EM mean@3 @0.6,val_eq320)
+
+| nq | triviaqa | popqa | hotpotqa | 2wiki | musique | bamboogle | **macro(7 源等权)** |
+|---|---|---|---|---|---|---|---|
+| 37.19 | 57.19 | 39.48 | 31.25 | 20.73 | 13.54 | 31.47 | **32.98** |
+
+对照 SEED Table 1(7B,test 全量 macro):GRPO 42.0 / SEED 本尊 48.6 ⇒ 起点 headroom ≈ +9 / +15.6pp。
+(口径警告:本行是 val_eq320 训练内读数,与 SEED 的 test 全量不可直接对比,仅作 headroom 量级参考。)
+旧 8-13 run 起点(val_shuf2048 micro)≈35.1%——micro 被大源(popqa/2wiki/triviaqa 占 test 73%)拉高,macro 口径更严。
+
+### 数据路径(162,`/data4/wushang/classic_tree/`)
+- 日志 `runs/classic_sqa7b_pgs.launch.log`(第四发自第 3637 行起)· watchdog `runs/watchdog_classic_sqa7b.log`
+- 时间预算:实测 16.1 min/步(旧 run)⇒ 1325 步 ≈ 15 天(约 9 月 10 日);step0 val 16 分钟/次 × 67 次 ≈ 18 小时纯评测
