@@ -6,7 +6,9 @@
 > 主表脚注与 SEED 的预算差异;③主表评测口径 = **我方 avg@3 @ temp0.6**,脚注 SEED 口径差异。
 > 全 6 格按统一协议复跑(旧 run 全部退火 bug 版,降级为辅助证据)。
 
-## 1. 六格矩阵与状态(2026-08-23)
+## 1. 六格矩阵与状态(2026-08-23 建;WS7B 2026-08-25 收官)
+
+> **终值数字单一真源 = `docs/classic-main-results.md`**(结果台账,每格含口径/路径/SEED 对拍)。
 
 | 格 | 配置(configs/classic/) | 指纹 | 协议 | 状态 |
 |---|---|---|---|---|
@@ -15,7 +17,7 @@
 | SQA3B | searchqa_3b_pgs.yaml | de57cfcca310 | 128×8,~2650 步(2ep),decay2800 | 待发(格新建 2026-08-23) |
 | SQA7B | searchqa_7b_pgs.yaml | 47c6734f849b | 同上 | 待发 |
 | WS3B | webshop_3b_pgs.yaml | 0a2c352725c3 | 32×16,200 步(1ep),decay210 | 待发 |
-| WS7B | webshop_7b_pgs.yaml(162 变体 `_162`) | 463b32932ef9(162: f2bb626e6f2d,仅宿主路径异) | 同上 | **在跑**@162 卡0-3(2026-08-23 发车,即本格正式 run) |
+| WS7B | webshop_7b_pgs.yaml(162 变体 `_162`) | 463b32932ef9(162: f2bb626e6f2d,仅宿主路径异) | 同上 | ✅ **完成** 2026-08-25(200/200 步)**Succ 83.78 / Score 89.49**,超 SEED 本尊 Succ +5.7pp;数字与路径见 [结果台账](classic-main-results.md#ws7b--webshop--qwen25-7b-instruct--pgs-) |
 
 统一机制参数(全 6 格同):`pgs_asym_grpo` + 熵门 v3.4 自标定(theta_init 0 / ratchet)+
 steered_fraction 0.5 + decay=总步数×1.05 + **epsilon 0.0**(2026-08-17 裁定全线关探针;

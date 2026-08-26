@@ -126,8 +126,12 @@ train:
   loss_agg_mode: seq-mean-token-mean
   vllm_rpc_timeout_ms: 300000
   agent_task_timeout_s: 5400  # 必须显著 > research.session_timeout_s(2400)
-  total_epochs: 2             # 用户裁定:不设步数上限,按 2 epochs
-                              # (169615/128 ≈ 1325 步/epoch ⇒ ≈2650 步)
+  total_epochs: 1             # ★ 2026-08-26 用户裁定(方案 B):由 2 epochs 收为 1
+                              # (169615/128 ≈ 1325 步)。依据:实测单步 16.1 分钟
+                              # (旧 run 254 步/67.8h),2650 步≈30 天会占满 162 唯一
+                              # 训练机到 9 月底,其余 4 格无处可跑;1325 步≈15 天。
+                              # 仍是 SEED 协议(150 updates)的 8.8×,主表脚注照旧记
+                              # "预算高于 SEED"。★ 改步数必须同改 decay(见 steering 段)。
   # val 集 2048 条(是 ALFWorld 274 的 7.5×)⇒ 每次 val 双臂各跑 2048 个
   # episode、约 5 分钟。test_freq=25 会让 2650 步跑 106 次 val ≈ 9 小时纯评测;
   # 放宽到 50 ⇒ 53 个 val 点,画曲线足够,且 2048 条的统计功效远强于 274
@@ -165,7 +169,8 @@ steering:
   w_beh_mode: "off"
   adv_mode: asym
   steered_adv_weight: 1.0
-  steered_adv_decay_steps: 2800   # α cosine 周期 = 总步数 2650 × 1.05(≈batch 128 × 2 epochs);
+  steered_adv_decay_steps: 1400   # α cosine 周期 = 总步数 1325 × 1.05 = 1391 → 取整 1400
+                                  # (2026-08-26 随 total_epochs 2→1 同步下调,原 2800 配 2650 步);
   # ★ 必须 ≥ 实际总步数:steered_retired 判据是 gs >= decay_steps,
   # 周期短于总步数会在中途**阶跃停产** steered 臂(256 行→0),
   # 同时突变 LOO 基线样本数与有效 batch ⇒ 等效学习率跳变。

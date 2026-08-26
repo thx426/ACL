@@ -111,11 +111,17 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
     --config "$YAML" --run-name "$NAME" --dry-run
 fi
 
-# ---- GPU 清场门(>500MiB 拒发;2026-08-14 残留显存静默死亡事故)----
+# ---- GPU 清场门(2026-08-14 残留显存静默死亡事故)----
+# 默认 500MiB:任何残留都拒发。GPU_BASELINE_MIB 用于**合法常驻服务**与训练共卡的
+# 场景(2026-08-26 SearchQA:retriever 一个进程占四卡 fp16 分片 ~10G/卡,且必须
+# 先于训练启动,否则抢不到显存)——由发车者显式声明预期基线,保护语义不变:
+# 超出声明值仍然拒发,残留照样拦得住。声明值进日志,事后可追溯。
+BASELINE_MIB=${GPU_BASELINE_MIB:-500}
+[ "$BASELINE_MIB" -ne 500 ] && echo "[launch] GPU 清场基线放宽至 ${BASELINE_MIB}MiB(常驻服务共卡;调用方显式声明)"
 for g in $(echo "$CVD" | tr "," " "); do
   used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g")
-  if [ "$used" -gt 500 ]; then
-    echo "FATAL: GPU $g 仍占用 ${used}MiB —— 先清场再发车(勿覆盖启动)"; exit 1
+  if [ "$used" -gt "$BASELINE_MIB" ]; then
+    echo "FATAL: GPU $g 占用 ${used}MiB > 允许基线 ${BASELINE_MIB}MiB —— 先清场再发车(勿覆盖启动)"; exit 1
   fi
 done
 
