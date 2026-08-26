@@ -88,4 +88,4 @@ step0 bare 基线 Succ = **15.33%**(3B 同点 4.0%)。**step160 单点回落 −
 
 ### 数据路径(162,`/data4/wushang/classic_tree/`)
 - 日志 `runs/classic_sqa7b_pgs.launch.log`(第四发自第 3637 行起)· watchdog `runs/watchdog_classic_sqa7b.log`
-- 时间预算:实测 16.1 min/步(旧 run)⇒ 1325 步 ≈ 15 天(约 9 月 10 日);step0 val 16 分钟/次 × 67 次 ≈ 18 小时纯评测
+- 时间预算:**162 实测 step1 = 788 s(13.1 min;gen 485 + update_actor 209)**,快于旧 A800 run 的 16.1 ⇒ 1325 步 ≈ 12.1 天 + val 67 次 × 16 min ≈ 18 h ⇒ **约 12.8 天,预计 9 月 8 日收官**;第一训练步 GPU 峰值 66.9G/卡(共卡余 ~13G)
