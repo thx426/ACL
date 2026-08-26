@@ -108,7 +108,7 @@ esac
 # ---- 干跑出口(不写盘不占卡)----
 if [ "${DRY_RUN:-0}" = "1" ]; then
   exec env CUDA_VISIBLE_DEVICES=$CVD "$TRACE_PYX" scripts/launch_train.py \
-    --config "$YAML" --run-name "$NAME" --dry-run
+    --config "$YAML" --run-name "$NAME" --dry-run ${TRACE_VERL_EXTRA_OVERRIDES:-}
 fi
 
 # ---- GPU 清场门(2026-08-14 残留显存静默死亡事故)----
@@ -126,8 +126,13 @@ for g in $(echo "$CVD" | tr "," " "); do
 done
 
 RAYDIR=/tmp/ray_${TAG}_${ARM}; mkdir -p "$RAYDIR" "$TRACE_TREE/runs"
+# 宿主特有的 verl/引擎 override(host_*.env 的 TRACE_VERL_EXTRA_OVERRIDES,空格分隔的
+# `+key=value` 列表;2026-08-26 首例:162 的 sglang 0.5.10 关 piecewise cuda graph)。
+# 不带引号展开 ⇒ 未设即无参数;launch_train.py 会把它们记进 manifest,可追溯。
+[ -n "${TRACE_VERL_EXTRA_OVERRIDES:-}" ] && echo "[launch] 宿主 override 追加:${TRACE_VERL_EXTRA_OVERRIDES}"
 setsid env CUDA_VISIBLE_DEVICES=$CVD RAY_TMPDIR=$RAYDIR \
   "$TRACE_PYX" scripts/launch_train.py --config "$YAML" \
     --run-name "$NAME" "+actor_rollout_ref.rollout.engine_kwargs.sglang.port=${PORT}" \
+    ${TRACE_VERL_EXTRA_OVERRIDES:-} \
   >> "$TRACE_TREE/runs/${NAME}.launch.log" 2>&1 < /dev/null &
 echo "FIRED $NAME host=$TRACE_HOST cfg=${CFG}_${ARM} cvd=$CVD port=$PORT pid=$!"
