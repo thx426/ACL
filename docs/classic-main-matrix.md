@@ -137,6 +137,14 @@ Qwen2.5-**3B/7B 均在 `/data3/wushang/model/Qwen/`**(3B 首分片 sha256 与 A8
 
 ## 6. 变更台账
 
+- **2026-08-26**:WS7B 完跑收官(Succ 83.78/Score 89.49,`classic-main-results.md`);GPU 方案
+  裁定=后续全格 162 训练 + 35B 留 A800(§4.9);SQA7B 改 **1 epoch/1325 步、decay 1400**
+  (方案 B)并于 22:25 第四发成功起跑。事故三则均根治:①旧 watchdog 完成盲区(→ 新
+  `watchdog_single.sh` 完成门);②162 sglang 0.5.10 piecewise CUDA graph illegal memory access
+  (→ `host_162.env` `TRACE_VERL_EXTRA_OVERRIDES` 关闭,发射器通用追加);③`val_eq320`
+  缺 trainer schema(→ `make_sqa_val7.py` 内建 fix+自检,两机 md5 一致)。retriever 环境真源
+  = `/data3/wushang/seed-venv`(排查纠错,runbook 已补启动命令)。
+
 - 2026-08-23(三):SQA val 抽样方案重做 —— val_eq320 七源等额(动机与规则见 §4.2);
   指纹不变(val_files 不进指纹,实测);A800 已生成并 DRY 验证(retriever 预检如设计拦截,
   服务未启);162 yaml 已同步、数据未生成(届时脚本一键复现)。
