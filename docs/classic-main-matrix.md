@@ -15,7 +15,7 @@
 | ALF3B | alfworld_3b_pgs.yaml | 88a3c7172848 | 16×8,444 步(2ep),decay470 | 待发 |
 | ALF7B | alfworld_7b_pgs.yaml | e914221e53da | 同上 | 待发 |
 | SQA3B | searchqa_3b_pgs.yaml | de57cfcca310 | 128×8,~2650 步(2ep),decay2800 —— ★发车前须同 SQA7B 改 1ep/decay1400 | 待发(格新建 2026-08-23) |
-| SQA7B | searchqa_7b_pgs.yaml | 47c6734f849b(162: 5a524cc3a2eb,宿主路径异) | **1 epoch=1325 步,decay1400**(2026-08-26 裁定方案 B) | **在跑**@162 卡0-3(2026-08-26 22:08 发车;retriever 共卡) |
+| SQA7B | searchqa_7b_pgs.yaml | **b28e18c19eba**(A800,decay1400 版;2ep 旧版 47c6734f849b——★decay 进指纹) | **1 epoch=1325 步,decay1400** | **在跑**@**A800 卡0-3**(2026-08-27 11:10 重发;卡4-7=四端点 35B,retriever@162,client 熔断上线;162 首日 run 已归档) |
 | WS3B | webshop_3b_pgs.yaml | 0a2c352725c3 | 32×16,200 步(1ep),decay210 | 待发 |
 | WS7B | webshop_7b_pgs.yaml(162 变体 `_162`) | 463b32932ef9(162: f2bb626e6f2d,仅宿主路径异) | 同上 | ✅ **完成** 2026-08-25(200/200 步)**Succ 83.78 / Score 89.49**,超 SEED 本尊 Succ +5.7pp;数字与路径见 [结果台账](classic-main-results.md#ws7b--webshop--qwen25-7b-instruct--pgs-) |
 

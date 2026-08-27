@@ -14,7 +14,7 @@
 | ALF3B | 待发 | — | 91.8(seen macro) | — |
 | ALF7B | 待发 | — | 96.1(seen macro) | — |
 | SQA3B | 待发 | — | 45.7(7 集 macro) | — |
-| SQA7B | **在跑** 2026-08-26 22:08 @162(1325 步) | — | 48.6(7 集 macro) | — |
+| SQA7B | **在跑** 2026-08-27 11:10 @A800(重发;1325 步) | — | 48.6(7 集 macro) | — |
 
 ---
 
@@ -71,8 +71,15 @@ step0 bare 基线 Succ = **15.33%**(3B 同点 4.0%)。**step160 单点回落 −
 
 ## SQA7B — SearchQA × Qwen2.5-7B-Instruct × PGS ⏳ 在跑
 
-**身份**:run `classic_sqa7b_pgs` @162 卡 0-3 · 指纹 `5a524cc3a2eb`(162 语境;A800 语境 47c6734f849b)
-**发车**:2026-08-26 22:25(第四发;前三发事故见总控 §6 / runbook 事故两则)
+**身份**:run `classic_sqa7b_pgs` @**A800 卡 0-3** · 指纹 **`b28e18c19eba`**(A800 语境 decay=1400 版;
+2ep 旧版 47c6734f849b,decay 进指纹——asym α 三参数 weight:decay:cap:mode 同批,config.py ~1701)
+**发车**:**2026-08-27 11:10(A800 重发,正式 run)**。前史:162 首日四发(piecewise×2 / val schema×1 /
+成功 1)后,因 A800 GPU 被抢占致 8880 端点 hang、37.5% 会话降级 bare,用户裁定停杀重构
+(162 17 步脏数据归档 `classic_sqa7b_pgs_aborted8880_20260827`)。
+**新架构(2026-08-27 用户裁定)**:A800 全机自有——卡 0-3 训练 + 卡 4-7 四端点 35B researcher
+(TP=1,8880-8883,serve_vllm.sh 环境序言);retriever 留 162 独占四卡(A800→162 HTTP 直连,
+8-13 原架构);**client 端点熔断上线**(PooledClient:连败 3 摘除/半开自愈/全灭兜底,commit 440ccaf)
+——单端点故障不再拖垮训练。
 **协议**:batch 128×n8 = 1024 eps/步 · **1 epoch = 1325 步**(2026-08-26 用户裁定方案 B;decay 1400)· lr 1e-6 constant · Dr.GRPO · pgs_asym_grpo · 熵门 v3.4 · steered_fraction 0.5 · epsilon 0.0 · 零 SFT · 文本标签协议 + one-shot · retriever wiki-18 e5 topk3 · 交互 4 轮
 **监控 val**:`val_eq320.parquet`(七源等额 6×320 + bamboogle 125 = 2045,md5 `1abbb5155ee8e6ef56147ab93c0adfd8`,两机一致);**论文数字出自 test 全量 51,713 终评,监控读数不进论文**
 
