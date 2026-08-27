@@ -83,6 +83,14 @@ step0 bare 基线 Succ = **15.33%**(3B 同点 4.0%)。**step160 单点回落 −
 **协议**:batch 128×n8 = 1024 eps/步 · **1 epoch = 1325 步**(2026-08-26 用户裁定方案 B;decay 1400)· lr 1e-6 constant · Dr.GRPO · pgs_asym_grpo · 熵门 v3.4 · steered_fraction 0.5 · epsilon 0.0 · 零 SFT · 文本标签协议 + one-shot · retriever wiki-18 e5 topk3 · 交互 4 轮
 **监控 val**:`val_eq320.parquet`(七源等额 6×320 + bamboogle 125 = 2045,md5 `1abbb5155ee8e6ef56147ab93c0adfd8`,两机一致);**论文数字出自 test 全量 51,713 终评,监控读数不进论文**
 
+### A800 重发首验(2026-08-27,机制五面全过)
+
+step0 七源(A800 自算,与 162 run Δ<2.2pp=评测随机性,macro 33.56):同集同权重同判分实证。
+机制:researcher 128/128 零超时零错(docW 中位 ~420)/ 分臂恰 50% 行受引导(step1 warmup=0 ✓)/
+doc_missing 全程 0 / won 41.0→45.3%(step6)。**墙钟 531.9 s/it ≈ 8.9 min/步**(vs 162 健康步 13.1:
+本机四端点零隧道 + SXM NVLink + retriever 独占),投影 **9 月 4 日收官**。
+观测面:A800 driver 日志无指标行(原因未深究),监控走 rollouts/*.json 自算 + tqdm。
+
 ### step0 基线(训练前,EM mean@3 @0.6,val_eq320)
 
 | nq | triviaqa | popqa | hotpotqa | 2wiki | musique | bamboogle | **macro(7 源等权)** |
