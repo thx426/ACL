@@ -73,7 +73,10 @@ step0 bare 基线 Succ = **15.33%**(3B 同点 4.0%)。**step160 单点回落 −
 
 **身份**:run `classic_sqa7b_pgs` @**A800 卡 0-3** · 指纹 **`b28e18c19eba`**(A800 语境 decay=1400 版;
 2ep 旧版 47c6734f849b,decay 进指纹——asym α 三参数 weight:decay:cap:mode 同批,config.py ~1701)
-**发车**:**2026-08-27 11:10(A800 重发,正式 run)**。前史:162 首日四发(piecewise×2 / val schema×1 /
+**发车**:**2026-08-27 21:50(A800 GPU 硬件故障修复后、用户裁定完全重头的第三次发车,正式 run;driver pid 6179 / watchdog 6182;launch.log 自第 1 行起)**。
+**★ 硬件事故(2026-08-27)**:11:10 发车的 run 跑到 step 10 后遭 A800 GPU 硬件故障——step10(12:37-12:48)已 25% 行 doc_missing、受引导行 38%(单个 35B 端点先失效);13:14-13:19 四个 35B 实例日志全部静止;13:24 训练最后产物;18:40 SIGTERM;21:24 机器重启。全程日志**零 CUDA/Xid 报错**(驱动/硬件楔死指纹),watchdog 只能告警"疑似卡死"(硬件故障无自愈路径,属预期)。数据归档 `runs/classic_sqa7b_pgs_gpufail0827`(10 步、无 ckpt;won 41.0→45.3→41.5%,分臂恒 50%)。重启后八卡冒烟全过:fp16 221-239 TFLOPS、rel_err 4e-4、每卡 72 GB HBM 扫描零坏块、NCCL 0-3 105.7 GB/s 校验正确、ECC/行重映射全零(`scripts/classic/ops_a800/gpu_smoke_a800.py`);四端点 35B 重起 300 s 就绪(environ 实证 ptxas/两条超时链路);dry-run 四门绿、指纹 **b28e18c19eba** 不变。**投影:8.9 min/步 × 1325 + 67 次 val × 10.5 min ≈ 8.7 天 ⇒ 约 9 月 5 日收官**。
+**运维教训**:A800 `/tmp` 重启即清——发车/巡检/起服/冒烟脚本改放持久目录 `/fs/fast/u2021000902/wushang/ops/`,并纳入 git `scripts/classic/ops_a800/`(162 侧 `ops_162/`);一条龙 `bringup_a800.sh`(冒烟→dry→35B 拉起);dry 模式退出码透传修复;35B 起服脚本只看本批日志(旧版同日旧日志误报)。162 四卡现与他人 sglang 训练共用(retriever 10 GB/卡,真实查询正常;不再是独占)。
+前史(11:10 之前):162 首日四发(piecewise×2 / val schema×1 /
 成功 1)后,因 A800 GPU 被抢占致 8880 端点 hang、37.5% 会话降级 bare,用户裁定停杀重构
 (162 17 步脏数据归档 `classic_sqa7b_pgs_aborted8880_20260827`)。
 **新架构(2026-08-27 用户裁定)**:A800 全机自有——卡 0-3 训练 + 卡 4-7 四端点 35B researcher
@@ -88,7 +91,7 @@ step0 bare 基线 Succ = **15.33%**(3B 同点 4.0%)。**step160 单点回落 −
 step0 七源(A800 自算,与 162 run Δ<2.2pp=评测随机性,macro 33.56):同集同权重同判分实证。
 机制:researcher 128/128 零超时零错(docW 中位 ~420)/ 分臂恰 50% 行受引导(step1 warmup=0 ✓)/
 doc_missing 全程 0 / won 41.0→45.3%(step6)。**墙钟 531.9 s/it ≈ 8.9 min/步**(vs 162 健康步 13.1:
-本机四端点零隧道 + SXM NVLink + retriever 独占),投影 **9 月 4 日收官**。
+本机四端点零隧道 + SXM NVLink + retriever 独占),投影 9 月 4 日收官(该 run 随后因硬件故障作废,见上;首验结论仍成立并被第三发复用)。
 观测面:A800 driver 日志无指标行(原因未深究),监控走 rollouts/*.json 自算 + tqdm。
 
 ### step0 基线(训练前,EM mean@3 @0.6,val_eq320)

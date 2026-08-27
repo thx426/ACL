@@ -15,7 +15,7 @@
 | ALF3B | alfworld_3b_pgs.yaml | 88a3c7172848 | 16×8,444 步(2ep),decay470 | 待发 |
 | ALF7B | alfworld_7b_pgs.yaml | e914221e53da | 同上 | 待发 |
 | SQA3B | searchqa_3b_pgs.yaml | de57cfcca310 | 128×8,~2650 步(2ep),decay2800 —— ★发车前须同 SQA7B 改 1ep/decay1400 | 待发(格新建 2026-08-23) |
-| SQA7B | searchqa_7b_pgs.yaml | **b28e18c19eba**(A800,decay1400 版;2ep 旧版 47c6734f849b——★decay 进指纹) | **1 epoch=1325 步,decay1400** | **在跑**@**A800 卡0-3**(2026-08-27 11:10 重发;卡4-7=四端点 35B,retriever@162,client 熔断上线;162 首日 run 已归档) |
+| SQA7B | searchqa_7b_pgs.yaml | **b28e18c19eba**(A800,decay1400 版;2ep 旧版 47c6734f849b——★decay 进指纹) | **1 epoch=1325 步,decay1400** | **在跑**@**A800 卡0-3**(2026-08-27 **21:50 第三次发车**——11:10 的 run 在 step10 后遭 A800 GPU 硬件故障,修复后重头重跑,旧数据归档 `_gpufail0827`;卡4-7=四端点 35B,retriever@162,client 熔断上线;162 首日 run 已归档) |
 | WS3B | webshop_3b_pgs.yaml | 0a2c352725c3 | 32×16,200 步(1ep),decay210 | 待发 |
 | WS7B | webshop_7b_pgs.yaml(162 变体 `_162`) | 463b32932ef9(162: f2bb626e6f2d,仅宿主路径异) | 同上 | ✅ **完成** 2026-08-25(200/200 步)**Succ 83.78 / Score 89.49**,超 SEED 本尊 Succ +5.7pp;数字与路径见 [结果台账](classic-main-results.md#ws7b--webshop--qwen25-7b-instruct--pgs-) |
 
@@ -136,6 +136,8 @@ Qwen2.5-**3B/7B 均在 `/data3/wushang/model/Qwen/`**(3B 首分片 sha256 与 A8
 | 每格跑完 | 归档 val 全量扫描(probe/val_scan_all.py)+ 终评批(§4)+ 更新本表状态 |
 
 ## 6. 变更台账
+
+- 2026-08-27(晚):**A800 GPU 硬件故障 → SQA7B 重头重跑**(21:50 第三发,指纹不变 b28e18c19eba;事故时间线与冒烟数据见结果台账)。运维资产入库:`scripts/classic/ops_a800/`(bringup 一条龙 / gpu_smoke / start_35b_x4 / sqa7b_launch / status / wait)与 `ops_162/`(retriever 拉起 / 精确杀进程 / 发车 / 巡检)——A800 `/tmp` 重启即清,远端持久位置 `/fs/fast/u2021000902/wushang/ops/`。修复:dry 退出码透传、35B 起服只看本批日志、冒烟 HBM 扫描用 aminmax(bool 求和会 8× 上转假 OOM)。观察:162 四卡现与他人 sglang 训练共用,retriever 正常但非独占。
 
 - **2026-08-26**:WS7B 完跑收官(Succ 83.78/Score 89.49,`classic-main-results.md`);GPU 方案
   裁定=后续全格 162 训练 + 35B 留 A800(§4.9);SQA7B 改 **1 epoch/1325 步、decay 1400**
