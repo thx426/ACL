@@ -221,7 +221,7 @@ roles:
   # researcher 是每 task 一次会话(128/步),narration 是每 episode 一次
   # (~1415/步,约 11×)。共用一个 client 会互相饿死,故分开配。
   narrator:
-    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # A800 本机 35B 三端点;162 宿主经反向隧道同地址即达(2026-08-23 统一,旧 162 双端点已下线)
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1,http://127.0.0.1:8883/v1"   # ★ 2026-08-27 用户裁定新架构:A800 全空,卡4-7 各起一个 35B(TP=1)= 四端点;训练在 A800 卡0-3,127.0.0.1 本机直达零隧道。client 层已有端点熔断(llm.py PooledClient:连败3次摘除/半开自愈),单端点故障不再拖垮训练。endpoint 不进 objective_fingerprint。
     model: qwen3.6-35b-a3b
     mode: external_pool
     api_key_env: TRACE_35B_KEY
@@ -236,7 +236,7 @@ roles:
       chat_template_kwargs:
         enable_thinking: false   # 叙述不需要思考模式,省 token
   researcher:
-    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1"   # A800 本机 35B 三端点;162 宿主经反向隧道同地址即达(2026-08-23 统一,旧 162 双端点已下线)
+    endpoint: "http://127.0.0.1:8880/v1,http://127.0.0.1:8881/v1,http://127.0.0.1:8882/v1,http://127.0.0.1:8883/v1"   # ★ 2026-08-27 用户裁定新架构:A800 全空,卡4-7 各起一个 35B(TP=1)= 四端点;训练在 A800 卡0-3,127.0.0.1 本机直达零隧道。client 层已有端点熔断(llm.py PooledClient:连败3次摘除/半开自愈),单端点故障不再拖垮训练。endpoint 不进 objective_fingerprint。
     model: qwen3.6-35b-a3b
     mode: external_pool
     api_key_env: TRACE_35B_KEY

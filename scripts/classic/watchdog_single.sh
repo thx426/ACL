@@ -134,13 +134,13 @@ PYEOF2
 
 probe_35b() {
   local ok=0
-  for port in 8880 8881; do
+  for port in 8880 8881 8882 8883; do
     code=$(curl -s -m 12 -o /dev/null -w "%{http_code}" \
       -H "Authorization: Bearer ${TRACE_35B_KEY:-token-abc123}" \
       "http://127.0.0.1:${port}/v1/models" 2>/dev/null || echo 000)
     [ "$code" = "200" ] && ok=$((ok+1))
   done
-  echo "$ok"
+  echo "$ok/4"
 }
 
 fire() {  # fire <arm> <cvd> <raydir> <sglport> —— 统一走 launch_classic.sh
