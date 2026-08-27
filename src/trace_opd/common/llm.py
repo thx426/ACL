@@ -293,6 +293,19 @@ class PooledClient:
     # seconds instead of riding the single-client 5-retry backoff (~60s)
     INNER_RETRIES = 2
 
+    # ---- 端点熔断(2026-08-27,8880 GPU 被抢占事故)----
+    # failover 是请求级救济、无记忆:sticky 首分配与 narration 的每个新 route_key
+    # 仍按负载抽签,1/N 概率抽中坏端点,每次抽中烧 timeout_s×(INNER_RETRIES+1)
+    # 才切走;hang 型故障(连接得上、completion 永不返回)下一个会话经不起抽中
+    # 两次(实测 2026-08-26:三端点之一 hang ⇒ 37.5% researcher 会话烧穿 2400s
+    # 会话预算,降级 bare)。熔断补上"记忆":连续 FAIL_THRESHOLD 次失败 ⇒ 端点
+    # DOWN 冷却 COOLDOWN_S 秒,选择器跳过它(sticky 指向它的会话也改道);冷却
+    # 期满自动半开——下一个选中它的请求就是探测,成功即恢复清零,失败立即续
+    # DOWN。全端点 DOWN 时退回可选(不死锁,由会话层 timeout 兜底)。纯可靠性
+    # 参数,不进 objective_fingerprint。
+    FAIL_THRESHOLD = 3
+    COOLDOWN_S = 120.0
+
     def __init__(
         self,
         *,
@@ -318,15 +331,25 @@ class PooledClient:
         self._stats = [
             {"requests": 0, "failures": 0, "failovers_in": 0} for _ in clients
         ]
+        # 熔断状态(进程内;每个 agent-loop worker 各自独立熔断)
+        self._consec_fail = [0] * len(clients)
+        self._down_until = [0.0] * len(clients)
+        self._downs = [0] * len(clients)
+
+    def _up(self, idx: int) -> bool:
+        """端点当前是否可选(未在熔断冷却期)。"""
+        return time.monotonic() >= self._down_until[idx]
 
     def _least_active(self, route_key: str | None, exclude: set[int]) -> int:
         cands = [i for i in range(len(self._clients)) if i not in exclude]
+        up = [i for i in cands if self._up(i)]
+        pool = up or cands  # 全 DOWN 兜底:仍可选(不死锁;会话层 timeout 兜底)
         tie = zlib.crc32((route_key or "").encode("utf-8"))
-        return min(cands, key=lambda i: (self._active[i], (i + tie) % len(self._clients)))
+        return min(pool, key=lambda i: (self._active[i], (i + tie) % len(self._clients)))
 
     def _order(self, route_key: str | None) -> list[int]:
         """Sticky endpoint first, then the rest by load (failover order)."""
-        first = (
+        cand = (
             self._sticky[route_key]
             if route_key is not None and route_key in self._sticky
             else (
@@ -335,6 +358,8 @@ class PooledClient:
                 else self._least_active(route_key, set())
             )
         )
+        # sticky/显式起点若在熔断冷却期 ⇒ 改道到健康端点(全 DOWN 时兜底原选)
+        first = cand if self._up(cand) else self._least_active(route_key, set())
         rest: list[int] = []
         seen = {first}
         while len(seen) < len(self._clients):
@@ -372,9 +397,26 @@ class PooledClient:
                     )
                     if route_key is not None:
                         self._sticky[route_key] = idx  # (re-)stick the session
+                    if self._consec_fail[idx] >= self.FAIL_THRESHOLD:
+                        print(
+                            f"[pool:{self.role}] endpoint RECOVERED: "
+                            f"{self._clients[idx].endpoint}(半开探测成功,恢复调度)",
+                            flush=True,
+                        )
+                    self._consec_fail[idx] = 0
                     return result
                 except LLMError as err:
                     self._stats[idx]["failures"] += 1
+                    self._consec_fail[idx] += 1
+                    if self._consec_fail[idx] >= self.FAIL_THRESHOLD and self._up(idx):
+                        self._down_until[idx] = time.monotonic() + self.COOLDOWN_S
+                        self._downs[idx] += 1
+                        print(
+                            f"[pool:{self.role}] endpoint DOWN #{self._downs[idx]}: "
+                            f"{self._clients[idx].endpoint}(连续 {self._consec_fail[idx]} 次失败,"
+                            f"熔断 {self.COOLDOWN_S:.0f}s 后半开探测)",
+                            flush=True,
+                        )
                     last_err = err
                 finally:
                     self._active[idx] -= 1
@@ -384,7 +426,14 @@ class PooledClient:
 
     def stats(self) -> list[dict[str, Any]]:
         return [
-            {"endpoint": c.endpoint, **s} for c, s in zip(self._clients, self._stats)
+            {
+                "endpoint": c.endpoint,
+                **s,
+                "consec_fail": self._consec_fail[i],
+                "down": not self._up(i),
+                "downs": self._downs[i],
+            }
+            for i, (c, s) in enumerate(zip(self._clients, self._stats))
         ]
 
     async def aclose(self) -> None:

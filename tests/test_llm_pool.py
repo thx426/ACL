@@ -238,3 +238,100 @@ def test_pool_failover_on_200_malformed_json():
     _run(main())
     # inner 会重试坏 200，穷尽后才切另一 endpoint。
     assert calls[-1] == "good" and calls.count("bad") == PooledClient.INNER_RETRIES + 1
+
+
+# ---- 端点熔断(2026-08-27,单端点 hang 拖垮 37.5% 会话事故)----
+
+def test_pool_circuit_breaker_removes_dead_endpoint():
+    pool = make_client("researcher", _Cfg("http://a:1/v1,http://b:2/v1"))
+    log_a, log_b = [], []
+    _wire(pool._clients[0], log_a, status=400)  # A 持续快速失败
+    _wire(pool._clients[1], log_b)
+
+    async def main():
+        # 三个新会话首选 A(sticky 预置),各失败一次 failover 到 B ⇒ A 连续 3 败熔断
+        for k in range(pool.FAIL_THRESHOLD):
+            pool._sticky[f"task/{k}"] = 0
+            r = await pool.chat([{"role": "user", "content": "x"}], route_key=f"task/{k}")
+            assert r.content == "ok"
+        assert not pool._up(0) and pool._downs[0] == 1
+        n_a = len(log_a)
+        # 熔断后:即便 sticky 指向 A,也零调用 A、直接打 B 并重粘
+        pool._sticky["task/new"] = 0
+        r = await pool.chat([{"role": "user", "content": "x"}], route_key="task/new")
+        assert r.content == "ok"
+        assert len(log_a) == n_a               # A 未再被打
+        assert pool._sticky["task/new"] == 1   # 改道并重粘 B
+        st = pool.stats()
+        assert st[0]["down"] is True and st[0]["downs"] == 1
+        await pool.aclose()
+
+    _run(main())
+
+
+def test_pool_circuit_breaker_half_open_recovers():
+    pool = make_client("researcher", _Cfg("http://a:1/v1,http://b:2/v1"))
+    pool.COOLDOWN_S = 0.05  # 实例级縮短冷却,便于测试
+    log_a, log_b = [], []
+    _wire(pool._clients[0], log_a, status=400)
+    _wire(pool._clients[1], log_b)
+
+    async def main():
+        for k in range(pool.FAIL_THRESHOLD):
+            pool._sticky[f"task/{k}"] = 0
+            await pool.chat([{"role": "user", "content": "x"}], route_key=f"task/{k}")
+        assert not pool._up(0)
+        await asyncio.sleep(0.08)              # 冷却期满 ⇒ 半开
+        assert pool._up(0)
+        _wire(pool._clients[0], log_a)          # A 修好
+        pool._sticky["task/probe"] = 0
+        r = await pool.chat([{"role": "user", "content": "x"}], route_key="task/probe")
+        assert r.content == "ok"
+        assert pool._consec_fail[0] == 0        # 探测成功清零恢复
+        assert pool._sticky["task/probe"] == 0  # 留在 A
+        await pool.aclose()
+
+    _run(main())
+
+
+def test_pool_half_open_probe_fail_re_downs():
+    pool = make_client("researcher", _Cfg("http://a:1/v1,http://b:2/v1"))
+    pool.COOLDOWN_S = 0.05
+    _wire(pool._clients[0], [], status=400)
+    _wire(pool._clients[1], [])
+
+    async def main():
+        for k in range(pool.FAIL_THRESHOLD):
+            pool._sticky[f"task/{k}"] = 0
+            await pool.chat([{"role": "user", "content": "x"}], route_key=f"task/{k}")
+        assert pool._downs[0] == 1
+        await asyncio.sleep(0.08)              # 半开
+        pool._sticky["task/p"] = 0
+        r = await pool.chat([{"role": "user", "content": "x"}], route_key="task/p")
+        assert r.content == "ok"               # failover 到 B 仍成功
+        assert pool._downs[0] == 2             # 探测失败 ⇒ 立即续 DOWN
+        assert not pool._up(0)
+        await pool.aclose()
+
+    _run(main())
+
+
+def test_pool_all_down_still_serves_no_deadlock():
+    pool = make_client("researcher", _Cfg("http://a:1/v1,http://b:2/v1"))
+    _wire(pool._clients[0], [], status=400)
+    _wire(pool._clients[1], [], status=400)
+
+    async def main():
+        # 双端点各连败 3 次 ⇒ 双双熔断(每次 chat 两端点各 +1 败)
+        for k in range(pool.FAIL_THRESHOLD):
+            with pytest.raises(LLMError):
+                await pool.chat([{"role": "user", "content": "x"}], route_key=f"t/{k}")
+        assert not pool._up(0) and not pool._up(1)
+        # 全 DOWN 兜底:仍会尝试(不死锁);端点修复后立即可用并 RECOVERED
+        _wire(pool._clients[0], [])
+        _wire(pool._clients[1], [])
+        r = await pool.chat([{"role": "user", "content": "x"}], route_key="t/z")
+        assert r.content == "ok"
+        await pool.aclose()
+
+    _run(main())
