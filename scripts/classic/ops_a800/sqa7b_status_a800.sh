@@ -7,8 +7,8 @@ OFF=$(cat /fs/fast/u2021000902/wushang/ops/sqa7b_launch_offset 2>/dev/null || ec
 LL() { tail -n +"$OFF" "$L" 2>/dev/null; }
 S=$(ls $R/$RUN/rollouts 2>/dev/null | grep -v val | tail -1); S=${S:-none}
 C=$(cat $R/$RUN/checkpoints/latest_checkpointed_iteration.txt 2>/dev/null || echo 0)
-E=$(LL | grep -cE "Traceback|CUDA out of memory|EngineDead|FATAL" || echo 0)
-WDH=$(grep '!!' $W 2>/dev/null | grep -vc '异常率' || echo 0)
+E=$(LL | grep -cE "Traceback|CUDA out of memory|EngineDead|FATAL" || true); E=${E:-0}   # ★ grep -c 计数 0 时退出码 1,旧版 || echo 0 会写成 "0\n0" 炸掉状态文件
+WDH=$(grep '!!' $W 2>/dev/null | grep -vc '异常率' || true); WDH=${WDH:-0}
 P=0; for f in /proc/[0-9]*/cmdline; do tr '\0' ' ' < $f 2>/dev/null | grep -qE -- "(--run-name|experiment_name=)classic_sqa7b_pg[s] " && P=$((P+1)); done
 now=$(date +%s); lp=$(find $R/$RUN/rollouts $R/$RUN/checkpoints -mindepth 1 -maxdepth 1 -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1); lp=${lp:-$(stat -c %Y $L 2>/dev/null || echo $now)}; FRESH=$(( (now-lp)/60 ))
 EP=0; for p in 8880 8881 8882 8883; do code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer token-abc123' http://127.0.0.1:$p/v1/models 2>/dev/null); [ "$code" = 200 ] && EP=$((EP+1)); done
