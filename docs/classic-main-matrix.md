@@ -15,7 +15,7 @@
 | ALF3B | alfworld_3b_pgs.yaml | 88a3c7172848 | 16×8,444 步(2ep),decay470 | 待发 |
 | ALF7B | alfworld_7b_pgs.yaml | e914221e53da | 同上 | 待发 |
 | SQA3B | searchqa_3b_pgs.yaml | de57cfcca310 | 128×8,~2650 步(2ep),decay2800 —— ★发车前须同 SQA7B 改 1ep/decay1400 | 待发(格新建 2026-08-23) |
-| SQA7B | searchqa_7b_pgs.yaml | **b28e18c19eba**(A800,decay1400 版;2ep 旧版 47c6734f849b——★decay 进指纹) | **1 epoch=1325 步,decay1400** | **在跑**@**A800 卡0-3**(2026-08-28 **13:18 从 ckpt_20 续跑**,第二次硬件故障 step38 后;2026-08-27 21:50 第三次发车——11:10 的 run 在 step10 后遭 A800 GPU 硬件故障,修复后重头重跑,旧数据归档 `_gpufail0827`;卡4-7=四端点 35B,retriever@162,client 熔断上线;162 首日 run 已归档) |
+| SQA7B | searchqa_7b_pgs.yaml | **b28e18c19eba**(A800,decay1400 版;2ep 旧版 47c6734f849b——★decay 进指纹) | **1 epoch=1325 步,decay1400** | **在跑**@**A800 卡0-3**(2026-08-29 **23:35 从 ckpt_80 续跑**,第三次硬件故障 step92 后;val 曲线 32.98→40.65@80;2026-08-28 13:18 从 ckpt_20 续跑,第二次故障 step38 后;2026-08-27 21:50 第三次发车——11:10 的 run 在 step10 后遭 A800 GPU 硬件故障,修复后重头重跑,旧数据归档 `_gpufail0827`;卡4-7=四端点 35B,retriever@162,client 熔断上线;162 首日 run 已归档) |
 | WS3B | webshop_3b_pgs.yaml | 0a2c352725c3 | 32×16,200 步(1ep),decay210 | 待发 |
 | WS7B | webshop_7b_pgs.yaml(162 变体 `_162`) | 463b32932ef9(162: f2bb626e6f2d,仅宿主路径异) | 同上 | ✅ **完成** 2026-08-25(200/200 步)**Succ 83.78 / Score 89.49**,超 SEED 本尊 Succ +5.7pp;数字与路径见 [结果台账](classic-main-results.md#ws7b--webshop--qwen25-7b-instruct--pgs-) |
 
@@ -136,6 +136,8 @@ Qwen2.5-**3B/7B 均在 `/data3/wushang/model/Qwen/`**(3B 首分片 sha256 与 A8
 | 每格跑完 | 归档 val 全量扫描(probe/val_scan_all.py)+ 终评批(§4)+ 更新本表状态 |
 
 ## 6. 变更台账
+
+- 2026-08-29:**A800 第三次 GPU 硬件故障(step 92,指纹同前)→ 23:35 从 ckpt_80 续跑**;val 曲线 step0/20/40/60/80 = 32.98/35.02/38.09/38.69/40.65。发现续跑孤儿 ckpt 问题(max_ckpt_to_keep 不跨会话),须手动清。本机静态主机路由换网段失效插曲(记忆 local-static-routes-servers)。
 
 - 2026-08-28:**A800 第二次 GPU 硬件故障(step 38)→ 13:18 从 ckpt_20 续跑**(resume_mode=auto + 指纹守门,指纹不变;陈旧 step21-38 rollouts 归档 `rollouts_stale_gpufail0828/`)。首个机制期 val step20 macro 35.02(+2.0pp)。bringup 一条龙改序(冒烟→35B→dry,端点门在末);等待器参数化 STEP=;状态脚本 grep -c 计数 bug 修。两次故障同指纹:单端点 doc_missing 25% 是整机楔死前兆。
 
