@@ -1,0 +1,18 @@
+# Configuration fragment: merge into an existing experiment, not a standalone run.
+research:
+  evolution:
+    enabled: true
+    initial_skill: ""
+    # Development only: two prompts, four samples each. Formal: [""].
+    discovery_prompts:
+      - ""
+      - "Check the task requirements before each action."
+    validation_prompt: ""
+    samples: 4
+    max_rounds: 3
+    seed: 1729
+    min_error_reduction: 0.01
+    min_success_gain: 0.01
+    max_holdout_regression: 0.0
+    require_holdout: true
+    holdout_tasks: "${TRACE_SKILL_HOLDOUT_TASKS}"

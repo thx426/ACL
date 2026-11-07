@@ -82,6 +82,12 @@ class ResearchArchive:
                 append_jsonl(final / "session.jsonl", msg)
             if result.doc:
                 (final / "doc.md").write_text(result.doc, encoding="utf-8")
+            if result.evolution_audit is not None:
+                write_json(final / "skill_evolution.json", result.evolution_audit)
+                for error in result.evolution_audit["errors"]:
+                    append_jsonl(final / "errors.jsonl", error)
+                for decision in result.evolution_audit["validations"]:
+                    append_jsonl(final / "skill_validations.jsonl", decision)
         for rec in records:
             append_jsonl(final / "episodes.jsonl", _episode_row(rec))
 

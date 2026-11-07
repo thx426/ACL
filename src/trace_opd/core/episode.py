@@ -79,6 +79,7 @@ class EpisodeResult:
     invalid_format: int
     truncated: bool
     gen_extra: dict[str, Any]  # first/last generation extras (e.g. policy version)
+    env_steps_by_turn: list[int] = field(default_factory=list)
 
     @property
     def won(self) -> bool:
@@ -96,6 +97,7 @@ async def run_episode(
     sample_idx: int = 0,
     response_budget: int,
     sampling_params: dict[str, Any],
+    resume: tuple[EpisodeResult, int] | None = None,
 ) -> EpisodeResult:
     """Run one multi-turn episode. Environment faults yield outcome=ENV_ERROR
     (never raise) — the caller decides whether to refund (research), retry
@@ -139,6 +141,7 @@ async def run_episode(
     truncated = False
     won = False
     gen_extra: dict[str, Any] = {}
+    env_steps_by_turn: list[int] = []
     # 轮末停止形态哨兵(2026-08-08 Qwen3.5 EOS 事故固化):clean=停在我们
     # 下发的轮末符;capped=满额截断;other=引擎用了停止集之外的符号停下
     # ——engine 后端(生产 rollout,停止 token 保留在输出)上 other 升高
@@ -179,6 +182,36 @@ async def run_episode(
         )
 
         env_steps = 0
+        if resume is not None:
+            source, before_step = resume
+            prefix_turns = before_step - 1
+            if (not getattr(adapter, "supports_exact_replay", False)
+                    or source.trajectory.task_id != adapter.task_id
+                    or not 0 <= prefix_turns < len(source.tokens.turn_spans)
+                    or len(source.env_steps_by_turn) != len(source.trajectory.steps)):
+                raise ValueError("exact replay is unsupported or prefix evidence is incomplete")
+            if initial_obs != source.trajectory.initial_obs:
+                raise ValueError("replay_drift: initial observation mismatch")
+            for step in source.trajectory.steps[:prefix_turns]:
+                if step.acted:
+                    live, ended = await asyncio.to_thread(adapter.replay_action, env, step.action_norm)
+                    def env_text(value):
+                        return protocol.strip_tool_response(value).split("\n(note: ", 1)[0].strip()
+                    if ended or env_text(live) != env_text(step.observation):
+                        raise ValueError("replay_drift: prefix observation mismatch or early termination")
+            cut = source.tokens.turn_spans[prefix_turns][0]
+            stream = list(source.tokens.response_ids[:cut])
+            # Local continuations are evaluation-only. Prefix tokens are never trained.
+            mask = [0] * len(stream)
+            assistant_turns = prefix_turns
+            env_steps = source.env_steps_by_turn[prefix_turns - 1] if prefix_turns else 0
+            for step in reversed(source.trajectory.steps[:prefix_turns]):
+                if step.acted:
+                    break
+                consecutive_bad += 1
+            traj.meta["resume"] = {"episode_id": source.trajectory.episode_id,
+                                   "before_step": before_step, "prefix_tokens": cut,
+                                   "env_steps_used": env_steps, "exact_replay": True}
         done = False
         while (
             env_steps < protocol.MAX_ENV_STEPS
@@ -239,6 +272,7 @@ async def run_episode(
                     acted=outcome.acted,
                 )
             )
+            env_steps_by_turn.append(env_steps + int(outcome.acted and outcome.consumed_env_step))
             if not outcome.acted:
                 invalid_format += 1
                 consecutive_bad += 1
@@ -303,6 +337,7 @@ async def run_episode(
             invalid_format=invalid_format,
             truncated=truncated,
             gen_extra=gen_extra,
+            env_steps_by_turn=env_steps_by_turn,
         )
     except Exception as err:  # noqa: BLE001 — engine/transport fault mid-episode
         traj.outcome = OUTCOME_ENV_ERROR
@@ -323,6 +358,7 @@ async def run_episode(
             invalid_format=invalid_format,
             truncated=truncated,
             gen_extra=gen_extra,
+            env_steps_by_turn=env_steps_by_turn,
         )
     finally:
         traj.meta.setdefault("wall_s", round(time.time() - t0, 2))

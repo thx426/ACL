@@ -1,10 +1,13 @@
 """The researcher session: a free-form multi-turn agent loop.
 
-Structure is deliberately minimal (pilot-validated rulings): no fixed
+The legacy structure is deliberately minimal (pilot-validated rulings): no fixed
 "rounds", no programmatic finalize gate — the researcher decides when it is
 done; the program only maintains counters, injects the near-limit wrap-up
 reminder, and records every message verbatim (SessionResult.messages is the
 archive/SFT source of truth).
+
+Optional Skill evolution keeps this loop and delegates evidence/acceptance
+checks to the router; finalize can release only the accepted Skill in that mode.
 
 Backend-agnostic: the researcher LLM is a ResearcherChatFn and tool
 transport is a ToolProtocol, so the strong-model form (external + fncall)
@@ -52,6 +55,7 @@ class SessionResult:
     # backend reports none, e.g. the engine form).
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    evolution_audit: dict[str, Any] | None = None
 
 
 class ResearchSession:
@@ -73,6 +77,11 @@ class ResearchSession:
         # 工具描述按 router 的 ResearchCfg 生成:k 的 default/max 必须与配置一致,
         # 否则模型照着写死的文案显式填 k,cfg.k_default 永远不生效(见
         # prompts.tool_schemas_for 的注释与 2026-08-07 的实测)。
+        if getattr(router, "evolution", None) is not None:
+            from .evolution_prompts import EVOLUTION_INSTRUCTIONS
+
+            system_prompt += "\n" + EVOLUTION_INSTRUCTIONS
+            system_prompt += "\nCURRENT SKILL:\n" + (router.evolution.active_skill or "(empty)")
         prepared_system, self._tools = toolproto.prepare(
             system_prompt, tool_schemas_for(router.cfg)
         )
@@ -113,6 +122,8 @@ class ResearchSession:
             error=error,
             prompt_tokens=self._prompt_tokens,
             completion_tokens=self._completion_tokens,
+            evolution_audit=(self._router.evolution.snapshot()
+                             if getattr(self._router, "evolution", None) else None),
         )
 
     async def run(self) -> SessionResult:

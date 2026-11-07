@@ -280,6 +280,9 @@ SYSTEM_PROMPT_FC = (
 class AlfworldTaskAdapter:
     """TaskAdapter implementation bound to one dataset row."""
 
+    # Fixed gamefile + deterministic action replay; the runner still checks every observation.
+    supports_exact_replay = True
+
     def __init__(
         self,
         item: dict,

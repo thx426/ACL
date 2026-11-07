@@ -404,6 +404,7 @@ class TraceAgentLoop(AgentLoopBase):
                 delta=self.delta,
                 episode_response_budget=self._episode_budget(),
                 narrate_fn=self._narrate_fn(route),
+                adapter_factory=self.factory.adapter_from_item,
             )
             session = ResearchSession(
                 researcher_chat=self._researcher_chat(adapter.task_id),
@@ -582,6 +583,7 @@ class TraceAgentLoop(AgentLoopBase):
                 delta=self.delta,
                 episode_response_budget=response_length,
                 narrate_fn=self._narrate_fn(tag),
+                adapter_factory=self.factory.adapter_from_item,
             )
             session = ResearchSession(
                 researcher_chat=chat,
@@ -725,6 +727,7 @@ class TraceAgentLoop(AgentLoopBase):
                     "research": dict(rowres.fields),
                     "doc": (sr.doc or "") if sr is not None else "",
                     "messages": list(sr.messages) if sr is not None else [],
+                    "skill_evolution": sr.evolution_audit if sr is not None else None,
                     "continuations": [
                         {"won": o.won, "error": o.error, "env_steps": o.env_steps,
                          "gen_tokens": o.gen_tokens, "truncated": o.truncated}

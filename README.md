@@ -7,6 +7,7 @@ self-teacher → 对 student 裸 on-policy rollout 做标准 OPD 蒸馏内化。
 
 - 设计真源:`docs/design.md`
 - 配置真源(全部超参数,带注释):`configs/trace.yaml`
+- 可选的错误定位—局部修订—独立验证：[Skill 演化说明](docs/skill-evolution.md)
 - verl:仓库外 `verl/` 克隆的 **trace-opd 分支**(h3-pilot 5 patch + validate 传递 patch)
 
 ## 布局

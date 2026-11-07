@@ -18,6 +18,8 @@ from typing import Any
 
 import yaml
 
+from .evolution_config import EvolutionCfg
+
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -112,6 +114,15 @@ class ResearchCfg:
                                    # 工具描述膨胀的暴露面(4B 实测中位 1426/
                                    # max 1598);旧 model_len−2048 的 2048 是
                                    # 无引用魔数,已废
+
+
+    evolution: EvolutionCfg = field(default_factory=EvolutionCfg)
+
+    def __post_init__(self):
+        if isinstance(self.evolution, dict):
+            self.evolution = EvolutionCfg(**self.evolution)
+        if not isinstance(self.evolution, EvolutionCfg):
+            raise ValueError("research.evolution must be an object")
 
 
 @dataclass
@@ -931,6 +942,14 @@ _KNOWN_SECTIONS = {
 
 def _validate(cfg: "Config") -> None:
     t = cfg.train
+    evolution = cfg.research.evolution
+    if evolution.enabled:
+        if not cfg.research.enabled or not cfg.steering.enabled or cfg.steering.doc_source != "researcher":
+            raise ValueError("research.evolution requires the enabled researcher document workflow")
+        if evolution.require_holdout and not evolution.holdout_tasks:
+            raise ValueError("research.evolution.holdout_tasks is required unless require_holdout=false")
+        if evolution.holdout_tasks and not Path(evolution.holdout_tasks).is_file():
+            raise ValueError("research.evolution.holdout_tasks must be an existing JSONL file")
     if not t.model_path:
         raise ValueError("train.model_path is required")
     if cfg.alfworld.protocol not in ("fncall", "text"):
@@ -1774,6 +1793,16 @@ def objective_fingerprint(cfg: "Config") -> str:
         material += "|" + json.dumps(
             research_material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
+    if cfg.research.evolution.enabled:
+        import json
+        from dataclasses import asdict
+
+        evolution_material = asdict(cfg.research.evolution)
+        holdout = cfg.research.evolution.holdout_tasks
+        evolution_material["holdout_sha256"] = (
+            hashlib.sha256(Path(holdout).read_bytes()).hexdigest() if holdout else None
+        )
+        material += "|skill_evolution_v1=" + json.dumps(evolution_material, sort_keys=True)
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
 

@@ -96,6 +96,7 @@ class ToolRouter:
         delta: TemplateDelta,
         episode_response_budget: int,
         narrate_fn: NarrateFn | None,
+        adapter_factory=None,
     ) -> None:
         self.adapter = adapter
         self.cfg = research
@@ -107,6 +108,11 @@ class ToolRouter:
         self._narrate_fn = narrate_fn
         self.state = SessionState()
         self._seen_guidance_hashes: set[str] = set()
+        self.evolution = None
+        if research.evolution.enabled:
+            from .evolution import SkillEvolution
+
+            self.evolution = SkillEvolution(self, adapter_factory=adapter_factory)
 
     # ------------------------------------------------------------ dispatch
 
@@ -122,11 +128,24 @@ class ToolRouter:
                     "(keep quotes and newlines inside string values escaped)."
                 )
             if call.name == "run_experiment":
+                if self.evolution is not None:
+                    return await self.evolution.discover(call.arguments)
                 return await self._run_experiment(call.arguments)
             if call.name == "fetch_raw":
                 return self._fetch_raw(call.arguments)
             if call.name == "finalize":
+                if self.evolution is not None:
+                    return self.evolution.finalize(call.arguments)
                 return self._finalize(call.arguments)
+            if self.evolution is not None:
+                if self.state.finalized:
+                    return "The session is already finalized."
+                if call.name == "record_error":
+                    return self.evolution.record_error(call.arguments)
+                if call.name == "propose_revision":
+                    return self.evolution.propose(call.arguments)
+                if call.name == "validate_revision":
+                    return await self.evolution.validate(call.arguments)
             # 角色纠正而非单纯报错:实测(2026-08-11,终端域 9B)调错工具
             # 几乎总是同一种——模型把自己当成 executor 去调环境工具(`bash`)。
             # 只说"未知工具"不纠正身份,模型下一轮还会再犯(每会话 1-2 个废轮)。

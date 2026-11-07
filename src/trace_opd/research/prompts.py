@@ -301,4 +301,20 @@ def tool_schemas_for(cfg) -> list[dict]:
                 f"maximum {cfg.k_max}). Prefer the default unless you have a "
                 f"specific reason to spend more of your episode budget."
             )
+    if getattr(getattr(cfg, "evolution", None), "enabled", False):
+        from .evolution_prompts import evolution_schemas
+
+        for tool in out:
+            fn = tool["function"]
+            if fn["name"] == "run_experiment":
+                fn["description"] = (
+                    "Collect discovery trajectories with the frozen executor and current Skill; "
+                    f"{cfg.evolution.samples} samples per configured prompt. Returns error records."
+                )
+                fn["parameters"] = {"type": "object", "properties": {}, "additionalProperties": False}
+            elif fn["name"] == "finalize":
+                fn["description"] = "Finish the session and release only the current accepted Skill."
+                fn["parameters"] = {"type": "object", "properties": {
+                    "self_assessment": {"type": "string"}}, "additionalProperties": False}
+        out.extend(evolution_schemas())
     return out
